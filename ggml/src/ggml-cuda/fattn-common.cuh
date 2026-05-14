@@ -4,6 +4,11 @@
 #include "convert.cuh"
 #include "vecdotq.cuh"
 #include "fattn-mma-tbq4.cuh"
+
+// AMD_BFE: recognized by ROCm LLVM codegen as v_bfe_u32
+#ifndef AMD_BFE
+#define AMD_BFE(val, offset, width) (((val) >> (offset)) & ((1u << (width)) - 1u))
+#endif
 #include "planar-iso-constants.cuh"
 #include "fattn-planar-iso.cuh"
 
@@ -318,8 +323,8 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_0(
             const float   norm    = __half2float(K_tbq4[ib].d);
             const uint8_t qs_byte = K_tbq4[ib].qs[j0 / 2];
 
-            const uint8_t idx0 = (qs_byte >> 0) & 0xF;
-            const uint8_t idx1 = (qs_byte >> 4) & 0xF;
+            const uint8_t idx0 = AMD_BFE(qs_byte, 0, 4);
+            const uint8_t idx1 = AMD_BFE(qs_byte, 4, 4);
 
             float2 kv;
             kv.x = d_tbq4_centroids[idx0] * norm;
@@ -673,10 +678,10 @@ static __device__ __forceinline__ void dequantize_V_tbq4_0(const void * __restri
         const uint8_t qs_byte0 = x[ib].qs[j0 / 2];
         const uint8_t qs_byte1 = x[ib].qs[j0 / 2 + 1];
 
-        const uint8_t idx0 = (qs_byte0 >> 0) & 0xF;
-        const uint8_t idx1 = (qs_byte0 >> 4) & 0xF;
-        const uint8_t idx2 = (qs_byte1 >> 0) & 0xF;
-        const uint8_t idx3 = (qs_byte1 >> 4) & 0xF;
+        const uint8_t idx0 = AMD_BFE(qs_byte0, 0, 4);
+        const uint8_t idx1 = AMD_BFE(qs_byte0, 4, 4);
+        const uint8_t idx2 = AMD_BFE(qs_byte1, 0, 4);
+        const uint8_t idx3 = AMD_BFE(qs_byte1, 4, 4);
 
 #ifdef FP16_AVAILABLE
         if constexpr (std::is_same_v<T, half>) {
