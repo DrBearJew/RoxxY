@@ -190,7 +190,9 @@ Compare q8_0 and TBQ4 when both fit:
 - If `draft_n` is absent while MTP was requested, fail the MTP gate: the server was not actually testing MTP acceptance.
 - If acceptance is high but coherence fails, coherence wins: the candidate fails.
 
-Observed TBQ4 smoke datum after the VEC fixes: 64-token MTP request at `-c 2048`, `--spec-type mtp --parallel 1`, produced `draft_n=208`, `draft_n_accepted=50`, `mtp_accept_pct=24.0%`, coherent output, and 38.1 tok/s generation.
+Observed TBQ4 smoke datum after the VEC fixes: 64-token MTP request at `-c 2048`, `--spec-type mtp --parallel 1 --spec-draft-n-max 3`, produced `draft_n=54`, `draft_n_accepted=45`, `mtp_accept_pct=83.3%`, coherent output, and 54.0 tok/s generation. q8_0 comparison at same settings: `draft_n=57`, `draft_n_accepted=44`, `mtp_accept_pct=77.2%`, 49.8 tok/s.
+
+**Critical**: llama.cpp defaults `--spec-draft-n-max` to 16, which severely degrades aggregate acceptance (~36%). PR #22673 recommends n_max=3 for optimal acceptance (70-87%). The harness always sets `--spec-draft-n-max 3` when MTP is enabled.
 
 ### 6. Cache and slot coherence
 
