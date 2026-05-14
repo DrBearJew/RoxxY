@@ -211,6 +211,31 @@ Results are written to `gate-summary.json`.
 | `q8_0` | 14k tokens | 16k | 394.2 |
 | `tbq4_0` (after KQ fix) | 14k tokens | 16k | 537.7 |
 
+### RDNA3 MoE MMQ accelerator (Qwen3.6 35B-A3B IQ4_XS)
+
+LDS double-buffered `mul_mat_q` prefill accelerator behind `RDNA2_MATMUL_OPT_V1=1`.
+Compile with `-DRDNA2_MATMUL_OPT_V1=1`, enable at runtime with env var.
+
+| Mode | pp128 | pp256 | tg32/tg64 |
+|---|---|---|---|
+| Baseline | 1258 ± 47 | 1939 ± 53 | 79.4 ± 0.7 |
+| **`RDNA2_MATMUL_OPT_V1=1`** | **2706 ± 57** | **3985 ± 50** | 79.9 ± 1.2 |
+| Delta | **+115%** | **+105%** | flat |
+
+Dense models (Q4_K_M 27B): pp128 646 → 673 (+4%, within noise). Decode unaffected.
+Based on Stormrage34's RDNA2 matmul optimization approach.
+
+### Cooperative TBQ4 set_rows + InnerQ + Layer-Adaptive KV
+
+Experimental features behind env flags on this branch:
+
+| Flag | Feature | Status |
+|---|---|---|
+| `TBQ4_COOP_SET_ROWS=1` | Cooperative 128-thread TBQ4 set_rows | Prefill neutral (−1-2%), harness passes |
+| `AMD_BFE` | `__builtin_amdgcn_ubfe` nibble extraction (compile-time) | 6 unconditional sites, enabled in AMD build |
+| `TBQ4_INNERQ=256` | Per-channel K/V equalization (calibration → forward scale) | Smoke passes; MoE 27B RMS 1.81 (scales 0.66–1.52), MoE 35B RMS 1.15 (scales 0.96–1.08) |
+| `TBQ4_LAYER_ADAPTIVE=7` | Boundary-V mixed precision (q8_0 for first+last 2 layers V) | Builds, to-benchmark |
+
 ## Key files changed
 
 | File | Purpose |
