@@ -1,10 +1,10 @@
 {
   "gate": "TBQ4 ROCm Coherence & Precision",
   "model": "/mnt/CC6AA71F6AA70574/models/MTP/Qwen3.6-27B-Q4_K_M-mtp.gguf",
-  "binary": "/tmp/llama.cpp-mtp/build-rocm-tq/bin/llama-server",
+  "binary": "/home/mrtrent/llama.cpp-mtp-tbq4-rdna3/build-rocm/bin/llama-server",
   "q8_ctx": 4096,
   "tbq4_ctx": 4096,
-  "timestamp": "2026-05-14T07:01:32Z",
+  "timestamp": "2026-05-14T09:56:14Z",
   "overall": "PASS",
   "passes": [
     "smoke: all deterministic tests passed",
@@ -72,7 +72,7 @@
           "q8_top1_rank_in_tbq4": 1,
           "top10_jaccard": 1.0,
           "shared_logprob_mae": 0.07201188177831712,
-          "approx_jsd": 0.0010553215304621708
+          "approx_jsd": 0.0010553215304621693
         },
         {
           "name": "math_2plus2",
@@ -83,7 +83,7 @@
           "q8_top1_rank_in_tbq4": 1,
           "top10_jaccard": 0.8181818181818182,
           "shared_logprob_mae": 0.08492880150423211,
-          "approx_jsd": 0.0008630924325685519
+          "approx_jsd": 0.0008630924325685517
         },
         {
           "name": "math_7x8",
@@ -94,7 +94,7 @@
           "q8_top1_rank_in_tbq4": 1,
           "top10_jaccard": 0.8181818181818182,
           "shared_logprob_mae": 0.16896254899071866,
-          "approx_jsd": 0.002616422095231538
+          "approx_jsd": 0.0026164220952315477
         },
         {
           "name": "code_python_func",
@@ -105,7 +105,7 @@
           "q8_top1_rank_in_tbq4": 1,
           "top10_jaccard": 1.0,
           "shared_logprob_mae": 0.07476705880392165,
-          "approx_jsd": 0.000495795462320553
+          "approx_jsd": 0.0004957954623205523
         },
         {
           "name": "factual_water",
@@ -116,7 +116,7 @@
           "q8_top1_rank_in_tbq4": 1,
           "top10_jaccard": 0.8181818181818182,
           "shared_logprob_mae": 0.08500113803893328,
-          "approx_jsd": 0.0002966173580624034
+          "approx_jsd": 0.00029661735806240475
         },
         {
           "name": "factual_earth",
@@ -126,8 +126,8 @@
           "top1_match": true,
           "q8_top1_rank_in_tbq4": 1,
           "top10_jaccard": 1.0,
-          "shared_logprob_mae": 0.10225279821503547,
-          "approx_jsd": 0.00015821396551273707
+          "shared_logprob_mae": 0.1320180046179938,
+          "approx_jsd": 0.00019181113863198264
         },
         {
           "name": "code_html",
@@ -138,7 +138,7 @@
           "q8_top1_rank_in_tbq4": 1,
           "top10_jaccard": 1.0,
           "shared_logprob_mae": 0.05933054939645235,
-          "approx_jsd": 0.009377996004148476
+          "approx_jsd": 0.009377996004148478
         },
         {
           "name": "code_sql",
@@ -149,7 +149,7 @@
           "q8_top1_rank_in_tbq4": 1,
           "top10_jaccard": 1.0,
           "shared_logprob_mae": 0.06090133719974094,
-          "approx_jsd": 0.0011141528961526352
+          "approx_jsd": 0.0011141528961526328
         },
         {
           "name": "factual_largest_ocean",
@@ -160,7 +160,7 @@
           "q8_top1_rank_in_tbq4": 1,
           "top10_jaccard": 1.0,
           "shared_logprob_mae": 0.1439480393651932,
-          "approx_jsd": 0.0006111295350035731
+          "approx_jsd": 0.0006111295350035735
         },
         {
           "name": "factual_light_speed",
@@ -171,14 +171,14 @@
           "q8_top1_rank_in_tbq4": 1,
           "top10_jaccard": 1.0,
           "shared_logprob_mae": 0.06573028303682804,
-          "approx_jsd": 0.00010132617628743926
+          "approx_jsd": 0.00010132617628743921
         }
       ],
       "class_summary": {
         "short factual/math/code": {
           "top1_match_pct": 100.0,
           "top10_jaccard_avg": 0.945,
-          "shared_logprob_mae_avg": 0.0918,
+          "shared_logprob_mae_avg": 0.0948,
           "approx_jsd_avg": 0.0017
         }
       },
@@ -212,12 +212,22 @@
     "mtp_acceptance": {
       "tests": [
         {
-          "name": "mtp_short",
-          "draft_n": 144,
-          "draft_n_accepted": 53,
-          "accept_pct": 36.80555555555556,
-          "gen_tok_s": 54.42223148156022,
-          "text": "\n\n<think>\nThinking Process:\n\n1.  **Deconstruct the user's request:**\n    *   Topic: AMD GPUs and open-source inference.\n"
+          "name": "mtp_short_q8_0",
+          "cache": "q8_0",
+          "draft_n": 57,
+          "draft_n_accepted": 44,
+          "accept_pct": 77.19298245614036,
+          "gen_tok_s": 50.64032314856209
+        },
+        {
+          "name": "mtp_short_tbq4",
+          "cache": "tbq4_0",
+          "draft_n": 57,
+          "draft_n_accepted": 44,
+          "accept_pct": 77.19298245614036,
+          "gen_tok_s": 53.27477547595601,
+          "text": "\n\n<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Topic:** AMD GPUs and open-source inference\n   ",
+          "accept_delta_vs_q8": 0.0
         }
       ],
       "critical_failures": []
