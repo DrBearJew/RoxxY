@@ -1,6 +1,6 @@
 #pragma once
 
-#include <cuda_runtime.h>
+#include "common.cuh"
 #include <stdint.h>
 
 // Initialize rotation constants for planar/iso CUDA kernels.
