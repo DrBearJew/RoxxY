@@ -45,7 +45,7 @@ The important point: TBQ4 made 64k context fit while keeping generation usable.
 
 The first ROCm TBQ4 attempt used rocWMMA. It was stable enough to run, but the output was wrong.
 
-The working path is the simpler VEC Flash Attention path:
+The working path is the simpler VEC Flash Attention path — the same approach [Stormrage34/llama.cpp-turboquant-hip](https://github.com/Stormrage34/llama.cpp-turboquant-hip) first validated for AMD (`turbo2/3/4` types), adapted here for the `tbq4_0` block format:
 
 1. read TBQ4 K/V blocks,
 2. dequantize inside the attention loop,
@@ -280,7 +280,8 @@ python convert.py base-model.gguf MTP-Q8_0.gguf output-mtp.gguf
 
 ### ROCm TBQ4 VEC path
 
-- **[TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant)** — Working AMD VEC inline dequant implementation that proved the VEC approach correct
+- **[Stormrage34/llama.cpp-turboquant-hip](https://github.com/Stormrage34/llama.cpp-turboquant-hip)** — **First working AMD VEC TurboQuant path** (RDNA2, `turbo2/3/4` KV types, BFE dequant, MoE LDS accelerator). Our TBQ4 VEC path follows the same inline-dequant-inside-FA pattern, adapted for the `tbq4_0` block format and RDNA3.
+- **[TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant)** — Original TurboQuant reference implementation (block formats, FWHT rotation model, centroids)
 - **[adelj88/rocm_wmma_gemm](https://github.com/adelj88/rocm_wmma_gemm)** — rocWMMA reference used in the experimental prototype
 - **[Kaden-Schutt/hipfire](https://github.com/Kaden-Schutt/hipfire)** — MMQ screening concept that inspired the coherence gate design
 
