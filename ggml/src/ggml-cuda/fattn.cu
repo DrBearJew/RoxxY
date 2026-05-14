@@ -5,6 +5,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn-wmma-f16.cuh"
+#include "fattn-wmma-tbq4.cu"
 #include "cpy-planar-iso.cuh"
 #include "fattn.cuh"
 
@@ -308,6 +309,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_ISO3_0,    GGML_TYPE_ISO3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_PLANAR4_0, GGML_TYPE_PLANAR4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_ISO4_0,    GGML_TYPE_ISO4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ4_0,    GGML_TYPE_TBQ4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,       GGML_TYPE_PLANAR3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,       GGML_TYPE_ISO3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,       GGML_TYPE_PLANAR4_0)
@@ -325,6 +327,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_ISO3_0,    GGML_TYPE_ISO3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_PLANAR4_0, GGML_TYPE_PLANAR4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_ISO4_0,    GGML_TYPE_ISO4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ4_0,    GGML_TYPE_TBQ4_0)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     GGML_ABORT("fatal error");
@@ -338,6 +341,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_WMMA_F16 = 300,
     BEST_FATTN_KERNEL_MMA_F16  = 400,
     BEST_FATTN_KERNEL_MMA_TBQ4 = 500,
+    BEST_FATTN_KERNEL_WMMA_TBQ4 = 550, // AMD rocWMMA TBQ4 path (experimental, disabled in favor of VEC)
 };
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
@@ -446,6 +450,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             }
             if (turing_mma_available(cc)) {
                 return BEST_FATTN_KERNEL_MMA_TBQ4;
+            }
+            if (amd_wmma_available(cc) && (Q->ne[0] == 128 || Q->ne[0] == 256)) {
+                return BEST_FATTN_KERNEL_VEC;
             }
             return BEST_FATTN_KERNEL_NONE;
         case GGML_TYPE_PLANAR3_0:
@@ -662,9 +669,24 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_TILE:
             ggml_cuda_flash_attn_ext_tile(ctx, dst);
             break;
-        case BEST_FATTN_KERNEL_VEC:
+        case BEST_FATTN_KERNEL_VEC: {
+            const ggml_tensor * Q = dst->src[0];
+            const ggml_tensor * K = dst->src[1];
+            const ggml_tensor * V = dst->src[2];
+
+            // TBQ4 stores K/V in its signed-FWHT domain. Match the TBQ4 MMA path:
+            // rotate every Q row (tokens × heads × sequences) before attention and
+            // inverse-rotate every output row when V is TBQ4.
+            const int64_t nrows = Q->ne[1] * Q->ne[2] * Q->ne[3];
+            if (K->type == GGML_TYPE_TBQ4_0) {
+                tbq4_rotate_input_cuda((float *) Q->data, nrows, Q->ne[0], ctx.stream());
+            }
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
+            if (V->type == GGML_TYPE_TBQ4_0) {
+                tbq4_rotate_output_cuda((float *) dst->data, nrows, V->ne[0], ctx.stream());
+            }
             break;
+        }
         case BEST_FATTN_KERNEL_WMMA_F16:
             ggml_cuda_flash_attn_ext_wmma_f16(ctx, dst);
             break;
@@ -673,6 +695,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MMA_TBQ4:
             ggml_cuda_flash_attn_ext_mma_tbq4(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_WMMA_TBQ4:
+            ggml_cuda_flash_attn_ext_wmma_tbq4(ctx, dst);
             break;
     }
 }

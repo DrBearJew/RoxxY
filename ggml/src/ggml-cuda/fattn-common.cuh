@@ -3,6 +3,7 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
+#include "fattn-mma-tbq4.cuh"
 #include "planar-iso-constants.cuh"
 #include "fattn-planar-iso.cuh"
 
@@ -285,6 +286,53 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
         const float Q_d = Q_ds[k_KQ_0/nthreads].x;
 
         sum += vec_dot_q8_0_q8_1_impl<float, 1>(&v, &Q_q8[k_KQ_0/nthreads], K_q8_0[ib].d, Q_d);
+    }
+
+    return sum;
+}
+
+// TBQ4 KQ dot product: dequant TBQ4 blocks inline, dot with Q (float2/half2)
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_tbq4_0 * K_tbq4 = (const block_tbq4_0 *) K_c;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
+    constexpr int cpy_ne = cpy_nb / 4;
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
+#pragma unroll
+        for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
+            const int k_KQ = k_KQ_0 + (threadIdx.x % nthreads)*cpy_ne + k_KQ_1;
+
+            const int elem0 = k_KQ * 2;
+            const int ib    = elem0 / QK_TBQ4;
+            const int j0    = elem0 % QK_TBQ4;
+
+            const float   norm    = __half2float(K_tbq4[ib].d);
+            const uint8_t qs_byte = K_tbq4[ib].qs[j0 / 2];
+
+            const uint8_t idx0 = (qs_byte >> 0) & 0xF;
+            const uint8_t idx1 = (qs_byte >> 4) & 0xF;
+
+            float2 kv;
+            kv.x = d_tbq4_centroids[idx0] * norm;
+            kv.y = d_tbq4_centroids[idx1] * norm;
+
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            const half2 qv = ((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
+            ggml_cuda_mad(sum, make_float2(kv.x, kv.y), __half22float2(qv));
+#else
+            const float2 qv = ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
+            sum += kv.x * qv.x + kv.y * qv.y;
+#endif
+        }
     }
 
     return sum;
@@ -603,9 +651,73 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_planar4_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_ISO4_0) {
         return vec_dot_fattn_vec_KQ_iso4_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TBQ4_0) {
+        return vec_dot_fattn_vec_KQ_tbq4_0<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
+    }
+}
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_tbq4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_tbq4_0 * x = (const block_tbq4_0 *) vx;
+
+    const int64_t ib = i0 / QK_TBQ4;
+    const int j0 = i0 % QK_TBQ4;
+    const float norm = __half2float(x[ib].d);
+
+    static_assert(ne == 2 || ne == 4, "bad ne");
+
+    if constexpr (ne == 4) {
+        const uint8_t qs_byte0 = x[ib].qs[j0 / 2];
+        const uint8_t qs_byte1 = x[ib].qs[j0 / 2 + 1];
+
+        const uint8_t idx0 = (qs_byte0 >> 0) & 0xF;
+        const uint8_t idx1 = (qs_byte0 >> 4) & 0xF;
+        const uint8_t idx2 = (qs_byte1 >> 0) & 0xF;
+        const uint8_t idx3 = (qs_byte1 >> 4) & 0xF;
+
+#ifdef FP16_AVAILABLE
+        if constexpr (std::is_same_v<T, half>) {
+            ((half2 *) dst)[0] = make_half2(
+                __float2half(d_tbq4_centroids[idx0] * norm),
+                __float2half(d_tbq4_centroids[idx1] * norm));
+            ((half2 *) dst)[1] = make_half2(
+                __float2half(d_tbq4_centroids[idx2] * norm),
+                __float2half(d_tbq4_centroids[idx3] * norm));
+        } else
+#endif // FP16_AVAILABLE
+        if constexpr (std::is_same_v<T, float>) {
+            ((float2 *) dst)[0] = make_float2(
+                d_tbq4_centroids[idx0] * norm,
+                d_tbq4_centroids[idx1] * norm);
+            ((float2 *) dst)[1] = make_float2(
+                d_tbq4_centroids[idx2] * norm,
+                d_tbq4_centroids[idx3] * norm);
+        } else {
+            static_assert(std::is_same_v<T, void>, "bad type");
+        }
+    } else { // ne == 2
+        const int j1 = j0 + 1;
+        const uint8_t qs_byte0 = x[ib].qs[j0 / 2];
+        const uint8_t qs_byte1 = x[ib].qs[j1 / 2];
+        const uint8_t idx0 = (j0 & 1) ? (qs_byte0 >> 4) : (qs_byte0 & 0xF);
+        const uint8_t idx1 = (j1 & 1) ? (qs_byte1 >> 4) : (qs_byte1 & 0xF);
+
+#ifdef FP16_AVAILABLE
+        if constexpr (std::is_same_v<T, half>) {
+            ((half2 *) dst)[0] = make_half2(
+                __float2half(d_tbq4_centroids[idx0] * norm),
+                __float2half(d_tbq4_centroids[idx1] * norm));
+        } else
+#endif // FP16_AVAILABLE
+        if constexpr (std::is_same_v<T, float>) {
+            ((float *) dst)[0] = d_tbq4_centroids[idx0] * norm;
+            ((float *) dst)[1] = d_tbq4_centroids[idx1] * norm;
+        } else {
+            static_assert(std::is_same_v<T, void>, "bad type");
+        }
     }
 }
 
@@ -633,6 +745,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_planar4_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_ISO4_0) {
         return dequantize_V_iso4_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TBQ4_0) {
+        return dequantize_V_tbq4_0<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;
