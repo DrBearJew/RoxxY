@@ -207,8 +207,26 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
+        // Layer-adaptive V cache (TBQ4_LAYER_ADAPTIVE=mode):
+        // Mode 7: first2+last2 layers get q8_0 V, middle get tbq4_0 V
+        // K stays unchanged (type_k as configured).
+        ggml_type type_v_layer = type_v;
+        {
+            static int layer_adaptive_mode = -1;
+            if (layer_adaptive_mode < 0) {
+                const char * env = getenv("TBQ4_LAYER_ADAPTIVE");
+                layer_adaptive_mode = env ? atoi(env) : 0;
+            }
+            if (layer_adaptive_mode == 7 && type_v == GGML_TYPE_TBQ4_0) {
+                int n_layer = (int)hparams.n_layer;
+                if (il < 2 || il >= n_layer - 2) {
+                    type_v_layer = GGML_TYPE_Q8_0;
+                }
+            }
+        }
+
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v_layer, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
