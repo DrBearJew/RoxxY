@@ -24,9 +24,9 @@ static int tbq4_innerq_calibration_groups() {
     return env ? atoi(env) : 0;
 }
 
-// Called from host before kernel launch: upload forward scale to device
-static void tbq4_innerq_upload_scale(const float * scale, cudaStream_t stream) {
-    CUDA_CHECK(hipMemcpyToSymbol(d_tbq4_innerq_scale, scale, 128 * sizeof(float), 0, hipMemcpyHostToDevice));
+// Called from host before kernel launch: publish scale_inv to device
+static void tbq4_innerq_upload_scale(const float * scale_inv, cudaStream_t stream) {
+    CUDA_CHECK(hipMemcpyToSymbol(d_tbq4_innerq_scale, scale_inv, 128 * sizeof(float), 0, hipMemcpyHostToDevice));
     GGML_UNUSED(stream);
     g_tbq4_innerq_pending_update = true;
 }
@@ -41,12 +41,9 @@ static void tbq4_innerq_activate(cudaStream_t stream) {
     g_tbq4_innerq_pending_update = false;
 }
 
-// Called from set_rows launcher: check if calibration should start/stop or finalize.
-// After calibration completes (group_count >= target), computes per-channel RMS,
-// derives forward scale = mean_rms / rms[j], uploads to device, and activates.
+// Called from set_rows launcher: check if calibration should start/stop
 static void tbq4_innerq_check_finalize(cudaStream_t stream) {
     static bool initialized = false;
-    static bool finalized = false;
     static int target_groups = 0;
     if (!initialized) {
         target_groups = tbq4_innerq_calibration_groups();
@@ -59,51 +56,12 @@ static void tbq4_innerq_check_finalize(cudaStream_t stream) {
         }
         initialized = true;
     }
-    if (!target_groups || finalized) return;
-
+    if (!target_groups) return;
     int count = 0;
     CUDA_CHECK(hipMemcpyFromSymbol(&count, d_tbq4_innerq_group_count, sizeof(int), 0, hipMemcpyDeviceToHost));
     if (count >= target_groups) {
-        // Sync stream to ensure all calibration kernel writes are visible
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-
-        // Read per-channel squared accumulators
-        float sq_accum[128];
-        CUDA_CHECK(hipMemcpyFromSymbol(sq_accum, d_tbq4_innerq_sq_accum, 128 * sizeof(float), 0, hipMemcpyDeviceToHost));
-
-        // Compute per-channel RMS and mean RMS
-        float rms[128];
-        float mean_rms = 0.0f;
-        float inv_count = 1.0f / (float)count;
-        for (int j = 0; j < 128; j++) {
-            rms[j] = sqrtf(fmaxf(sq_accum[j] * inv_count, 1e-8f));
-            mean_rms += rms[j];
-        }
-        mean_rms /= 128.0f;
-
-        // Forward scale: scale[j] = mean_rms / rms[j]
-        // High-variance channels (rms[j] > mean) get scale < 1, damped in K/V.
-        // Low-variance channels (rms[j] < mean) get scale > 1, amplified.
-        // Q rotation uses 1.0f / scale[j] to compensate.
-        float scale[128];
-        for (int j = 0; j < 128; j++) {
-            scale[j] = mean_rms / fmaxf(rms[j], 1e-6f);
-        }
-
-        // Upload forward scale and activate
-        CUDA_CHECK(hipMemcpyToSymbol(d_tbq4_innerq_scale, scale, 128 * sizeof(float), 0, hipMemcpyHostToDevice));
-
         int zero = 0;
         CUDA_CHECK(hipMemcpyToSymbol(d_tbq4_innerq_calibrating, &zero, sizeof(bool), 0, hipMemcpyHostToDevice));
-        int one = 1;
-        CUDA_CHECK(hipMemcpyToSymbol(d_tbq4_innerq_active, &one, sizeof(bool), 0, hipMemcpyHostToDevice));
-
-        fprintf(stderr, "tbq4_innerq: calibration complete after %d groups. mean_rms=%.6f range=[%.6f, %.6f]\n",
-                count, mean_rms, rms[0], rms[127]);
-        for (int j = 0; j < 128; j += 16) {
-            fprintf(stderr, "  channel %3d-%3d: scale %.4f-%.4f\n", j, j+15, scale[j], scale[j+15]);
-        }
-        finalized = true;
     }
     GGML_UNUSED(stream);
 }
