@@ -2530,7 +2530,6 @@ ggml_tensor * llm_graph_context::build_attn(
     if (v_rot) {
         cur = ggml_mul_mat_aux(ctx0, cur, v_rot);
     }
-    }
 
     if (wo) {
         cur = build_lora_mm(wo, cur, wo_s);
