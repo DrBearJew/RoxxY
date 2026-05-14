@@ -165,6 +165,18 @@ static __global__ void k_set_rows_tbq4_coop(
     x[j] = src_row[i_blk * QK_TBQ4 + j];
     __syncthreads();
 
+    // ---- InnerQ: calibrate on original (unscaled) values ----
+    if (d_tbq4_innerq_calibrating) {
+        atomicAdd(&d_tbq4_innerq_sq_accum[j], x[j] * x[j]);
+        if (j == 0) atomicAdd(&d_tbq4_innerq_group_count, 1);
+    }
+
+    // ---- InnerQ: apply channel scale (only when active) ----
+    if (d_tbq4_innerq_active) {
+        x[j] *= d_tbq4_innerq_scale[j];
+    }
+    __syncthreads();
+
     // ---- Step 2: Parallel L2 norm ----
     constexpr int n_warps = QK_TBQ4 / WARP_SIZE;  // = 4
     __shared__ float warp_accum[4];
@@ -266,6 +278,8 @@ static void set_rows_cuda_tbq4_coop(
         cudaStream_t stream) {
 
     GGML_ASSERT(ne00 % QK_TBQ4 == 0);
+
+    tbq4_innerq_check_finalize(stream);
 
     const int64_t n_blocks_per_row = ne00 / QK_TBQ4;
     const int64_t ne_total = n_blocks_per_row * ne01 * ne02 * ne03;

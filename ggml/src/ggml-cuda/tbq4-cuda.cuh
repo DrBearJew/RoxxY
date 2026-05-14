@@ -6,6 +6,66 @@
 #include "common.cuh"
 #include "ggml-common.h"
 
+// ---- InnerQ: per-channel equalization for TBQ4 KV quantization ----
+// Controlled by TBQ4_INNERQ env var (value = number of calibration groups before finalization).
+// When active, K/V channels are scaled before FWHT quantization to equalize variance.
+// Inverse scale is applied during Q rotation (pre-KQ-dot) and output rotation (post-V-accumulation).
+
+static __device__ bool          d_tbq4_innerq_calibrating = false;
+static __device__ bool          d_tbq4_innerq_active       = false;
+static __device__ float         d_tbq4_innerq_scale[128];
+static __device__ float         d_tbq4_innerq_sq_accum[128];
+static __device__ int           d_tbq4_innerq_group_count  = 0;
+static            bool          g_tbq4_innerq_pending_update = false;
+
+// Host-side env var parsing
+static int tbq4_innerq_calibration_groups() {
+    const char * env = getenv("TBQ4_INNERQ");
+    return env ? atoi(env) : 0;
+}
+
+// Called from host before kernel launch: publish scale_inv to device
+static void tbq4_innerq_upload_scale(const float * scale_inv, cudaStream_t stream) {
+    CUDA_CHECK(hipMemcpyToSymbol(d_tbq4_innerq_scale, scale_inv, 128 * sizeof(float), 0, hipMemcpyHostToDevice));
+    GGML_UNUSED(stream);
+    g_tbq4_innerq_pending_update = true;
+}
+
+// Called from host to activate InnerQ after calibration
+static void tbq4_innerq_activate(cudaStream_t stream) {
+    int zero = 0;
+    CUDA_CHECK(hipMemcpyToSymbol(d_tbq4_innerq_calibrating, &zero, sizeof(bool), 0, hipMemcpyHostToDevice));
+    int one = 1;
+    CUDA_CHECK(hipMemcpyToSymbol(d_tbq4_innerq_active, &one, sizeof(bool), 0, hipMemcpyHostToDevice));
+    GGML_UNUSED(stream);
+    g_tbq4_innerq_pending_update = false;
+}
+
+// Called from set_rows launcher: check if calibration should start/stop
+static void tbq4_innerq_check_finalize(cudaStream_t stream) {
+    static bool initialized = false;
+    static int target_groups = 0;
+    if (!initialized) {
+        target_groups = tbq4_innerq_calibration_groups();
+        if (target_groups > 0) {
+            int one = 1;
+            int zero = 0;
+            CUDA_CHECK(hipMemcpyToSymbol(d_tbq4_innerq_calibrating, &one, sizeof(bool), 0, hipMemcpyHostToDevice));
+            CUDA_CHECK(hipMemcpyToSymbol(d_tbq4_innerq_active, &zero, sizeof(bool), 0, hipMemcpyHostToDevice));
+            CUDA_CHECK(hipMemcpyToSymbol(d_tbq4_innerq_group_count, &zero, sizeof(int), 0, hipMemcpyHostToDevice));
+        }
+        initialized = true;
+    }
+    if (!target_groups) return;
+    int count = 0;
+    CUDA_CHECK(hipMemcpyFromSymbol(&count, d_tbq4_innerq_group_count, sizeof(int), 0, hipMemcpyDeviceToHost));
+    if (count >= target_groups) {
+        int zero = 0;
+        CUDA_CHECK(hipMemcpyToSymbol(d_tbq4_innerq_calibrating, &zero, sizeof(bool), 0, hipMemcpyHostToDevice));
+    }
+    GGML_UNUSED(stream);
+}
+
 // Lloyd-Max centroids for N(0, 1/sqrt(128))
 static __constant__ float d_tbq4_centroids[16] = {
     -0.241556f, -0.182907f, -0.143047f, -0.111065f,
