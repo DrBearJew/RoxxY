@@ -87,6 +87,10 @@ static __device__ __noinline__ void tbq4_rotate_Q_tile(
                 half2 pair = tile_Q[half2_offset];
                 float val = (tid & 1) ? __high2float(pair) : __low2float(pair);
 
+                if (d_tbq4_innerq_active) {
+                    val *= (1.0f / d_tbq4_innerq_scale[tid]);
+                }
+
                 val *= d_tbq4_wht_s1[tid];
 
 #pragma unroll
@@ -141,6 +145,10 @@ static __global__ void k_tbq4_rotate_input(
     for (int blk = 0; blk < n_blocks; blk++) {
         const int offset = blk * 128;
         float val = row_data[offset + tid];
+
+        if (d_tbq4_innerq_active) {
+            val *= (1.0f / d_tbq4_innerq_scale[tid]);
+        }
 
         val *= d_tbq4_wht_s1[tid];
 
@@ -223,7 +231,13 @@ static __global__ void k_tbq4_rotate_output(
         }
 
         constexpr float inv_sqrt_128 = 0.08838834764831845f;
-        row_data[offset + tid] = val * inv_sqrt_128 * d_tbq4_wht_s1[tid];
+        val = val * inv_sqrt_128 * d_tbq4_wht_s1[tid];
+
+        if (d_tbq4_innerq_active) {
+            val *= (1.0f / d_tbq4_innerq_scale[tid]);
+        }
+
+        row_data[offset + tid] = val;
     }
 }
 

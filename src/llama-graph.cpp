@@ -1997,20 +1997,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         cb(v, "v_rq_reshaped", il);
     }
 
-    // Planar/IsoQuant need explicit dequant before attention (no fused MMA kernel).
-    // Cast to F32 always — existing F32→F16 cast (line 2031) handles FA path.
-    const bool k_is_rotorquant = k->type == GGML_TYPE_PLANAR3_0 || k->type == GGML_TYPE_ISO3_0 ||
-                                  k->type == GGML_TYPE_PLANAR4_0 || k->type == GGML_TYPE_ISO4_0;
-    const bool v_is_rotorquant = v->type == GGML_TYPE_PLANAR3_0 || v->type == GGML_TYPE_ISO3_0 ||
-                                  v->type == GGML_TYPE_PLANAR4_0 || v->type == GGML_TYPE_ISO4_0;
-    if (!k_is_tbq && k_is_rotorquant) {
-        k = ggml_cast(ctx0, k, GGML_TYPE_F32);
-        cb(k, "k_rq_f32", il);
-    }
-    if (!v_is_tbq && v_is_rotorquant) {
-        v = ggml_cast(ctx0, v, GGML_TYPE_F32);
-        cb(v, "v_rq_f32", il);
-    }
+    // Planar/IsoQuant have fused VEC FlashAttention support. Keep the KV cache
+    // compressed here; the HIP dispatch below forces quantized KV to VEC so these
+    // types avoid TILE/WMMA full-f16 temporary buffers at long context.
 
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);

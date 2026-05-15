@@ -1,16 +1,19 @@
-// ROCm/rocWMMA fused TBQ4 flash attention — specialized for gfx1100 / RDNA3.
-// Reads raw TBQ4_0 K/V directly, dequants multiple rows into warp-local shared half buffer,
+// ROCm/rocWMMA fused compressed-KV flash attention — specialized for RDNA3/4.
+// Reads compressed K/V directly, materializes each logical K/V tile into f16 LDS,
 // then calls existing rocwmma::load_matrix_sync / mma_sync for the GEMM.
 //
-// Supports D=128 and D=256. AMD gfx1100 only. V_is_K_view=false.
-// Q is pre-rotated (tbq4_rotate_input_cuda), output post-inverse-rotated.
+// This keeps the FA pipeline independent from the KV packing format: TBQ4,
+// PlanarQuant, and IsoQuant are selected by loader traits rather than by a
+// hand-coded dequant loop inside the attention math.
 //
-// Based on fattn-wmma-f16.cu plus TBQ4 dequant from fattn-mma-tbq4.cuh.
+// TBQ4 stores values in its FWHT domain, so TBQ4 launchers pre-rotate Q and
+// inverse-rotate O. Planar/Iso loaders materialize original-domain values.
 
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-wmma-f16.cuh"
 #include "fattn-mma-tbq4.cuh"
+#include "fattn-compressed-kv.cuh"
 #include <rocwmma/rocwmma.hpp>
 
 namespace wmma = rocwmma;
@@ -23,9 +26,68 @@ constexpr int get_VKQ_stride(int D, int nwarps, int frag_m) {
     return (get_max_power_of_2(D/frag_m) < nwarps ? get_max_power_of_2(D/frag_m) : nwarps)*frag_m;
 }
 
-template<int D, int ncols, int nwarps, int VKQ_stride, typename KQ_acc_t, bool use_logit_softcap>
+static __device__ __forceinline__ float ggml_cuda_fattn_wmma_mask_term(
+        const half * __restrict__ maskh,
+        const int stride_mask,
+        const int j,
+        const int k,
+        const bool enabled) {
+    return enabled ? __half2float(maskh[j * stride_mask + k]) : 0.0f;
+}
+
+static __device__ __forceinline__ float ggml_cuda_fattn_wmma_softmax_rescale(
+        const float old_max,
+        const float new_max) {
+    const float diff = old_max - new_max;
+    float scale = expf(diff);
+    if (diff <= SOFTMAX_FTZ_THRESHOLD) {
+        scale = 0.0f;
+    }
+    return scale;
+}
+
+static __device__ __forceinline__ float ggml_cuda_fattn_wmma_softmax_prob(
+        const float score,
+        const float row_max) {
+    const float d = score - row_max;
+    float prob = expf(d);
+    if (d <= SOFTMAX_FTZ_THRESHOLD) {
+        prob = 0.0f;
+    }
+    return prob;
+}
+
+static __device__ __forceinline__ int ggml_cuda_fattn_wmma_tile_valid_rows(
+        const int row_first,
+        const int row_limit,
+        const int frag_m) {
+    int valid_rows = row_limit - row_first;
+    valid_rows = valid_rows < 0 ? 0 : valid_rows;
+    valid_rows = valid_rows > frag_m ? frag_m : valid_rows;
+    return valid_rows;
+}
+
+template <ggml_type type, int D, int frag_m, int D_padded>
+static __device__ __forceinline__ _Float16 * ggml_cuda_fattn_wmma_materialize_compressed_tile(
+        const char * __restrict__ base_ptr,
+        const int64_t stride_bytes,
+        const int row_first,
+        const int row_limit,
+        _Float16 * __restrict__ tile_buf) {
+    const int valid_rows = ggml_cuda_fattn_wmma_tile_valid_rows(row_first, row_limit, frag_m);
+    const ggml_cuda_fattn_contiguous_row_mapper rows = {
+        base_ptr + int64_t(valid_rows > 0 ? row_first : 0) * stride_bytes,
+        stride_bytes,
+    };
+    ggml_cuda_fattn_materialize_compressed_rows_f16<type, D, frag_m, D_padded>(
+        rows, valid_rows, tile_buf);
+    ggml_cuda_fattn_sync_compressed_tile();
+    return tile_buf;
+}
+
+template<int D, int ncols, ggml_type type_K, ggml_type type_V, int nwarps, int VKQ_stride, typename KQ_acc_t, bool use_logit_softcap>
 __launch_bounds__(nwarps * ggml_cuda_get_physical_warp_size(), 1)
-static __global__ void flash_attn_ext_wmma_tbq4(
+static __global__ void flash_attn_ext_wmma_compressed_kv(
         const char * __restrict__ Q,
         const char * __restrict__ K,
         const char * __restrict__ V,
@@ -76,9 +138,6 @@ static __global__ void flash_attn_ext_wmma_tbq4(
     constexpr int kqs_padded = FATTN_KQ_STRIDE + 8;
     constexpr int kqar = sizeof(KQ_acc_t) / sizeof(half);
 
-    // TBQ4: each block_tbq4_0 covers 128 values. D/128 blocks per row.
-    constexpr int tbq4_blocks_per_row = D / 128;
-
     const int sequence  = blockIdx.z / ne02;
     const int head      = blockIdx.z - sequence * ne02;
     const int gqa_ratio = ne02 / ne12;
@@ -104,9 +163,9 @@ static __global__ void flash_attn_ext_wmma_tbq4(
     __shared__ half VKQ[ncols * D_padded];
     half2 * VKQ2 = (half2 *)VKQ;
 
-    // TBQ4 dequant buffer: one frag_m × D_padded section per warp
-    constexpr int tbq4_warp_stride = frag_m * D_padded;
-    __shared__ _Float16 tbq4_buf[nwarps * tbq4_warp_stride];
+    // Compressed-KV tile buffer: one frag_m × D_padded section per warp.
+    constexpr int compressed_warp_stride = frag_m * D_padded;
+    __shared__ _Float16 compressed_buf[nwarps * compressed_warp_stride];
 
     float KQ_rowsum_f[ncols / nwarps] = {0.0f};
     float KQ_max_f[ncols / nwarps];
@@ -126,33 +185,7 @@ static __global__ void flash_attn_ext_wmma_tbq4(
         }
     }
 
-    // ── TBQ4 dequant: frag_m rows → warp-local section of tbq4_buf ──
-    // D=128: 1 block_tbq4_0 per row (66 bytes → 128 half)
-    // D=256: 2 block_tbq4_0 per row (132 bytes → 256 half)
-    auto dequant_tbq4_frag_m_rows = [&](const char * base_ptr, int64_t stride_bytes, int warp_idx, int oob_flag) {
-        _Float16 * my_buf = tbq4_buf + warp_idx * tbq4_warp_stride;
-        for (int r = 0; r < frag_m; ++r) {
-            _Float16 * row_buf = my_buf + r * D_padded;
-            if (oob_flag) {
-                // Zero-fill entire row for out-of-bounds access
-                for (int i = threadIdx.x; i < D; i += warp_size) row_buf[i] = (_Float16)0.0f;
-                continue;
-            }
-            const char * raw_row = base_ptr + int64_t(r) * stride_bytes;
-            const block_tbq4_0 * blks = (const block_tbq4_0 *)raw_row;
-            for (int b = 0; b < tbq4_blocks_per_row; ++b) {
-                const block_tbq4_0 * blk = blks + b;
-                const float norm = __half2float(blk->d);
-                const int col_offset = b * 128;
-                for (int i = threadIdx.x; i < 64; i += warp_size) {
-                    const uint8_t byte = blk->qs[i];
-                    row_buf[col_offset + 2 * i]     = __float2half(d_tbq4_centroids[byte & 0xF] * norm);
-                    row_buf[col_offset + 2 * i + 1] = __float2half(d_tbq4_centroids[byte >> 4] * norm);
-                }
-            }
-        }
-        __syncthreads();
-    };
+    // ── compressed K/V materialization happens at each K/V tile load site ──
 
     // ── load Q to shared then to fragments ──
 #pragma unroll
@@ -190,15 +223,13 @@ static __global__ void flash_attn_ext_wmma_tbq4(
                 wmma::fill_fragment(KQ_c[j], static_cast<KQ_acc_t>(0.0f));
 
             const int k_row_first = k_VKQ_0 + i_KQ_0 + frag_m * threadIdx.y;
-            const int k_row_oob = (k_row_first >= k_VKQ_max);
-            dequant_tbq4_frag_m_rows(
-                K_b + int64_t((k_row_oob ? 0 : k_row_first)) * stride_K_bytes,
-                stride_K_bytes, threadIdx.y, k_row_oob);
+            _Float16 * my_buf = ggml_cuda_fattn_wmma_materialize_compressed_tile<type_K, D, frag_m, D_padded>(
+                K_b, stride_K_bytes, k_row_first, k_VKQ_max,
+                compressed_buf + threadIdx.y * compressed_warp_stride);
 
 #pragma unroll
             for (int k_KQ_0 = 0; k_KQ_0 < D; k_KQ_0 += 16) {
                 frag_a_K K_a;
-                _Float16 * my_buf = tbq4_buf + threadIdx.y * tbq4_warp_stride;
                 wmma::load_matrix_sync(K_a, my_buf + k_KQ_0, D_padded);
 #pragma unroll
                 for (int j = 0; j < ncols / frag_n; ++j) {
@@ -217,6 +248,8 @@ static __global__ void flash_attn_ext_wmma_tbq4(
 #pragma unroll
         for (int j0 = 0; j0 < ncols; j0 += nwarps) {
             const int j = j0 + threadIdx.y;
+            const int stride_mask = nb31 / sizeof(half);
+            const bool mask_enabled = mask && ic0 + j < int(ne01.z);
             float KQ_f_tmp[FATTN_KQ_STRIDE / warp_size];
 #pragma unroll
             for (int k0 = 0; k0 < FATTN_KQ_STRIDE; k0 += warp_size) {
@@ -226,21 +259,19 @@ static __global__ void flash_attn_ext_wmma_tbq4(
 #pragma unroll
             for (int k0 = 0; k0 < FATTN_KQ_STRIDE; k0 += warp_size) {
                 const int k = k0 + threadIdx.x;
-                KQ_f_tmp[k0 / warp_size] += mask && ic0 + j < int(ne01.z) ?
-                    __half2float(maskh[j * (nb31 / sizeof(half)) + k_VKQ_0 + k]) : 0.0f;
+                KQ_f_tmp[k0 / warp_size] += ggml_cuda_fattn_wmma_mask_term(
+                    maskh, stride_mask, j, k_VKQ_0 + k, mask_enabled);
                 KQ_max_new = max(KQ_max_new, KQ_f_tmp[k0 / warp_size] + FATTN_KQ_MAX_OFFSET);
             }
             KQ_max_new = warp_reduce_max<warp_size>(KQ_max_new);
-            const float diff = KQ_max_f[j0 / nwarps] - KQ_max_new;
-            KQ_max_scale_f[j0 / nwarps] = expf(diff);
-            if (diff <= SOFTMAX_FTZ_THRESHOLD) KQ_max_scale_f[j0 / nwarps] = 0.0f;
+            KQ_max_scale_f[j0 / nwarps] = ggml_cuda_fattn_wmma_softmax_rescale(
+                KQ_max_f[j0 / nwarps], KQ_max_new);
             KQ_max_f[j0 / nwarps] = KQ_max_new;
             float KQ_rowsum_add = 0.0f;
 #pragma unroll
             for (int k0 = 0; k0 < FATTN_KQ_STRIDE; k0 += warp_size) {
-                const float d = KQ_f_tmp[k0 / warp_size] - KQ_max_f[j0 / nwarps];
-                KQ_f_tmp[k0 / warp_size] = expf(d);
-                if (d <= SOFTMAX_FTZ_THRESHOLD) KQ_f_tmp[k0 / warp_size] = 0.0f;
+                KQ_f_tmp[k0 / warp_size] = ggml_cuda_fattn_wmma_softmax_prob(
+                    KQ_f_tmp[k0 / warp_size], KQ_max_f[j0 / nwarps]);
                 KQ_rowsum_add += KQ_f_tmp[k0 / warp_size];
                 KQ[j * (kqar * kqs_padded) + k0 + threadIdx.x] = KQ_f_tmp[k0 / warp_size];
             }
@@ -274,13 +305,11 @@ static __global__ void flash_attn_ext_wmma_tbq4(
                 const int k = k0 + (threadIdx.y % VKQ_ratio) * 16;
 
                 const int v_row_first = k_VKQ_0 + k;
-                const int v_row_oob = (v_row_first >= k_VKQ_max);
-                dequant_tbq4_frag_m_rows(
-                    V_b + int64_t((v_row_oob ? 0 : v_row_first)) * stride_V_bytes,
-                    stride_V_bytes, threadIdx.y, v_row_oob);
+                _Float16 * my_v_buf = ggml_cuda_fattn_wmma_materialize_compressed_tile<type_V, D, frag_m, D_padded>(
+                    V_b, stride_V_bytes, v_row_first, k_VKQ_max,
+                    compressed_buf + threadIdx.y * compressed_warp_stride);
 
                 frag_a_V v_a;
-                _Float16 * my_v_buf = tbq4_buf + threadIdx.y * tbq4_warp_stride;
                 wmma::load_matrix_sync(v_a,
                     my_v_buf + i_VKQ_0 + frag_m * (threadIdx.y / VKQ_ratio),
                     D_padded);
@@ -357,9 +386,9 @@ static __global__ void flash_attn_ext_wmma_tbq4(
 #endif
 }
 
-// ── ROCm-only TBQ4 launcher helper ──
-template <int D, int cols_per_block>
-static void ggml_cuda_flash_attn_ext_wmma_tbq4_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+// ── ROCm-only compressed-KV launcher helper ──
+template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V>
+static void ggml_cuda_flash_attn_ext_wmma_compressed_kv_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     static_assert(D == 128 || D == 256);
 
     const ggml_tensor * KQV = dst;
@@ -375,14 +404,95 @@ static void ggml_cuda_flash_attn_ext_wmma_tbq4_case(ggml_backend_cuda_context & 
 
     fattn_kernel_t fattn_kernel;
     if (logit_softcap == 0.0f) {
-        fattn_kernel = (fattn_kernel_t)flash_attn_ext_wmma_tbq4<D, cols_per_block, nwarps, VKQ, float, false>;
+        fattn_kernel = (fattn_kernel_t)flash_attn_ext_wmma_compressed_kv<D, cols_per_block, type_K, type_V, nwarps, VKQ, float, false>;
     } else {
-        fattn_kernel = (fattn_kernel_t)flash_attn_ext_wmma_tbq4<D, cols_per_block, nwarps, VKQ, float, true>;
+        fattn_kernel = (fattn_kernel_t)flash_attn_ext_wmma_compressed_kv<D, cols_per_block, type_K, type_V, nwarps, VKQ, float, true>;
     }
     launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, 0, FATTN_KQ_STRIDE, false, false, false, warp_size);
 }
 
-// ── public entry point ──
+template <ggml_type type_K, ggml_type type_V>
+static void ggml_cuda_flash_attn_ext_wmma_compressed_kv_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#ifndef FLASH_ATTN_AVAILABLE
+    GGML_UNUSED_VARS(ctx, dst);
+    return;
+#else
+    const ggml_tensor * Q = dst->src[0];
+
+    if (Q->ne[1] <= 32 || Q->ne[0] == 256) {
+        switch (Q->ne[0]) {
+            case 128: ggml_cuda_flash_attn_ext_wmma_compressed_kv_case<128, 16, type_K, type_V>(ctx, dst); break;
+            case 256: ggml_cuda_flash_attn_ext_wmma_compressed_kv_case<256, 16, type_K, type_V>(ctx, dst); break;
+            default: GGML_ABORT("compressed-KV rocWMMA FA: only D=128,256 supported");
+        }
+    } else {
+        switch (Q->ne[0]) {
+            case 128: ggml_cuda_flash_attn_ext_wmma_compressed_kv_case<128, 32, type_K, type_V>(ctx, dst); break;
+            default: GGML_ABORT("compressed-KV rocWMMA FA: only D=128 supported");
+        }
+    }
+#endif
+}
+
+template <ggml_type type>
+static void ggml_cuda_flash_attn_ext_wmma_original_domain_compressed_kv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    static_assert(
+        ggml_cuda_fattn_compressed_kv_traits<type>::domain == GGML_CUDA_FATTN_COMPRESSED_KV_DOMAIN_ORIGINAL,
+        "generic Planar/Iso compressed-KV launcher must stay in original domain");
+    ggml_cuda_flash_attn_ext_wmma_compressed_kv_impl<type, type>(ctx, dst);
+}
+
+static int64_t ggml_cuda_flash_attn_ext_wmma_tbq4_domain_rows(const ggml_tensor * Q) {
+    return Q->ne[1] * Q->ne[2] * Q->ne[3];
+}
+
+static void ggml_cuda_flash_attn_ext_wmma_tbq4_rotate_q(ggml_backend_cuda_context & ctx, const ggml_tensor * Q) {
+    static_assert(
+        ggml_cuda_fattn_compressed_kv_traits<GGML_TYPE_TBQ4_0>::domain == GGML_CUDA_FATTN_COMPRESSED_KV_DOMAIN_FWHT,
+        "TBQ4 compressed-KV launcher must keep explicit FWHT-domain Q rotation");
+    tbq4_rotate_input_cuda((float *)Q->data, ggml_cuda_flash_attn_ext_wmma_tbq4_domain_rows(Q), Q->ne[0], ctx.stream());
+}
+
+static void ggml_cuda_flash_attn_ext_wmma_tbq4_rotate_o(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * Q) {
+    static_assert(
+        ggml_cuda_fattn_compressed_kv_traits<GGML_TYPE_TBQ4_0>::domain == GGML_CUDA_FATTN_COMPRESSED_KV_DOMAIN_FWHT,
+        "TBQ4 compressed-KV launcher must keep explicit FWHT-domain O inverse rotation");
+    tbq4_rotate_output_cuda((float *)dst->data, ggml_cuda_flash_attn_ext_wmma_tbq4_domain_rows(Q), Q->ne[0], ctx.stream());
+}
+
+// ── public entry point: Planar/Iso compressed-KV without TBQ4 FWHT-domain transforms ──
+void ggml_cuda_flash_attn_ext_wmma_compressed_kv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#ifndef FLASH_ATTN_AVAILABLE
+    GGML_UNUSED_VARS(ctx, dst);
+    return;
+#else
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    if (K->type != V->type) {
+        GGML_ABORT("compressed-KV rocWMMA FA: K/V type mismatch");
+    }
+
+    switch (K->type) {
+        case GGML_TYPE_PLANAR3_0:
+            ggml_cuda_flash_attn_ext_wmma_original_domain_compressed_kv<GGML_TYPE_PLANAR3_0>(ctx, dst);
+            break;
+        case GGML_TYPE_ISO3_0:
+            ggml_cuda_flash_attn_ext_wmma_original_domain_compressed_kv<GGML_TYPE_ISO3_0>(ctx, dst);
+            break;
+        case GGML_TYPE_PLANAR4_0:
+            ggml_cuda_flash_attn_ext_wmma_original_domain_compressed_kv<GGML_TYPE_PLANAR4_0>(ctx, dst);
+            break;
+        case GGML_TYPE_ISO4_0:
+            ggml_cuda_flash_attn_ext_wmma_original_domain_compressed_kv<GGML_TYPE_ISO4_0>(ctx, dst);
+            break;
+        default:
+            GGML_ABORT("compressed-KV rocWMMA FA: unsupported K/V type");
+    }
+#endif
+}
+
+// ── public entry point: TBQ4 keeps its FWHT-domain Q/O transforms outside the generic FA math ──
 void ggml_cuda_flash_attn_ext_wmma_tbq4(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED_VARS(ctx, dst);
@@ -390,21 +500,8 @@ void ggml_cuda_flash_attn_ext_wmma_tbq4(ggml_backend_cuda_context & ctx, ggml_te
 #else
     const ggml_tensor * Q = dst->src[0];
 
-    tbq4_rotate_input_cuda((float *)Q->data, Q->ne[1], Q->ne[0], ctx.stream());
-
-    if (Q->ne[1] <= 32 || Q->ne[0] == 256) {
-        switch (Q->ne[0]) {
-            case 128: ggml_cuda_flash_attn_ext_wmma_tbq4_case<128, 16>(ctx, dst); break;
-            case 256: ggml_cuda_flash_attn_ext_wmma_tbq4_case<256, 16>(ctx, dst); break;
-            default: GGML_ABORT("TBQ4 rocWMMA FA: only D=128,256 supported");
-        }
-    } else {
-        switch (Q->ne[0]) {
-            case 128: ggml_cuda_flash_attn_ext_wmma_tbq4_case<128, 32>(ctx, dst); break;
-            default: GGML_ABORT("TBQ4 rocWMMA FA: only D=128 supported");
-        }
-    }
-
-    tbq4_rotate_output_cuda((float *)dst->data, Q->ne[1], Q->ne[0], ctx.stream());
+    ggml_cuda_flash_attn_ext_wmma_tbq4_rotate_q(ctx, Q);
+    ggml_cuda_flash_attn_ext_wmma_compressed_kv_impl<GGML_TYPE_TBQ4_0, GGML_TYPE_TBQ4_0>(ctx, dst);
+    ggml_cuda_flash_attn_ext_wmma_tbq4_rotate_o(ctx, dst, Q);
 #endif
 }

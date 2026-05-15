@@ -3491,7 +3491,13 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         // Overlap loading of next tile_x with current vec_dot computation.
         // +1 LDS padding breaks 32-bank symmetry and reduces bank-conflict variance.
         constexpr int lds_bank_pad = 1;
-        int * tile_x_next = tile_x + GGML_PAD(mmq_x*MMQ_TILE_Y_K, nwarps*warp_size) + lds_bank_pad;
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        constexpr int tile_x_elems = mmq_y * mmq_get_mma_tile_x_k(type);
+#else
+        constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(type, mmq_y);
+        constexpr int tile_x_elems = txs.qs + txs.dm + txs.sc;
+#endif
+        int * tile_x_next = tile_x + tile_x_elems + lds_bank_pad;
 
         load_tiles(x, tile_x, offset_x + kb0_start, tile_x_max_i, stride_row_x);
         __syncthreads();
@@ -3993,14 +3999,34 @@ struct mmq_args {
     bool use_stream_k; int64_t ncols_max;
 };
 
+static bool mmq_use_rdna2_matmul_opt(const int cc) {
+#ifdef RDNA2_MATMUL_OPT_V1
+    const char * exp_env = getenv("RDNA2_MATMUL_OPT_V1");
+    return exp_env && strcmp(exp_env, "1") == 0 && (GGML_CUDA_CC_IS_RDNA2(cc) || GGML_CUDA_CC_IS_RDNA3(cc));
+#else
+    (void) cc;
+    return false;
+#endif
+}
+
 template<ggml_type type>
-static size_t mmq_get_nbytes_shared(const int mmq_x, const int mmq_y, const int cc, const int warp_size, const int nwarps) {
+static size_t mmq_get_nbytes_shared(const int mmq_x, const int mmq_y, const int cc, const int warp_size, const int nwarps, const bool use_experimental = false) {
     const tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(type, mmq_y);
     const int mmq_tile_x_k = mmq_get_mma_tile_x_k(type);
     const size_t nbs_ids = mmq_x*sizeof(int);
     const size_t nbs_x = (turing_mma_available(cc) || amd_mfma_available(cc) || amd_wmma_available(cc)) ? mmq_y*mmq_tile_x_k*sizeof(int) : txs.qs*sizeof(int) + txs.dm*sizeof(half2) + txs.sc*sizeof(int);
     const size_t nbs_y = mmq_x * (sizeof(block_q8_1_mmq));
-    return nbs_ids + nbs_x + GGML_PAD(nbs_y, nwarps*warp_size*sizeof(int));
+    size_t nbs = nbs_ids + nbs_x + GGML_PAD(nbs_y, nwarps*warp_size*sizeof(int));
+#ifdef RDNA2_MATMUL_OPT_V1
+    if (use_experimental) {
+        // The experimental path keeps a second tile_x buffer in LDS and inserts
+        // one int of padding between buffers to break bank-conflict symmetry.
+        nbs += nbs_x + sizeof(int);
+    }
+#else
+    (void) use_experimental;
+#endif
+    return nbs;
 }
 
 template <ggml_type type, int mmq_x>
@@ -4008,24 +4034,18 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
+    const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
     const int nwarps = mmq_get_nwarps_host(cc, warp_size);
     const int mmq_y = get_mmq_y_host(cc);
 
-    // Experimental matmul opt: runtime gate (compile-time + env + hardware check)
-    bool use_experimental = false;
-#ifdef RDNA2_MATMUL_OPT_V1
-    {
-        const char* exp_env = getenv("RDNA2_MATMUL_OPT_V1");
-        if (exp_env && strcmp(exp_env, "1") == 0 && (GGML_CUDA_CC_IS_RDNA2(cc) || GGML_CUDA_CC_IS_RDNA3(cc))) {
-            use_experimental = true;
-        }
-    }
-#endif
+    const bool use_experimental_requested = mmq_use_rdna2_matmul_opt(cc);
+    const bool use_experimental = use_experimental_requested &&
+        mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps, true) <= smpbo;
 
     const dim3 block_dims(warp_size, nwarps, 1);
 
-    const int nbytes_shared = mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps);
+    const int nbytes_shared = mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps, use_experimental);
 
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x, false>), nbytes_shared);
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x,  true>), nbytes_shared);
@@ -4137,6 +4157,7 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
 
     const int mmq_x_max = get_mmq_x_max_host(cc);
     const int mmq_y = get_mmq_y_host(cc);
+    const bool use_experimental_requested = mmq_use_rdna2_matmul_opt(cc);
 
     int mmq_x_best  = 0;
     int ntiles_x_best = INT_MAX;
@@ -4144,7 +4165,11 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     for (int mmq_x = 8; mmq_x <= mmq_x_max && ntiles_x_best > 1; mmq_x += 8) {
         const int granularity = mmq_get_granularity_host(mmq_x, cc);
 
-        if (mmq_x % granularity != 0 || mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps) > smpbo) {
+        const bool use_experimental = use_experimental_requested &&
+            mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps, true) <= smpbo;
+        const size_t nbytes_shared = mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps, use_experimental);
+
+        if (mmq_x % granularity != 0 || nbytes_shared > smpbo) {
             continue;
         }
 

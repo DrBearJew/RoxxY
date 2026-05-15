@@ -6,8 +6,14 @@
 #include "fattn-vec.cuh"
 #include "fattn-wmma-f16.cuh"
 void ggml_cuda_flash_attn_ext_wmma_tbq4(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+void ggml_cuda_flash_attn_ext_wmma_compressed_kv(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 #include "cpy-planar-iso.cuh"
 #include "fattn.cuh"
+
+void ggml_cuda_tbq4_innerq_fattn_set_scale(const float * scale, cudaStream_t stream) {
+    tbq4_innerq_upload_scale(scale, stream);
+    tbq4_innerq_activate(stream);
+}
 
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -310,6 +316,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_PLANAR4_0, GGML_TYPE_PLANAR4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_ISO4_0,    GGML_TYPE_ISO4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ4_0,    GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ4_0,    GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,       GGML_TYPE_PLANAR3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,       GGML_TYPE_ISO3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,       GGML_TYPE_PLANAR4_0)
@@ -328,6 +335,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_PLANAR4_0, GGML_TYPE_PLANAR4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_ISO4_0,    GGML_TYPE_ISO4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ4_0,    GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ4_0,    GGML_TYPE_Q8_0)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     GGML_ABORT("fatal error");
@@ -342,7 +350,39 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_MMA_F16  = 400,
     BEST_FATTN_KERNEL_MMA_TBQ4 = 500,
     BEST_FATTN_KERNEL_WMMA_TBQ4 = 550, // AMD rocWMMA TBQ4 path (experimental, disabled in favor of VEC)
+    BEST_FATTN_KERNEL_WMMA_COMPRESSED_KV = 560, // experimental Planar/Iso compressed-KV WMMA path
 };
+
+static const char * ggml_cuda_fattn_kernel_name(const best_fattn_kernel kernel) {
+    switch (kernel) {
+        case BEST_FATTN_KERNEL_NONE:               return "none";
+        case BEST_FATTN_KERNEL_TILE:               return "tile";
+        case BEST_FATTN_KERNEL_VEC:                return "vec";
+        case BEST_FATTN_KERNEL_WMMA_F16:           return "wmma_f16";
+        case BEST_FATTN_KERNEL_MMA_F16:            return "mma_f16";
+        case BEST_FATTN_KERNEL_MMA_TBQ4:           return "mma_tbq4";
+        case BEST_FATTN_KERNEL_WMMA_TBQ4:          return "wmma_tbq4";
+        case BEST_FATTN_KERNEL_WMMA_COMPRESSED_KV: return "wmma_compressed_kv";
+    }
+    return "unknown";
+}
+
+static void ggml_cuda_fattn_log_selection(const best_fattn_kernel kernel, const ggml_tensor * dst) {
+    const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG");
+    if (!log_env || atoi(log_env) == 0) {
+        return;
+    }
+
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    GGML_LOG_INFO("%s: kernel=%s Q=%s K=%s V=%s nq=%lld nkv=%lld d_q=%lld d_v=%lld\n",
+        __func__, ggml_cuda_fattn_kernel_name(kernel),
+        ggml_type_name(Q->type), ggml_type_name(K->type), ggml_type_name(V->type),
+        (long long) Q->ne[1], (long long) K->ne[1],
+        (long long) Q->ne[0], (long long) V->ne[0]);
+}
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
@@ -422,7 +462,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
-    if (K->type != V->type) {
+    if (K->type != V->type && !(K->type == GGML_TYPE_TBQ4_0 && V->type == GGML_TYPE_Q8_0)) {
         return BEST_FATTN_KERNEL_NONE;
     }
 #endif // GGML_CUDA_FA_ALL_QUANTS
@@ -441,12 +481,28 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
             break;
-        case GGML_TYPE_TBQ4_0:
-            if (V->type != GGML_TYPE_TBQ4_0) {
+        case GGML_TYPE_TBQ4_0: {
+            const bool v_is_tbq4 = V->type == GGML_TYPE_TBQ4_0;
+            const bool v_is_q8_0 = V->type == GGML_TYPE_Q8_0;
+            if (!v_is_tbq4 && !v_is_q8_0) {
                 return BEST_FATTN_KERNEL_NONE;
             }
             if ((Q->ne[0] != 128 && Q->ne[0] != 256) || V->ne[0] != Q->ne[0]) {
                 return BEST_FATTN_KERNEL_NONE;
+            }
+#ifdef GGML_USE_HIP
+            // Experimental prefill path: direct TBQ4->rocWMMA FlashAttention.
+            // Keep default decode/quantized-KV route on VEC; enable only with
+            // TBQ4_WMMA_FATTN=1 and only for pure TBQ4 V. Mixed TBQ4/Q8_0
+            // layer-adaptive layers remain on VEC because the WMMA launcher is
+            // instantiated only for compressed TBQ4 K + compressed TBQ4 V.
+            const char * tbq4_wmma_fattn_env = getenv("TBQ4_WMMA_FATTN");
+            if (v_is_tbq4 && Q->ne[1] > 2 && tbq4_wmma_fattn_env && atoi(tbq4_wmma_fattn_env) != 0 && amd_wmma_available(cc)) {
+                return BEST_FATTN_KERNEL_WMMA_TBQ4;
+            }
+#endif // GGML_USE_HIP
+            if (v_is_q8_0) {
+                return amd_wmma_available(cc) ? BEST_FATTN_KERNEL_VEC : BEST_FATTN_KERNEL_NONE;
             }
             if (turing_mma_available(cc)) {
                 return BEST_FATTN_KERNEL_MMA_TBQ4;
@@ -455,12 +511,21 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 return BEST_FATTN_KERNEL_VEC;
             }
             return BEST_FATTN_KERNEL_NONE;
+        }
         case GGML_TYPE_PLANAR3_0:
         case GGML_TYPE_ISO3_0:
         case GGML_TYPE_PLANAR4_0:
         case GGML_TYPE_ISO4_0:
-            // Planar/IsoQuant: VEC path supported (via fattn-planar-iso.cuh), MMA fused TBD
+            // Planar/IsoQuant: VEC remains the default compressed-KV path.
+            // Experimental rocWMMA path uses the same composable loader interface
+            // as TBQ4, but is opt-in to avoid perturbing stable long-context runs.
             if (Q->ne[0] == 128 || Q->ne[0] == 256) {
+#ifdef GGML_USE_HIP
+                const char * compressed_wmma_fattn_env = getenv("COMPRESSED_KV_WMMA_FATTN");
+                if (K->type == V->type && Q->ne[1] > 2 && compressed_wmma_fattn_env && atoi(compressed_wmma_fattn_env) != 0 && amd_wmma_available(cc)) {
+                    return BEST_FATTN_KERNEL_WMMA_COMPRESSED_KV;
+                }
+#endif // GGML_USE_HIP
                 break; // falls through to VEC/TILE selection
             }
             return BEST_FATTN_KERNEL_NONE;
@@ -474,6 +539,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+#ifdef GGML_USE_HIP
+    // HIP/ROCm: keep quantized KV on VEC when possible. TILE/WMMA/MMA routes
+    // convert quantized K/V to full f16 temporary buffers in launch_fattn(),
+    // which can erase compression savings and OOM at long context. VEC handles
+    // TBQ4/Planar/Iso/Q8 inline with no full-cache temp buffer on RDNA3/3.5/4.
+    if ((ggml_is_quantized(K->type) || ggml_is_quantized(V->type)) && can_use_vector_kernel) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
+#endif // GGML_USE_HIP
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
@@ -663,7 +738,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         }
     }
 
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    const best_fattn_kernel best_kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    ggml_cuda_fattn_log_selection(best_kernel, dst);
+
+    switch (best_kernel) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
@@ -698,6 +776,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_WMMA_TBQ4:
             ggml_cuda_flash_attn_ext_wmma_tbq4(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_WMMA_COMPRESSED_KV:
+            ggml_cuda_flash_attn_ext_wmma_compressed_kv(ctx, dst);
             break;
     }
 }

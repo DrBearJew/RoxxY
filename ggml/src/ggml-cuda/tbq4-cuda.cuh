@@ -6,6 +6,118 @@
 #include "common.cuh"
 #include "ggml-common.h"
 
+// ---- InnerQ: per-channel equalization for TBQ4 KV quantization ----
+// Controlled by TBQ4_INNERQ env var (value = number of calibration groups before finalization).
+// When active, K/V channels are scaled before FWHT quantization to equalize variance.
+// Inverse scale is applied during Q rotation (pre-KQ-dot) and output rotation (post-V-accumulation).
+
+static __device__ bool          d_tbq4_innerq_calibrating = false;
+static __device__ bool          d_tbq4_innerq_active       = false;
+static __device__ float         d_tbq4_innerq_scale[128];
+static __device__ float         d_tbq4_innerq_sq_accum[128];
+static __device__ int           d_tbq4_innerq_group_count  = 0;
+
+// Host-side env var parsing
+static int tbq4_innerq_calibration_groups() {
+    const char * env = getenv("TBQ4_INNERQ");
+    return env ? atoi(env) : 0;
+}
+
+// Called from host before kernel launch: upload forward scale to device
+static void tbq4_innerq_upload_scale(const float * scale, cudaStream_t stream) {
+    CUDA_CHECK(hipMemcpyToSymbol(d_tbq4_innerq_scale, scale, 128 * sizeof(float), 0, hipMemcpyHostToDevice));
+    GGML_UNUSED(stream);
+}
+
+// Called from host to activate InnerQ after calibration
+static void tbq4_innerq_activate(cudaStream_t stream) {
+    const bool inactive = false;
+    CUDA_CHECK(hipMemcpyToSymbol(d_tbq4_innerq_calibrating, &inactive, sizeof(bool), 0, hipMemcpyHostToDevice));
+    const bool active = true;
+    CUDA_CHECK(hipMemcpyToSymbol(d_tbq4_innerq_active, &active, sizeof(bool), 0, hipMemcpyHostToDevice));
+    GGML_UNUSED(stream);
+}
+
+// Called from set_rows launcher: check if calibration should start/stop or finalize.
+// After calibration completes (group_count >= target), computes per-channel RMS,
+// derives forward scale = mean_rms / rms[j], uploads to device, and activates.
+static bool tbq4_innerq_check_finalize(cudaStream_t stream, float * finalized_scale = nullptr) {
+    static bool initialized = false;
+    static bool finalized = false;
+    static int target_groups = 0;
+    if (!initialized) {
+        target_groups = tbq4_innerq_calibration_groups();
+        if (target_groups > 0) {
+            const bool calibrating = true;
+            const bool active = false;
+            const int zero_count = 0;
+            float zero_accum[128] = {};
+            float identity_scale[128];
+            for (int j = 0; j < 128; ++j) {
+                identity_scale[j] = 1.0f;
+            }
+            CUDA_CHECK(hipMemcpyToSymbol(d_tbq4_innerq_calibrating, &calibrating, sizeof(bool), 0, hipMemcpyHostToDevice));
+            CUDA_CHECK(hipMemcpyToSymbol(d_tbq4_innerq_active, &active, sizeof(bool), 0, hipMemcpyHostToDevice));
+            CUDA_CHECK(hipMemcpyToSymbol(d_tbq4_innerq_group_count, &zero_count, sizeof(int), 0, hipMemcpyHostToDevice));
+            CUDA_CHECK(hipMemcpyToSymbol(d_tbq4_innerq_sq_accum, zero_accum, 128 * sizeof(float), 0, hipMemcpyHostToDevice));
+            CUDA_CHECK(hipMemcpyToSymbol(d_tbq4_innerq_scale, identity_scale, 128 * sizeof(float), 0, hipMemcpyHostToDevice));
+        }
+        initialized = true;
+    }
+    if (!target_groups || finalized) return false;
+
+    int count = 0;
+    CUDA_CHECK(hipMemcpyFromSymbol(&count, d_tbq4_innerq_group_count, sizeof(int), 0, hipMemcpyDeviceToHost));
+    if (count >= target_groups) {
+        // Sync stream to ensure all calibration kernel writes are visible
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        // Read per-channel squared accumulators
+        float sq_accum[128];
+        CUDA_CHECK(hipMemcpyFromSymbol(sq_accum, d_tbq4_innerq_sq_accum, 128 * sizeof(float), 0, hipMemcpyDeviceToHost));
+
+        // Compute per-channel RMS and mean RMS
+        float rms[128];
+        float mean_rms = 0.0f;
+        float inv_count = 1.0f / (float)count;
+        for (int j = 0; j < 128; j++) {
+            rms[j] = sqrtf(fmaxf(sq_accum[j] * inv_count, 1e-8f));
+            mean_rms += rms[j];
+        }
+        mean_rms /= 128.0f;
+
+        // Forward scale: scale[j] = mean_rms / rms[j]
+        // High-variance channels (rms[j] > mean) get scale < 1, damped in K/V.
+        // Low-variance channels (rms[j] < mean) get scale > 1, amplified.
+        // Q rotation uses 1.0f / scale[j] to compensate.
+        float scale[128];
+        for (int j = 0; j < 128; j++) {
+            scale[j] = mean_rms / fmaxf(rms[j], 1e-6f);
+        }
+
+        if (finalized_scale) {
+            for (int j = 0; j < 128; ++j) {
+                finalized_scale[j] = scale[j];
+            }
+        }
+
+        // Upload forward scale and activate this translation unit's TBQ4 symbols.
+        tbq4_innerq_upload_scale(scale, stream);
+        tbq4_innerq_activate(stream);
+
+        fprintf(stderr, "tbq4_innerq: calibration complete after %d groups. mean_rms=%.6f range=[%.6f, %.6f]\n",
+                count, mean_rms, rms[0], rms[127]);
+        for (int j = 0; j < 128; j += 16) {
+            fprintf(stderr, "  channel %3d-%3d: scale %.4f-%.4f\n", j, j+15, scale[j], scale[j+15]);
+        }
+        finalized = true;
+        GGML_UNUSED(stream);
+        return true;
+    }
+    GGML_UNUSED(stream);
+    return false;
+}
+
 // Lloyd-Max centroids for N(0, 1/sqrt(128))
 static __constant__ float d_tbq4_centroids[16] = {
     -0.241556f, -0.182907f, -0.143047f, -0.111065f,

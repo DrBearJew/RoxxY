@@ -75,7 +75,10 @@ static __global__ void flash_attn_ext_vec(
 #endif // GGML_USE_HIP
 
     constexpr int nthreads    = ggml_cuda_fattn_vec_get_nthreads_device();
-    constexpr bool KQ_uses_Q_reg = type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16 || type_K == GGML_TYPE_TBQ4_0;
+    constexpr bool KQ_uses_Q_reg = type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16 ||
+                                    type_K == GGML_TYPE_TBQ4_0 ||
+                                    type_K == GGML_TYPE_PLANAR3_0 || type_K == GGML_TYPE_ISO3_0 ||
+                                    type_K == GGML_TYPE_PLANAR4_0 || type_K == GGML_TYPE_ISO4_0;
     constexpr int nthreads_KQ = KQ_uses_Q_reg ? 128 / cpy_nb : nthreads_KQ_q;
     constexpr int nthreads_V  = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 128 / cpy_nb : nthreads_V_q;
 
@@ -268,7 +271,7 @@ static __global__ void flash_attn_ext_vec(
                 }
 
                 if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
-                    sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
+                    sum += slope*__half2float(maskh[j*(nb31/(int32_t)sizeof(half)) + i_KQ]);
                 }
 
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
@@ -604,3 +607,6 @@ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_BF16)
 DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TBQ4_0, GGML_TYPE_TBQ4_0);
 DECL_FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_0, GGML_TYPE_TBQ4_0);
 DECL_FATTN_VEC_CASE(256, GGML_TYPE_TBQ4_0, GGML_TYPE_TBQ4_0);
+DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TBQ4_0, GGML_TYPE_Q8_0);
+DECL_FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_0, GGML_TYPE_Q8_0);
+DECL_FATTN_VEC_CASE(256, GGML_TYPE_TBQ4_0, GGML_TYPE_Q8_0);
