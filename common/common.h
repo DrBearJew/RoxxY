@@ -13,6 +13,7 @@
 #include <string_view>
 #include <vector>
 #include <map>
+#include <algorithm>
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0A00
@@ -157,15 +158,21 @@ enum common_params_sampling_config : uint64_t {
 
 enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NONE,          // no speculative decoding
-    COMMON_SPECULATIVE_TYPE_DRAFT,         // draft model
-    COMMON_SPECULATIVE_TYPE_EAGLE3,        // eagle draft model
-    COMMON_SPECULATIVE_TYPE_MTP,           // multi-token prediction
-    COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,  // standalone draft model speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // Eagle3 speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_MTP,     // Multi-token prediction
+    COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding based on n-grams
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
-    COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
+    COMMON_SPECULATIVE_TYPE_COUNT,         // number of types, unknown type
+
+    // Backwards-compatible local aliases. Keep old wrappers/configs working while
+    // upstream uses draft-* names.
+    COMMON_SPECULATIVE_TYPE_DRAFT  = COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,
+    COMMON_SPECULATIVE_TYPE_EAGLE3 = COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,
+    COMMON_SPECULATIVE_TYPE_MTP    = COMMON_SPECULATIVE_TYPE_DRAFT_MTP,
 };
 
 // Grammar type enumeration
@@ -304,10 +311,14 @@ struct common_params_speculative_draft {
     int32_t n_min = 0;  // minimum number of draft tokens to use for speculative decoding
 
     float p_split = 0.1f;  // speculative decoding split probability
-    float p_min   = 0.75f; // minimum speculative decoding probability (greedy)
+    float p_min   = 0.75f; // minimum speculative decoding probability (greedy) // TODO: change default to 0.0f
 
     common_params_model mparams;
 
+    llama_context * ctx_tgt = nullptr;
+    llama_context * ctx_dft = nullptr;
+
+    // Legacy local draft-model fields retained for older call sites/wrappers.
     llama_model * model = nullptr; // a llama_model that can be shared by multiple speculative contexts
 
     llama_context_params cparams; // these are the parameters for the draft llama_context
@@ -354,10 +365,16 @@ struct common_params_speculative_mtp {
 };
 
 struct common_params_speculative {
-    // TODO: become a vector in order to support "chains of speculators"
+    std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
+
+    // Legacy mirror used by local server task serialization and older wrappers.
+    // New code should use `types`; `mtp` maps to upstream `draft-mtp`.
     common_speculative_type type = COMMON_SPECULATIVE_TYPE_NONE;
 
+    // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
+
+    // Legacy local separate-MTP-model slot; retained so older code keeps compiling.
     common_params_speculative_mtp   mtp;
 
     common_params_speculative_ngram_mod ngram_mod;
@@ -369,6 +386,15 @@ struct common_params_speculative {
 
     bool has_dft() const {
         return !draft.mparams.path.empty() || !draft.mparams.hf_repo.empty();
+    }
+
+    uint32_t need_n_rs_seq() const {
+        bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+        });
+        needs_rs_seq = needs_rs_seq || type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+
+        return needs_rs_seq ? draft.n_max : 0u;
     }
 };
 
@@ -889,13 +915,18 @@ enum common_context_seq_rm_type {
     COMMON_CONTEXT_SEQ_RM_TYPE_NO           = 0, // seq_rm not supported (e.g. no memory module)
     COMMON_CONTEXT_SEQ_RM_TYPE_PART         = 1, // can seq_rm partial sequences
     COMMON_CONTEXT_SEQ_RM_TYPE_FULL         = 2, // can seq_rm full sequences only
-    COMMON_CONTEXT_SEQ_RM_TYPE_PART_BOUNDED = 3, // can seq_rm partial sequences, bounded by n_rs_seq
+    COMMON_CONTEXT_SEQ_RM_TYPE_RS           = 3, // can seq_rm partial sequences, bounded by n_rs_seq
+    COMMON_CONTEXT_SEQ_RM_TYPE_PART_BOUNDED = COMMON_CONTEXT_SEQ_RM_TYPE_RS, // backwards-compatible local name
 };
 
 // check if the llama_context can remove sequences
 // note: clears the memory of the context
 common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx);
 
+// aborts execution on failure
+void common_context_seq_rm (llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta);
+void common_context_seq_cp (llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1);
 
 //
 // Batch utils
@@ -1034,3 +1065,50 @@ ggml_opt_dataset_t common_opt_dataset_init(struct llama_context * ctx, const std
 
 // "adamw" or "sgd" (case insensitive)
 enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
+
+//
+// prompt utils
+//
+
+struct common_prompt_checkpoint {
+    int64_t n_tokens;
+
+    llama_pos pos_min;
+    llama_pos pos_max;
+
+    std::vector<uint8_t> data_tgt;
+    std::vector<uint8_t> data_dft;
+
+    size_t size() const;
+
+    bool empty() const;
+    void clear();
+
+    void update_pos(
+            int64_t n_tokens,
+            llama_pos pos_min,
+            llama_pos pos_max);
+
+    void update_tgt(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags);
+
+    void update_dft(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags);
+
+    void load_tgt(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags) const;
+
+    void load_dft(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags) const;
+
+    void clear_tgt();
+    void clear_dft();
+};

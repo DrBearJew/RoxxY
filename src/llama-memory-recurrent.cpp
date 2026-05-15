@@ -120,8 +120,8 @@ llama_memory_recurrent::llama_memory_recurrent(
         const size_t memory_size_r = size_r_bytes();
         const size_t memory_size_s = size_s_bytes();
 
-        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs), R (%s): %7.2f MiB, S (%s): %7.2f MiB\n", __func__,
-                (float)(memory_size_r + memory_size_s) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max,
+        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs %2u rs_seq), R (%s): %7.2f MiB, S (%s): %7.2f MiB\n", __func__,
+                (float)(memory_size_r + memory_size_s) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq,
                 ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
                 ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f));
     }
@@ -722,6 +722,15 @@ size_t llama_memory_recurrent::size_s_bytes() const {
 void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     GGML_UNUSED(flags);
 
+    // [TAG_RS_STATE_ROLLBACK_SUPPORT]
+    if (n_rs_seq != 0) {
+        for (uint32_t i = 0; i < rs_idx.size(); ++i) {
+            if (rs_idx[i] != 0) {
+                GGML_ABORT("recurrent state read/write is not supported with partial rollback");
+            }
+        }
+    }
+
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges; // ranges, from inclusive, to exclusive
     uint32_t cell_count = 0;
 
@@ -744,6 +753,10 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
     }
     if (cell_range_begin != size) {
         cell_ranges.emplace_back(cell_range_begin, size);
+    }
+
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) && cell_ranges.size() > 1) {
+        GGML_ABORT("cannot save/load multiple ranges of cells to/from device memory\n");
     }
 
     // DEBUG CHECK: Sum of cell counts in ranges should equal the total cell count

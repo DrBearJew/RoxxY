@@ -335,11 +335,15 @@ static bool common_params_handle_remote_preset(common_params & params, llama_exa
 struct handle_model_result {
     bool found_mmproj = false;
     common_params_model mmproj;
+
+    bool found_mtp = false;
+    common_params_model mtp;
 };
 
 static handle_model_result common_params_handle_model(struct common_params_model & model,
                                                       const std::string          & bearer_token,
-                                                      bool                         offline) {
+                                                      bool                         offline,
+                                                      bool                         search_mtp = false) {
     handle_model_result result;
 
     if (!model.docker_repo.empty()) {
@@ -354,7 +358,7 @@ static handle_model_result common_params_handle_model(struct common_params_model
         common_download_opts opts;
         opts.bearer_token = bearer_token;
         opts.offline = offline;
-        auto download_result = common_download_model(model, opts, true);
+        auto download_result = common_download_model(model, opts, true, search_mtp);
 
         if (download_result.model_path.empty()) {
             LOG_ERR("error: failed to download model from Hugging Face\n");
@@ -367,6 +371,11 @@ static handle_model_result common_params_handle_model(struct common_params_model
         if (!download_result.mmproj_path.empty()) {
             result.found_mmproj = true;
             result.mmproj.path  = download_result.mmproj_path;
+        }
+
+        if (!download_result.mtp_path.empty()) {
+            result.found_mtp = true;
+            result.mtp.path  = download_result.mtp_path;
         }
     } else if (!model.url.empty()) {
         if (model.path.empty()) {
@@ -440,6 +449,37 @@ static bool parse_bool_value(const std::string & value) {
 //
 // CLI argument parsing functions
 //
+
+void common_params_handle_models(common_params & params, llama_example curr_ex) {
+    const bool spec_type_draft_mtp = std::find(params.speculative.types.begin(),
+                                         params.speculative.types.end(),
+                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+
+    auto res = common_params_handle_model(params.model, params.hf_token, params.offline, spec_type_draft_mtp);
+    if (params.no_mmproj) {
+        params.mmproj = {};
+    } else if (res.found_mmproj && params.mmproj.path.empty() && params.mmproj.url.empty()) {
+        // optionally, handle mmproj model when -hf is specified
+        params.mmproj = res.mmproj;
+    }
+    // only download mmproj if the current example is using it
+    for (const auto & ex : mmproj_examples) {
+        if (curr_ex == ex) {
+            common_params_handle_model(params.mmproj,    params.hf_token, params.offline);
+            break;
+        }
+    }
+    // when --spec-type mtp is set and no draft model was provided explicitly,
+    // fall back to the MTP head discovered alongside the -hf model
+    if (spec_type_draft_mtp && res.found_mtp &&
+        params.speculative.draft.mparams.path.empty() &&
+        params.speculative.draft.mparams.hf_repo.empty() &&
+        params.speculative.draft.mparams.url.empty()) {
+        params.speculative.draft.mparams.path = res.mtp.path;
+    }
+    common_params_handle_model(params.speculative.draft.mparams, params.hf_token, params.offline);
+    common_params_handle_model(params.vocoder.model,             params.hf_token, params.offline);
+}
 
 static bool common_params_parse_ex(int argc, char ** argv, common_params_context & ctx_arg) {
     common_params & params = ctx_arg.params;
@@ -3574,26 +3614,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
-        {"--spec-type"}, "[none|mtp|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]",
-        string_format("type of speculative decoding to use when no draft model is provided (default: %s)\n",
-            common_speculative_type_to_str(params.speculative.type).c_str()),
+        {"--spec-type"}, common_speculative_all_types_str(),
+        string_format("comma-separated list of types of speculative decoding to use (default: %s)\n",
+            common_speculative_type_name_str(params.speculative.types).c_str()),
         [](common_params & params, const std::string & value) {
-            if (value == "none") {
-                params.speculative.type = COMMON_SPECULATIVE_TYPE_NONE;
-            } else if (value == "mtp") {
-                params.speculative.type = COMMON_SPECULATIVE_TYPE_MTP;
-            } else if (value == "ngram-cache") {
-                params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_CACHE;
-            } else if (value == "ngram-simple") {
-                params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE;
-            } else if (value == "ngram-map-k") {
-                params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K;
-            } else if (value == "ngram-map-k4v") {
-                params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V;
-            } else if (value == "ngram-mod") {
-                params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_MOD;
-            } else {
-                throw std::invalid_argument("unknown speculative decoding type without draft model");
+            const auto types_str = string_split<std::string>(value, ',');
+            auto types = common_speculative_types_from_names(types_str);
+            params.speculative.types.insert(params.speculative.types.end(), types.begin(), types.end());
+            if (!types.empty()) {
+                params.speculative.type = types.back(); // legacy mirror for local wrappers/tasks
             }
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_TYPE"));
@@ -4083,7 +4112,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--spec-default"},
         string_format("enable default speculative decoding config"),
         [](common_params & params) {
-            params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_MOD;
+            params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
             params.speculative.ngram_mod.n_match = 24;
             params.speculative.ngram_mod.n_min = 48;
             params.speculative.ngram_mod.n_max = 64;
