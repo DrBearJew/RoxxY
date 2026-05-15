@@ -96,6 +96,15 @@ Command shape: `llama-bench -p 128,256,512 -n 0 -fa 1 -ctk tbq4_0 -ctv tbq4_0 -b
 
 Default 35B llama-swap routes use the `MAX_X=48` selector and stay **non-MTP**. 27B MTP routes keep the MTP prefill env instead.
 
+Policy tool:
+
+```bash
+scripts/hip/rdna3-mmq-policy.py \
+  --summary benches/rocm-rdna3/qwen35b-pp128-256-512-20260516-005350/summary.variants.clean.json \
+  --out-dir benches/rocm-rdna3/qwen35b-pp128-256-512-20260516-005350/policy
+source benches/rocm-rdna3/qwen35b-pp128-256-512-20260516-005350/policy/env.sh
+```
+
 ## What changed
 
 | Area | Status | Notes |
