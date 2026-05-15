@@ -24,6 +24,12 @@ Use the local `LLM` conda environment:
 experiments/compressed_kv_triton/run_all.sh
 ```
 
+Optional aggregate JSON report:
+
+```bash
+/home/mrtrent/miniconda3/envs/LLM/bin/python experiments/compressed_kv_triton/run_all_json.py
+```
+
 Known-good local environment:
 
 - GPU: AMD Radeon RX 7900 XTX / `gfx1100`
@@ -66,6 +72,8 @@ The gate covers:
 | --- | --- | --- |
 | Environment | `scripts/hip/check-triton-feasibility.py` | Confirms Triton/torch/ROCm can compile and launch. |
 | Compatibility | `compat_gate.py` | Guards Python imports, bytecode compile, and Triton API assumptions. |
+| llama.cpp parity | `llama_cpp_tensor_layout_parity.py`, `llama_cpp_block_table_parity.py` | Checks KV tensor byte offsets and block-table mappings against llama.cpp slot/view rules. |
+| Dispatch policy | `dispatch_policy_contract.py` | Freezes default VEC, env-gated WMMA, and mixed `TBQ4_0/Q8_0` behavior. |
 | Row mapping | `paged_row_mapping_contract.py` | Checks logical-row to physical-row mapping independent of format decode. |
 | Materializers | `materializers.py`, `paged_materializers.py` | Verifies compressed-row decode for contiguous and paged layouts. |
 | QK | `qk_only.py`, `qk_2d_tiled.py` | Compares compressed-K dot products against dense references. |
@@ -73,6 +81,7 @@ The gate covers:
 | QKV | `full_qkv.py`, `qkv_2d_tiled.py` | Validates end-to-end attention output for tiled compressed KV. |
 | Metadata | `varlen_qkv.py` | Tests variable-length sequence metadata and GQA head mapping. |
 | Long context | `segmented_qkv.py`, `compare_2d_segmented.py` | Tests segmented reduction semantics without making timing claims. |
+| Domain parity | `tbq4_domain_parity.py`, `planar_iso_domain_parity.py` | Verifies TBQ4 FWHT Q/O rotation policy and Planar/Iso original-domain policy. |
 | Autotune metadata | `autotune_metadata.py` | Records fixed RDNA3 configs and tuning keys without adding dependencies. |
 
 ## Production invariants
@@ -84,7 +93,7 @@ These experiments are allowed to influence C++ code only if the production invar
 - Triton/Python does not enter production CMake or `llama-server` runtime;
 - wrappers and llama-swap configs do not export experimental WMMA flags;
 - mixed `TBQ4_0/Q8_0` stays on VEC until a Q8 V loader and domain policy exist;
-- paged/block-table C++ row mapping remains gated until llama.cpp tensor parity tests exist.
+- paged/block-table C++ row mapping remains gated until llama.cpp tensor/block-table parity tests pass and a separate C++ adapter is designed.
 
 Related production checks:
 
@@ -92,6 +101,15 @@ Related production checks:
 scripts/hip/check-compressed-kv-fa-invariants.sh
 scripts/hip/run-compressed-kv-wmma-smokes.sh
 ```
+
+## C++ paged mapper target
+
+Do not add a production paged/block-table mapper until the llama.cpp parity gates pass. The intended C++ adapter remains narrow:
+
+- `row_ptr(logical_row)` resolves block-table metadata to a llama.cpp KV slot;
+- byte offset stays `stream_stride * stream + head_stride * head + token_stride * slot`;
+- format traits still only decode a physical compressed row and element offset;
+- backend code still owns tiling, masks, synchronization, MMA/WMMA, and softmax.
 
 ## Promotion rule
 

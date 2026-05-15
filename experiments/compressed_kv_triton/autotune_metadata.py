@@ -49,6 +49,7 @@ FORMAT_DOMAINS = {
 
 def metadata_report() -> dict[str, object]:
     return {
+        "result": "PASS",
         "autotuner_dependency": "none",
         "keys": AUTOTUNE_METADATA_KEYS,
         "fixed_rdna3_configs": FIXED_RDNA3_CONFIGS,

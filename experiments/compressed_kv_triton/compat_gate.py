@@ -58,6 +58,10 @@ def _scan_sources() -> list[dict[str, object]]:
 
 EXPERIMENT_MODULES = (
     "compressed_kv_tl",
+    "llama_cpp_kv_layout",
+    "llama_cpp_tensor_layout_parity",
+    "llama_cpp_block_table_parity",
+    "dispatch_policy_contract",
     "materializers",
     "paged_materializers",
     "qk_only",
@@ -69,7 +73,10 @@ EXPERIMENT_MODULES = (
     "mask_semantics",
     "segmented_qkv",
     "compare_2d_segmented",
+    "tbq4_domain_parity",
+    "planar_iso_domain_parity",
     "autotune_metadata",
+    "run_all_json",
 )
 
 

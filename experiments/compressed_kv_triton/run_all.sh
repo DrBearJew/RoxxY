@@ -7,6 +7,9 @@ py=${TRITON_PYTHON:-/home/mrtrent/miniconda3/envs/LLM/bin/python}
 cd "$repo"
 "$py" scripts/hip/check-triton-feasibility.py
 "$py" experiments/compressed_kv_triton/compat_gate.py
+"$py" experiments/compressed_kv_triton/llama_cpp_tensor_layout_parity.py
+"$py" experiments/compressed_kv_triton/llama_cpp_block_table_parity.py
+"$py" experiments/compressed_kv_triton/dispatch_policy_contract.py
 "$py" experiments/compressed_kv_triton/paged_row_mapping_contract.py
 "$py" experiments/compressed_kv_triton/materializers.py
 "$py" experiments/compressed_kv_triton/paged_materializers.py
@@ -19,4 +22,6 @@ cd "$repo"
 "$py" experiments/compressed_kv_triton/mask_semantics.py
 "$py" experiments/compressed_kv_triton/segmented_qkv.py
 "$py" experiments/compressed_kv_triton/compare_2d_segmented.py
+"$py" experiments/compressed_kv_triton/tbq4_domain_parity.py
+"$py" experiments/compressed_kv_triton/planar_iso_domain_parity.py
 "$py" experiments/compressed_kv_triton/autotune_metadata.py

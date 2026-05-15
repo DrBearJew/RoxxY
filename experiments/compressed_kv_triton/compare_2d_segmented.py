@@ -16,7 +16,9 @@ def _max_err(report: dict[str, object]) -> float:
 def main() -> int:
     qkv_2d = run_qkv_2d_checks(q_rows=8, k_rows=17, dims=(128,))
     segmented = run_segmented_qkv_checks(q_rows=5, k_rows=37, dims=(128,))
+    result = "PASS" if qkv_2d["result"] == "PASS" and segmented["result"] == "PASS" else "FAIL"
     report = {
+        "result": result,
         "comparison": "correctness_only_no_timing",
         "qkv_2d_result": qkv_2d["result"],
         "qkv_2d_max_abs_err": _max_err(qkv_2d),
@@ -29,7 +31,7 @@ def main() -> int:
         ],
     }
     print(json.dumps(report, indent=2, sort_keys=True))
-    return 0 if qkv_2d["result"] == "PASS" and segmented["result"] == "PASS" else 1
+    return 0 if result == "PASS" else 1
 
 
 if __name__ == "__main__":
