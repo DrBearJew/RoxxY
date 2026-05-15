@@ -1,56 +1,104 @@
-# Compressed-KV Triton experiment lane
+# Compressed-KV Triton experiments
 
-This directory is Track B from `docs/rocm-tbq4-paths/21-compressed-kv-fa-two-track-roadmap.md`.
+This directory is a ROCm/Triton validation lane for compressed-KV FlashAttention ideas used by the HIP implementation. It is intentionally isolated from production `llama-server`.
 
-## Scope
+## What this is
 
-- Prototype compressed-KV tile materializers and FlashAttention-shaped loops in Triton/ROCm.
-- Feed conclusions back into the C++/HIP materializer/backend contract.
-- Stay isolated from production llama.cpp CMake, wrappers, and server runtime.
+- A correctness harness for compressed KV formats: `planar3_0`, `iso3_0`, and `tbq4_0`.
+- A place to test materialization, paged row mapping, QK/QKV loops, masks, varlen metadata, and segmented long-context reductions.
+- A design oracle for C++/HIP refactors: prove the contract here first, then port only the minimal validated idea.
 
-## Environment
+## What this is not
 
-Use the local conda LLM environment:
+- Not a production runtime dependency.
+- Not wired into CMake.
+- Not used by the wrapper or llama-swap configs.
+- Not a performance claim; scripts here are correctness gates unless they explicitly say otherwise.
+
+## Quick start
+
+Use the local `LLM` conda environment:
 
 ```bash
-/home/mrtrent/miniconda3/envs/LLM/bin/python --version
 /home/mrtrent/miniconda3/envs/LLM/bin/python scripts/hip/check-triton-feasibility.py
+experiments/compressed_kv_triton/run_all.sh
 ```
 
-Known-good checkpoint on this machine:
+Known-good local environment:
 
-- Triton 3.7.0
-- torch `2.12.0a0+rocm7.13.0a20260412`
-- HIP `7.13.60980`
-- AMD Radeon RX 7900 XTX / `gfx1100`
+- GPU: AMD Radeon RX 7900 XTX / `gfx1100`
+- Triton: `3.7.0`
+- PyTorch: `2.12.0a0+rocm7.13.0a20260412`
+- HIP runtime reported by torch: `7.13.60980`
 
-## Isolation rules
+## Contract under test
 
-- No files here are referenced by production CMake.
-- No wrapper or llama-swap config should set Triton-related runtime flags.
-- Dense materializer outputs in this directory are test artifacts only; production must keep compressed KV in global memory and materialize only per-tile values on chip.
+The experiments keep three responsibilities separate:
 
-## Checks
+1. **Format decoder**
+   - receives a physical compressed row and dimension offsets;
+   - decodes values for one format;
+   - does not know about paging or attention scheduling.
+2. **Row mapper**
+   - maps logical rows through block tables to physical compressed rows;
+   - owns tail-row and non-monotonic page behavior;
+   - is tested independently before being used by attention kernels.
+3. **Attention backend**
+   - owns tile shape, synchronization, masks, online softmax, QK/QKV loops, and reductions;
+   - materializes only the current tile/rows, never a sequence-wide dense fp16 KV cache.
+
+Format-domain rule:
+
+- `planar3_0` and `iso3_0` are original-domain formats.
+- `tbq4_0` is a FWHT-domain format; production C++ keeps Q pre-rotation and O inverse rotation outside the generic materializer.
+
+## Aggregate gate
+
+Run everything:
 
 ```bash
 experiments/compressed_kv_triton/run_all.sh
 ```
 
-The aggregate check runs:
+The gate covers:
 
-1. `scripts/hip/check-triton-feasibility.py`
-2. `compat_gate.py`
-3. `materializers.py`
-4. `paged_materializers.py`
-5. `qk_only.py`
-6. `qk_2d_tiled.py`
-7. `online_softmax.py`
-8. `full_qkv.py`
-9. `qkv_2d_tiled.py`
-10. `varlen_qkv.py`
-11. `mask_semantics.py`
-12. `segmented_qkv.py`
-13. `compare_2d_segmented.py`
-14. `autotune_metadata.py`
+| Stage | Script | Purpose |
+| --- | --- | --- |
+| Environment | `scripts/hip/check-triton-feasibility.py` | Confirms Triton/torch/ROCm can compile and launch. |
+| Compatibility | `compat_gate.py` | Guards Python imports, bytecode compile, and Triton API assumptions. |
+| Row mapping | `paged_row_mapping_contract.py` | Checks logical-row to physical-row mapping independent of format decode. |
+| Materializers | `materializers.py`, `paged_materializers.py` | Verifies compressed-row decode for contiguous and paged layouts. |
+| QK | `qk_only.py`, `qk_2d_tiled.py` | Compares compressed-K dot products against dense references. |
+| Softmax/masks | `online_softmax.py`, `mask_semantics.py` | Tests online softmax, causal masks, sliding windows, and tail tiles. |
+| QKV | `full_qkv.py`, `qkv_2d_tiled.py` | Validates end-to-end attention output for tiled compressed KV. |
+| Metadata | `varlen_qkv.py` | Tests variable-length sequence metadata and GQA head mapping. |
+| Long context | `segmented_qkv.py`, `compare_2d_segmented.py` | Tests segmented reduction semantics without making timing claims. |
+| Autotune metadata | `autotune_metadata.py` | Records fixed RDNA3 configs and tuning keys without adding dependencies. |
 
-Current prototype status is recorded in `docs/rocm-tbq4-paths/24-triton-prototype-results.md`.
+## Production invariants
+
+These experiments are allowed to influence C++ code only if the production invariants still hold:
+
+- default compressed-KV FlashAttention dispatch remains VEC;
+- `TBQ4_WMMA_FATTN=1` and `COMPRESSED_KV_WMMA_FATTN=1` remain explicit opt-in gates;
+- Triton/Python does not enter production CMake or `llama-server` runtime;
+- wrappers and llama-swap configs do not export experimental WMMA flags;
+- mixed `TBQ4_0/Q8_0` stays on VEC until a Q8 V loader and domain policy exist;
+- paged/block-table C++ row mapping remains gated until llama.cpp tensor parity tests exist.
+
+Related production checks:
+
+```bash
+scripts/hip/check-compressed-kv-fa-invariants.sh
+scripts/hip/run-compressed-kv-wmma-smokes.sh
+```
+
+## Promotion rule
+
+A C++ refactor may use this lane as evidence only when:
+
+1. `run_all.sh` passes;
+2. the production invariant checker passes;
+3. default llama-swap VEC smoke still passes;
+4. opt-in WMMA smokes pass when attention dispatch or materialization changed;
+5. rollback remains one env/config change back to the VEC path.
