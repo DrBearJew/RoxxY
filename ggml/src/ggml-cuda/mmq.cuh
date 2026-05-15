@@ -4045,8 +4045,8 @@ static size_t mmq_get_nbytes_shared(const int mmq_x, const int mmq_y, const int 
     size_t nbs = nbs_ids + nbs_x + GGML_PAD(nbs_y, nwarps*warp_size*sizeof(int));
 #ifdef RDNA2_MATMUL_OPT_V1
     if (use_experimental) {
-        // The experimental path keeps a second tile_x buffer in LDS and inserts
-        // one int of padding between buffers to break bank-conflict symmetry.
+        // Keep the LDS double buffer explicit and non-overlapping. The older aliasing layout is fast
+        // but corrupts long-prompt generations into deterministic repeated-token garbage.
         nbs += nbs_x + sizeof(int);
     }
 #else
@@ -4065,7 +4065,9 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int nwarps = mmq_get_nwarps_host(cc, warp_size);
     const int mmq_y = get_mmq_y_host(cc);
 
-    const bool use_experimental_requested = mmq_use_rdna2_matmul_opt(cc);
+    // The RDNA2/RDNA3 LDS double-buffer path is only used for MoE compact/expert prefill-sized matmuls.
+    // Decode/small-batch MoE and dense MTP/base matmuls stay on the coherent MMQ path.
+    const bool use_experimental_requested = args.ids_dst != nullptr && args.ncols_max >= 128 && mmq_use_rdna2_matmul_opt(cc);
     const bool use_experimental = use_experimental_requested &&
         mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps, true) <= smpbo;
 
@@ -4183,7 +4185,9 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
 
     const int mmq_x_max = get_mmq_x_max_host(cc);
     const int mmq_y = get_mmq_y_host(cc);
-    const bool use_experimental_requested = mmq_use_rdna2_matmul_opt(cc);
+    // Keep the RDNA2/RDNA3 experimental fast path scoped to MoE compact/expert prefill-sized matmuls.
+    // Dense MTP/base and decode/small-batch MoE still use MMQ when selected, but not the LDS double-buffer variant.
+    const bool use_experimental_requested = args.ids_dst != nullptr && args.ncols_max >= 128 && mmq_use_rdna2_matmul_opt(cc);
 
     int mmq_x_best  = 0;
     int ntiles_x_best = INT_MAX;
