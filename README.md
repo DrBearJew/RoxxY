@@ -75,6 +75,27 @@ No ROCm OOM, no `ggml_cuda_op_mul_mat_cublas` fallback stack, and no shutdown do
 
 The important point: TBQ4 made 64k usable and 200k fit on a 24 GB RX 7900 XTX while keeping the MTP path alive.
 
+## RDNA3 MoE MMQ selector (Qwen3.6 35B-A3B IQ4_XS)
+
+Current best 35B non-MTP prompt-processing setting:
+
+```bash
+RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48
+```
+
+Bench artifact: `benches/rocm-rdna3/qwen35b-pp128-256-512-20260516-005350/summary.variants.clean.md`.
+Command shape: `llama-bench -p 128,256,512 -n 0 -fa 1 -ctk tbq4_0 -ctv tbq4_0 -b 1024 -ub 512 -r 5`.
+
+| Runtime env | pp128 | pp256 | pp512 |
+|---|---:|---:|---:|
+| baseline | 1241.3 ± 40.1 | 1910.9 ± 39.8 | 2621.7 ± 14.0 |
+| `RDNA2_MATMUL_OPT_V1=1` | 1245.5 ± 51.2 | 1901.8 ± 33.3 | 2622.3 ± 25.3 |
+| **`RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48`** | **1780.7 ± 44.5** | **2479.6 ± 25.0** | **3150.0 ± 40.5** |
+| `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=64` | 1660.1 ± 56.6 | 2401.1 ± 39.0 | 3100.2 ± 16.1 |
+| scratch16k probe | 1238.5 ± 54.5 | 1904.5 ± 24.7 | 2613.6 ± 37.1 |
+
+Default 35B llama-swap routes use the `MAX_X=48` selector and stay **non-MTP**. 27B MTP routes keep the MTP prefill env instead.
+
 ## What changed
 
 | Area | Status | Notes |
@@ -329,27 +350,6 @@ Results are written to `gate-summary.json`.
 | `tbq4_0` (before fix) | 28k tokens | 64k | 100.8 |
 | `q8_0` | 14k tokens | 16k | 394.2 |
 | `tbq4_0` (after KQ fix) | 14k tokens | 16k | 537.7 |
-
-### RDNA3 MoE MMQ selector (Qwen3.6 35B-A3B IQ4_XS)
-
-Current best 35B non-MTP prompt-processing setting:
-
-```bash
-RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48
-```
-
-Bench artifact: `benches/rocm-rdna3/qwen35b-pp128-256-512-20260516-005350/summary.variants.clean.md`.
-Command shape: `llama-bench -p 128,256,512 -n 0 -fa 1 -ctk tbq4_0 -ctv tbq4_0 -b 1024 -ub 512 -r 5`.
-
-| Runtime env | pp128 | pp256 | pp512 |
-|---|---:|---:|---:|
-| baseline | 1241.3 ± 40.1 | 1910.9 ± 39.8 | 2621.7 ± 14.0 |
-| `RDNA2_MATMUL_OPT_V1=1` | 1245.5 ± 51.2 | 1901.8 ± 33.3 | 2622.3 ± 25.3 |
-| **`RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48`** | **1780.7 ± 44.5** | **2479.6 ± 25.0** | **3150.0 ± 40.5** |
-| `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=64` | 1660.1 ± 56.6 | 2401.1 ± 39.0 | 3100.2 ± 16.1 |
-| scratch16k probe | 1238.5 ± 54.5 | 1904.5 ± 24.7 | 2613.6 ± 37.1 |
-
-Default 35B llama-swap routes use the `MAX_X=48` selector and stay **non-MTP**. 27B MTP routes keep the MTP prefill env instead.
 
 ### Cooperative TBQ4 set_rows + InnerQ + Layer-Adaptive KV
 
