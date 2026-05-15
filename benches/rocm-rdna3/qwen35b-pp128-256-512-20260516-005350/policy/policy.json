@@ -1,6 +1,6 @@
 {
   "backend": "ROCm/HIP",
-  "generated_at": "2026-05-15T23:41:03.422876+00:00",
+  "generated_at": "2026-05-15T23:52:34.189079+00:00",
   "gpu_label": "gfx1100/RX 7900 XTX",
   "hardware_budget": {
     "accum_soft_budget_bytes_per_thread": 96,
@@ -10,7 +10,7 @@
     "warp_size": 32
   },
   "model_label": "Qwen3.6-35B-A3B-IQ4_XS",
-  "repo_commit": "8db207c3133e",
+  "repo_commit": "22f383e1810a",
   "schema_version": 1,
   "selected_env": {
     "GGML_CUDA_MMQ_MAX_X": "48",
@@ -249,6 +249,50 @@
       "static": null
     },
     {
+      "eligible": false,
+      "env": {
+        "GGML_CUDA_MMQ_MAX_X": "32",
+        "RDNA2_MATMUL_OPT_V1": "1"
+      },
+      "name": "maxx32",
+      "perf": {
+        "missing_prompts": [
+          128,
+          256,
+          512
+        ],
+        "prompts": {},
+        "speedup_vs_baseline": 0.0,
+        "throughput_tok_s": 0.0,
+        "total_weighted_tokens": 0.0,
+        "weighted_seconds": 0.0
+      },
+      "reject_reasons": [
+        "missing prompt rows: [128, 256, 512]"
+      ],
+      "static": {
+        "accum_bytes_per_thread": 64.0,
+        "accum_floats_per_thread": 16.0,
+        "coherent_fits": true,
+        "coherent_shared": 44160,
+        "explicit_double_buffer_fits": false,
+        "explicit_double_buffer_shared": 83076,
+        "mmq_x": 32,
+        "mmq_y": 128,
+        "nbs_ids": 128,
+        "nbs_x": 38912,
+        "nbs_y_padded": 5120,
+        "nbs_y_raw": 4608,
+        "ncols_max": 512,
+        "reason": "fits coherent LDS and soft accumulator budget",
+        "safe_by_accum_budget": true,
+        "score": 16.16845703125,
+        "tiles_x": 16,
+        "valid_granularity": true,
+        "viable": true
+      }
+    },
+    {
       "eligible": true,
       "env": {
         "GGML_CUDA_MMQ_MAX_X": "48",
@@ -348,6 +392,96 @@
         "safe_by_accum_budget": false,
         "score": 12.1845703125,
         "tiles_x": 8,
+        "valid_granularity": true,
+        "viable": false
+      }
+    },
+    {
+      "eligible": false,
+      "env": {
+        "GGML_CUDA_MMQ_MAX_X": "96",
+        "RDNA2_MATMUL_OPT_V1": "1"
+      },
+      "name": "maxx96",
+      "perf": {
+        "missing_prompts": [
+          128,
+          256,
+          512
+        ],
+        "prompts": {},
+        "speedup_vs_baseline": 0.0,
+        "throughput_tok_s": 0.0,
+        "total_weighted_tokens": 0.0,
+        "weighted_seconds": 0.0
+      },
+      "reject_reasons": [
+        "missing prompt rows: [128, 256, 512]",
+        "over soft accumulator/register budget"
+      ],
+      "static": {
+        "accum_bytes_per_thread": 192.0,
+        "accum_floats_per_thread": 48.0,
+        "coherent_fits": true,
+        "coherent_shared": 53632,
+        "explicit_double_buffer_fits": false,
+        "explicit_double_buffer_shared": 92548,
+        "mmq_x": 96,
+        "mmq_y": 128,
+        "nbs_ids": 384,
+        "nbs_x": 38912,
+        "nbs_y_padded": 14336,
+        "nbs_y_raw": 13824,
+        "ncols_max": 512,
+        "reason": "over soft accumulator/register budget",
+        "safe_by_accum_budget": false,
+        "score": 18.20458984375,
+        "tiles_x": 6,
+        "valid_granularity": true,
+        "viable": false
+      }
+    },
+    {
+      "eligible": false,
+      "env": {
+        "GGML_CUDA_MMQ_MAX_X": "128",
+        "RDNA2_MATMUL_OPT_V1": "1"
+      },
+      "name": "maxx128",
+      "perf": {
+        "missing_prompts": [
+          128,
+          256,
+          512
+        ],
+        "prompts": {},
+        "speedup_vs_baseline": 0.0,
+        "throughput_tok_s": 0.0,
+        "total_weighted_tokens": 0.0,
+        "weighted_seconds": 0.0
+      },
+      "reject_reasons": [
+        "missing prompt rows: [128, 256, 512]",
+        "over soft accumulator/register budget"
+      ],
+      "static": {
+        "accum_bytes_per_thread": 256.0,
+        "accum_floats_per_thread": 64.0,
+        "coherent_fits": true,
+        "coherent_shared": 57856,
+        "explicit_double_buffer_fits": false,
+        "explicit_double_buffer_shared": 96772,
+        "mmq_x": 128,
+        "mmq_y": 128,
+        "nbs_ids": 512,
+        "nbs_x": 38912,
+        "nbs_y_padded": 18432,
+        "nbs_y_raw": 18432,
+        "ncols_max": 512,
+        "reason": "over soft accumulator/register budget",
+        "safe_by_accum_budget": false,
+        "score": 24.220703125,
+        "tiles_x": 4,
         "valid_granularity": true,
         "viable": false
       }

@@ -11,8 +11,11 @@ Basis: fastest eligible weighted llama-bench throughput
 |---|:---:|---|---:|---:|---|---|
 | `baseline` | yes | `baseline/no extra env` | 2072.2 | 1.000x | no fixed MAX_X |  |
 | `rdna2_opt` | yes | `RDNA2_MATMUL_OPT_V1=1` | 2071.1 | 0.999x | no fixed MAX_X |  |
+| `maxx32` | NO | `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=32` | — | — | x32: fits coherent LDS and soft accumulator budget | missing prompt rows: [128, 256, 512] |
 | `maxx48` | yes | `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48` | 2653.5 | 1.281x | x48: fits coherent LDS and soft accumulator budget | selected |
 | `maxx64` | NO | `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=64` | 2568.3 | 1.239x | x64: over soft accumulator/register budget | over soft accumulator/register budget |
+| `maxx96` | NO | `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=96` | — | — | x96: over soft accumulator/register budget | missing prompt rows: [128, 256, 512]; over soft accumulator/register budget |
+| `maxx128` | NO | `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=128` | — | — | x128: over soft accumulator/register budget | missing prompt rows: [128, 256, 512]; over soft accumulator/register budget |
 | `scratch16k` | NO | `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_IQ4_XS_MMQ_SCRATCH16K=1` | 2066.1 | 0.997x | x64: over soft accumulator/register budget | over soft accumulator/register budget |
 
 ## Static shape candidates

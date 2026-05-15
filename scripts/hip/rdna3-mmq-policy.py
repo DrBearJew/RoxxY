@@ -12,7 +12,9 @@ Typical use:
 
 The default policy is conservative: variants that exceed the current known-good
 F32 accumulator pressure budget are listed but not selected unless
---allow-over-budget is passed.
+--allow-over-budget is passed. For stabilization work, run a cap sweep across
+maxx32/maxx48/maxx64/maxx128 and then rerun this tool with --allow-over-budget;
+only promote a larger cap if it beats the current safe cap and passes canaries.
 """
 
 from __future__ import annotations
@@ -32,8 +34,11 @@ DTYPE_BITS = {"f32": 32}
 KNOWN_VARIANT_ENVS: dict[str, dict[str, str]] = {
     "baseline": {},
     "rdna2_opt": {"RDNA2_MATMUL_OPT_V1": "1"},
+    "maxx32": {"RDNA2_MATMUL_OPT_V1": "1", "GGML_CUDA_MMQ_MAX_X": "32"},
     "maxx48": {"RDNA2_MATMUL_OPT_V1": "1", "GGML_CUDA_MMQ_MAX_X": "48"},
     "maxx64": {"RDNA2_MATMUL_OPT_V1": "1", "GGML_CUDA_MMQ_MAX_X": "64"},
+    "maxx96": {"RDNA2_MATMUL_OPT_V1": "1", "GGML_CUDA_MMQ_MAX_X": "96"},
+    "maxx128": {"RDNA2_MATMUL_OPT_V1": "1", "GGML_CUDA_MMQ_MAX_X": "128"},
     "scratch16k": {"RDNA2_MATMUL_OPT_V1": "1", "GGML_CUDA_IQ4_XS_MMQ_SCRATCH16K": "1"},
 }
 
@@ -42,8 +47,11 @@ KNOWN_VARIANT_ENVS: dict[str, dict[str, str]] = {
 KNOWN_VARIANT_MMQ_X: dict[str, int | None] = {
     "baseline": None,
     "rdna2_opt": None,
+    "maxx32": 32,
     "maxx48": 48,
     "maxx64": 64,
+    "maxx96": 96,
+    "maxx128": 128,
     "scratch16k": 64,
 }
 

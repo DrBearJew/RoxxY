@@ -109,6 +109,12 @@ Command shape: `llama-bench -p 128,256,512 -n 0 -fa 1 -ctk tbq4_0 -ctv tbq4_0 -b
 
 Default 35B llama-swap routes use the `MAX_X=48` selector and stay **non-MTP**. 27B MTP routes keep the MTP prefill env instead.
 
+Stabilization target: sweep `MAX_X=32/48/64/128`, then promote only if it beats 48 and passes canaries.
+
+```bash
+scripts/hip/run-rdna3-mmq-cap-sweep.sh
+```
+
 Policy tool:
 
 ```bash
