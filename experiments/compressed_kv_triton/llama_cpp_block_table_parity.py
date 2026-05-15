@@ -34,8 +34,10 @@ class OffsetCase:
     fmt: str
     d_head: int
     n_head_kv: int
-    kv_size: int
+    cache_size: int
+    n_kv: int
     n_stream: int
+    stream_base: int
 
 
 def default_block_cases() -> list[BlockTableCase]:
@@ -48,7 +50,7 @@ def default_block_cases() -> list[BlockTableCase]:
 
 def default_offset_cases() -> list[OffsetCase]:
     return [
-        OffsetCase(fmt=fmt, d_head=d_head, n_head_kv=n_head_kv, kv_size=80, n_stream=3)
+        OffsetCase(fmt=fmt, d_head=d_head, n_head_kv=n_head_kv, cache_size=96, n_kv=80, n_stream=3, stream_base=1)
         for fmt in COMPRESSED_KV_FORMATS
         for d_head in (128, 256)
         for n_head_kv in (1, 4)
@@ -60,8 +62,10 @@ def _validate_block_case(case: BlockTableCase, offset_case: OffsetCase) -> dict[
         fmt=offset_case.fmt,
         d_head=offset_case.d_head,
         n_head_kv=offset_case.n_head_kv,
-        kv_size=offset_case.kv_size,
+        kv_size=offset_case.cache_size,
+        n_kv=offset_case.n_kv,
         n_stream=offset_case.n_stream,
+        stream_base=offset_case.stream_base,
     )
 
     needed_blocks = (case.rows + case.block_size - 1) // case.block_size
@@ -77,8 +81,8 @@ def _validate_block_case(case: BlockTableCase, offset_case: OffsetCase) -> dict[
     for logical_row in range(case.rows):
         slot = block_table_slot(case.block_table, logical_row, case.block_size)
         slots.append(slot)
-        if slot >= offset_case.kv_size:
-            failures.append(f"slot {slot} exceeds kv_size {offset_case.kv_size}")
+        if slot >= offset_case.n_kv:
+            failures.append(f"slot {slot} exceeds active n_kv {offset_case.n_kv}")
             continue
         for head in range(offset_case.n_head_kv):
             block_table_off = view.row_offset_bytes(stream=case.stream, head=head, slot=slot)
@@ -109,7 +113,10 @@ def _validate_block_case(case: BlockTableCase, offset_case: OffsetCase) -> dict[
         "format": offset_case.fmt,
         "D": offset_case.d_head,
         "n_head_kv": offset_case.n_head_kv,
-        "stream": case.stream,
+        "local_stream": case.stream,
+        "absolute_stream": view.absolute_stream(case.stream),
+        "cache_size": offset_case.cache_size,
+        "n_kv": offset_case.n_kv,
         "rows": case.rows,
         "block_size": case.block_size,
         "block_table": list(case.block_table),
@@ -126,8 +133,10 @@ def _validate_cross_stream_isolation(block_cases: list[BlockTableCase], offset_c
         fmt=offset_case.fmt,
         d_head=offset_case.d_head,
         n_head_kv=offset_case.n_head_kv,
-        kv_size=offset_case.kv_size,
+        kv_size=offset_case.cache_size,
+        n_kv=offset_case.n_kv,
         n_stream=offset_case.n_stream,
+        stream_base=offset_case.stream_base,
     )
     occupied: dict[int, str] = {}
     failures: list[str] = []
@@ -136,7 +145,10 @@ def _validate_cross_stream_isolation(block_cases: list[BlockTableCase], offset_c
             slot = block_table_slot(case.block_table, logical_row, case.block_size)
             for head in range(offset_case.n_head_kv):
                 off = view.row_offset_bytes(stream=case.stream, head=head, slot=slot)
-                tag = f"{case.name}:stream={case.stream}:logical={logical_row}:head={head}:slot={slot}"
+                tag = (
+                    f"{case.name}:local_stream={case.stream}:absolute_stream={view.absolute_stream(case.stream)}:"
+                    f"logical={logical_row}:head={head}:slot={slot}"
+                )
                 previous = occupied.get(off)
                 if previous is not None:
                     failures.append(f"cross-sequence alias {off}: {previous} and {tag}")
@@ -145,6 +157,9 @@ def _validate_cross_stream_isolation(block_cases: list[BlockTableCase], offset_c
         "format": offset_case.fmt,
         "D": offset_case.d_head,
         "n_head_kv": offset_case.n_head_kv,
+        "cache_size": offset_case.cache_size,
+        "n_kv": offset_case.n_kv,
+        "stream_base": offset_case.stream_base,
         "mapped_offsets": len(occupied),
         "passed": not failures,
         "failures": failures,
@@ -181,7 +196,7 @@ def run() -> dict[str, object]:
     passed = all(c["passed"] for c in checks) and all(c["passed"] for c in isolation) and representability["passed"]
     return {
         "result": "PASS" if passed else "FAIL",
-        "contract": "block table logical rows must resolve to the same stream/head/slot byte offsets as llama.cpp slot_info rows",
+        "contract": "block table logical rows must resolve to the same absolute-stream/head/slot byte offsets as llama.cpp slot_info rows with active n_kv <= cache size",
         "checks": checks,
         "cross_stream_isolation": isolation,
         "slot_info_representability": representability,

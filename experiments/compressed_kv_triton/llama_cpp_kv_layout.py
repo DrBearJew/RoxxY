@@ -94,6 +94,17 @@ class AttentionView:
     n_head_kv: int
     kv_size: int
     n_stream: int
+    # n_kv is the active attention length passed to get_k/get_v. kv_size is the
+    # cache capacity returned by get_size(); production uses it for stream stride
+    # and set_rows global indices even when n_kv < kv_size.
+    n_kv: int | None = None
+    # stream_base models sinfo.s0/view_offs. Kernel sequence IDs are local to the
+    # view, while set_rows indices use absolute stream IDs from sinfo.strm[].
+    stream_base: int = 0
+
+    @property
+    def active_n_kv(self) -> int:
+        return self.kv_size if self.n_kv is None else self.n_kv
 
     @property
     def n_embd_gqa(self) -> int:
@@ -111,40 +122,41 @@ class AttentionView:
 
     @property
     def stream_stride_bytes(self) -> int:
-        # get_k/get_v offset stream s by row_size(type, n_embd_gqa * kv_size) * s.
+        # get_k/get_v offset stream s by row_size(type, n_embd_gqa * get_size()) * s.
         return row_size_bytes(self.fmt, self.n_embd_gqa * self.kv_size)
 
     @property
     def attention_ne(self) -> tuple[int, int, int, int]:
-        # K/V shape seen by CUDA FA after graph permute: [D, n_kv, n_head_kv, n_stream].
-        return (self.d_head, self.kv_size, self.n_head_kv, self.n_stream)
+        # K/V shape seen by CUDA FA after graph permute: [D, n_kv, n_head_kv, ns].
+        return (self.d_head, self.active_n_kv, self.n_head_kv, self.n_stream)
 
     @property
     def attention_nb(self) -> tuple[int | None, int, int, int]:
         # nb0 is type-size/block metadata for quantized tensors and is not used by row mapping.
         return (None, self.token_stride_bytes, self.head_stride_bytes, self.stream_stride_bytes)
 
-    def row_offset_bytes(self, *, stream: int, head: int, slot: int) -> int:
+    def absolute_stream(self, stream: int) -> int:
         if not 0 <= stream < self.n_stream:
-            raise ValueError(f"stream {stream} outside [0, {self.n_stream})")
+            raise ValueError(f"local stream {stream} outside [0, {self.n_stream})")
+        return self.stream_base + stream
+
+    def row_offset_bytes(self, *, stream: int, head: int, slot: int) -> int:
         if not 0 <= head < self.n_head_kv:
             raise ValueError(f"head {head} outside [0, {self.n_head_kv})")
-        if not 0 <= slot < self.kv_size:
-            raise ValueError(f"slot {slot} outside [0, {self.kv_size})")
+        if not 0 <= slot < self.active_n_kv:
+            raise ValueError(f"slot {slot} outside active n_kv [0, {self.active_n_kv})")
         return (
-            stream * self.stream_stride_bytes
+            self.absolute_stream(stream) * self.stream_stride_bytes
             + head * self.head_stride_bytes
             + slot * self.token_stride_bytes
         )
 
     def set_rows_global_index(self, *, stream: int, slot: int) -> int:
-        # set_input_k_idxs/set_input_v_idxs use stream*kv_size + sinfo.idxs[s][i]
+        # set_input_k_idxs/set_input_v_idxs use absolute_stream*get_size() + sinfo.idxs[s][i]
         # when v_trans is false, and cpy_k/cpy_v reshape the cache across streams.
-        if not 0 <= stream < self.n_stream:
-            raise ValueError(f"stream {stream} outside [0, {self.n_stream})")
         if not 0 <= slot < self.kv_size:
-            raise ValueError(f"slot {slot} outside [0, {self.kv_size})")
-        return stream * self.kv_size + slot
+            raise ValueError(f"slot {slot} outside cache size [0, {self.kv_size})")
+        return self.absolute_stream(stream) * self.kv_size + slot
 
     def set_rows_offset_bytes(self, *, stream: int, head: int, slot: int) -> int:
         global_index = self.set_rows_global_index(stream=stream, slot=slot)

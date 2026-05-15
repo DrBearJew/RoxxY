@@ -32,6 +32,11 @@ def modeled_dispatch(
     if q_d not in (128, 256):
         return "none"
 
+    # Production default builds keep GGML_CUDA_FA_ALL_QUANTS unset, so mixed K/V
+    # types are rejected before format-specific dispatch except TBQ4_0/Q8_0.
+    if k_type != v_type and not (k_type == "tbq4_0" and v_type == "q8_0"):
+        return "none"
+
     if k_type == "tbq4_0":
         if v_type not in {"tbq4_0", "q8_0"}:
             return "none"
@@ -43,7 +48,7 @@ def modeled_dispatch(
 
     if k_type in {"planar3_0", "iso3_0"}:
         if v_type != k_type:
-            return "vec"
+            return "none"
         if q_cols > 2 and compressed_wmma_env and amd_wmma_available:
             return "wmma_compressed_kv"
         return "vec"
@@ -57,6 +62,7 @@ def _source_checks() -> list[dict[str, object]]:
     checks = [
         ("tbq4_env_gate", 'getenv("TBQ4_WMMA_FATTN")' in fattn),
         ("compressed_env_gate", 'getenv("COMPRESSED_KV_WMMA_FATTN")' in fattn),
+        ("default_rejects_mixed_except_tbq4_q8", "K->type != V->type && !(K->type == GGML_TYPE_TBQ4_0 && V->type == GGML_TYPE_Q8_0)" in fattn),
         ("mixed_tbq4_q8_allowed", "K->type == GGML_TYPE_TBQ4_0 && V->type == GGML_TYPE_Q8_0" in fattn),
         ("mixed_tbq4_q8_vec_return", "if (v_is_q8_0)" in fattn and "BEST_FATTN_KERNEL_VEC" in fattn),
         ("compressed_wmma_same_type_only", "K->type == V->type" in fattn and "BEST_FATTN_KERNEL_WMMA_COMPRESSED_KV" in fattn),
@@ -103,9 +109,9 @@ def _policy_cases() -> list[dict[str, object]]:
             "expected": "vec",
         },
         {
-            "name": "planar_iso_mixed_not_wmma",
+            "name": "planar_iso_mixed_rejected_by_default_mixed_type_guard",
             "args": dict(k_type="planar3_0", v_type="iso3_0", q_d=128, q_cols=8, tbq4_wmma_env=False, compressed_wmma_env=True),
-            "expected": "vec",
+            "expected": "none",
         },
         {
             "name": "unsupported_dim_none",
@@ -152,7 +158,7 @@ def run() -> dict[str, object]:
     passed = all(c["passed"] for c in source_checks + policy_cases + domain_checks)
     return {
         "result": "PASS" if passed else "FAIL",
-        "contract": "default VEC; WMMA env-gated; mixed TBQ4_0/Q8_0 remains VEC; Triton stays experimental",
+        "contract": "default VEC; WMMA env-gated; mixed TBQ4_0/Q8_0 remains VEC; other mixed compressed-KV pairs are rejected by default; Triton stays experimental",
         "source_checks": source_checks,
         "policy_cases": policy_cases,
         "domain_checks": domain_checks,
