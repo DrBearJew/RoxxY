@@ -1,11 +1,12 @@
-# llama.cpp ROCm TBQ4 KV Cache — working VEC path for RX 7900 XTX
+# llama.cpp ROCm TBQ4 KV Cache — production-stable MTP path for RX 7900 XTX
 
-This branch brings the TBQ4 KV-cache path to AMD ROCm/RDNA3, tested on an RX 7900 XTX (`gfx1100`).
+This branch brings the TBQ4 KV-cache path to AMD ROCm/RDNA3, tested on an RX 7900 XTX (`gfx1100`). It now has a validated 32k/64k Qwen3.6-27B MTP server path with bounded VRAM, no request-time ROCm OOM, and clean shutdown.
 
 The goal is simple:
 
 - keep long-context VRAM use low with TBQ4 KV cache,
 - keep MTP/speculative decoding working,
+- keep the default production Flash Attention route on the stable VEC path,
 - avoid the broken rocWMMA prototype path for now,
 - validate output against a `q8_0` KV baseline before calling it usable.
 
@@ -16,20 +17,25 @@ This is not a general "all AMD GPUs are supported" claim. The tested target is R
 Test setup:
 
 - GPU: RX 7900 XTX, 24 GB
-- Backend: ROCm/HIP
+- Backend: ROCm/HIP, tested with ROCm 7.2.3
 - Model: Qwen3.6 27B MTP GGUF, Q4_K_M
-- Context: up to 64k
+- Context: 32k and 64k production smokes
 - KV cache: `tbq4_0`
 - MTP: `--spec-type mtp --spec-draft-n-max 3`
+- Stable MTP env: `LLAMA_MTP_PREFILL_CHUNK=512 LLAMA_MTP_PREFILL_FORCE_MMQ=1`
+- Server flags: `--flash-attn on --batch-size 1024 --ubatch-size 512 --cache-ram 128 --parallel 1`
 
-Observed generation speed:
+Production smoke result from this branch:
 
-| KV cache | Context | MTP | Speed | VRAM |
-|---|---:|---:|---:|---:|
-| `tbq4_0` | 64k | yes, `n_max=3` | 38–54 tok/s | ~20 GB |
-| `q8_0` | 16k | yes, `n_max=3` | ~50 tok/s | ~22 GB |
+| KV cache | Context | HTTP | Prompt | Decode | Peak VRAM | Shutdown |
+|---|---:|---:|---:|---:|---:|---:|
+| `tbq4_0` | 32k | 200 | ~466.6 tok/s | ~47.5 tok/s | ~20.7 GiB | clean, `server_rc=0` |
+| `tbq4_0` | 64k | 200 | ~481.4 tok/s | ~38.6 tok/s | ~21.3 GiB | clean, `server_rc=0` |
+| `q8_0` | 16k | 200 | — | ~50 tok/s | ~22 GiB | historical comparison |
 
-The important point: TBQ4 made 64k context fit while keeping generation usable.
+No ROCm OOM, no `ggml_cuda_op_mul_mat_cublas` fallback stack, and no shutdown double-free were observed in the 32k/64k TBQ4+MTP smokes.
+
+The important point: TBQ4 made 64k context fit while keeping MTP generation usable on a 24 GB RX 7900 XTX.
 
 ## What changed
 
@@ -37,6 +43,8 @@ The important point: TBQ4 made 64k context fit while keeping generation usable.
 |---|---|---|
 | TBQ4 VEC Flash Attention | Working | Dequant happens inside the FA loop; no separate dequant pass |
 | MTP speculative decoding | Working | Best observed setting here: `--spec-draft-n-max 3` |
+| MTP prefill allocator stability | Working | `LLAMA_MTP_PREFILL_CHUNK=512` plus `LLAMA_MTP_PREFILL_FORCE_MMQ=1` avoids the hipBLAS temp-allocation OOM path |
+| MTP server shutdown | Fixed | Speculative state is released before the target context/model, so MTP detach no longer double-frees |
 | Coherence gate | Passing | TBQ4 compared against `q8_0` next-token distributions |
 | rocWMMA TBQ4 | Experimental | Built during investigation, but not the working path |
 | RotorQuant / PlanarQuant / IsoQuant | Present | Dispatch exists, but not validated here |
@@ -123,10 +131,14 @@ cmake --build build-rocm --target llama-server -j8
 ### Run
 
 ```bash
-# TBQ4 KV (low VRAM, 4.25 bpv) with MTP
+# TBQ4 KV (low VRAM, 4.25 bpv) with MTP — validated 64k ROCm path
+LLAMA_MTP_PREFILL_CHUNK=512 \
+LLAMA_MTP_PREFILL_FORCE_MMQ=1 \
 ./build-rocm/bin/llama-server \
   -m /path/to/Qwen3.6-27B-Q4_K_M-mtp.gguf \
   --cache-type-k tbq4_0 --cache-type-v tbq4_0 \
+  --flash-attn on \
+  --batch-size 1024 --ubatch-size 512 --cache-ram 128 \
   --spec-type mtp --spec-draft-n-max 3 \
   --jinja --chat-template-file docs/rocm-tbq4-paths/qwen36-merged-template.jinja \
   -c 65536 --port 8080 --no-webui --no-warmup --parallel 1
@@ -135,6 +147,7 @@ cmake --build build-rocm --target llama-server -j8
 ./build-rocm/bin/llama-server \
   -m /path/to/Qwen3.6-27B-Q4_K_M-mtp.gguf \
   --cache-type-k q8_0 --cache-type-v q8_0 \
+  --flash-attn on \
   -c 16384 --port 8080 --no-webui --no-warmup
 ```
 
@@ -193,14 +206,15 @@ Results are written to `gate-summary.json`.
 
 ## Benchmarks (RX 7900 XTX, Qwen3.6-27B Q4_K_M)
 
-### Generation
+### Generation / server smoke
 
-| KV cache | Context | MTP | tok/s | VRAM |
-|---|---|---|---|---|
-| `tbq4_0` | 64k | yes, `n_max=3` | 38–54 | ~20 GB |
-| `tbq4_0` | 16k | yes, `n_max=3` | 36–38 | ~17 GB |
-| `q8_0` | 32k | no | ~31 | ~23 GB |
-| `q8_0` | 16k | yes, `n_max=3` | ~50 | ~22 GB |
+| KV cache | Context | MTP | Prompt tok/s | Decode tok/s | Peak VRAM | Exit |
+|---|---:|---|---:|---:|---:|---:|
+| `tbq4_0` | 64k | yes, `n_max=3` | ~481.4 | ~38.6 | ~21.3 GiB | `server_rc=0` |
+| `tbq4_0` | 32k | yes, `n_max=3` | ~466.6 | ~47.5 | ~20.7 GiB | `server_rc=0` |
+| `tbq4_0` | 16k | yes, `n_max=3` | historical | 36–38 | ~17 GiB | — |
+| `q8_0` | 32k | no | historical | ~31 | ~23 GiB | — |
+| `q8_0` | 16k | yes, `n_max=3` | historical | ~50 | ~22 GiB | — |
 
 ### Prefill
 
@@ -243,6 +257,11 @@ Experimental features behind env flags on this branch:
 | `ggml/src/ggml-cuda/fattn-common.cuh` | `vec_dot_fattn_vec_KQ_tbq4_0`, `dequantize_V_tbq4_0` |
 | `ggml/src/ggml-cuda/fattn-vec.cuh` | `DECL_FATTN_VEC_CASE` for TBQ4 D=64/128/256 |
 | `ggml/src/ggml-cuda/fattn.cu` | Routes AMD WMMA-capable targets to TBQ4 VEC |
+| `ggml/src/ggml-cuda/mmq.cu` | Env-gated MTP prefill MMQ routing for supported quantized matmuls |
+| `ggml/src/ggml-cuda/mmq.cuh` | 256-thread MMQ workgroup cleanup plus diagnostic `GGML_CUDA_MMQ_MAX_X` |
+| `src/llama-context.cpp` | MTP prefill chunking and safer hook-batch storage |
+| `src/llama-mtp.h` | Vector-backed hook batch storage |
+| `tools/server/server-context.cpp` | Releases speculative MTP state before freeing the target context |
 | `src/llama-kv-cache.cpp` | Disables generic `attn_rot_*` for TBQ4 |
 | `ggml/src/ggml-cuda/fattn-wmma-tbq4.cu` | Experimental rocWMMA path (research only) |
 
@@ -251,6 +270,8 @@ Experimental features behind env flags on this branch:
 1. **VEC correctness**: `dequantize_V_tbq4_0` used wrong index; TBQ4 was double-rotated via generic Hadamard
 2. **VEC prefill speed**: TBQ4 KQ dot used f16-style `Q_reg` but RDNA quantized lane mapping → fixed with `KQ_uses_Q_reg` + `nthreads_KQ=8`
 3. **Rotation model**: TBQ4 stores K/V in signed-FWHT domain; Q pre-rotated, output inverse-rotated
+4. **MTP request-time OOM**: draft-prefill hipBLAS temp allocation could request multi-GiB buffers; supported quantized MTP prefill matmuls can be routed through MMQ with `LLAMA_MTP_PREFILL_FORCE_MMQ=1`
+5. **MTP shutdown double-free**: server cleanup freed the target context before speculative MTP state detached from it; speculative state now resets first
 
 ## GPU architecture status
 
@@ -296,7 +317,12 @@ python convert.py base-model.gguf MTP-Q8_0.gguf output-mtp.gguf
 |---|---|
 | `--cache-type-k tbq4_0 --cache-type-v tbq4_0` | TBQ4 KV cache (low-error compressed, 4.25 bpv) |
 | `--cache-type-k q8_0 --cache-type-v q8_0` | q8_0 KV cache (higher speed, more VRAM) |
+| `--flash-attn on` | Required for quantized V cache |
+| `--batch-size 1024 --ubatch-size 512` | Validated MTP+TBQ4 server batch settings |
+| `--cache-ram 128` | Keeps host-side prompt/cache reuse bounded in the tested server setup |
 | `--spec-type mtp --spec-draft-n-max 3` | MTP; `n_max=3` was best observed here |
+| `LLAMA_MTP_PREFILL_CHUNK=512` | Chunks target hidden-state transfer into draft-prefill decode calls |
+| `LLAMA_MTP_PREFILL_FORCE_MMQ=1` | Env-gated workaround for MTP draft-prefill hipBLAS/ROCm temp allocation OOM |
 | `--jinja --chat-template-file <path>` | Qwen merged chat template |
 | `--parallel 1` | Required for MTP |
 | `--no-warmup` | Skip startup warmup |
