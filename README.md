@@ -75,6 +75,19 @@ No ROCm OOM, no `ggml_cuda_op_mul_mat_cublas` fallback stack, and no shutdown do
 
 The important point: TBQ4 made 64k usable and 200k fit on a 24 GB RX 7900 XTX while keeping the MTP path alive.
 
+## RDNA3 FlashAttention path (compressed KV)
+
+Use `--flash-attn on`. Current policy selects `kernel=vec` for `tbq4_0`, `planar3_0`, and `iso3_0` because it keeps compressed KV inside the FA loop and avoids full f16 K/V temp buffers.
+
+New rocWMMA FA routes exist, but stay opt-in until fresh coherence/perf smokes pass:
+`TBQ4_WMMA_FATTN=1` for TBQ4, `COMPRESSED_KV_WMMA_FATTN=1` for Planar/Iso.
+
+```bash
+scripts/hip/rdna3-fattn-policy.py \
+  --summary benches/rocm-rdna3/ctx-fit-quant-sweep-20260516-004216/summary.json \
+  --out-dir benches/rocm-rdna3/ctx-fit-quant-sweep-20260516-004216/fattn-policy
+```
+
 ## RDNA3 MoE MMQ selector (Qwen3.6 35B-A3B IQ4_XS)
 
 Current best 35B non-MTP prompt-processing setting:

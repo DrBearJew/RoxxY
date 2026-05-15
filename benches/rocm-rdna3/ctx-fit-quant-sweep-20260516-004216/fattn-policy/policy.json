@@ -1,0 +1,210 @@
+{
+  "backend": "ROCm/HIP",
+  "candidates": [
+    {
+      "cache_types": [
+        "tbq4_0",
+        "planar3_0",
+        "iso3_0"
+      ],
+      "eligible": true,
+      "env": {},
+      "name": "vec_compressed_kv",
+      "notes": "Preserves compressed KV in the FA loop; no full-cache f16 K/V temp materialization.",
+      "reject_reasons": [],
+      "route": "kernel=vec",
+      "server_flags": [
+        "--flash-attn",
+        "on"
+      ],
+      "status": "stable default"
+    },
+    {
+      "cache_types": [
+        "tbq4_0"
+      ],
+      "eligible": false,
+      "env": {
+        "COMPRESSED_KV_FATTN_LOG": "1",
+        "TBQ4_WMMA_FATTN": "1"
+      },
+      "name": "wmma_tbq4",
+      "notes": "New direct TBQ4 rocWMMA FA route for D=128/256, nq>2, K=V=tbq4_0.",
+      "reject_reasons": [
+        "experimental opt-in path; needs standalone coherence/perf smokes before promotion",
+        "pass --allow-experimental-wmma only after fresh smokes"
+      ],
+      "route": "kernel=wmma_tbq4",
+      "server_flags": [
+        "--flash-attn",
+        "on"
+      ],
+      "status": "experimental opt-in"
+    },
+    {
+      "cache_types": [
+        "planar3_0",
+        "iso3_0"
+      ],
+      "eligible": false,
+      "env": {
+        "COMPRESSED_KV_FATTN_LOG": "1",
+        "COMPRESSED_KV_WMMA_FATTN": "1"
+      },
+      "name": "wmma_planar_iso",
+      "notes": "New original-domain Planar/Iso rocWMMA FA route for D=128/256, nq>2, K=V.",
+      "reject_reasons": [
+        "experimental opt-in path; needs standalone coherence/perf smokes before promotion",
+        "pass --allow-experimental-wmma only after fresh smokes"
+      ],
+      "route": "kernel=wmma_compressed_kv",
+      "server_flags": [
+        "--flash-attn",
+        "on"
+      ],
+      "status": "experimental opt-in"
+    },
+    {
+      "cache_types": [
+        "tbq4_0",
+        "planar3_0",
+        "iso3_0"
+      ],
+      "eligible": false,
+      "env": {},
+      "name": "tile_or_full_temp_quantized",
+      "notes": "Useful for non-quant/f16 cases, not the 24 GB long-context compressed-KV target.",
+      "reject_reasons": [
+        "can materialize full f16 K/V temp buffers and erase compressed-KV memory savings"
+      ],
+      "route": "kernel=tile/wmma/mma with f16 temp",
+      "server_flags": [
+        "--flash-attn",
+        "on"
+      ],
+      "status": "rejected for long-context compressed KV"
+    }
+  ],
+  "evidence": {
+    "iso3_0": {
+      "contexts": [
+        131072,
+        204800
+      ],
+      "decode_tok_s": {
+        "iso3_0-ctx128k": 36.22313450857281,
+        "iso3_0-ctx200k": 34.787045304328664
+      },
+      "failures": [],
+      "kernel_counts": {
+        "other": 0,
+        "vec": 40,
+        "wmma": 0
+      },
+      "ok": true,
+      "peak_vram_gib": {
+        "iso3_0-ctx128k": 21.09598159790039,
+        "iso3_0-ctx200k": 22.359127044677734
+      },
+      "prompt_tok_s": {
+        "iso3_0-ctx128k": 366.0939853724541,
+        "iso3_0-ctx200k": 392.39027488251986
+      },
+      "quant": "iso3_0",
+      "selected_kernel_examples": [
+        "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=iso3_0 V=iso3_0 nq=4 nkv=2048 d_q=256 d_v=256",
+        "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=iso3_0 V=iso3_0 nq=1 nkv=2048 d_q=256 d_v=256",
+        "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=iso3_0 V=iso3_0 nq=1 nkv=2048 d_q=256 d_v=256",
+        "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=iso3_0 V=iso3_0 nq=4 nkv=2048 d_q=256 d_v=256",
+        "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=iso3_0 V=iso3_0 nq=1 nkv=2048 d_q=256 d_v=256",
+        "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=iso3_0 V=iso3_0 nq=1 nkv=2048 d_q=256 d_v=256"
+      ]
+    },
+    "planar3_0": {
+      "contexts": [
+        131072,
+        204800
+      ],
+      "decode_tok_s": {
+        "planar3_0-ctx128k": 32.88355931646042,
+        "planar3_0-ctx200k": 34.85089624888187
+      },
+      "failures": [],
+      "kernel_counts": {
+        "other": 0,
+        "vec": 40,
+        "wmma": 0
+      },
+      "ok": true,
+      "peak_vram_gib": {
+        "planar3_0-ctx128k": 21.101905822753906,
+        "planar3_0-ctx200k": 22.364757537841797
+      },
+      "prompt_tok_s": {
+        "planar3_0-ctx128k": 196.65336938876035,
+        "planar3_0-ctx200k": 295.9514085618877
+      },
+      "quant": "planar3_0",
+      "selected_kernel_examples": [
+        "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=planar3_0 V=planar3_0 nq=4 nkv=2048 d_q=256 d_v=256",
+        "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=planar3_0 V=planar3_0 nq=1 nkv=2048 d_q=256 d_v=256",
+        "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=planar3_0 V=planar3_0 nq=1 nkv=2048 d_q=256 d_v=256",
+        "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=planar3_0 V=planar3_0 nq=4 nkv=2048 d_q=256 d_v=256",
+        "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=planar3_0 V=planar3_0 nq=1 nkv=2048 d_q=256 d_v=256",
+        "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=planar3_0 V=planar3_0 nq=1 nkv=2048 d_q=256 d_v=256"
+      ]
+    },
+    "tbq4_0": {
+      "contexts": [
+        131072,
+        204800
+      ],
+      "decode_tok_s": {
+        "tbq4_0-ctx128k": 29.084986330056424,
+        "tbq4_0-ctx200k": 24.156534342539658
+      },
+      "failures": [],
+      "kernel_counts": {
+        "other": 0,
+        "vec": 40,
+        "wmma": 0
+      },
+      "ok": true,
+      "peak_vram_gib": {
+        "tbq4_0-ctx128k": 21.498371124267578,
+        "tbq4_0-ctx200k": 23.036251068115234
+      },
+      "prompt_tok_s": {
+        "tbq4_0-ctx128k": 257.9254640841063,
+        "tbq4_0-ctx200k": 223.05782529958447
+      },
+      "quant": "tbq4_0",
+      "selected_kernel_examples": [
+        "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=tbq4_0 V=tbq4_0 nq=4 nkv=2048 d_q=256 d_v=256",
+        "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=tbq4_0 V=tbq4_0 nq=1 nkv=2048 d_q=256 d_v=256",
+        "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=tbq4_0 V=tbq4_0 nq=1 nkv=2048 d_q=256 d_v=256",
+        "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=tbq4_0 V=tbq4_0 nq=4 nkv=2048 d_q=256 d_v=256",
+        "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=tbq4_0 V=tbq4_0 nq=1 nkv=2048 d_q=256 d_v=256",
+        "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=tbq4_0 V=tbq4_0 nq=1 nkv=2048 d_q=256 d_v=256"
+      ]
+    }
+  },
+  "generated_at": "2026-05-15T23:46:59.855309+00:00",
+  "gpu_label": "gfx1100/RX 7900 XTX",
+  "model_label": "Qwen3.6-27B MTP compressed KV",
+  "repo_commit": "63788066e1f7",
+  "schema_version": 1,
+  "selected_cache_types": [
+    "tbq4_0",
+    "planar3_0",
+    "iso3_0"
+  ],
+  "selected_candidate": "vec_compressed_kv",
+  "selected_env": {},
+  "selected_server_flags": [
+    "--flash-attn",
+    "on"
+  ],
+  "selection_basis": "stable compressed-KV VEC FA route with smoke evidence; rocWMMA remains opt-in",
+  "summary": "/home/mrtrent/llama.cpp-mtp-tbq4-rdna3/benches/rocm-rdna3/ctx-fit-quant-sweep-20260516-004216/summary.json"
+}
