@@ -107,7 +107,7 @@ for name in case_names:
                     rows.append(obj)
             if line.startswith(f"=== {name} rc="):
                 try:
-                    rc = int(line.rsplit("=", 1)[1].split()[0])
+                    rc = int(line.split(" rc=", 1)[1].split()[0])
                 except Exception:
                     rc = 1
     rows.sort(key=lambda x: x.get("n_prompt", 0))
