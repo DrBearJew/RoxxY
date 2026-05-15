@@ -206,6 +206,46 @@ Keep production boring. Flip these only when testing:
 | Vulkan device check | `LD_LIBRARY_PATH=$PWD/build-vulkan/bin ./build-vulkan/bin/llama-server --list-devices` | Expect `Vulkan0` |
 | Use Vulkan in combined build | `--device Vulkan0` | Combined build also has `ROCm0` |
 
+### Start Vulkan
+
+Vulkan is useful as a backend check today. Compressed-KV Vulkan parity is **not** claimed yet.
+
+```bash
+# Build Vulkan-only server
+cmake -B build-vulkan -DGGML_VULKAN=ON -DGGML_HIP=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build-vulkan --target llama-server -j8
+
+# Check device name; expect Vulkan0 on this box
+LD_LIBRARY_PATH=$PWD/build-vulkan/bin \
+  ./build-vulkan/bin/llama-server --list-devices
+
+# Start a small Vulkan server smoke
+MODEL=/path/to/model.gguf
+LD_LIBRARY_PATH=$PWD/build-vulkan/bin \
+  ./build-vulkan/bin/llama-server \
+  -m "$MODEL" --device Vulkan0 \
+  --ctx-size 4096 --host 127.0.0.1 --port 8080 \
+  --no-webui --no-warmup -ngl 99
+```
+
+Combined ROCm+Vulkan build:
+
+```bash
+LD_LIBRARY_PATH=$PWD/build-rocm-vulkan/bin:/opt/rocm-7.2.3/lib:/opt/amdgpu/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-} \
+  ./build-rocm-vulkan/bin/llama-server --list-devices
+
+# Pick Vulkan explicitly from the combined build
+LD_LIBRARY_PATH=$PWD/build-rocm-vulkan/bin:/opt/rocm-7.2.3/lib:/opt/amdgpu/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-} \
+  ./build-rocm-vulkan/bin/llama-server -m "$MODEL" --device Vulkan0 --ctx-size 4096 --no-webui -ngl 99
+```
+
+Docker helper:
+
+```bash
+scripts/vulkan/start-vulkan-docker-server.sh --list-devices
+PORT=8080 CTX_SIZE=4096 scripts/vulkan/start-vulkan-docker-server.sh /path/to/model.gguf --no-warmup
+```
+
 ### Chat template (Qwen 3.6)
 
 Use the merged template included in this repo (`docs/rocm-tbq4-paths/qwen36-merged-template.jinja`).

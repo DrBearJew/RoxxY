@@ -484,6 +484,26 @@ docker build -t llama-cpp-vulkan --target light -f .devops/vulkan.Dockerfile .
 docker run -it --rm -v "$(pwd):/app:Z" --device /dev/dri/renderD128:/dev/dri/renderD128 --device /dev/dri/card1:/dev/dri/card1 llama-cpp-vulkan -m "/app/models/YOUR_MODEL_FILE" -p "Building a website can be done in 10 simple steps:" -n 400 -e -ngl 33
 ```
 
+For `llama-server`, this branch also includes a small helper script that builds the `server` target and maps the host `/dev/dri` devices:
+
+```sh
+# List Vulkan devices inside the container
+scripts/vulkan/start-vulkan-docker-server.sh --list-devices
+
+# Start a Vulkan server on http://127.0.0.1:8080
+PORT=8080 CTX_SIZE=4096 \
+  scripts/vulkan/start-vulkan-docker-server.sh /path/to/model.gguf --no-warmup
+```
+
+Useful knobs:
+
+```sh
+IMAGE=llama-cpp-vulkan-server:local   # docker image name
+BUILD=0                               # skip docker build if image already exists
+VULKAN_DEVICE=Vulkan0                 # device name from --list-devices
+VOLUME_OPTS=ro,Z                      # use on SELinux hosts if needed
+```
+
 ### For Linux users:
 
 #### Using the LunarG Vulkan SDK
