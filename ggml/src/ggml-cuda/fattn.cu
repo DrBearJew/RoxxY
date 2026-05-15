@@ -28,13 +28,14 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     }
 
     if constexpr (ncols2 <= 16) {
-        if ((turing_mma_available(cc) || amd_wmma_available(cc)) && Q->ne[1] <= 16/ncols2) {
+        if (Q->ne[1] <= 16/ncols2) {
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2>(ctx, dst);
             return;
         }
     }
 
-    if (ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING || amd_wmma_available(cc) || Q->ne[1] <= 32/ncols2) {
+    if (Q->ne[1] <= 32/ncols2 || (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) ||
+            (GGML_CUDA_CC_IS_AMD(cc) && DKQ > 256)) {
         ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
         return;
     }
@@ -575,12 +576,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
+    const int ncols2_max = Q->ne[0] == 320 ? 32 : ((Q->ne[0] == 576 || Q->ne[0] == 192) ? 16 : 8);
+    int gqa_ratio_eff = 1;
+    while (gqa_ratio % (2*gqa_ratio_eff) == 0 && gqa_ratio_eff < ncols2_max) {
+        gqa_ratio_eff *= 2;
+    }
+
     if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
-        int gqa_ratio_eff = 1;
-        const int ncols2_max = Q->ne[0] == 576 ? 16 : 8;
-        while (gqa_ratio % (2*gqa_ratio_eff) == 0 && gqa_ratio_eff < ncols2_max) {
-            gqa_ratio_eff *= 2;
-        }
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }
@@ -598,32 +600,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_WMMA_F16;
     }
 
-    if (amd_wmma_available(cc) && GGML_CUDA_CC_IS_RDNA4(cc) && gqa_opt_applies && Q->ne[0] <= 128 && Q->ne[0] != 40 && Q->ne[0] != 72) {
-        if (can_use_vector_kernel) {
-            if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
-                if (Q->ne[1] == 1) {
-                    if (!gqa_opt_applies) {
-                        return BEST_FATTN_KERNEL_VEC;
-                    }
-                }
-            } else {
-                if (Q->ne[1] <= 2) {
-                    return BEST_FATTN_KERNEL_VEC;
-                }
-            }
+    // AMD MFMA needs a certain minimum batch size to outscale the tile kernel for large head sizes.
+    if ((amd_mfma_available(cc) && Q->ne[0] <= 256) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+        if ((Q->ne[0] <= 64 && Q->ne[1] * gqa_ratio_eff > 8)) {
+            return BEST_FATTN_KERNEL_MMA_F16;
         }
-        int gqa_ratio_eff = 1;
-        const int ncols2_max = Q->ne[0] == 576 ? 16 : 8;
-        while (gqa_ratio % (2*gqa_ratio_eff) == 0 && gqa_ratio_eff < ncols2_max) {
-            gqa_ratio_eff *= 2;
+        if ((Q->ne[0] <= 128 && Q->ne[1] * gqa_ratio_eff > 16)) {
+            return BEST_FATTN_KERNEL_MMA_F16;
         }
-        if (Q->ne[1] * gqa_ratio_eff <= 8) {
-            return BEST_FATTN_KERNEL_TILE; // AMD WMMA is only faster if the full tile width of 16 can be utilized.
+        if ((Q->ne[0] <= 256 && Q->ne[1] * gqa_ratio_eff > 64)) {
+            return BEST_FATTN_KERNEL_MMA_F16;
         }
-        return BEST_FATTN_KERNEL_MMA_F16;
     }
 
-    // Use MFMA flash attention for CDNA (MI100+):
+    // Use MFMA flash attention for CDNA (MI100+) for other supported head sizes.
     if (amd_mfma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 256 && Q->ne[0] != 512 && Q->ne[0] != 576) {
         const int64_t eff_nq = Q->ne[1] * (gqa_opt_applies ? gqa_ratio : 1);
         // MMA vs tile crossover benchmarked on MI300X @ d32768:
@@ -633,6 +623,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_MMA_F16;
         }
         // Fall through to tile kernel for small effective batch sizes.
+    }
+
+    // AMD WMMA is always faster than the tile kernel if the full tile width of 16 can be utilized.
+    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 128) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[1] * gqa_ratio_eff > 8) {
+        return BEST_FATTN_KERNEL_MMA_F16;
     }
 
     // If there are no tensor cores available, use the generic tile kernel:
