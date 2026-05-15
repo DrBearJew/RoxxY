@@ -714,13 +714,15 @@ private:
     bool sleeping = false;
 
     void destroy() {
-        llama_init.reset();
-
+        // Speculative states may hold non-owning pointers into the target context.
+        // Release them before llama_init frees ctx/model; MTP detach calls back into ctx.
         for (server_slot & slot : slots) {
             if (slot.can_speculate()) {
                 slot.spec.reset();
             }
         }
+
+        llama_init.reset();
 
         ctx = nullptr;
         model = nullptr;

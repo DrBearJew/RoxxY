@@ -3,6 +3,29 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 
+#include <cstdlib>
+
+static bool ggml_cuda_mtp_prefill_force_mmq_runtime() {
+    static const bool force = []() {
+        const char * env = getenv("LLAMA_MTP_PREFILL_FORCE_MMQ");
+        if (env == nullptr) {
+            return false;
+        }
+        char * end = nullptr;
+        const long val = std::strtol(env, &end, 10);
+        if (end == env) {
+            GGML_LOG_WARN("LLAMA_MTP_PREFILL_FORCE_MMQ ignored: expected integer, got '%s'\n", env);
+            return false;
+        }
+        const bool enabled = val != 0;
+        if (enabled) {
+            GGML_LOG_INFO("LLAMA_MTP_PREFILL_FORCE_MMQ: forcing supported quantized matmuls through MMQ\n");
+        }
+        return enabled;
+    }();
+    return force;
+}
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
@@ -315,6 +338,10 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 #ifdef GGML_CUDA_FORCE_MMQ
     return true;
 #endif //GGML_CUDA_FORCE_MMQ
+
+    if (ggml_cuda_mtp_prefill_force_mmq_runtime()) {
+        return true;
+    }
 
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
         return !fp16_mma_hardware_available(cc) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;

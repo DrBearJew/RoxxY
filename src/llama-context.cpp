@@ -13,6 +13,7 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -390,9 +391,14 @@ llama_context::~llama_context() {
             }
         }
     }
-    if (mtp.hook_batch.pos != nullptr) {
-        llama_batch_free(mtp.hook_batch);
-    }
+    mtp.hook_batch = llama_batch{};
+    mtp.hook_token.clear();
+    mtp.hook_embd.clear();
+    mtp.hook_pos.clear();
+    mtp.hook_n_seq_id.clear();
+    mtp.hook_seq_id_storage.clear();
+    mtp.hook_seq_id_ptrs.clear();
+    mtp.hook_logits.clear();
     ggml_opt_free(opt_ctx);
 }
 
@@ -3389,10 +3395,14 @@ void llama_set_mtp(struct llama_context * ctx_target, struct llama_context * ctx
 void llama_context::set_mtp(llama_context * ctx_mtp_in) {
     if (mtp.ctx_mtp == ctx_mtp_in) return;
 
-    if (mtp.hook_batch.pos != nullptr) {
-        llama_batch_free(mtp.hook_batch);
-        mtp.hook_batch = llama_batch{};
-    }
+    mtp.hook_batch = llama_batch{};
+    mtp.hook_token.clear();
+    mtp.hook_embd.clear();
+    mtp.hook_pos.clear();
+    mtp.hook_n_seq_id.clear();
+    mtp.hook_seq_id_storage.clear();
+    mtp.hook_seq_id_ptrs.clear();
+    mtp.hook_logits.clear();
 
     mtp.ctx_mtp     = ctx_mtp_in;
     mtp.pending_pos = -1;
@@ -3400,8 +3410,26 @@ void llama_context::set_mtp(llama_context * ctx_mtp_in) {
     if (mtp.ctx_mtp) {
         const int32_t n_ub   = (int32_t) cparams.n_ubatch;
         const int32_t n_embd = (int32_t) model.hparams.n_embd;
-        mtp.hook_batch       = llama_batch_init(n_ub, n_embd, 1);
-        mtp.hook_batch.token = (llama_token *) malloc(sizeof(llama_token) * n_ub);
+
+        mtp.hook_token.resize(n_ub);
+        mtp.hook_embd.resize((size_t) n_ub * n_embd);
+        mtp.hook_pos.resize(n_ub);
+        mtp.hook_n_seq_id.resize(n_ub);
+        mtp.hook_seq_id_storage.resize(n_ub);
+        mtp.hook_seq_id_ptrs.resize((size_t) n_ub + 1);
+        mtp.hook_logits.resize(n_ub);
+        for (int32_t i = 0; i < n_ub; ++i) {
+            mtp.hook_seq_id_ptrs[i] = &mtp.hook_seq_id_storage[i];
+        }
+        mtp.hook_seq_id_ptrs[n_ub] = nullptr;
+
+        mtp.hook_batch.token    = mtp.hook_token.data();
+        mtp.hook_batch.embd     = mtp.hook_embd.data();
+        mtp.hook_batch.pos      = mtp.hook_pos.data();
+        mtp.hook_batch.n_seq_id = mtp.hook_n_seq_id.data();
+        mtp.hook_batch.seq_id   = mtp.hook_seq_id_ptrs.data();
+        mtp.hook_batch.logits   = mtp.hook_logits.data();
+
         mtp.pending_h.assign(n_embd, 0.0f);
         LLAMA_LOG_INFO("%s: MTP draft head registered (ctx_mtp=%p, n_ubatch=%d, n_embd=%d)\n",
                        __func__, (const void *) mtp.ctx_mtp, n_ub, n_embd);
@@ -3445,37 +3473,70 @@ void llama_context::handle_mtp_for_ubatch(
     const int    n_out     = (pending_continues ? 1 : 0) + (n_rows - 1);
 
     if (n_out > 0) {
+        int chunk_max = n_out;
+        if (const char * env = getenv("LLAMA_MTP_PREFILL_CHUNK")) {
+            char * end = nullptr;
+            const long env_chunk = std::strtol(env, &end, 10);
+            if (end != env && env_chunk > 0) {
+                chunk_max = (int) std::min<long>(env_chunk, n_out);
+            } else {
+                LLAMA_LOG_WARN("%s: ignoring invalid LLAMA_MTP_PREFILL_CHUNK='%s'\n", __func__, env);
+            }
+        }
+        chunk_max = std::max(1, std::min(chunk_max, (int) cparams.n_ubatch));
+        if (chunk_max < n_out) {
+            LLAMA_LOG_INFO("%s: chunking MTP prefill n_out=%d chunk=%d\n", __func__, n_out, chunk_max);
+        }
+
         int out_idx = 0;
-        if (pending_continues) {
-            std::memcpy(mtp.hook_batch.embd + (size_t) out_idx * n_embd,
-                        mtp.pending_h.data(), row_bytes);
-            mtp.hook_batch.token[out_idx]     = tokens[0];
-            mtp.hook_batch.pos[out_idx]       = pos_start;
+        int decoded = 0;
+        auto decode_chunk = [&]() -> bool {
+            if (out_idx == 0) {
+                return true;
+            }
+            mtp.hook_batch.n_tokens = out_idx;
+            const int32_t rc_dec = llama_decode(mtp.ctx_mtp, mtp.hook_batch);
+            mtp.ctx_mtp->synchronize();
+            if (rc_dec != 0) {
+                LLAMA_LOG_ERROR("%s: llama_decode(ctx_mtp) failed rc=%d (pos=%d, n=%d)\n",
+                                __func__, (int) rc_dec, (int) mtp.hook_batch.pos[0], out_idx);
+                return false;
+            }
+            decoded += out_idx;
+            out_idx = 0;
+            return true;
+        };
+
+        auto finish_row = [&](llama_token token, llama_pos pos) -> bool {
+            mtp.hook_batch.token[out_idx]     = token;
+            mtp.hook_batch.pos[out_idx]       = pos;
             mtp.hook_batch.n_seq_id[out_idx]  = 1;
             mtp.hook_batch.seq_id[out_idx][0] = 0;
             mtp.hook_batch.logits[out_idx]    = 0;
             ++out_idx;
+            return out_idx < chunk_max || decode_chunk();
+        };
+
+        if (pending_continues) {
+            std::memcpy(mtp.hook_batch.embd + (size_t) out_idx * n_embd,
+                        mtp.pending_h.data(), row_bytes);
+            if (!finish_row(tokens[0], pos_start)) {
+                return;
+            }
         }
         for (int k = 0; k + 1 < n_rows; ++k) {
             ggml_backend_tensor_get(t,
                 mtp.hook_batch.embd + (size_t) out_idx * n_embd,
                 (size_t) k * row_bytes,
                 row_bytes);
-            mtp.hook_batch.token[out_idx]     = tokens[k + 1];
-            mtp.hook_batch.pos[out_idx]       = positions[k + 1];
-            mtp.hook_batch.n_seq_id[out_idx]  = 1;
-            mtp.hook_batch.seq_id[out_idx][0] = 0;
-            mtp.hook_batch.logits[out_idx]    = 0;
-            ++out_idx;
+            if (!finish_row(tokens[k + 1], positions[k + 1])) {
+                return;
+            }
         }
-        GGML_ASSERT(out_idx == n_out);
-        mtp.hook_batch.n_tokens = n_out;
-
-        const int32_t rc_dec = llama_decode(mtp.ctx_mtp, mtp.hook_batch);
-        if (rc_dec != 0) {
-            LLAMA_LOG_ERROR("%s: llama_decode(ctx_mtp) failed rc=%d (pos=%d, n=%d)\n",
-                            __func__, (int) rc_dec, (int) pos_start, n_out);
+        if (!decode_chunk()) {
+            return;
         }
+        GGML_ASSERT(decoded == n_out);
     }
 
     // Stash the last h-row as the new pending (for the next ubatch's first

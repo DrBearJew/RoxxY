@@ -11,10 +11,10 @@
 
 using namespace ggml_cuda_mma;
 
-#define MMQ_DP4A_MAX_BATCH_SIZE 64 // Max. batch size to use for dp4a MMQ kernels when FP16 tensor cores are available.
-#define MMQ_ITER_K             256
-#define MMQ_ITER_K_FP4         512
-#define MMQ_NWARPS               8
+#define MMQ_DP4A_MAX_BATCH_SIZE 64  // Max. batch size to use for dp4a MMQ kernels when FP16 tensor cores are available.
+#define MMQ_ITER_K              256
+#define MMQ_ITER_K_FP4          512
+#define MMQ_TARGET_WG_THREADS   256 // Default target: 8 waves on wave32, 4 waves on wave64. CDNA MFMA keeps its legacy 8-wave path.
 
 typedef void (*load_tiles_mmq_t)(const char * __restrict__ x, int * x_tile, const int kbx0, const int i_max, const int stride);
 typedef void (*vec_dot_mmq_t)(const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00);
@@ -108,14 +108,39 @@ struct tile_x_sizes {
     int sc;
 };
 
+static int ggml_cuda_mmq_x_max_env() {
+    static const int env_cap = []() {
+        const char * env = getenv("GGML_CUDA_MMQ_MAX_X");
+        if (env == nullptr) {
+            return 0;
+        }
+        char * end = nullptr;
+        const long val = std::strtol(env, &end, 10);
+        if (end == env || val <= 0) {
+            GGML_LOG_WARN("GGML_CUDA_MMQ_MAX_X ignored: expected positive integer, got '%s'\n", env);
+            return 0;
+        }
+        return (int) val;
+    }();
+    return env_cap;
+}
+
 static int get_mmq_x_max_host(const int cc) {
-    return (turing_mma_available(cc) || amd_wmma_available(cc)) ? 128 :
+    const int native_max = (turing_mma_available(cc) || amd_wmma_available(cc)) ? 128 :
         GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA ?
 #ifdef GGML_CUDA_FORCE_MMQ
             128                     : 64;
 #else
             MMQ_DP4A_MAX_BATCH_SIZE : 64;
 #endif // GGML_CUDA_FORCE_MMQ
+
+    const int env_cap = ggml_cuda_mmq_x_max_env();
+    if (env_cap == 0 || env_cap >= native_max) {
+        return native_max;
+    }
+
+    const int capped = 8 * (env_cap / 8) < 8 ? 8 : 8 * (env_cap / 8);
+    return capped < native_max ? capped : native_max;
 }
 
 static constexpr __device__ int get_mmq_x_max_device() {
@@ -296,22 +321,23 @@ static constexpr __device__ int mmq_get_granularity_device(const int /*mmq_x*/) 
 }
 #endif // AMD_MFMA_AVAILABLE
 
-#if defined(GGML_USE_HIP)
 static int mmq_get_nwarps_host(const int cc, const int warp_size) {
-    return amd_mfma_available(cc) ? 8 : 256/warp_size;
-}
+#if defined(GGML_USE_HIP)
+    if (amd_mfma_available(cc)) {
+        return 8;
+    }
 #else
-static int mmq_get_nwarps_host(const int /*cc*/, const int warp_size) {
-    return 256/warp_size;
+    (void) cc;
+#endif // defined(GGML_USE_HIP)
+    return MMQ_TARGET_WG_THREADS/warp_size;
 }
-#endif // (GGML_USE_HIP)
 
 static constexpr __device__ int mmq_get_nwarps_device() {
-#if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+#if defined(AMD_MFMA_AVAILABLE)
     return 8;
 #else
-    return 256/ggml_cuda_get_physical_warp_size();
-#endif // AMD_MFMA_AVAILABLE
+    return MMQ_TARGET_WG_THREADS/ggml_cuda_get_physical_warp_size();
+#endif // defined(AMD_MFMA_AVAILABLE)
 }
 
 // ------------------------------------------------------------
