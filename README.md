@@ -47,7 +47,8 @@ The important point: TBQ4 made 64k context fit while keeping MTP generation usab
 | MTP server shutdown | Fixed | Speculative state is released before the target context/model, so MTP detach no longer double-frees |
 | Coherence gate | Passing | TBQ4 compared against `q8_0` next-token distributions |
 | rocWMMA TBQ4 | Experimental | Built during investigation, but not the working path |
-| RotorQuant / PlanarQuant / IsoQuant | Present | Dispatch exists, but not validated here |
+| RotorQuant / `tbq4_0` | Production-smoked on gfx1100 | 32k/64k TBQ4+MTP server smokes pass cleanly |
+| PlanarQuant / IsoQuant (`planar3_0`, `iso3_0`) | Fixed and gated | Compressed-KV materializers/dispatch are covered by the Triton oracle + invariant gates; opt-in WMMA remains behind `COMPRESSED_KV_WMMA_FATTN=1` |
 
 ## Why VEC, not the experimental AMD rocWMMA path?
 
@@ -189,6 +190,16 @@ Quick-mode result (4k context):
 | Cache | PASS | Same output with and without `cache_prompt` |
 
 This is a practical correctness gate, not a proof of mathematical losslessness.
+
+Compressed-KV prototype/gate coverage also includes `planar3_0` and `iso3_0`:
+
+| Gate | Formats | Result |
+|---|---|---|
+| `experiments/compressed_kv_triton/run_all.sh` | `planar3_0`, `iso3_0`, `tbq4_0` | PASS |
+| `run_all_json.py` | `planar3_0`, `iso3_0`, `tbq4_0` | PASS 20/20 |
+| `scripts/hip/check-compressed-kv-fa-invariants.sh` | production dispatch/gating | PASS |
+
+The long-context production server smokes above are TBQ4-focused. Planar/Iso are fixed and covered by the compressed-KV gates, but their WMMA route remains opt-in rather than the default production path.
 
 ### Run the gate
 
