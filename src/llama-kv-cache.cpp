@@ -96,7 +96,16 @@ llama_kv_cache::llama_kv_cache(
 
     GGML_ASSERT(kv_size % n_pad == 0);
 
-    const uint32_t n_layer_kv = hparams.n_layer_kv();
+    uint32_t n_layer_kv = 0;
+    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+        const bool included_by_filter = filter && filter(il);
+        const bool keep_layer         = !filter || included_by_filter;
+        const bool has_kv             = hparams.has_kv(il) || included_by_filter;
+
+        if (keep_layer && has_kv) {
+            n_layer_kv++;
+        }
+    }
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
@@ -160,12 +169,16 @@ llama_kv_cache::llama_kv_cache(
     const bool is_mla = hparams.is_mla();
 
     for (uint32_t il = 0; il < hparams.n_layer; il++) {
-        if (!hparams.has_kv(il)) {
+        const bool included_by_filter = filter && filter(il);
+        const bool keep_layer         = !filter || included_by_filter;
+        const bool has_kv             = hparams.has_kv(il) || included_by_filter;
+
+        if (!has_kv) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
             continue;
         }
 
-        if (filter && !filter(il)) {
+        if (!keep_layer) {
             LLAMA_LOG_DEBUG("%s: layer %3d: filtered\n", __func__, il);
             continue;
         }

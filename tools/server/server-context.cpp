@@ -689,6 +689,25 @@ private:
     bool sleeping = false;
 
     void destroy() {
+        // Speculative state owns samplers and non-owning context pointers. Drop it
+        // before freeing ctx_dft/ctx_tgt; MTP teardown can otherwise observe stale
+        // target/draft contexts during shutdown or sleep/resume.
+        for (server_slot & slot : slots) {
+            slot.spec = nullptr;
+            slot.ctx_tgt = nullptr;
+            slot.ctx_dft = nullptr;
+            slot.spec_draft.clear();
+            slot.spec_prompt.clear();
+            slot.spec_i_batch.clear();
+            slot.spec_ckpt.clear();
+        }
+        spec.reset();
+        params_base.speculative.draft.ctx_tgt = nullptr;
+        params_base.speculative.draft.ctx_dft = nullptr;
+
+        ctx_dft.reset();
+        model_dft.reset();
+
         llama_init.reset();
 
         ctx_tgt = nullptr;
