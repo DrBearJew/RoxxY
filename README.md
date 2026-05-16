@@ -82,6 +82,8 @@ Use `--flash-attn on`. Current policy selects `kernel=vec` for `tbq4_0`, `planar
 New rocWMMA FA routes exist, but stay opt-in until fresh coherence/perf smokes pass:
 `TBQ4_WMMA_FATTN=1` for TBQ4, `COMPRESSED_KV_WMMA_FATTN=1` for Planar/Iso.
 
+F16 MMA note: RDNA3/RDNA4 tensor-core FA uses 32-logical VKQ tiles only when the head dim divides by 32; h=80/112 fall back to 16/FP32. RDNA3/4 h>128 stays tile-favored unless fresh benches prove otherwise. CDNA can go to h<=256.
+
 ```bash
 scripts/hip/rdna3-fattn-policy.py \
   --summary benches/rocm-rdna3/ctx-fit-quant-sweep-20260516-004216/summary.json \

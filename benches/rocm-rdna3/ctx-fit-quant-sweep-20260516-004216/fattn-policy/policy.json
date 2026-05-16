@@ -1,4 +1,26 @@
 {
+  "architecture_guardrails": [
+    {
+      "guardrail": "Use 32-logical VKQ tiles with fp16 accumulation only when the head dimension is divisible by 32; head sizes 80 and 112 use 16-wide VKQ tiles with fp32 accumulation.",
+      "policy": "Keep the layout split explicit so compressed-KV WMMA experiments do not inherit the f16 MMA path by accident.",
+      "target": "RDNA3/RDNA4 f16 MMA FA"
+    },
+    {
+      "guardrail": "The faster VKQ transpose path scrambles accumulator layout along the head dimension.",
+      "policy": "Require DATA_LAYOUT_I_MAJOR_SCRAMBLED/unscramble handling before storing or reusing VKQ accumulators.",
+      "target": "RDNA4 f16 MMA FA"
+    },
+    {
+      "guardrail": "Do not promote MMA FA for head sizes above 128 without fresh local performance evidence; tile has been faster in this range.",
+      "policy": "Prefer TILE/VEC fallback for h > 128 on RDNA-class GPUs.",
+      "target": "RDNA3/RDNA4 large heads"
+    },
+    {
+      "guardrail": "MFMA can work for head sizes up to 256 with the tuned kernel parameters.",
+      "policy": "CDNA may select MMA up to h <= 256 when the batch-size crossover is met.",
+      "target": "CDNA MFMA f16 FA"
+    }
+  ],
   "backend": "ROCm/HIP",
   "candidates": [
     {
@@ -189,10 +211,10 @@
       ]
     }
   },
-  "generated_at": "2026-05-15T23:46:59.855309+00:00",
+  "generated_at": "2026-05-16T00:15:31.501769+00:00",
   "gpu_label": "gfx1100/RX 7900 XTX",
   "model_label": "Qwen3.6-27B MTP compressed KV",
-  "repo_commit": "63788066e1f7",
+  "repo_commit": "4e4935ca41ad",
   "schema_version": 1,
   "selected_cache_types": [
     "tbq4_0",

@@ -32,6 +32,29 @@ from typing import Any
 STABLE_COMPRESSED_KV_TYPES = ["tbq4_0", "planar3_0", "iso3_0"]
 EXPERIMENTAL_WMMA_TYPES = ["tbq4_0", "planar3_0", "iso3_0"]
 
+ARCHITECTURE_GUARDRAILS = [
+    {
+        "target": "RDNA3/RDNA4 f16 MMA FA",
+        "guardrail": "Use 32-logical VKQ tiles with fp16 accumulation only when the head dimension is divisible by 32; head sizes 80 and 112 use 16-wide VKQ tiles with fp32 accumulation.",
+        "policy": "Keep the layout split explicit so compressed-KV WMMA experiments do not inherit the f16 MMA path by accident.",
+    },
+    {
+        "target": "RDNA4 f16 MMA FA",
+        "guardrail": "The faster VKQ transpose path scrambles accumulator layout along the head dimension.",
+        "policy": "Require DATA_LAYOUT_I_MAJOR_SCRAMBLED/unscramble handling before storing or reusing VKQ accumulators.",
+    },
+    {
+        "target": "RDNA3/RDNA4 large heads",
+        "guardrail": "Do not promote MMA FA for head sizes above 128 without fresh local performance evidence; tile has been faster in this range.",
+        "policy": "Prefer TILE/VEC fallback for h > 128 on RDNA-class GPUs.",
+    },
+    {
+        "target": "CDNA MFMA f16 FA",
+        "guardrail": "MFMA can work for head sizes up to 256 with the tuned kernel parameters.",
+        "policy": "CDNA may select MMA up to h <= 256 when the batch-size crossover is met.",
+    },
+]
+
 
 @dataclass
 class QuantEvidence:
@@ -234,6 +257,7 @@ def build_policy(args: argparse.Namespace) -> dict[str, Any]:
         "selected_server_flags": selected.server_flags if selected else [],
         "selected_cache_types": selected.cache_types if selected else [],
         "selection_basis": "stable compressed-KV VEC FA route with smoke evidence; rocWMMA remains opt-in",
+        "architecture_guardrails": ARCHITECTURE_GUARDRAILS,
         "evidence": {q: asdict(ev) | {"ok": ev.ok} for q, ev in sorted(evidence.items())},
         "candidates": [asdict(c) for c in candidates],
     }
@@ -264,6 +288,18 @@ def render_markdown(policy: dict[str, Any]) -> str:
             f"| `{c['name']}` | {'yes' if c['eligible'] else 'NO'} | `{c['route']}` | "
             f"`{', '.join(c['cache_types'])}` | `{env_inline(c['env'])}` | {c['status']} | {notes} |"
         )
+
+    lines += [
+        "",
+        "## F16 MMA guardrails",
+        "",
+        "These apply to the f16 MMA FlashAttention path. They do not promote compressed-KV WMMA, which remains opt-in.",
+        "",
+        "| target | guardrail | policy |",
+        "|---|---|---|",
+    ]
+    for item in policy.get("architecture_guardrails") or []:
+        lines.append(f"| {item['target']} | {item['guardrail']} | {item['policy']} |")
 
     lines += [
         "",
