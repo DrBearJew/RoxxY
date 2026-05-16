@@ -1,0 +1,11 @@
+{
+  "base": "baseline",
+  "cache_type_k": "tbq4_0",
+  "cache_type_v": "tbq4_0",
+  "env": {},
+  "flash_attn": true,
+  "mmq_x": null,
+  "name": "baseline",
+  "note": "default compressed-KV VEC FlashAttention route",
+  "route": "tbq4_vec"
+}
