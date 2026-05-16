@@ -384,13 +384,35 @@ static void ggml_cuda_fattn_log_selection(const best_fattn_kernel kernel, const 
     const bool sparse_v_dequant = kernel == BEST_FATTN_KERNEL_VEC && V->type == GGML_TYPE_TBQ4_0 && Q->ne[1] == 1 && ggml_cuda_sparse_v_dequant_enabled();
     const bool q8k_tbq4v_vec = kernel == BEST_FATTN_KERNEL_VEC && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TBQ4_0;
     const int sparse_v_tau_level = sparse_v_dequant ? ggml_cuda_sparse_v_tau_level() : 0;
+    const bool tbq4_lds_d_k = kernel == BEST_FATTN_KERNEL_VEC && K->type == GGML_TYPE_TBQ4_0 && (Q->ne[0] == 128 || Q->ne[0] == 256) && Q->ne[1] == 1 &&
+        ggml_cuda_tbq4_lds_route_d_k_enabled() && (!sparse_v_dequant || sparse_v_tau_level == 0);
     const char * route = ggml_cuda_fattn_kernel_name(kernel);
-    if (q8k_tbq4v_vec) {
+    if (tbq4_lds_d_k) {
+        if (Q->ne[0] == 256) {
+            route = sparse_v_dequant ? "tbq4_lds_route_d_k_d256_sparsev" : "tbq4_lds_route_d_k_d256";
+        } else {
+            route = sparse_v_dequant ? "tbq4_lds_route_d_k_d128_sparsev" : "tbq4_lds_route_d_k_d128";
+        }
+    } else if (q8k_tbq4v_vec) {
         route = sparse_v_dequant ? "q8k_tbq4v_sparsev" : "q8k_tbq4v_vec";
     } else if (tbq4_vec_norm_hoist) {
         route = sparse_v_dequant ? "tbq4_vec_norm_hoist_sparsev" : "tbq4_vec_norm_hoist";
     } else if (kernel == BEST_FATTN_KERNEL_VEC && K->type == GGML_TYPE_TBQ4_0) {
         route = sparse_v_dequant ? "tbq4_vec_sparsev" : "tbq4_vec";
+    }
+
+    if (tbq4_lds_d_k) {
+        const int lds_tile_rows = Q->ne[0] == 256 ? ggml_cuda_tbq4_lds_d_k_tile_rows<256>() : ggml_cuda_tbq4_lds_d_k_tile_rows<128>();
+        const int lds_f16_stride = Q->ne[0] == 256 ? ggml_cuda_tbq4_lds_d_k_f16_stride_half2<256>() : ggml_cuda_tbq4_lds_d_k_f16_stride_half2<128>();
+        const int lds_packed_stride = Q->ne[0] == 256 ? ggml_cuda_tbq4_lds_d_k_packed_stride<256>() : ggml_cuda_tbq4_lds_d_k_packed_stride<128>();
+        GGML_LOG_INFO("%s: kernel=%s route=%s d=%lld tile_rows=%d f16_stride=%d packed_stride=%d sparse_v_tau=%d fallback=tbq4_vec Q=%s K=%s V=%s nq=%lld nkv=%lld d_q=%lld d_v=%lld\n",
+            __func__, ggml_cuda_fattn_kernel_name(kernel), route,
+            (long long) Q->ne[0], lds_tile_rows, lds_f16_stride, lds_packed_stride,
+            sparse_v_tau_level,
+            ggml_type_name(Q->type), ggml_type_name(K->type), ggml_type_name(V->type),
+            (long long) Q->ne[1], (long long) K->ne[1],
+            (long long) Q->ne[0], (long long) V->ne[0]);
+        return;
     }
 
     GGML_LOG_INFO("%s: kernel=%s route=%s Q=%s K=%s V=%s nq=%lld nkv=%lld d_q=%lld d_v=%lld sparse_v_tau_level=%d\n",

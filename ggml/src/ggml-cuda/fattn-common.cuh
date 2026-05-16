@@ -13,6 +13,8 @@
 #include "fattn-planar-iso.cuh"
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 #define FATTN_KQ_STRIDE       256
 #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
@@ -69,6 +71,44 @@ static inline bool ggml_cuda_sparse_v_dequant_enabled() {
     return false;
 #endif
 }
+
+static inline bool ggml_cuda_tbq4_lds_route_d_k_enabled() {
+#ifdef GGML_USE_HIP
+    const char * env = getenv("GGML_CUDA_TBQ4_LDS_ROUTE");
+    return env != nullptr && strcmp(env, "D_K") == 0;
+#else
+    return false;
+#endif
+}
+
+static constexpr int GGML_CUDA_TBQ4_LDS_D_K_PACKED_STAGES = 2;
+
+template <int D>
+static constexpr int ggml_cuda_tbq4_lds_d_k_tile_rows() {
+    return D == 256 ? 48 : (D == 128 ? 96 : 0);
+}
+
+template <int D>
+static constexpr int ggml_cuda_tbq4_lds_d_k_packed_stride() {
+    constexpr int raw = (D / QK_TBQ4) * int(sizeof(block_tbq4_0));
+    return (raw + 15) & ~15;
+}
+
+template <int D>
+static constexpr int ggml_cuda_tbq4_lds_d_k_f16_stride_half2() {
+    return D/2 + 2;
+}
+
+template <int D>
+static constexpr int ggml_cuda_tbq4_lds_d_k_shared_bytes() {
+    return GGML_CUDA_TBQ4_LDS_D_K_PACKED_STAGES * ggml_cuda_tbq4_lds_d_k_tile_rows<D>() * ggml_cuda_tbq4_lds_d_k_packed_stride<D>() +
+        ggml_cuda_tbq4_lds_d_k_tile_rows<D>() * ggml_cuda_tbq4_lds_d_k_f16_stride_half2<D>() * int(sizeof(half2));
+}
+
+static constexpr int GGML_CUDA_TBQ4_LDS_D_K_TILE_ROWS        = ggml_cuda_tbq4_lds_d_k_tile_rows<128>();
+static constexpr int GGML_CUDA_TBQ4_LDS_D_K_PACKED_STRIDE    = ggml_cuda_tbq4_lds_d_k_packed_stride<128>();
+static constexpr int GGML_CUDA_TBQ4_LDS_D_K_F16_STRIDE_HALF2 = ggml_cuda_tbq4_lds_d_k_f16_stride_half2<128>();
+static constexpr int GGML_CUDA_TBQ4_LDS_D_K_SHARED_BYTES     = ggml_cuda_tbq4_lds_d_k_shared_bytes<128>();
 
 static inline int ggml_cuda_sparse_v_tau_level() {
 #ifdef GGML_USE_HIP
@@ -426,6 +466,101 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_0_norm_hoist(
     }
 
     return sum;
+}
+
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_0_lds_f16(
+    const half2 * __restrict__ K_h2, const void * __restrict__ Q_v) {
+
+    static_assert(D == 128 || D == 256, "TBQ4 LDS D_K is currently implemented for D128/D256");
+
+    constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
+    constexpr int cpy_ne = cpy_nb / 4;
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
+#pragma unroll
+        for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
+            const int k_KQ = k_KQ_0 + (threadIdx.x % nthreads)*cpy_ne + k_KQ_1;
+            const half2 kv = K_h2[k_KQ];
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            const half2 qv = ((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
+            ggml_cuda_mad(sum, kv, qv);
+#else
+            const float2 qv = ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
+            const float2 kv_f = __half22float2(kv);
+            sum += kv_f.x*qv.x + kv_f.y*qv.y;
+#endif // V_DOT2_F32_F16_AVAILABLE
+        }
+    }
+
+    return sum;
+}
+
+template <int D>
+static __device__ __forceinline__ void tbq4_lds_d_k_copy_and_materialize(
+        const char * __restrict__ K,
+        const int64_t nb11,
+        const int rows_this_tile,
+        const int packed_stage,
+        uint8_t * __restrict__ packed_smem,
+        half2 * __restrict__ f16_smem) {
+
+    static_assert(D == 128 || D == 256, "TBQ4 LDS D_K is currently implemented for D128/D256");
+    constexpr int rows          = ggml_cuda_tbq4_lds_d_k_tile_rows<D>();
+    constexpr int packed_stride = ggml_cuda_tbq4_lds_d_k_packed_stride<D>();
+    constexpr int f16_stride    = ggml_cuda_tbq4_lds_d_k_f16_stride_half2<D>();
+    constexpr int row_bytes     = (D / QK_TBQ4) * int(sizeof(block_tbq4_0));
+    constexpr int D_half2       = D/2;
+    constexpr int nthreads      = 128;
+
+    const int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
+    uint8_t * __restrict__ packed = packed_smem + packed_stage*rows*packed_stride;
+
+    for (int linear = tid; linear < rows*packed_stride; linear += nthreads) {
+        const int row = linear / packed_stride;
+        const int col = linear - row*packed_stride;
+        uint8_t value = 0;
+        if (row < rows_this_tile && col < row_bytes) {
+            value = ((const uint8_t *) (K + int64_t(row)*nb11))[col];
+        }
+        packed[linear] = value;
+    }
+
+    __syncthreads();
+
+    for (int linear = tid; linear < rows*D_half2; linear += nthreads) {
+        const int row = linear / D_half2;
+        const int k   = linear - row*D_half2;
+        half2 value = make_half2(0.0f, 0.0f);
+        if (row < rows_this_tile) {
+            const uint8_t * __restrict__ src = packed + row*packed_stride;
+            const int elem0 = k*2;
+            const int ib = elem0 / QK_TBQ4;
+            const int j0 = elem0 - ib*QK_TBQ4;
+            const uint8_t * __restrict__ block = src + ib*int(sizeof(block_tbq4_0));
+            half norm_h;
+            ggml_cuda_memcpy_1<sizeof(half)>(&norm_h, block);
+            const float norm = __half2float(norm_h);
+            const uint8_t qs_byte = block[sizeof(half) + j0/2];
+            const uint8_t idx0 = AMD_BFE(qs_byte, 0, 4);
+            const uint8_t idx1 = AMD_BFE(qs_byte, 4, 4);
+            value = make_half2(
+                __float2half(d_tbq4_centroids[idx0] * norm),
+                __float2half(d_tbq4_centroids[idx1] * norm));
+        }
+        f16_smem[row*f16_stride + k] = value;
+    }
+
+    for (int linear = tid; linear < rows*(f16_stride - D_half2); linear += nthreads) {
+        const int row = linear / (f16_stride - D_half2);
+        const int pad = linear - row*(f16_stride - D_half2);
+        f16_smem[row*f16_stride + D_half2 + pad] = make_half2(0.0f, 0.0f);
+    }
+
+    __syncthreads();
 }
 
 template <typename Tds, int ni>

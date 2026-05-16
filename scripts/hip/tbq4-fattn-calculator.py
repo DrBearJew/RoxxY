@@ -387,26 +387,26 @@ def lds_route_estimates(d_values: list[int]) -> list[LdsRouteEstimate]:
 
 
 def lds_experiment_contracts() -> list[LdsExperimentContract]:
-    """Concrete Stage-1 contracts from the LDS research report.
+    """Concrete LDS contracts from the LDS research report and Qwen head shape.
 
-    These rows do not enable runtime behavior. They make the env gate, tile
-    shape, LDS footprint, fallback, and sparse-V policy machine-checkable before
-    Stage 2 adds a kernel branch.
+    Qwen3.6 27B/35B uses D=256 heads, so D256 is the first runtime target.
+    D128 remains a secondary shape contract for non-Qwen/dev canaries.
     """
-    row = row_estimate(128)
-    packed_stride = row.tbq4_padded16_row_bytes
-    f16_stride_half2 = 66
-    f16_stride_bytes = f16_stride_half2 * 4
 
     def make(
             route: str,
             base_route: str,
             role: str,
             env_value: str,
+            d: int,
             tile_rows: int,
             packed_stages: int,
             status: str,
             next_evidence: str) -> LdsExperimentContract:
+        row = row_estimate(d)
+        packed_stride = row.tbq4_padded16_row_bytes
+        f16_stride_half2 = d // 2 + 2
+        f16_stride_bytes = f16_stride_half2 * 4
         lds_bytes_per_row = packed_stages * packed_stride + f16_stride_bytes
         total = tile_rows * lds_bytes_per_row
         packed_part = f" packed_stride={packed_stride}" if packed_stages else " packed_stride=direct_global"
@@ -417,7 +417,7 @@ def lds_experiment_contracts() -> list[LdsExperimentContract]:
             role=role,
             env_var="GGML_CUDA_TBQ4_LDS_ROUTE",
             env_value=env_value,
-            d=128,
+            d=d,
             tile_rows=tile_rows,
             packed_stages=packed_stages,
             packed_stride_bytes=packed_stride,
@@ -431,42 +431,45 @@ def lds_experiment_contracts() -> list[LdsExperimentContract]:
             sparse_v_tau_level=0,
             sparse_v_threshold="1e-6",
             fallback_route=PRODUCTION_ROUTE_LABEL,
-            supported_shape="D=128 K=TBQ4_0 K-only; env absent or unsupported shape must fall back",
-            route_log_contract=f"route={route} env=GGML_CUDA_TBQ4_LDS_ROUTE={env_value} d=128 tile_rows={tile_rows} f16_stride={f16_stride_half2}{packed_part} sparse_v_tau_level=0 fallback={PRODUCTION_ROUTE_LABEL}",
+            supported_shape=f"D={d} K=TBQ4_0 K-only; env absent or unsupported shape must fall back",
+            route_log_contract=f"route={route} env=GGML_CUDA_TBQ4_LDS_ROUTE={env_value} d={d} tile_rows={tile_rows} f16_stride={f16_stride_half2}{packed_part} sparse_v_tau_level=0 fallback={PRODUCTION_ROUTE_LABEL}",
             status=status,
             next_evidence=next_evidence,
         )
 
     return [
         make(
+            route="tbq4_lds_route_d_k_d256",
+            base_route="tbq4_lds_route_d",
+            role="first_runtime_experiment_qwen",
+            env_value="D_K",
+            d=256,
+            tile_rows=48,
+            packed_stages=2,
+            status="stage2_runtime_target_locked",
+            next_evidence="Stage 2/3: default-off D256 K-only route must prove fallback/route logs on Qwen before full canaries",
+        ),
+        make(
             route="tbq4_lds_route_d_k_d128",
             base_route="tbq4_lds_route_d",
-            role="first_experiment",
+            role="secondary_dev_shape",
             env_value="D_K",
+            d=128,
             tile_rows=96,
             packed_stages=2,
             status="stage1_contract_locked",
-            next_evidence="Stage 2: implement default-off D128 K-only route and prove fallback/route logs before canaries",
+            next_evidence="Keep as secondary shape canary; Qwen runtime target is D256",
         ),
         make(
-            route="tbq4_lds_route_b_k_d128",
+            route="tbq4_lds_route_b_k_d256",
             base_route="tbq4_lds_route_b",
-            role="backup_diagnostic",
+            role="backup_diagnostic_qwen",
             env_value="B_K",
-            tile_rows=96,
+            d=256,
+            tile_rows=48,
             packed_stages=0,
             status="backup_contract_locked",
-            next_evidence="Use only if D-lite fails from complexity or needs a simpler f16-materialization diagnostic",
-        ),
-        make(
-            route="tbq4_lds_route_b_k_d128_rows128",
-            base_route="tbq4_lds_route_b",
-            role="backup_diagnostic_larger_tile",
-            env_value="B_K",
-            tile_rows=128,
-            packed_stages=0,
-            status="backup_contract_locked",
-            next_evidence="Try after rows96 if correctness is clean and profiler says LDS budget/occupancy remain safe",
+            next_evidence="Use only if D_K needs a simpler f16-materialization diagnostic",
         ),
     ]
 
@@ -498,20 +501,30 @@ def gate_decisions(d_values: list[int], tile_rows: list[int]) -> list[GateDecisi
             ),
             *([
                 GateDecision(
-                    route="tbq4_lds_route_d_k_d128",
+                    route="tbq4_lds_route_d_k_d256",
                     d=d,
-                    decision="stage1_first_experiment",
+                    decision="stage2_first_runtime_experiment",
                     priority=2,
-                    reason="research report recommends Route D-lite D128 K-only: ping-pong packed TBQ4 K staging plus one padded f16/half2 K tile, V unchanged",
-                    required_next_evidence="Stage 2 default-off implementation for GGML_CUDA_TBQ4_LDS_ROUTE=D_K with route log and fallback proof",
+                    reason="Qwen3.6 27B/35B heads are D256; Route D-lite K-only uses ping-pong packed TBQ4 K staging plus one padded f16/half2 K tile, V unchanged",
+                    required_next_evidence="Stage 2/3 default-off implementation for GGML_CUDA_TBQ4_LDS_ROUTE=D_K with Qwen route log, fallback proof, and canaries",
                 ),
                 GateDecision(
-                    route="tbq4_lds_route_b_k_d128",
+                    route="tbq4_lds_route_b_k_d256",
                     d=d,
-                    decision="stage1_backup_diagnostic",
+                    decision="stage2_backup_diagnostic",
                     priority=3,
-                    reason="backup B-lite D128 K-only isolates whether direct f16 K materialization helps without ping-pong complexity",
+                    reason="backup B-lite D256 K-only isolates whether direct f16 K materialization helps without ping-pong complexity",
                     required_next_evidence="implement only if D-lite fails from complexity or profiler needs simpler diagnostic comparison",
+                ),
+            ] if d == 256 else []),
+            *([
+                GateDecision(
+                    route="tbq4_lds_route_d_k_d128",
+                    d=d,
+                    decision="secondary_dev_shape",
+                    priority=7,
+                    reason="D128 remains useful for non-Qwen/dev canaries but is not the Qwen runtime target",
+                    required_next_evidence="keep default-off and validate only as secondary shape coverage",
                 ),
             ] if d == 128 else []),
             GateDecision(
@@ -528,7 +541,7 @@ def gate_decisions(d_values: list[int], tile_rows: list[int]) -> list[GateDecisi
                 decision="model_before_code",
                 priority=5,
                 reason=f"single f16 materialization can fit up to {max_fit} rows under 64KiB in this simple model, but scratch/padding/occupancy are not modeled yet",
-                required_next_evidence="generic route only; Stage-1 concrete backup is tbq4_lds_route_b_k_d128",
+                required_next_evidence="generic route only; concrete Qwen backup is tbq4_lds_route_b_k_d256",
             ),
             GateDecision(
                 route="tbq4_lds_route_c",
@@ -544,7 +557,7 @@ def gate_decisions(d_values: list[int], tile_rows: list[int]) -> list[GateDecisi
                 decision="model_before_code",
                 priority=6,
                 reason="raw ping-pong plus one f16 tile may overlap loads without doubling f16 LDS cost, but scheduling/barrier cost is unknown",
-                required_next_evidence="generic route only; Stage-1 concrete first experiment is tbq4_lds_route_d_k_d128",
+                required_next_evidence="generic route only; concrete Qwen first experiment is tbq4_lds_route_d_k_d256",
             ),
             GateDecision(
                 route="f16_mma_fa",
@@ -661,9 +674,11 @@ def print_markdown(args: argparse.Namespace) -> None:
         max_fit = max(fit_rows) if fit_rows else 0
         print(f"| VEC inline D{d} | yes | yes | baseline; K+V logical load {vec.kv_current_bytes_per_qk_pair} B/pair | none | production default |")
         print(f"| VEC norm-hoist D{d} | yes | yes | reduce repeated norm loads; model saves {vec.savings_percent:.1f}% of K+V TBQ4 dequant load bytes | no format change | best first optimization candidate |")
+        if d == 256:
+            print("| LDS D-lite K-only D256 | yes | yes | first Qwen runtime contract: ping-pong packed TBQ4 K staging + padded f16 K tile; V unchanged | `GGML_CUDA_TBQ4_LDS_ROUTE=D_K`, tile_rows=48, f16_stride=130 | Stage 2 implementation target; default-off |")
+            print("| LDS B-lite K-only D256 | yes | yes | backup diagnostic: direct TBQ4 K -> padded f16 K tile without ping-pong | `GGML_CUDA_TBQ4_LDS_ROUTE=B_K`, tile_rows=48, f16_stride=130 | backup only if D-lite needs diagnostic fallback |")
         if d == 128:
-            print("| LDS D-lite K-only D128 | yes | yes | first Stage-1 contract: ping-pong packed TBQ4 K staging + padded f16 K tile; V unchanged | `GGML_CUDA_TBQ4_LDS_ROUTE=D_K`, tile_rows=96, f16_stride=66 | Stage 2 implementation target; default-off |")
-            print("| LDS B-lite K-only D128 | yes | yes | backup diagnostic: direct TBQ4 K -> padded f16 K tile without ping-pong | `GGML_CUDA_TBQ4_LDS_ROUTE=B_K`, tile_rows=96/128, f16_stride=66 | backup only if D-lite needs diagnostic fallback |")
+            print("| LDS D-lite K-only D128 | yes | yes | secondary dev-shape contract: ping-pong packed TBQ4 K staging + padded f16 K tile; V unchanged | `GGML_CUDA_TBQ4_LDS_ROUTE=D_K`, tile_rows=96, f16_stride=66 | default-off secondary shape |")
         print(f"| TBQ4 WMMA/materialized FA D{d} | yes | yes | new FA path with f16 tile materialization | max materialized rows within 64KiB: {max_fit} | env-gated; previous sweep slower |")
         print(f"| f16 MMA FA D{d} | no | no | compare tensor-core FA ceiling with f16 KV | f16 row {row.f16_row_bytes} B vs TBQ4 row {row.tbq4_raw_row_bytes} B | benchmark comparison only |")
         print(f"| {FUTURE_FORMAT_LABEL} VEC D{d} | no | yes | estimate future 4x32 transform upside, {rotation_estimate(d).addsub_savings_percent:.1f}% fewer add/sub ops | new format + quality canaries | harness-only future format experiment |")
@@ -687,11 +702,11 @@ def print_markdown(args: argparse.Namespace) -> None:
         print(f"| {key} | {shown} |")
 
     print("\n## Stage execution hypotheses")
-    print("1. **Stage 1 contract gate**: calculator rows lock `tbq4_lds_route_d_k_d128` as first experiment and `tbq4_lds_route_b_k_d128` as backup; no runtime behavior changes.")
-    print("2. **Stage 2 D-lite implementation**: add `GGML_CUDA_TBQ4_LDS_ROUTE=D_K` for D128 K-only with fallback to `tbq4_vec` for env-absent/unsupported shapes.")
+    print("1. **Stage 1 contract gate**: calculator rows now identify `tbq4_lds_route_d_k_d256` as the first Qwen runtime experiment; D128 remains secondary/dev-shape.")
+    print("2. **Stage 2 D-lite implementation**: add `GGML_CUDA_TBQ4_LDS_ROUTE=D_K` for D256 K-only with fallback to `tbq4_vec` for env-absent/unsupported shapes.")
     print("3. **Stage 3 canaries before benchmarks**: route log, tiny decode, OOB/tile-tail, GQA/mask/KV_max, sparse-V tau0 unchanged, NIAH/coherence.")
     print("4. **Stage 4 profiler-driven iteration**: compare against `tbq4_vec`, `q8k_tbq4v_sparsev` tau0, and opt-in norm-hoist; sweep tile rows and f16 stride.")
-    print("5. **Stage 5 expansion only after D128 success**: D256 then optional V integration with sparse-V tau0 pre-dequant skip; Route C remains negative-control only.")
+    print("5. **Stage 5 expansion only after D256 success**: optional V integration with sparse-V tau0 pre-dequant skip; Route C remains negative-control only.")
 
 
 def main() -> None:
