@@ -115,16 +115,12 @@ Stabilization target: sweep `MAX_X=32/48/64/128`, then promote only if it beats 
 
 ```bash
 scripts/hip/run-rdna3-mmq-cap-sweep.sh
+
+# Include FA route experiments in the same summary/policy calculation.
+INCLUDE_FA_EXPERIMENTS=1 scripts/hip/run-rdna3-mmq-cap-sweep.sh
 ```
 
-Policy tool:
-
-```bash
-scripts/hip/rdna3-mmq-policy.py \
-  --summary benches/rocm-rdna3/qwen35b-pp128-256-512-20260516-005350/summary.variants.clean.json \
-  --out-dir benches/rocm-rdna3/qwen35b-pp128-256-512-20260516-005350/policy
-source benches/rocm-rdna3/qwen35b-pp128-256-512-20260516-005350/policy/env.sh
-```
+The sweep script is the calculation entry point. It writes `summary.caps.json`, `summary.caps.md`, and `policy/{policy.json,policy.md,env.sh}` under `OUT_DIR`.
 
 ## What changed
 

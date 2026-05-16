@@ -129,6 +129,7 @@ class PerfScore:
 class VariantPolicy:
     name: str
     env: dict[str, str]
+    meta: dict[str, Any]
     static: dict[str, Any] | None
     perf: dict[str, Any] | None
     eligible: bool
@@ -279,9 +280,11 @@ def build_policy(args: argparse.Namespace) -> dict[str, Any]:
     summary = load_summary(Path(args.summary) if args.summary else None)
     cases: dict[str, list[dict[str, Any]]] = {}
     variant_rc: dict[str, int] = {}
+    variant_meta: dict[str, dict[str, Any]] = {}
     if summary:
         cases = {str(k): list(v) for k, v in summary.get("cases", {}).items()}
         variant_rc = {str(k): int(v) for k, v in summary.get("variant_rc", {}).items()}
+        variant_meta = {str(k): dict(v) for k, v in summary.get("variant_meta", {}).items()}
 
     shape_candidates = make_shape_candidates(args, hw)
     baseline_perf: PerfScore | None = None
@@ -294,9 +297,10 @@ def build_policy(args: argparse.Namespace) -> dict[str, Any]:
         names.append(extra_name)
 
     for name in names:
-        env = KNOWN_VARIANT_ENVS.get(name, {})
-        mmq_x = KNOWN_VARIANT_MMQ_X.get(name)
-        static_shape = current_iq4xs_q8_f32_shape(mmq_x, args.mmq_y, args.ncols_max, hw) if mmq_x else None
+        meta = variant_meta.get(name, {})
+        env = dict(meta.get("env") or KNOWN_VARIANT_ENVS.get(name, {}))
+        mmq_x = meta.get("mmq_x", KNOWN_VARIANT_MMQ_X.get(name))
+        static_shape = current_iq4xs_q8_f32_shape(int(mmq_x), args.mmq_y, args.ncols_max, hw) if mmq_x else None
         perf = score_case(cases.get(name, []), weights) if cases else None
         if perf and baseline_perf and baseline_perf.throughput_tok_s > 0:
             perf.speedup_vs_baseline = perf.throughput_tok_s / baseline_perf.throughput_tok_s
@@ -314,6 +318,7 @@ def build_policy(args: argparse.Namespace) -> dict[str, Any]:
         variants.append(VariantPolicy(
             name=name,
             env=env,
+            meta=meta,
             static=asdict(static_shape) | {"viable": static_shape.viable} if static_shape else None,
             perf=asdict(perf) if perf else None,
             eligible=not reject,
@@ -354,6 +359,7 @@ def build_policy(args: argparse.Namespace) -> dict[str, Any]:
         "selection_basis": basis,
         "selected_variant": selected.name if selected else None,
         "selected_env": selected.env if selected else {},
+        "selected_meta": selected.meta if selected else {},
         "shape_candidates": [asdict(s) | {"viable": s.viable} for s in shape_candidates],
         "variants": [asdict(v) for v in variants],
     }
@@ -367,18 +373,23 @@ def env_to_inline(env: dict[str, str]) -> str:
 def render_markdown(policy: dict[str, Any]) -> str:
     selected = policy.get("selected_variant") or "none"
     selected_env = policy.get("selected_env") or {}
+    selected_meta = policy.get("selected_meta") or {}
+    selected_cache = ""
+    if selected_meta:
+        selected_cache = f"Cache K/V: `{selected_meta.get('cache_type_k', '?')}/{selected_meta.get('cache_type_v', '?')}`; route: `{selected_meta.get('route', '?')}`"
     lines = [
         f"# RDNA3 MMQ selector policy: {policy['model_label']}",
         "",
         f"GPU/backend: `{policy['gpu_label']}` / `{policy['backend']}`",
         f"Selected: `{selected}`",
         f"Env: `{env_to_inline(selected_env)}`",
+        selected_cache,
         f"Basis: {policy['selection_basis']}",
         "",
         "## Variant scores",
         "",
-        "| variant | eligible | env | weighted tok/s | speedup vs baseline | static | notes |",
-        "|---|:---:|---|---:|---:|---|---|",
+        "| variant | eligible | route | cache K/V | env | weighted tok/s | speedup vs baseline | static | notes |",
+        "|---|:---:|---|---|---|---:|---:|---|---|",
     ]
     for variant in policy["variants"]:
         perf = variant.get("perf") or {}
@@ -391,11 +402,14 @@ def render_markdown(policy: dict[str, Any]) -> str:
             static_s = f"x{static['mmq_x']}: {static['reason']}"
         else:
             static_s = "no fixed MAX_X"
+        meta = variant.get("meta") or {}
+        route_s = meta.get("route") or "—"
+        cache_s = f"{meta.get('cache_type_k', '?')}/{meta.get('cache_type_v', '?')}" if meta else "—"
         notes = "; ".join(variant.get("reject_reasons") or [])
         if not notes and variant["name"] == selected:
             notes = "selected"
         lines.append(
-            f"| `{variant['name']}` | {'yes' if variant['eligible'] else 'NO'} | "
+            f"| `{variant['name']}` | {'yes' if variant['eligible'] else 'NO'} | `{route_s}` | `{cache_s}` | "
             f"`{env_to_inline(variant['env'])}` | {tok_s_s} | {speed_s} | {static_s} | {notes} |"
         )
 
@@ -418,6 +432,8 @@ def render_markdown(policy: dict[str, Any]) -> str:
         "",
         "```bash",
     ]
+    if selected_meta:
+        lines.append(f"# bench/server flags: -fa 1 -ctk {selected_meta.get('cache_type_k', '?')} -ctv {selected_meta.get('cache_type_v', '?')}")
     if selected_env:
         for k, v in selected_env.items():
             lines.append(f"export {k}={v}")
@@ -428,10 +444,13 @@ def render_markdown(policy: dict[str, Any]) -> str:
 
 
 def render_env(policy: dict[str, Any]) -> str:
+    selected_meta = policy.get("selected_meta") or {}
     lines = [
         "# Generated by scripts/hip/rdna3-mmq-policy.py",
         f"# selected_variant={policy.get('selected_variant')}",
     ]
+    if selected_meta:
+        lines.append(f"# bench/server flags: -fa 1 -ctk {selected_meta.get('cache_type_k', '?')} -ctv {selected_meta.get('cache_type_v', '?')}")
     for k, v in (policy.get("selected_env") or {}).items():
         lines.append(f"export {k}={v}")
     return "\n".join(lines) + "\n"
