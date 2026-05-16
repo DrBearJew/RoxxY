@@ -52,6 +52,37 @@ typedef void (* fattn_kernel_t)(
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
 
+static inline bool ggml_cuda_tbq4_vec_norm_hoist_enabled() {
+#ifdef GGML_USE_HIP
+    const char * env = getenv("GGML_CUDA_TBQ4_VEC_NORM_HOIST");
+    return env != nullptr && atoi(env) != 0;
+#else
+    return false;
+#endif
+}
+
+static inline bool ggml_cuda_sparse_v_dequant_enabled() {
+#ifdef GGML_USE_HIP
+    const char * env = getenv("GGML_CUDA_SPARSE_V_DEQUANT");
+    return env != nullptr && atoi(env) != 0;
+#else
+    return false;
+#endif
+}
+
+static inline int ggml_cuda_sparse_v_tau_level() {
+#ifdef GGML_USE_HIP
+    const char * env = getenv("GGML_CUDA_SPARSE_V_TAU_LEVEL");
+    if (env == nullptr) {
+        return 0;
+    }
+    const int level = atoi(env);
+    return level < 0 ? 0 : (level > 5 ? 5 : level);
+#else
+    return 0;
+#endif
+}
+
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f16(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds_v) {
@@ -321,6 +352,60 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_0(
             const int j0    = elem0 % QK_TBQ4;
 
             const float   norm    = __half2float(K_tbq4[ib].d);
+            const uint8_t qs_byte = K_tbq4[ib].qs[j0 / 2];
+
+            const uint8_t idx0 = AMD_BFE(qs_byte, 0, 4);
+            const uint8_t idx1 = AMD_BFE(qs_byte, 4, 4);
+
+            float2 kv;
+            kv.x = d_tbq4_centroids[idx0] * norm;
+            kv.y = d_tbq4_centroids[idx1] * norm;
+
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            const half2 qv = ((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
+            ggml_cuda_mad(sum, make_float2(kv.x, kv.y), __half22float2(qv));
+#else
+            const float2 qv = ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
+            sum += kv.x * qv.x + kv.y * qv.y;
+#endif
+        }
+    }
+
+    return sum;
+}
+
+// Gated TBQ4 KQ dot product variant: same dequant math as baseline, but keep
+// the current block norm in registers while a lane stays inside one TBQ4 block.
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_0_norm_hoist(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_tbq4_0 * K_tbq4 = (const block_tbq4_0 *) K_c;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
+    constexpr int cpy_ne = cpy_nb / 4;
+
+    float sum = 0.0f;
+    int last_ib = -1;
+    float last_norm = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
+#pragma unroll
+        for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
+            const int k_KQ = k_KQ_0 + (threadIdx.x % nthreads)*cpy_ne + k_KQ_1;
+
+            const int elem0 = k_KQ * 2;
+            const int ib    = elem0 / QK_TBQ4;
+            const int j0    = elem0 % QK_TBQ4;
+
+            if (ib != last_ib) {
+                last_ib = ib;
+                last_norm = __half2float(K_tbq4[ib].d);
+            }
+            const float   norm    = last_norm;
             const uint8_t qs_byte = K_tbq4[ib].qs[j0 / 2];
 
             const uint8_t idx0 = AMD_BFE(qs_byte, 0, 4);
@@ -632,7 +717,7 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     }
 }
 
-template <ggml_type type_K, int D, int nthreads>
+template <ggml_type type_K, int D, int nthreads, bool tbq4_vec_norm_hoist = false>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
         return vec_dot_fattn_vec_KQ_f16<D, nthreads>;
@@ -657,7 +742,11 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     } else if constexpr (type_K == GGML_TYPE_ISO4_0) {
         return vec_dot_fattn_vec_KQ_iso4_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TBQ4_0) {
-        return vec_dot_fattn_vec_KQ_tbq4_0<D, nthreads>;
+        if constexpr (tbq4_vec_norm_hoist) {
+            return vec_dot_fattn_vec_KQ_tbq4_0_norm_hoist<D, nthreads>;
+        } else {
+            return vec_dot_fattn_vec_KQ_tbq4_0<D, nthreads>;
+        }
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;

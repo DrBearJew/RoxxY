@@ -16,7 +16,7 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
-template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
+template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool tbq4_vec_norm_hoist = false, bool sparse_v_dequant = false, int sparse_v_tau_level = 0> // D == head size
 __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
 static __global__ void flash_attn_ext_vec(
         const char * __restrict__ Q,
@@ -75,6 +75,20 @@ static __global__ void flash_attn_ext_vec(
 #endif // GGML_USE_HIP
 
     constexpr int nthreads    = ggml_cuda_fattn_vec_get_nthreads_device();
+    if constexpr (tbq4_vec_norm_hoist) {
+        static_assert(type_K == GGML_TYPE_TBQ4_0, "TBQ4 norm hoist is only valid for TBQ4 K");
+    }
+    if constexpr (sparse_v_dequant) {
+        static_assert(type_V == GGML_TYPE_TBQ4_0, "Sparse V dequant is currently gated to TBQ4 V");
+        static_assert(ncols == 1, "Sparse V dequant is currently decode-only");
+        static_assert(sparse_v_tau_level >= 0 && sparse_v_tau_level <= 5, "Sparse V tau level must be in [0, 5]");
+    }
+    constexpr float sparse_v_tau =
+        sparse_v_tau_level == 1 ? 3.0e-7f :
+        sparse_v_tau_level == 2 ? 1.0e-7f :
+        sparse_v_tau_level == 3 ? 3.0e-8f :
+        sparse_v_tau_level == 4 ? 1.0e-5f :
+        sparse_v_tau_level == 5 ? 1.0e-4f : 1.0e-6f;
     constexpr bool KQ_uses_Q_reg = type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16 ||
                                     type_K == GGML_TYPE_TBQ4_0 ||
                                     type_K == GGML_TYPE_PLANAR3_0 || type_K == GGML_TYPE_ISO3_0 ||
@@ -88,7 +102,7 @@ static __global__ void flash_attn_ext_vec(
     constexpr int V_rows_per_thread = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 2*cpy_ne : 4;
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
 
-    constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ>();
+    constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ, tbq4_vec_norm_hoist>();
     constexpr bool Q_q8_1 = !KQ_uses_Q_reg;
 #ifdef V_DOT2_F32_F16_AVAILABLE
     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread>();
@@ -123,6 +137,7 @@ static __global__ void flash_attn_ext_vec(
     float2           VKQ[ncols][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
     __shared__ float  KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
 #endif // V_DOT2_F32_F16_AVAILABLE
+    __shared__ float KQ_sparse_sum_shared[ncols][WARP_SIZE];
 
     float KQ_max[ncols];
     float KQ_sum[ncols];
@@ -310,6 +325,34 @@ static __global__ void flash_attn_ext_vec(
 #endif // V_DOT2_F32_F16_AVAILABLE
         }
 
+        float KQ_sparse_sum[ncols];
+        if constexpr (sparse_v_dequant) {
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                float sparse_sum = warp_reduce_sum(KQ_sum[j]);
+                if (threadIdx.x == 0) {
+                    KQ_sparse_sum_shared[j][threadIdx.y] = sparse_sum;
+                }
+            }
+            __syncthreads();
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                float sparse_sum = 0.0f;
+                if (threadIdx.y == 0) {
+                    sparse_sum = threadIdx.x < nwarps ? KQ_sparse_sum_shared[j][threadIdx.x] : 0.0f;
+                    sparse_sum = warp_reduce_sum(sparse_sum);
+                    if (threadIdx.x == 0) {
+                        KQ_sparse_sum_shared[j][0] = sparse_sum;
+                    }
+                }
+            }
+            __syncthreads();
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                KQ_sparse_sum[j] = KQ_sparse_sum_shared[j][0];
+            }
+        }
+
 #ifndef GGML_USE_HIP
         __syncwarp();
 #endif // GGML_USE_HIP
@@ -323,6 +366,16 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
                 KQ_k[j] = __half2half2(KQ[j*nthreads + k]);
+            }
+            if constexpr (sparse_v_dequant) {
+                bool skip_v = true;
+#pragma unroll
+                for (int j = 0; j < ncols; ++j) {
+                    skip_v = skip_v && (__half2float(__low2half(KQ_k[j])) < sparse_v_tau*KQ_sparse_sum[j]);
+                }
+                if (skip_v) {
+                    continue;
+                }
             }
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
@@ -352,6 +405,16 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
                 KQ_k[j] = KQ[j*nthreads + k];
+            }
+            if constexpr (sparse_v_dequant) {
+                bool skip_v = true;
+#pragma unroll
+                for (int j = 0; j < ncols; ++j) {
+                    skip_v = skip_v && (KQ_k[j] < sparse_v_tau*KQ_sparse_sum[j]);
+                }
+                if (skip_v) {
+                    continue;
+                }
             }
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
@@ -523,17 +586,66 @@ static __global__ void flash_attn_ext_vec(
 #pragma clang diagnostic pop
 #endif // __clang__
 
-template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
+template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool tbq4_vec_norm_hoist = false, bool sparse_v_dequant = false, int sparse_v_tau_level = 0>
 void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     const int nthreads = ggml_cuda_fattn_vec_get_nthreads_host(cc);
     const int nwarps   = nthreads / WARP_SIZE;
-    fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap>;
+    fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, tbq4_vec_norm_hoist, sparse_v_dequant, sparse_v_tau_level>;
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
     launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false);
+}
+
+template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool tbq4_vec_norm_hoist>
+void ggml_cuda_flash_attn_ext_vec_case_impl_sparse_tau(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    switch (ggml_cuda_sparse_v_tau_level()) {
+        case 5:
+            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap, tbq4_vec_norm_hoist, true, 5>(ctx, dst);
+            return;
+        case 4:
+            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap, tbq4_vec_norm_hoist, true, 4>(ctx, dst);
+            return;
+        case 3:
+            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap, tbq4_vec_norm_hoist, true, 3>(ctx, dst);
+            return;
+        case 2:
+            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap, tbq4_vec_norm_hoist, true, 2>(ctx, dst);
+            return;
+        case 1:
+            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap, tbq4_vec_norm_hoist, true, 1>(ctx, dst);
+            return;
+        default:
+            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap, tbq4_vec_norm_hoist, true, 0>(ctx, dst);
+            return;
+    }
+}
+
+template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
+void ggml_cuda_flash_attn_ext_vec_case_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#ifdef GGML_USE_HIP
+    if constexpr (type_K == GGML_TYPE_TBQ4_0 && type_V == GGML_TYPE_TBQ4_0 && cols_per_block == 1) {
+        if (ggml_cuda_tbq4_vec_norm_hoist_enabled() && ggml_cuda_sparse_v_dequant_enabled()) {
+            ggml_cuda_flash_attn_ext_vec_case_impl_sparse_tau<D, cols_per_block, type_K, type_V, use_logit_softcap, true>(ctx, dst);
+            return;
+        }
+    }
+    if constexpr (type_K == GGML_TYPE_TBQ4_0) {
+        if (ggml_cuda_tbq4_vec_norm_hoist_enabled()) {
+            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap, true, false>(ctx, dst);
+            return;
+        }
+    }
+    if constexpr (type_V == GGML_TYPE_TBQ4_0 && cols_per_block == 1) {
+        if (ggml_cuda_sparse_v_dequant_enabled()) {
+            ggml_cuda_flash_attn_ext_vec_case_impl_sparse_tau<D, cols_per_block, type_K, type_V, use_logit_softcap, false>(ctx, dst);
+            return;
+        }
+    }
+#endif // GGML_USE_HIP
+    ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap, false, false>(ctx, dst);
 }
 
 template <int D, ggml_type type_K, ggml_type type_V>
@@ -548,10 +660,10 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
         constexpr int cols_per_block = 1;
         if (logit_softcap == 0.0f) {
             constexpr bool use_logit_softcap = false;
-            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+            ggml_cuda_flash_attn_ext_vec_case_dispatch<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
         } else {
             constexpr bool use_logit_softcap = true;
-            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+            ggml_cuda_flash_attn_ext_vec_case_dispatch<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
         }
         return;
     }
@@ -559,10 +671,10 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     constexpr int cols_per_block = 2;
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
-        ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+        ggml_cuda_flash_attn_ext_vec_case_dispatch<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
     } else {
         constexpr bool use_logit_softcap = true;
-        ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+        ggml_cuda_flash_attn_ext_vec_case_dispatch<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
     }
 }
 
@@ -610,3 +722,6 @@ DECL_FATTN_VEC_CASE(256, GGML_TYPE_TBQ4_0, GGML_TYPE_TBQ4_0);
 DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TBQ4_0, GGML_TYPE_Q8_0);
 DECL_FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_0, GGML_TYPE_Q8_0);
 DECL_FATTN_VEC_CASE(256, GGML_TYPE_TBQ4_0, GGML_TYPE_Q8_0);
+DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q8_0,   GGML_TYPE_TBQ4_0);
+DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q8_0,   GGML_TYPE_TBQ4_0);
+DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q8_0,   GGML_TYPE_TBQ4_0);

@@ -318,6 +318,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_ISO4_0,    GGML_TYPE_ISO4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ4_0,    GGML_TYPE_TBQ4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ4_0,    GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,      GGML_TYPE_TBQ4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,       GGML_TYPE_PLANAR3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,       GGML_TYPE_ISO3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,       GGML_TYPE_PLANAR4_0)
@@ -337,6 +338,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_ISO4_0,    GGML_TYPE_ISO4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ4_0,    GGML_TYPE_TBQ4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ4_0,    GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,      GGML_TYPE_TBQ4_0)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     GGML_ABORT("fatal error");
@@ -378,11 +380,24 @@ static void ggml_cuda_fattn_log_selection(const best_fattn_kernel kernel, const 
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    GGML_LOG_INFO("%s: kernel=%s Q=%s K=%s V=%s nq=%lld nkv=%lld d_q=%lld d_v=%lld\n",
-        __func__, ggml_cuda_fattn_kernel_name(kernel),
+    const bool tbq4_vec_norm_hoist = kernel == BEST_FATTN_KERNEL_VEC && K->type == GGML_TYPE_TBQ4_0 && ggml_cuda_tbq4_vec_norm_hoist_enabled();
+    const bool sparse_v_dequant = kernel == BEST_FATTN_KERNEL_VEC && V->type == GGML_TYPE_TBQ4_0 && Q->ne[1] == 1 && ggml_cuda_sparse_v_dequant_enabled();
+    const bool q8k_tbq4v_vec = kernel == BEST_FATTN_KERNEL_VEC && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TBQ4_0;
+    const int sparse_v_tau_level = sparse_v_dequant ? ggml_cuda_sparse_v_tau_level() : 0;
+    const char * route = ggml_cuda_fattn_kernel_name(kernel);
+    if (q8k_tbq4v_vec) {
+        route = sparse_v_dequant ? "q8k_tbq4v_sparsev" : "q8k_tbq4v_vec";
+    } else if (tbq4_vec_norm_hoist) {
+        route = sparse_v_dequant ? "tbq4_vec_norm_hoist_sparsev" : "tbq4_vec_norm_hoist";
+    } else if (kernel == BEST_FATTN_KERNEL_VEC && K->type == GGML_TYPE_TBQ4_0) {
+        route = sparse_v_dequant ? "tbq4_vec_sparsev" : "tbq4_vec";
+    }
+
+    GGML_LOG_INFO("%s: kernel=%s route=%s Q=%s K=%s V=%s nq=%lld nkv=%lld d_q=%lld d_v=%lld sparse_v_tau_level=%d\n",
+        __func__, ggml_cuda_fattn_kernel_name(kernel), route,
         ggml_type_name(Q->type), ggml_type_name(K->type), ggml_type_name(V->type),
         (long long) Q->ne[1], (long long) K->ne[1],
-        (long long) Q->ne[0], (long long) V->ne[0]);
+        (long long) Q->ne[0], (long long) V->ne[0], sparse_v_tau_level);
 }
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
@@ -463,7 +478,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
-    if (K->type != V->type && !(K->type == GGML_TYPE_TBQ4_0 && V->type == GGML_TYPE_Q8_0)) {
+    if (K->type != V->type &&
+            !(K->type == GGML_TYPE_TBQ4_0 && V->type == GGML_TYPE_Q8_0) &&
+            !(K->type == GGML_TYPE_Q8_0   && V->type == GGML_TYPE_TBQ4_0)) {
         return BEST_FATTN_KERNEL_NONE;
     }
 #endif // GGML_CUDA_FA_ALL_QUANTS
