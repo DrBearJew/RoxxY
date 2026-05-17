@@ -155,8 +155,11 @@ struct common_speculative_impl {
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted) = 0;
 
-    // true if this implementation requires the target context to extract embeddings
+    // true if this implementation requires the target context to extract post-norm embeddings
     virtual bool need_embd() const = 0;
+
+    // true if this implementation requires the target context to extract pre-norm embeddings
+    virtual bool need_embd_pre_norm() const { return false; }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -438,8 +441,8 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
 
-        llama_set_embeddings_pre_norm(ctx_tgt, true);
-        llama_set_embeddings_pre_norm(ctx_dft, true);
+        llama_set_embeddings_pre_norm(ctx_tgt, true, /*masked*/ false);
+        llama_set_embeddings_pre_norm(ctx_dft, true, /*masked*/ true);
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 
@@ -700,6 +703,10 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
     }
 
     bool need_embd() const override {
+        return false;
+    }
+
+    bool need_embd_pre_norm() const override {
         return true;
     }
 };
@@ -1410,6 +1417,20 @@ bool common_speculative_need_embd(common_speculative * spec) {
 
     for (auto & impl : spec->impls) {
         if (impl->need_embd()) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool common_speculative_need_embd_pre_norm(common_speculative * spec) {
+    if (spec == nullptr) {
+        return false;
+    }
+
+    for (auto & impl : spec->impls) {
+        if (impl->need_embd_pre_norm()) {
             return true;
         }
     }
