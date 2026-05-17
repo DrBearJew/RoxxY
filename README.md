@@ -2,6 +2,17 @@
 
 This branch targets AMD ROCm/RDNA3 on an RX 7900 XTX (`gfx1100`): **27B MTP long context** with TBQ4 compressed KV, plus a **35B MoE non-MTP prefill path** using the current best MMQ selector. Full long-fill prefill sweeps are still pending.
 
+**Latest speed update (2026-05-18):** this branch now includes upstream PR #23198 (`899097b81`, build `9136`), which avoids copying full logits during MTP prompt decode. On the same 8K server sweep, MTP prefill is no longer the old slow path:
+
+| Model | Mode | Prompt tok/s | Decode tok/s | Draft accepted |
+|---|---|---:|---:|---:|
+| 35B MoE | no MTP | 2240.20 | 75.11 | - |
+| 35B MoE | MTP `n_max=3` | 1927.00 | 101.67 | 81/135 |
+| 27B | no MTP | 682.84 | 26.10 | - |
+| 27B | MTP `n_max=3` | 632.04 | 47.26 | 90/110 |
+
+Artifacts: `benches/rocm-rdna3/pr23198-mtp-prefill-check-20260518-001214/summary.md`. Older 8K MTP summaries are kept for history but marked superseded.
+
 The goal is simple:
 
 - keep long-context VRAM use low with TBQ4 KV cache,
@@ -22,7 +33,7 @@ Read this branch like this:
 | Area | What works here | What to expect |
 |---|---|---|
 | ROCm/HIP production path | Qwen3.6-27B MTP + `tbq4_0` KV on RX 7900 XTX | Use `build-rocm`; default compressed-KV route stays VEC, not WMMA |
-| MTP/speculative decoding | Qwen MTP works via upstream-style `--spec-type draft-mtp`; legacy `mtp` alias is still accepted | Keep `--parallel 1`; use bounded draft length; MTP draft prefill needs the env fixes below |
+| MTP/speculative decoding | Qwen MTP works via upstream-style `--spec-type draft-mtp`; legacy `mtp` alias is still accepted; PR #23198 prefill fix included | Keep `--parallel 1`; use bounded draft length; `n_max=3` is best observed here |
 | TurboQuant-style KV usage | `--cache-type-k/--cache-type-v` is the user-facing contract, same as upstream/forks | `tbq4_0`, `planar3_0`, `iso3_0` names only work in this patched branch/forks that register them |
 | 35B MoE prefill | non-MTP 35B path uses `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48` | Current best pp selector; this is MoE MMQ prefill, not TBQ4 attention |
 | Vulkan | Vulkan build and device listing work; combined ROCm+Vulkan build also works | Vulkan compressed-KV parity is **not** claimed yet; treat it as backend availability, not TBQ4/Planar/Iso feature parity |
@@ -34,7 +45,7 @@ Read this branch like this:
 |---|---|---|
 | 27B long context + MTP | `tbq4_0`, `--spec-type draft-mtp --spec-draft-n-max 3`, MTP env below | 32k/64k production-smoked; 128k/200k allocation-fit smokes pass |
 | 35B MoE default | non-MTP 35B IDs, `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48` | default llama-swap setting |
-| 35B MTP | `35b-mtp-exp-*` IDs only | experimental |
+| 35B MTP | `35b-mtp-exp-*` IDs only, best observed `--spec-draft-n-max 3` | experimental, but PR #23198 removes most of the old prefill hit |
 | Vulkan | `build-vulkan` or `--device Vulkan0` in combined build | device works; compressed-KV parity not claimed |
 
 ## Results: Qwen3.6-27B MTP compressed KV
@@ -109,7 +120,7 @@ Command shape: `llama-bench -p 128,256,512 -n 0 -fa 1 -ctk tbq4_0 -ctv tbq4_0 -b
 | `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=64` | 1660.1 ± 56.6 | 2401.1 ± 39.0 | 3100.2 ± 16.1 |
 | scratch16k probe | 1238.5 ± 54.5 | 1904.5 ± 24.7 | 2613.6 ± 37.1 |
 
-Default 35B llama-swap routes use the `MAX_X=48` selector and stay **non-MTP**. 27B MTP routes keep the MTP prefill env instead.
+Default 35B llama-swap routes use the `MAX_X=48` selector and stay **non-MTP**. 35B MTP remains exposed only through explicit experimental IDs; with PR #23198, 8K MTP `n_max=3` measured 1927.00 prompt tok/s and 101.67 decode tok/s, but non-MTP still wins pure prompt fill.
 
 Stabilization target: sweep `MAX_X=32/48/64/128`, then promote only if it beats 48 and passes canaries.
 
@@ -129,6 +140,7 @@ The sweep script is the calculation entry point. It writes `summary.caps.json`, 
 | TBQ4 VEC Flash Attention | Working | Dequant happens inside the FA loop; no separate dequant pass |
 | MTP speculative decoding | Working | Use `--spec-type draft-mtp`; old `mtp` alias still works; best observed setting here: `--spec-draft-n-max 3` |
 | MTP prefill allocator stability | Working | `LLAMA_MTP_PREFILL_CHUNK=512` plus `LLAMA_MTP_PREFILL_FORCE_MMQ=1` avoids the hipBLAS temp-allocation OOM path |
+| MTP prompt-decode speed | Improved | PR #23198 avoids full-logit copies during MTP prompt decode; 35B n3 prefill improved 1376.82 → 1927.00 tok/s, 27B n3 506.34 → 632.04 tok/s in the 8K sweep |
 | MTP server shutdown | Fixed | Speculative state is released before the target context/model, so MTP detach no longer double-frees |
 | Coherence gate | Passing | TBQ4 compared against `q8_0` next-token distributions |
 | rocWMMA TBQ4 | Experimental | Built during investigation, but not the working path |
@@ -306,7 +318,7 @@ Source repos:
 
 The llama.cpp server default for `--spec-draft-n-max` is 16. On this setup, that was too aggressive and lowered aggregate acceptance.
 
-For this model/backend, `--spec-draft-n-max 3` gave the best observed result:
+For this model/backend, `--spec-draft-n-max 3` gave the best observed result. The old short-run acceptance check was:
 
 | KV cache | `n_max` | Drafted | Accepted | Accept rate | Speed |
 |---|---:|---:|---:|---:|---:|
@@ -314,7 +326,16 @@ For this model/backend, `--spec-draft-n-max 3` gave the best observed result:
 | `tbq4_0` | 3 | 54 | 45 | 83.3% | 54.0 tok/s |
 | `tbq4_0` | 16 | 144 | 53 | 36.8% | 38.1 tok/s |
 
-This does not prove TBQ4 improves MTP acceptance. It shows that, **in this tested run**, TBQ4 did not damage acceptance compared with `q8_0`.
+The current post-PR #23198 8K sweep keeps the same conclusion: `n_max=3` is still the best overall setting, and the MTP prefill penalty is now much smaller.
+
+| Model | Mode | Prompt tok/s | Decode tok/s | Accepted | vs no-MTP decode |
+|---|---|---:|---:|---:|---:|
+| 35B MoE | no MTP | 2240.20 | 75.11 | - | baseline |
+| 35B MoE | MTP `n_max=3` | 1927.00 | 101.67 | 81/135 | +35.4% |
+| 27B | no MTP | 682.84 | 26.10 | - | baseline |
+| 27B | MTP `n_max=3` | 632.04 | 47.26 | 90/110 | +81.1% |
+
+This does not prove TBQ4 improves MTP acceptance. It shows that, **in these tested runs**, TBQ4 did not damage acceptance compared with `q8_0`, and PR #23198 removes most of the old MTP prompt-fill slowdown.
 
 ## Validation
 
@@ -357,6 +378,17 @@ python3 harness.py --tbq4-ctx 65536 --q8-ctx 16384
 Results are written to `gate-summary.json`.
 
 ## Benchmarks (RX 7900 XTX)
+
+### 8K MTP speed after PR #23198
+
+Artifact: `benches/rocm-rdna3/pr23198-mtp-prefill-check-20260518-001214/summary.md`.
+
+| Model | Mode | Prompt tok/s | Decode tok/s | Draft accepted | Note |
+|---|---|---:|---:|---:|---|
+| 35B MoE | no MTP | 2240.20 | 75.11 | - | `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48` |
+| 35B MoE | MTP `n_max=3` | 1927.00 | 101.67 | 81/135 | old MTP prefill was 1376.82 tok/s before PR #23198 |
+| 27B | no MTP | 682.84 | 26.10 | - | `RDNA2_MATMUL_OPT_V1=1` |
+| 27B | MTP `n_max=3` | 632.04 | 47.26 | 90/110 | old MTP prefill was 506.34 tok/s before PR #23198 |
 
 ### Generation / server smoke
 
@@ -410,6 +442,7 @@ Experimental features behind env flags on this branch:
 3. **Rotation model**: TBQ4 stores K/V in signed-FWHT domain; Q pre-rotated, output inverse-rotated
 4. **MTP request-time OOM**: draft-prefill hipBLAS temp allocation could request multi-GiB buffers; supported quantized MTP prefill matmuls can be routed through MMQ with `LLAMA_MTP_PREFILL_FORCE_MMQ=1`
 5. **MTP shutdown double-free**: server cleanup freed the target context before speculative MTP state detached from it; speculative state now resets first
+6. **MTP prompt-decode logits copy**: upstream PR #23198 avoids copying full logits for every prompt token when MTP only needs pre-norm embeddings; this fixes most of the old 8K MTP prefill slowdown
 
 ## GPU architecture status
 
