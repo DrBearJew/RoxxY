@@ -36,8 +36,10 @@ Read this branch like this:
 |---|---|---|
 | 27B long context + MTP | `q8_0` K + `tbq4_0` V, `--spec-type draft-mtp --spec-draft-n-max 3`, MTP env below | Promoted default for user experience; use `tbq4_0/tbq4_0` only when you need the lowest VRAM / maximum context fallback |
 | 35B MoE default | 35B IDs with `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48`; speculative MTP optional | default llama-swap can use an MTP-capable model without enabling MTP |
-| 35B MTP | same 35B MTP-capable model plus `--spec-type draft-mtp --spec-draft-n-max 3` | experimental runtime mode; short result note is at the bottom |
+| 35B MTP | same 35B MTP-capable model plus `--spec-type draft-mtp --spec-draft-n-max 3` and MTP env below | experimental runtime mode; short result note is at the bottom |
 | Vulkan | `build-vulkan` or `--device Vulkan0` in combined build | device works; compressed-KV parity not claimed |
+
+**Do not mix up the env groups:** every MTP route should include `LLAMA_MTP_PREFILL_CHUNK=512 LLAMA_MTP_PREFILL_FORCE_MMQ=1`. The `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48` pair is the 35B MoE prompt-processing selector; it is not a substitute for the MTP prefill allocator workaround.
 
 ## Current ROCm runtime summary
 
@@ -183,8 +185,8 @@ Keep production boring. Flip these only when testing:
 
 | Want | Toggle / command | Note |
 |---|---|---|
-| 27B MTP stability | `LLAMA_MTP_PREFILL_CHUNK=512 LLAMA_MTP_PREFILL_FORCE_MMQ=1` | Pair with `--spec-type draft-mtp --parallel 1`; default KV is `q8_0/tbq4_0` |
-| 35B MoE prefill boost | `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48` | Best current 35B prompt-processing setting; MTP can be enabled separately |
+| 27B / explicit 35B MTP stability | `LLAMA_MTP_PREFILL_CHUNK=512 LLAMA_MTP_PREFILL_FORCE_MMQ=1` | Required for MTP routes; pair with `--spec-type draft-mtp --parallel 1`; default KV is `q8_0/tbq4_0` |
+| 35B MoE prefill boost | `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48` | Best current 35B prompt-processing setting; not the MTP OOM workaround |
 | Deprecated rocWMMA FA | `TBQ4_WMMA_FATTN=1`, `COMPRESSED_KV_WMMA_FATTN=1` | Do not use for now; VEC is the production path |
 | IQ4_XS scratch MMQ | `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_IQ4_XS_MMQ_SCRATCH16K=1` | Coherent, but slower so far |
 | Vulkan device check | `LD_LIBRARY_PATH=$PWD/build-vulkan/bin ./build-vulkan/bin/llama-server --list-devices` | Expect `Vulkan0` |
@@ -381,7 +383,7 @@ python convert.py base-model.gguf MTP-Q8_0.gguf output-mtp.gguf
 | `LLAMA_MTP_PREFILL_FORCE_MMQ=1` | Env-gated workaround for MTP draft-prefill hipBLAS/ROCm temp allocation OOM |
 | `--jinja --chat-template-file <path>` | Qwen merged chat template |
 | `--parallel 1` | Required for MTP |
-| `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48` | Best current Qwen3.6-35B-A3B prompt-processing selector; compatible with MTP-capable models |
+| `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48` | Best current Qwen3.6-35B-A3B prompt-processing selector; compatible with MTP-capable models, but MTP still needs the `LLAMA_MTP_PREFILL_*` pair |
 | `--no-warmup` | Skip startup warmup |
 
 ## Credits
