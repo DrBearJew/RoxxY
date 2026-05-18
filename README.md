@@ -151,15 +151,17 @@ cmake -B build-rocm -DGGML_HIP=ON \
 cmake --build build-rocm --target llama-server -j8
 ```
 
-This builds one ROCm `llama-server` binary for all model routes in this README. Do **not** rebuild per model. Pick the runtime env/flags per server entry or wrapper:
+This builds one ROCm `llama-server` binary for all model routes in this README. Do **not** rebuild per model, and do **not** set model-route env here; those are runtime settings.
+
+### Run
+
+Set env per server entry or wrapper at runtime:
 
 | Route | Runtime env to set |
 |---|---|
 | 27B MTP | `LLAMA_MTP_PREFILL_CHUNK=512 LLAMA_MTP_PREFILL_FORCE_MMQ=1` |
 | 35B MoE prompt-processing / non-MTP | `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48` |
 | 35B MoE with MTP enabled | `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48 LLAMA_MTP_PREFILL_CHUNK=512 LLAMA_MTP_PREFILL_FORCE_MMQ=1` |
-
-### Run
 
 ```bash
 # Recommended TurboQuant KV: q8_0 K + tbq4_0 V with MTP
