@@ -47,6 +47,7 @@ Use this README as runtime guidance first; detailed result notes are intentional
 |---|---|---|
 | Best default user experience | `--cache-type-k q8_0 --cache-type-v tbq4_0` | Promoted TurboQuant setting: keep K fidelity/speed, compress V |
 | Lowest VRAM / maximum context fallback | `--cache-type-k tbq4_0 --cache-type-v tbq4_0` | Still useful when context fit matters more than K quality/speed |
+| 3-bit Planar/Iso formats | `planar3_0`, `iso3_0` | Registered and gated, but not promoted as defaults; use only for max-compression experiments |
 | 27B MTP | `--spec-type draft-mtp --spec-draft-n-max 3` plus `LLAMA_MTP_PREFILL_CHUNK=512 LLAMA_MTP_PREFILL_FORCE_MMQ=1` | Stable ROCm/MTP server setting |
 | 35B MoE prompt-processing | `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48` | Keep default 35B llama-swap route non-MTP |
 | rocWMMA compressed-KV | Do not enable | Deprecated for now; VEC FlashAttention is the production path |
@@ -65,7 +66,7 @@ Use `--flash-attn on` for quantized V cache. The production AMD path is VEC Flas
 | Coherence gate | Passing | q8K/tbq4V and TBQ4 fallback compared against `q8_0` next-token distributions |
 | rocWMMA compressed-KV | Deprecated for now | Built during investigation, but not a correct/user-facing path; do not enable in wrappers |
 | RotorQuant / `tbq4_0` | Production-smoked on gfx1100 | 32k/64k TBQ4+MTP server smokes pass cleanly |
-| PlanarQuant / IsoQuant (`planar3_0`, `iso3_0`) | Fixed and gated | Covered by Triton oracle + invariant gates; rocWMMA route is deprecated for now |
+| PlanarQuant / IsoQuant (`planar3_0`, `iso3_0`) | Fixed and gated | 3-bit original-domain formats; covered by Triton oracle + invariant gates; not default user path |
 | 35B MoE MMQ selector | Working, env-gated | Best current local setting: `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48`; 35B default remains non-MTP |
 | Vulkan backend | Builds/list-devices | Separate `build-vulkan` and combined `build-rocm-vulkan` verified; compressed-KV Vulkan parity is not claimed |
 
@@ -419,6 +420,7 @@ These are result summaries, not first-run instructions. Prefer the build/run com
 
 - **Promoted q8K/tbq4V path:** `q8_0` K + `tbq4_0` V is now the default recommendation for user experience. Evidence: q8K/tbq4V NIAH passed 3/3 at 8k, sparse-V PPL delta was ~0.36%, and PPL ratios stayed near 1.0004-1.0020 across sparse-V thresholds.
 - **Long-context fallback:** pure `tbq4_0/tbq4_0` remains the lowest-VRAM escape hatch. 32k/64k server smokes were clean; 128k/200k allocation-fit smokes stayed within roughly 21.5-23.0 GiB on RX 7900 XTX.
+- **3-bit Planar/Iso formats:** the names are `planar3_0` and `iso3_0` (not Sonar). They are original-domain 3-bit compressed KV formats, fixed/gated, and useful for max-compression experiments, but not promoted over `q8_0/tbq4_0`. Short canaries fit 128k/200k: `planar3_0` about 32.9/34.9 tok/s at 21.10/22.36 GiB, `iso3_0` about 36.2/34.8 tok/s at 21.10/22.36 GiB.
 - **MTP after PR #23198:** `--spec-draft-n-max 3` remains the best observed draft length. The 8k sweep measured 27B MTP at ~632 prompt tok/s / ~47 decode tok/s and 35B MTP at ~1927 prompt tok/s / ~102 decode tok/s.
 - **35B MoE selector:** `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48` remains the local non-MTP prefill default, with the selector sweep peaking around pp128 1781, pp256 2480, pp512 3150 tok/s.
 - **rocWMMA status:** compressed-KV rocWMMA prototypes are deprecated for now. They were useful for investigation, but the validated ROCm path is VEC FlashAttention.
