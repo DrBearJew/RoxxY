@@ -1,4 +1,4 @@
-# AMD ROCm notes — Indras MTP + TBQ4/RotorQuant
+# AMD ROCm notes — Indras MTP + TurboQuant/RotorQuant
 
 This branch is based on `Indras-Mirror/llama.cpp-mtp` and adds the minimal HIP compatibility fixes needed to build on AMD ROCm / gfx1100.
 
@@ -27,14 +27,16 @@ cmake --build . --target llama-server -j$(nproc)
 
 ## Relevant runtime flags
 
-Indras uses upstream MTP naming and its own quant names:
+Recommended user-facing TurboQuant settings:
 
 ```bash
---spec-type mtp
+--spec-type draft-mtp
 --spec-draft-n-max 3
---cache-type-k tbq4_0
+--cache-type-k q8_0
 --cache-type-v tbq4_0
 ```
+
+Use `--cache-type-k tbq4_0 --cache-type-v tbq4_0` only as the lowest-VRAM fallback when maximum context fit matters more than K fidelity/speed.
 
 Available KV cache types shown by `llama-server --help`:
 
@@ -49,6 +51,6 @@ Available KV cache types shown by `llama-server --help`:
 
 - ROCm configure: PASS
 - ROCm `llama-server` build: PASS
-- Runtime benchmark on RX 7900 XTX: TODO
+- Runtime benchmark on RX 7900 XTX: PASS for the promoted ROCm/TurboQuant path documented in `README.md`
 
-The branch is intended as the next benchmark candidate after `mtp-turboquant`.
+The branch now promotes the TurboQuant-style `q8_0` K + `tbq4_0` V runtime path for the best default user experience.

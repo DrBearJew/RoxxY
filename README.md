@@ -1,6 +1,6 @@
-# llama.cpp ROCm TBQ4 KV Cache — Qwen3.6 27B MTP + 35B MoE on RX 7900 XTX
+# llama.cpp ROCm TurboQuant KV Cache — Qwen3.6 27B MTP + 35B MoE on RX 7900 XTX
 
-This branch targets AMD ROCm/RDNA3 on an RX 7900 XTX (`gfx1100`): **27B MTP long context** with TBQ4 compressed KV, plus a **35B MoE non-MTP prefill path** using the current best MMQ selector. Full long-fill prefill sweeps are still pending.
+This branch targets AMD ROCm/RDNA3 on an RX 7900 XTX (`gfx1100`): **27B MTP long context** with the promoted TurboQuant setting (`q8_0` K + `tbq4_0` V), plus a **35B MoE non-MTP prefill path** using the current best MMQ selector. Full long-fill prefill sweeps are still pending.
 
 **Latest speed update (2026-05-18):** this branch now includes upstream PR #23198 (`899097b81`, build `9136`), which avoids copying full logits during MTP prompt decode. On the same 8K server sweep, MTP prefill is no longer the old slow path:
 
@@ -15,12 +15,12 @@ Artifacts: `benches/rocm-rdna3/pr23198-mtp-prefill-check-20260518-001214/summary
 
 The goal is simple:
 
-- keep long-context VRAM use low with TBQ4 KV cache,
+- promote the best user-facing TurboQuant default: `--cache-type-k q8_0 --cache-type-v tbq4_0`,
 - keep MTP/speculative decoding working,
 - keep the default production Flash Attention route on the stable VEC path,
 - keep 35B MoE default non-MTP with `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48`,
 - avoid the broken rocWMMA prototype path for now,
-- validate output against a `q8_0` KV baseline before calling it usable.
+- keep `tbq4_0/tbq4_0` as the lowest-VRAM fallback when maximum context matters more than K quality/speed.
 
 This is not a general "all AMD GPUs are supported" claim. The tested target is RDNA3 / RX 7900 XTX. RDNA3.5 and RDNA4 are compile/dispatch candidates, but still need real validation.
 
@@ -32,9 +32,9 @@ Read this branch like this:
 
 | Area | What works here | What to expect |
 |---|---|---|
-| ROCm/HIP production path | Qwen3.6-27B MTP + `tbq4_0` KV on RX 7900 XTX | Use `build-rocm`; default compressed-KV route stays VEC, not WMMA |
+| ROCm/HIP production path | Qwen3.6-27B MTP + `q8_0` K / `tbq4_0` V on RX 7900 XTX | Use `build-rocm`; default compressed-KV route stays VEC, not WMMA |
 | MTP/speculative decoding | Qwen MTP works via upstream-style `--spec-type draft-mtp`; legacy `mtp` alias is still accepted; PR #23198 prefill fix included | Keep `--parallel 1`; use bounded draft length; `n_max=3` is best observed here |
-| TurboQuant-style KV usage | `--cache-type-k/--cache-type-v` is the user-facing contract, same as upstream/forks | `tbq4_0`, `planar3_0`, `iso3_0` names only work in this patched branch/forks that register them |
+| TurboQuant-style KV usage | `--cache-type-k/--cache-type-v` is the user-facing contract, same as upstream/forks | Best default is `q8_0/tbq4_0`; `tbq4_0/tbq4_0` is the lower-VRAM fallback |
 | 35B MoE prefill | non-MTP 35B path uses `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48` | Current best pp selector; this is MoE MMQ prefill, not TBQ4 attention |
 | Vulkan | Vulkan build and device listing work; combined ROCm+Vulkan build also works | Vulkan compressed-KV parity is **not** claimed yet; treat it as backend availability, not TBQ4/Planar/Iso feature parity |
 | Experimental kernels | WMMA compressed-KV and scratch MMQ variants build behind env gates | Opt in explicitly, run canaries, and never enable in production wrappers by default |
@@ -43,12 +43,12 @@ Read this branch like this:
 
 | Need | Use | Status |
 |---|---|---|
-| 27B long context + MTP | `tbq4_0`, `--spec-type draft-mtp --spec-draft-n-max 3`, MTP env below | 32k/64k production-smoked; 128k/200k allocation-fit smokes pass |
+| 27B long context + MTP | `q8_0` K + `tbq4_0` V, `--spec-type draft-mtp --spec-draft-n-max 3`, MTP env below | Promoted default for user experience; use `tbq4_0/tbq4_0` only when you need the lowest VRAM / maximum context fallback |
 | 35B MoE default | non-MTP 35B IDs, `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48` | default llama-swap setting |
 | 35B MTP | `35b-mtp-exp-*` IDs only, best observed `--spec-draft-n-max 3` | experimental, but PR #23198 removes most of the old prefill hit |
 | Vulkan | `build-vulkan` or `--device Vulkan0` in combined build | device works; compressed-KV parity not claimed |
 
-## Results: Qwen3.6-27B MTP compressed KV
+## Results: Qwen3.6-27B MTP TurboQuant KV
 
 Test setup:
 
@@ -56,24 +56,31 @@ Test setup:
 - Backend: ROCm/HIP production, tested with ROCm 7.2.3; Vulkan build verified separately
 - Model: Qwen3.6 27B MTP GGUF, Q4_K_M
 - Context: 32k/64k production smokes; 128k/200k allocation-fit + short MTP decode smokes
-- KV cache: `tbq4_0`
+- Recommended KV cache: `q8_0` K + `tbq4_0` V
+- Lowest-VRAM fallback: `tbq4_0` K + `tbq4_0` V
 - MTP: `--spec-type draft-mtp --spec-draft-n-max 3` (`mtp` alias still accepted)
 - Stable MTP env: `LLAMA_MTP_PREFILL_CHUNK=512 LLAMA_MTP_PREFILL_FORCE_MMQ=1`
 - Server flags: `--flash-attn on --batch-size 1024 --ubatch-size 512 --cache-ram 128 --parallel 1`
 
-Smoke result from this branch:
+Fallback `tbq4_0/tbq4_0` smoke result from this branch:
 
 | KV cache | Context | HTTP | Prompt | Decode | Peak VRAM | Shutdown |
 |---|---:|---:|---:|---:|---:|---:|
-| `tbq4_0` | 32k | 200 | ~466.6 tok/s | ~47.5 tok/s | ~20.7 GiB | clean, `server_rc=0` |
-| `tbq4_0` | 64k | 200 | ~481.4 tok/s | ~38.6 tok/s | ~21.3 GiB | clean, `server_rc=0` |
-| `tbq4_0` | 128k | 200 | 257.9 tok/s* | 29.1 tok/s* | 21.50 GiB | clean, `server_rc=0` |
-| `tbq4_0` | 200k | 200 | 223.1 tok/s* | 24.2 tok/s* | 23.04 GiB | clean, `server_rc=0` |
-| `q8_0` | 16k | 200 | — | ~50 tok/s | ~22 GiB | historical comparison |
+| `tbq4_0/tbq4_0` | 32k | 200 | ~466.6 tok/s | ~47.5 tok/s | ~20.7 GiB | clean, `server_rc=0` |
+| `tbq4_0/tbq4_0` | 64k | 200 | ~481.4 tok/s | ~38.6 tok/s | ~21.3 GiB | clean, `server_rc=0` |
+| `tbq4_0/tbq4_0` | 128k | 200 | 257.9 tok/s* | 29.1 tok/s* | 21.50 GiB | clean, `server_rc=0` |
+| `tbq4_0/tbq4_0` | 200k | 200 | 223.1 tok/s* | 24.2 tok/s* | 23.04 GiB | clean, `server_rc=0` |
+| `q8_0/q8_0` | 16k | 200 | — | ~50 tok/s | ~22 GiB | diagnostic comparison |
 
 \* 128k/200k rows allocated that context size, but only filled ~2k prompt tokens. Treat tok/s as a short MTP sanity check, **not** full-context throughput.
 
-Artifact: `benches/rocm-rdna3/ctx-fit-quant-sweep-20260516-004216/summary.json`.
+Fallback artifact: `benches/rocm-rdna3/ctx-fit-quant-sweep-20260516-004216/summary.json`.
+
+Promotion evidence for mixed `q8_0/tbq4_0`:
+
+- `benches/rocm-rdna3/q8k-tbq4v-vec-sparsev-20260516-041159/quality-summary.json`: 3/3 NIAH pass at 8k and PPL delta ~0.36% on the sparse-V probe.
+- Same q8K/tbq4V bench family: 35B decode smokes at 8k/16k/32k reported ~79-80 tok/s with FA on.
+- `benches/rocm-rdna3/q8k-tbq4v-sparsev-quality-sweep-20260516-052442/ppl-kld-summary.md`: q8K/tbq4V PPL ratios stayed near 1.0004-1.0020 across sparse-V thresholds.
 
 Other compressed KV types also fit in the same short canary sweep:
 
@@ -84,11 +91,11 @@ Other compressed KV types also fit in the same short canary sweep:
 
 No ROCm OOM, no `ggml_cuda_op_mul_mat_cublas` fallback stack, and no shutdown double-free were observed in these smokes.
 
-The important point: TBQ4 made 64k usable and 200k fit on a 24 GB RX 7900 XTX while keeping the MTP path alive.
+The important point: mixed `q8_0` K + `tbq4_0` V is now the promoted user setting for better K fidelity/speed while still compressing V. Pure `tbq4_0/tbq4_0` remains the escape hatch for the lowest VRAM footprint and maximum context fit.
 
 ## RDNA3 FlashAttention path (compressed KV)
 
-Use `--flash-attn on`. Current policy selects `kernel=vec` for `tbq4_0`, `planar3_0`, and `iso3_0` because it keeps compressed KV inside the FA loop and avoids full f16 K/V temp buffers.
+Use `--flash-attn on`. Current policy selects the stable VEC FlashAttention path for the promoted mixed KV route (`q8_0` K + compressed V) and for fully compressed KV (`tbq4_0`, `planar3_0`, `iso3_0`), avoiding the experimental rocWMMA compressed-KV route by default.
 
 New rocWMMA FA routes exist, but stay opt-in until fresh coherence/perf smokes pass:
 `TBQ4_WMMA_FATTN=1` for TBQ4, `COMPRESSED_KV_WMMA_FATTN=1` for Planar/Iso.
@@ -110,7 +117,7 @@ RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48
 ```
 
 Bench artifact: `benches/rocm-rdna3/qwen35b-pp128-256-512-20260516-005350/summary.variants.clean.md`.
-Command shape: `llama-bench -p 128,256,512 -n 0 -fa 1 -ctk tbq4_0 -ctv tbq4_0 -b 1024 -ub 512 -r 5`.
+For user-facing routes, combine this selector with `-ctk q8_0 -ctv tbq4_0`. The historical selector sweep used `llama-bench -p 128,256,512 -n 0 -fa 1 -ctk tbq4_0 -ctv tbq4_0 -b 1024 -ub 512 -r 5`.
 
 | Runtime env | pp128 | pp256 | pp512 |
 |---|---:|---:|---:|
@@ -167,7 +174,7 @@ That path is slower than a mature native matrix-core implementation could be, bu
 ```mermaid
 flowchart LR
     Q[Q activations] --> QROT[Pre-rotate Q / FWHT domain]
-    K[TBQ4 K cache<br/>4.25 bpv] --> KDEQ[Inline K dequant]
+    K[q8_0 K cache<br/>recommended] --> KDEQ[Inline K dequant]
     V[TBQ4 V cache<br/>4.25 bpv] --> VDEQ[Inline V dequant]
 
     QROT --> KQ[KQ dot inside VEC Flash Attention]
@@ -179,7 +186,7 @@ flowchart LR
     OROT --> OUT[Attention output]
 ```
 
-TBQ4 is not first expanded globally. Dequant happens inside the attention path.
+The promoted route keeps K at `q8_0` and compresses V as `tbq4_0`. TBQ4 V is not first expanded globally; dequant happens inside the attention path.
 
 ### Dispatch decision
 
@@ -187,18 +194,19 @@ TBQ4 is not first expanded globally. Dequant happens inside the attention path.
 flowchart TD
     A[Flash Attention request] --> B{K/V cache type}
 
-    B -->|tbq4_0| C{Backend / GPU}
-    B -->|q8_0, f16, q4_0, etc.| D[Existing llama.cpp FA paths]
+    B -->|q8_0 K + tbq4_0 V| C{Backend / GPU}
+    B -->|tbq4_0 K + tbq4_0 V| C
+    B -->|f16, q4_0, q8_0/q8_0, etc.| D[Existing llama.cpp FA paths]
 
-    C -->|NVIDIA CUDA| E[CUDA MMA TBQ4 path<br/>from upstream/fork]
-    C -->|AMD RDNA3 tested| F[ROCm VEC TBQ4 path<br/>working path]
+    C -->|NVIDIA CUDA| E[CUDA MMA / TurboQuant path<br/>from upstream/fork]
+    C -->|AMD RDNA3 tested| F[ROCm VEC TurboQuant path<br/>working path]
     C -->|AMD rocWMMA TBQ4| G[Experimental path<br/>not default / not trusted]
     C -->|RDNA3.5 / RDNA4| H[Compile/dispatch candidate<br/>needs validation]
 
     F --> I[Coherence gate vs q8_0]
     I --> J{Pass?}
-    J -->|yes| K[Use TBQ4 KV]
-    J -->|no| L[Fall back to q8_0 / debug]
+    J -->|yes| K[Use q8K/tbq4V default]
+    J -->|no| L[Fall back to tbq4/tbq4 or q8/q8 debug]
 ```
 
 This separates working, experimental, and untested instead of blending them together.
@@ -231,7 +239,19 @@ cmake --build build-rocm --target llama-server -j8
 ### Run
 
 ```bash
-# TBQ4 KV (low VRAM, 4.25 bpv) with MTP — validated 64k ROCm path
+# Recommended TurboQuant KV: q8_0 K + tbq4_0 V with MTP
+LLAMA_MTP_PREFILL_CHUNK=512 \
+LLAMA_MTP_PREFILL_FORCE_MMQ=1 \
+./build-rocm/bin/llama-server \
+  -m /path/to/Qwen3.6-27B-Q4_K_M-mtp.gguf \
+  --cache-type-k q8_0 --cache-type-v tbq4_0 \
+  --flash-attn on \
+  --batch-size 1024 --ubatch-size 512 --cache-ram 128 \
+  --spec-type draft-mtp --spec-draft-n-max 3 \
+  --jinja --chat-template-file docs/rocm-tbq4-paths/qwen36-merged-template.jinja \
+  -c 65536 --port 8080 --no-webui --no-warmup --parallel 1
+
+# Lowest-VRAM fallback when you need maximum context fit
 LLAMA_MTP_PREFILL_CHUNK=512 \
 LLAMA_MTP_PREFILL_FORCE_MMQ=1 \
 ./build-rocm/bin/llama-server \
@@ -242,13 +262,6 @@ LLAMA_MTP_PREFILL_FORCE_MMQ=1 \
   --spec-type draft-mtp --spec-draft-n-max 3 \
   --jinja --chat-template-file docs/rocm-tbq4-paths/qwen36-merged-template.jinja \
   -c 65536 --port 8080 --no-webui --no-warmup --parallel 1
-
-# q8_0 KV (higher speed, more VRAM)
-./build-rocm/bin/llama-server \
-  -m /path/to/Qwen3.6-27B-Q4_K_M-mtp.gguf \
-  --cache-type-k q8_0 --cache-type-v q8_0 \
-  --flash-attn on \
-  -c 16384 --port 8080 --no-webui --no-warmup
 ```
 
 ### Quick toggles: experiments and Vulkan
@@ -257,7 +270,7 @@ Keep production boring. Flip these only when testing:
 
 | Want | Toggle / command | Note |
 |---|---|---|
-| 27B MTP stability | `LLAMA_MTP_PREFILL_CHUNK=512 LLAMA_MTP_PREFILL_FORCE_MMQ=1` | Pair with `--spec-type draft-mtp --parallel 1` |
+| 27B MTP stability | `LLAMA_MTP_PREFILL_CHUNK=512 LLAMA_MTP_PREFILL_FORCE_MMQ=1` | Pair with `--spec-type draft-mtp --parallel 1`; default KV is `q8_0/tbq4_0` |
 | 35B MoE prefill boost | `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48` | Best current 35B non-MTP setting; llama-swap default |
 | TBQ4 WMMA FA | `TBQ4_WMMA_FATTN=1` | Experimental; canary first |
 | Planar/Iso WMMA FA | `COMPRESSED_KV_WMMA_FATTN=1` | ROCm/HIP only for now |
@@ -486,10 +499,11 @@ python convert.py base-model.gguf MTP-Q8_0.gguf output-mtp.gguf
 
 | Flag | Purpose |
 |---|---|
-| `--cache-type-k tbq4_0 --cache-type-v tbq4_0` | TBQ4 KV cache (low-error compressed, 4.25 bpv) |
-| `--cache-type-k q8_0 --cache-type-v q8_0` | q8_0 KV cache (higher speed, more VRAM) |
+| `--cache-type-k q8_0 --cache-type-v tbq4_0` | Recommended TurboQuant KV default: q8 K fidelity/speed with compressed TBQ4 V |
+| `--cache-type-k tbq4_0 --cache-type-v tbq4_0` | Lowest-VRAM fallback for maximum context fit |
+| `--cache-type-k q8_0 --cache-type-v q8_0` | Diagnostic/reference KV cache (highest VRAM) |
 | `--flash-attn on` | Required for quantized V cache |
-| `--batch-size 1024 --ubatch-size 512` | Validated MTP+TBQ4 server batch settings |
+| `--batch-size 1024 --ubatch-size 512` | Validated MTP+TurboQuant server batch settings |
 | `--cache-ram 128` | Keeps host-side prompt/cache reuse bounded in the tested server setup |
 | `--spec-type draft-mtp --spec-draft-n-max 3` | MTP; `n_max=3` was best observed here; `mtp` alias still works |
 | `LLAMA_MTP_PREFILL_CHUNK=512` | Chunks target hidden-state transfer into draft-prefill decode calls |
