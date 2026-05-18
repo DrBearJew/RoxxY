@@ -164,29 +164,30 @@ Set env per server entry or wrapper at runtime:
 | 35B MoE with MTP enabled | `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48 LLAMA_MTP_PREFILL_CHUNK=512 LLAMA_MTP_PREFILL_FORCE_MMQ=1` |
 
 ```bash
-# Recommended TurboQuant KV: q8_0 K + tbq4_0 V with MTP
+# 35B MoE default: prompt-processing selector, MTP disabled
+RDNA2_MATMUL_OPT_V1=1 \
+GGML_CUDA_MMQ_MAX_X=48 \
+./build-rocm/bin/llama-server \
+  -m /path/to/Qwen3.6-35B-A3B-Q4_K_M.gguf \
+  --cache-type-k q8_0 --cache-type-v tbq4_0 \
+  --flash-attn on \
+  --batch-size 1024 --ubatch-size 512 --cache-ram 128 \
+  --jinja --chat-template-file docs/rocm-tbq4-paths/qwen36-merged-template.jinja \
+  -c 32768 --port 8080 --no-webui --no-warmup --parallel 1
+
+# 35B MoE with explicit MTP enabled: combine the MoE selector with the MTP prefill env
+RDNA2_MATMUL_OPT_V1=1 \
+GGML_CUDA_MMQ_MAX_X=48 \
 LLAMA_MTP_PREFILL_CHUNK=512 \
 LLAMA_MTP_PREFILL_FORCE_MMQ=1 \
 ./build-rocm/bin/llama-server \
-  -m /path/to/Qwen3.6-27B-Q4_K_M-mtp.gguf \
+  -m /path/to/Qwen3.6-35B-A3B-MTP-Q4_K_M.gguf \
   --cache-type-k q8_0 --cache-type-v tbq4_0 \
   --flash-attn on \
   --batch-size 1024 --ubatch-size 512 --cache-ram 128 \
   --spec-type draft-mtp --spec-draft-n-max 3 \
   --jinja --chat-template-file docs/rocm-tbq4-paths/qwen36-merged-template.jinja \
-  -c 65536 --port 8080 --no-webui --no-warmup --parallel 1
-
-# Lowest-VRAM fallback when you need maximum context fit
-LLAMA_MTP_PREFILL_CHUNK=512 \
-LLAMA_MTP_PREFILL_FORCE_MMQ=1 \
-./build-rocm/bin/llama-server \
-  -m /path/to/Qwen3.6-27B-Q4_K_M-mtp.gguf \
-  --cache-type-k tbq4_0 --cache-type-v tbq4_0 \
-  --flash-attn on \
-  --batch-size 1024 --ubatch-size 512 --cache-ram 128 \
-  --spec-type draft-mtp --spec-draft-n-max 3 \
-  --jinja --chat-template-file docs/rocm-tbq4-paths/qwen36-merged-template.jinja \
-  -c 65536 --port 8080 --no-webui --no-warmup --parallel 1
+  -c 32768 --port 8080 --no-webui --no-warmup --parallel 1
 ```
 
 ### Quick toggles: experiments and Vulkan
