@@ -130,36 +130,58 @@ flowchart TD
 
 This separates working, deprecated, and untested instead of blending them together.
 
-## Build (ROCm / RX 7900 XTX)
+## Build (ROCm, Vulkan, or ROCm+Vulkan / RX 7900 XTX)
 
 ### Prerequisites
 
 - ROCm 7.2.3+ (tested: `/opt/rocm-7.2.3`)
 - HIP compiler: `/opt/rocm-7.2.3/bin/amdclang++`
+- Vulkan/RADV runtime for Vulkan builds
 - GPU: RDNA3 (`gfx1100`/`gfx1101`/`gfx1102`/`gfx1103`)
 - Model: Qwen3.6 MTP GGUF (see below)
 
-### Build
+### Build: choose one binary shape
+
+All three build shapes use the same branch and source tree. Pick the one that matches what you want to test:
+
+- `build-rocm`: ROCm/HIP production path for TurboQuant-style KV and 35B MoE prompt processing.
+- `build-vulkan`: Vulkan backend/device smoke path. In this experiment branch, compressed-KV Vulkan parity is **not** claimed.
+- `build-rocm-vulkan`: 2-in-1 binary that can expose both `ROCm0` and `Vulkan0`; choose the active backend at runtime with `--device`.
 
 ```bash
 git clone https://github.com/DrBearJew/llama.cpp.git
 cd llama.cpp
 git checkout tbq4-rdna3-experiment
 
+# ROCm/HIP production build
 cmake -B build-rocm -DGGML_HIP=ON \
   -DAMDGPU_TARGETS=gfx1100 \
   -DCMAKE_HIP_COMPILER=/opt/rocm-7.2.3/bin/amdclang++ \
   -DCMAKE_HIP_FLAGS="-DRDNA2_MATMUL_OPT_V1=1" \
   -DCMAKE_BUILD_TYPE=Release
-
 cmake --build build-rocm --target llama-server -j8
+
+# Vulkan-only backend check
+cmake -B build-vulkan -DGGML_VULKAN=ON -DGGML_HIP=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build-vulkan --target llama-server -j8
+
+# Combined ROCm+Vulkan 2-in-1 build
+cmake -B build-rocm-vulkan \
+  -DGGML_HIP=ON -DGGML_VULKAN=ON \
+  -DAMDGPU_TARGETS=gfx1100 \
+  -DCMAKE_HIP_COMPILER=/opt/rocm-7.2.3/bin/amdclang++ \
+  -DCMAKE_HIP_FLAGS="-DRDNA2_MATMUL_OPT_V1=1" \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build-rocm-vulkan --target llama-server -j8
 ```
 
-This builds one ROCm `llama-server` binary for all model routes in this README. Do **not** rebuild per model, and do **not** set model-route env here; those are runtime settings.
+Do **not** rebuild per model, and do **not** set model-route env at CMake time; those are runtime settings.
 
 The `-DRDNA2_MATMUL_OPT_V1=1` HIP compile flag only makes the RDNA2/RDNA3 MMQ selector code available. You still must set runtime `RDNA2_MATMUL_OPT_V1=1` to enable that path; if the binary is built without the compile flag, the runtime env is ignored.
 
-### Run
+### Run: ROCm routes
+
+Use `./build-rocm/bin/llama-server` for ROCm-only builds. If you built the combined binary, use `./build-rocm-vulkan/bin/llama-server --device ROCm0` instead.
 
 Set env per server entry or wrapper at runtime. MTP examples use `--batch-size 512 --ubatch-size 512` to match `LLAMA_MTP_PREFILL_CHUNK=512`; the 35B no-MTP example keeps `--batch-size 1024 --ubatch-size 512` for prompt processing.
 
@@ -196,7 +218,49 @@ LLAMA_MTP_PREFILL_FORCE_MMQ=1 \
   -c 32768 --port 8080 --no-webui --no-warmup --parallel 1
 ```
 
-### Quick toggles: experiments and Vulkan
+### Run: Vulkan or combined backend checks
+
+Vulkan is useful as a backend check today. Compressed-KV Vulkan parity is **not** claimed yet in this experiment branch.
+
+```bash
+# Vulkan-only: check device name; expect Vulkan0 on this box
+LD_LIBRARY_PATH=$PWD/build-vulkan/bin \
+  ./build-vulkan/bin/llama-server --list-devices
+
+# Vulkan-only: start a small server smoke
+MODEL=/path/to/model.gguf
+LD_LIBRARY_PATH=$PWD/build-vulkan/bin \
+  ./build-vulkan/bin/llama-server \
+  -m "$MODEL" --device Vulkan0 \
+  --ctx-size 4096 --host 127.0.0.1 --port 8080 \
+  --no-webui --no-warmup -ngl 99
+
+# Combined build: list devices; expect both ROCm0 and Vulkan0 when both backends load
+LD_LIBRARY_PATH=$PWD/build-rocm-vulkan/bin:/opt/rocm-7.2.3/lib:/opt/amdgpu/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-} \
+  ./build-rocm-vulkan/bin/llama-server --list-devices
+
+# Combined build: pick Vulkan explicitly
+LD_LIBRARY_PATH=$PWD/build-rocm-vulkan/bin:/opt/rocm-7.2.3/lib:/opt/amdgpu/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-} \
+  ./build-rocm-vulkan/bin/llama-server \
+  -m "$MODEL" --device Vulkan0 \
+  --ctx-size 4096 --no-webui --no-warmup -ngl 99
+
+# Combined build: pick ROCm/HIP explicitly
+LD_LIBRARY_PATH=$PWD/build-rocm-vulkan/bin:/opt/rocm-7.2.3/lib:/opt/amdgpu/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-} \
+  ./build-rocm-vulkan/bin/llama-server \
+  -m "$MODEL" --device ROCm0 \
+  --cache-type-k q8_0 --cache-type-v tbq4_0 \
+  --flash-attn on --ctx-size 4096 --no-webui --no-warmup -ngl 99
+```
+
+Docker helper:
+
+```bash
+scripts/vulkan/start-vulkan-docker-server.sh --list-devices
+PORT=8080 CTX_SIZE=4096 scripts/vulkan/start-vulkan-docker-server.sh /path/to/model.gguf --no-warmup
+```
+
+### Quick toggles: experiments
 
 Keep production boring. Flip these only when testing:
 
@@ -213,48 +277,6 @@ Keep production boring. Flip these only when testing:
 | Deprecated rocWMMA FA | `TBQ4_WMMA_FATTN=1`, `COMPRESSED_KV_WMMA_FATTN=1` | Do not use for now; VEC is the production path |
 | Compressed-KV FA logging | `COMPRESSED_KV_FATTN_LOG=1` | Diagnostic logging only; not a performance setting |
 | IQ4_XS scratch MMQ | `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_IQ4_XS_MMQ_SCRATCH16K=1` | Coherent, but slower so far |
-| Vulkan device check | `LD_LIBRARY_PATH=$PWD/build-vulkan/bin ./build-vulkan/bin/llama-server --list-devices` | Expect `Vulkan0` |
-| Use Vulkan in combined build | `--device Vulkan0` | Combined build also has `ROCm0` |
-
-### Start Vulkan
-
-Vulkan is useful as a backend check today. Compressed-KV Vulkan parity is **not** claimed yet.
-
-```bash
-# Build Vulkan-only server
-cmake -B build-vulkan -DGGML_VULKAN=ON -DGGML_HIP=OFF -DCMAKE_BUILD_TYPE=Release
-cmake --build build-vulkan --target llama-server -j8
-
-# Check device name; expect Vulkan0 on this box
-LD_LIBRARY_PATH=$PWD/build-vulkan/bin \
-  ./build-vulkan/bin/llama-server --list-devices
-
-# Start a small Vulkan server smoke
-MODEL=/path/to/model.gguf
-LD_LIBRARY_PATH=$PWD/build-vulkan/bin \
-  ./build-vulkan/bin/llama-server \
-  -m "$MODEL" --device Vulkan0 \
-  --ctx-size 4096 --host 127.0.0.1 --port 8080 \
-  --no-webui --no-warmup -ngl 99
-```
-
-Combined ROCm+Vulkan build:
-
-```bash
-LD_LIBRARY_PATH=$PWD/build-rocm-vulkan/bin:/opt/rocm-7.2.3/lib:/opt/amdgpu/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-} \
-  ./build-rocm-vulkan/bin/llama-server --list-devices
-
-# Pick Vulkan explicitly from the combined build
-LD_LIBRARY_PATH=$PWD/build-rocm-vulkan/bin:/opt/rocm-7.2.3/lib:/opt/amdgpu/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-} \
-  ./build-rocm-vulkan/bin/llama-server -m "$MODEL" --device Vulkan0 --ctx-size 4096 --no-webui -ngl 99
-```
-
-Docker helper:
-
-```bash
-scripts/vulkan/start-vulkan-docker-server.sh --list-devices
-PORT=8080 CTX_SIZE=4096 scripts/vulkan/start-vulkan-docker-server.sh /path/to/model.gguf --no-warmup
-```
 
 ### Chat template (Qwen 3.6)
 
