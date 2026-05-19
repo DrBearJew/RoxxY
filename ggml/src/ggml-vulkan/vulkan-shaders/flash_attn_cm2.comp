@@ -38,6 +38,7 @@ uint fa_block_elems(uint ty) {
         case 7u:  return uint(QUANT_K_Q5_1);
         case 8u:  return uint(QUANT_K_Q8_0);
         case 41u: return uint(QUANT_K_Q1_0);
+        case 43u: return uint(QUANT_K_TBQ4_0);
         default:
             return 1u;
     }
@@ -52,6 +53,7 @@ float16_t faDecodeK(const decodeBufFA_K bl_in, const uint blockCoords[2], const 
         case 7u: return dequantFuncQ5_1(decodeBufQ5_1(bl_in), blockCoords, coordInBlock);
         case 8u: return dequantFuncQ8_0(decodeBufQ8_0(bl_in), blockCoords, coordInBlock);
         case 41u: return dequantFuncQ1_0(decodeBufQ1_0(bl_in), blockCoords, coordInBlock);
+        case 43u: return dequantFuncTBQ4_0(decodeBufTBQ4_0(bl_in), blockCoords, coordInBlock);
         default: return float16_t(0);
     }
 }
@@ -65,6 +67,7 @@ float16_t faDecodeV(const decodeBufFA_V bl_in, const uint blockCoords[2], const 
         case 7u: return dequantFuncQ5_1(decodeBufQ5_1(bl_in), blockCoords, coordInBlock);
         case 8u: return dequantFuncQ8_0(decodeBufQ8_0(bl_in), blockCoords, coordInBlock);
         case 41u: return dequantFuncQ1_0(decodeBufQ1_0(bl_in), blockCoords, coordInBlock);
+        case 43u: return dequantFuncTBQ4_0(decodeBufTBQ4_0(bl_in), blockCoords, coordInBlock);
         default: return float16_t(0);
     }
 }

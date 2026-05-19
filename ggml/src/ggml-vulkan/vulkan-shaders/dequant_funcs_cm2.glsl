@@ -63,6 +63,56 @@ float16_t dequantFuncTQ3_0(const in decodeBufTQ3_0 bl, const in uint blockCoords
     return tq3_centroids_cm2[ci] * d;
 }
 
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufTBQ4_0 {
+   block_tbq4_0_packed16 block;
+};
+
+const float tbq4_centroids_cm2[16] = float[16](
+    -0.241556f, -0.182907f, -0.143047f, -0.111065f,
+    -0.083317f, -0.058069f, -0.034311f, -0.011353f,
+     0.011353f,  0.034311f,  0.058069f,  0.083317f,
+     0.111065f,  0.143047f,  0.182907f,  0.241556f
+);
+
+const float tbq4_wht_s1_cm2[128] = float[128](
+    -1, 1, 1,-1,-1, 1,-1, 1,-1,-1, 1, 1, 1, 1, 1, 1, 1,-1, 1,-1, 1,-1,-1, 1, 1, 1,-1, 1, 1,-1,-1,-1,
+    -1, 1, 1,-1, 1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1, 1, 1, 1,-1,-1,-1,-1,-1, 1,-1, 1, 1, 1, 1,-1, 1,
+    -1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1, 1,-1,-1, 1, 1, 1,-1,-1, 1, 1,-1, 1, 1,-1, 1,-1,
+    -1, 1, 1,-1, 1,-1, 1,-1, 1, 1, 1, 1,-1, 1,-1, 1, 1,-1, 1, 1,-1,-1,-1,-1,-1, 1, 1,-1, 1, 1,-1, 1
+);
+
+const float tbq4_wht_s2_cm2[128] = float[128](
+     1, 1, 1, 1,-1, 1, 1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1,-1, 1, 1, 1,
+     1, 1,-1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1, 1,-1, 1,-1, 1, 1, 1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1,
+     1,-1, 1,-1,-1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1, 1,-1, 1,-1, 1, 1,-1, 1,-1,-1,-1,-1, 1,-1,-1, 1,-1,
+     1,-1, 1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1, 1,-1, 1,-1,-1,-1,-1,-1, 1,-1
+);
+
+uint tbq4_cm2_code(const in decodeBufTBQ4_0 bl, const uint j) {
+    const uint byte_idx = j >> 1;
+    const uint word = uint(bl.block.qs[byte_idx >> 1]);
+    const uint byte_val = ((byte_idx & 1u) == 0u) ? (word & 0xFFu) : ((word >> 8) & 0xFFu);
+    return ((j & 1u) == 0u) ? (byte_val & 0xFu) : ((byte_val >> 4) & 0xFu);
+}
+
+float16_t dequantFuncTBQ4_0(const in decodeBufTBQ4_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const uint out_idx = coordInBlock[1] & 127u;
+    float sum = 0.0f;
+
+    [[unroll]] for (uint j = 0u; j < 128u; ++j) {
+        const uint ci = tbq4_cm2_code(bl, j);
+        float v = tbq4_centroids_cm2[ci] * tbq4_wht_s2_cm2[j];
+        if ((bitCount(out_idx & j) & 1) != 0) {
+            v = -v;
+        }
+        sum += v;
+    }
+
+    const float inv_sqrt_128 = 0.08838834764831845f;
+    return float16_t(sum * inv_sqrt_128 * tbq4_wht_s1_cm2[out_idx] * float(bl.block.d));
+}
+
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufQ4_0 {
    block_q4_0_packed16 block;
 };
@@ -803,6 +853,8 @@ float16_t dequantFuncNVFP4(const in decodeBufNVFP4 bl, const in uint blockCoords
 #define dequantFuncA dequantFuncNVFP4
 #elif defined(DATA_A_TQ3_0)
 #define dequantFuncA dequantFuncTQ3_0
+#elif defined(DATA_A_TBQ4_0)
+#define dequantFuncA dequantFuncTBQ4_0
 #elif defined(DATA_A_F32)
 #define dequantFuncA dequantFuncF32
 #endif

@@ -263,6 +263,132 @@ void quantize(uint dst_idx, uint src_idx)
 }
 #endif
 
+#if defined(DATA_A_TBQ4_0)
+const float tbq4_centroids_q[16] = float[16](
+    -0.241556f, -0.182907f, -0.143047f, -0.111065f,
+    -0.083317f, -0.058069f, -0.034311f, -0.011353f,
+     0.011353f,  0.034311f,  0.058069f,  0.083317f,
+     0.111065f,  0.143047f,  0.182907f,  0.241556f
+);
+
+const float tbq4_midpoints_q[15] = float[15](
+    -0.212232f, -0.162977f, -0.127056f, -0.097191f, -0.070693f,
+    -0.046190f, -0.022832f,  0.000000f,  0.022832f,  0.046190f,
+     0.070693f,  0.097191f,  0.127056f,  0.162977f,  0.212232f
+);
+
+const float tbq4_wht_s1_q[128] = float[128](
+    -1, 1, 1,-1,-1, 1,-1, 1,-1,-1, 1, 1, 1, 1, 1, 1, 1,-1, 1,-1, 1,-1,-1, 1, 1, 1,-1, 1, 1,-1,-1,-1,
+    -1, 1, 1,-1, 1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1, 1, 1, 1,-1,-1,-1,-1,-1, 1,-1, 1, 1, 1, 1,-1, 1,
+    -1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1, 1,-1,-1, 1, 1, 1,-1,-1, 1, 1,-1, 1, 1,-1, 1,-1,
+    -1, 1, 1,-1, 1,-1, 1,-1, 1, 1, 1, 1,-1, 1,-1, 1, 1,-1, 1, 1,-1,-1,-1,-1,-1, 1, 1,-1, 1, 1,-1, 1
+);
+
+const float tbq4_wht_s2_q[128] = float[128](
+     1, 1, 1, 1,-1, 1, 1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1,-1, 1, 1, 1,
+     1, 1,-1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1, 1,-1, 1,-1, 1, 1, 1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1,
+     1,-1, 1,-1,-1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1, 1,-1, 1,-1, 1, 1,-1, 1,-1,-1,-1,-1, 1,-1,-1, 1,-1,
+     1,-1, 1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1, 1,-1, 1,-1,-1,-1,-1,-1, 1,-1
+);
+
+void tbq4_fwht_128_q(inout float x[128]) {
+    [[unroll]] for (int h = 1; h < 128; h *= 2) {
+        [[unroll]] for (int i = 0; i < 128; i += h * 2) {
+            [[unroll]] for (int j = i; j < i + h; j++) {
+                float a = x[j];
+                float b = x[j + h];
+                x[j] = a + b;
+                x[j + h] = a - b;
+            }
+        }
+    }
+    const float inv_sqrt_128 = 0.08838834764831845f;
+    [[unroll]] for (int i = 0; i < 128; i++) {
+        x[i] *= inv_sqrt_128;
+    }
+}
+
+void tbq4_rotate_forward_q(inout float x[128]) {
+    [[unroll]] for (int i = 0; i < 128; i++) {
+        x[i] *= tbq4_wht_s1_q[i];
+    }
+    tbq4_fwht_128_q(x);
+    [[unroll]] for (int i = 0; i < 128; i++) {
+        x[i] *= tbq4_wht_s2_q[i];
+    }
+}
+
+uint tbq4_find_nearest_q(float val) {
+    if (val < tbq4_midpoints_q[7]) {
+        if (val < tbq4_midpoints_q[3]) {
+            if (val < tbq4_midpoints_q[1]) {
+                return val < tbq4_midpoints_q[0] ? 0u : 1u;
+            } else {
+                return val < tbq4_midpoints_q[2] ? 2u : 3u;
+            }
+        } else {
+            if (val < tbq4_midpoints_q[5]) {
+                return val < tbq4_midpoints_q[4] ? 4u : 5u;
+            } else {
+                return val < tbq4_midpoints_q[6] ? 6u : 7u;
+            }
+        }
+    } else {
+        if (val < tbq4_midpoints_q[11]) {
+            if (val < tbq4_midpoints_q[9]) {
+                return val < tbq4_midpoints_q[8] ? 8u : 9u;
+            } else {
+                return val < tbq4_midpoints_q[10] ? 10u : 11u;
+            }
+        } else {
+            if (val < tbq4_midpoints_q[13]) {
+                return val < tbq4_midpoints_q[12] ? 12u : 13u;
+            } else {
+                return val < tbq4_midpoints_q[14] ? 14u : 15u;
+            }
+        }
+    }
+}
+
+void quantize(uint dst_idx, uint src_idx)
+{
+    float norm_sq = 0.0f;
+    [[unroll]] for (int j = 0; j < QUANT_K_TBQ4_0; j++) {
+        const float v = data_s[src_idx + j];
+        norm_sq += v * v;
+    }
+
+    float norm = sqrt(norm_sq);
+    float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
+
+    float x[128];
+    [[unroll]] for (int j = 0; j < QUANT_K_TBQ4_0; j++) {
+        x[j] = data_s[src_idx + j] * inv_norm;
+    }
+    tbq4_rotate_forward_q(x);
+
+    uint8_t qs[QUANT_K_TBQ4_0 / 2];
+    [[unroll]] for (int j = 0; j < QUANT_K_TBQ4_0; j += 2) {
+        uint idx0 = tbq4_find_nearest_q(x[j]);
+        uint idx1 = tbq4_find_nearest_q(x[j + 1]);
+        qs[j / 2] = uint8_t((idx1 << 4) | idx0);
+        data_q[dst_idx].qs[j / 2] = qs[j / 2];
+    }
+
+    float recon_sq = 0.0f;
+    [[unroll]] for (int j = 0; j < QUANT_K_TBQ4_0; j++) {
+        uint q = uint(qs[j / 2]);
+        uint idx = ((j & 1) != 0) ? (q >> 4) : (q & 0xFu);
+        float r = tbq4_centroids_q[idx];
+        recon_sq += r * r;
+    }
+
+    float recon_norm = sqrt(recon_sq);
+    float corrected = recon_norm > 1e-10f ? norm / recon_norm : norm;
+    data_q[dst_idx].d = float16_t(corrected);
+}
+#endif
+
 #if defined(DATA_A_IQ4_NL)
 uint best_index(float x) {
     if (x <= kvalues_iq4nl[0]) return 0;

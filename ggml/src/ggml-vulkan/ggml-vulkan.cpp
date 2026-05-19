@@ -856,6 +856,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_conv2d_dw_cwhn_f32, pipeline_conv2d_dw_cwhn_f16_f32;
 
     std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16[GGML_TYPE_COUNT];
+    std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16_q8_0_tbq4_0;
 
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
 
@@ -3086,9 +3087,17 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat2(const vk_device& device
     return result;
 }
 
+static bool ggml_vk_fa_scalar_mixed_q8_tbq4(ggml_type k_type, ggml_type v_type) {
+    return k_type == GGML_TYPE_Q8_0 && v_type == GGML_TYPE_TBQ4_0;
+}
+
 static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
-    // Mixed K/V is only implemented on the coopmat2 (flash_attn_cm2) path; never use scalar/cm1.
+    // Generic mixed K/V is implemented on the coopmat2 (flash_attn_cm2) path.
+    // RDNA3/RADV lacks coopmat2, so keep the q8_0 K + tbq4_0 V KV path on scalar Vulkan instead of falling back to CPU.
     if (k_type != v_type) {
+        if (ggml_vk_fa_scalar_mixed_q8_tbq4(k_type, v_type)) {
+            return get_fa_tuning_params_scalar(device, hsk, hsv, n_rows, n_kv, k_type, f32acc);
+        }
         GGML_ASSERT(device->coopmat2);
         return get_fa_tuning_params_coopmat2(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
     }
@@ -3662,6 +3671,38 @@ static void ggml_vk_load_shaders(vk_device& device) {
     }
 #undef CREATE_FA_CM2_MIXED
 #endif
+#define CREATE_FA_Q8_TBQ4(SUFFIX) \
+        for (auto &fa : device->pipeline_flash_attn_f32_f16_q8_0_tbq4_0) { \
+            FaCodePath path = fa.first.path; \
+            uint32_t Br = fa.first.Br; \
+            uint32_t Bc = fa.first.Bc; \
+            bool aligned = fa.first.aligned; \
+            bool f32acc = fa.first.f32acc; \
+            uint32_t fa_sgs = fa.first.subgroup_size; \
+            bool fa_ds = fa.first.subgroup_size == 0; \
+            if (path == FA_SCALAR) { \
+                if (aligned) { \
+                    if (f32acc) { \
+                        ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_q8_0_tbq4_0_aligned_f32acc", flash_attn_f32_f16_q8_0_tbq4_0 ## SUFFIX ## _len,  flash_attn_f32_f16_q8_0_tbq4_0 ## SUFFIX ## _data,  "main", 7, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), Bc, true, !fa_ds, (!fa_ds ? fa_sgs : 0)); \
+                    } else { \
+                        ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_q8_0_tbq4_0_aligned_f16acc", flash_attn_f32_f16_q8_0_tbq4_0_f16acc ## SUFFIX ## _len,  flash_attn_f32_f16_q8_0_tbq4_0_f16acc ## SUFFIX ## _data,  "main", 7, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), Bc, true, !fa_ds, (!fa_ds ? fa_sgs : 0)); \
+                    } \
+                } else { \
+                    if (f32acc) { \
+                        ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_q8_0_tbq4_0_f32acc", flash_attn_f32_f16_q8_0_tbq4_0 ## SUFFIX ## _len,  flash_attn_f32_f16_q8_0_tbq4_0 ## SUFFIX ## _data,  "main", 7, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), 1, true, !fa_ds, (!fa_ds ? fa_sgs : 0)); \
+                    } else { \
+                        ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_q8_0_tbq4_0_f16acc", flash_attn_f32_f16_q8_0_tbq4_0_f16acc ## SUFFIX ## _len,  flash_attn_f32_f16_q8_0_tbq4_0_f16acc ## SUFFIX ## _data,  "main", 7, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), 1, true, !fa_ds, (!fa_ds ? fa_sgs : 0)); \
+                    } \
+                } \
+            } \
+        }
+    if (device->fp16) {
+        CREATE_FA_Q8_TBQ4()
+    } else {
+        CREATE_FA_Q8_TBQ4(_fp32)
+    }
+#undef CREATE_FA_Q8_TBQ4
+
 #undef CREATE_FA
 
     const int mul_mat_id_param_count = 5;
@@ -4545,6 +4586,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_Q8_0], "set_rows_q8_0" #itype, set_rows_q8_0 ## itype ## _len, set_rows_q8_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_IQ4_NL], "set_rows_iq4_nl" #itype, set_rows_iq4_nl ## itype ## _len, set_rows_iq4_nl ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_TQ3_0], "set_rows_tq3_0" #itype, set_rows_tq3_0 ## itype ## _len, set_rows_tq3_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_TBQ4_0], "set_rows_tbq4_0" #itype, set_rows_tbq4_0 ## itype ## _len, set_rows_tbq4_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_PLANAR3_0], "set_rows_planar3_0" #itype, set_rows_planar3_0 ## itype ## _len, set_rows_planar3_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_ISO3_0], "set_rows_iso3_0" #itype, set_rows_iso3_0 ## itype ## _len, set_rows_iso3_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true);
 
@@ -9156,7 +9198,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k->type, v->type, f32acc);
 
     if (tuning_params.path != FA_COOPMAT2) {
-        GGML_ASSERT(k->type == v->type);
+        GGML_ASSERT(k->type == v->type || ggml_vk_fa_scalar_mixed_q8_tbq4(k->type, v->type));
     }
 
     const uint32_t q_stride = (uint32_t)(nbq1 / ggml_type_size(q->type));
@@ -9202,7 +9244,9 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     {
         std::lock_guard<std::recursive_mutex> guard(ctx->device->mutex);
-        auto &pipelines = ctx->device->pipeline_flash_attn_f32_f16[k->type];
+        auto &pipelines = ggml_vk_fa_scalar_mixed_q8_tbq4(k->type, v->type) && tuning_params.path == FA_SCALAR ?
+                ctx->device->pipeline_flash_attn_f32_f16_q8_0_tbq4_0 :
+                ctx->device->pipeline_flash_attn_f32_f16[k->type];
         auto it = pipelines.find(fa_pipeline_state);
         if (it != pipelines.end()) {
             pipeline = it->second;
@@ -15686,8 +15730,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (op->src[3] && op->src[3]->type != GGML_TYPE_F16) {
                     return false;
                 }
-                // mismatching K/V type is currently supported for coopmat2 only.
-                if (op->src[1]->type != op->src[2]->type && !coopmat2) {
+                // Generic mismatching K/V type is supported for coopmat2 only; q8_0 K + tbq4_0 V has a scalar Vulkan path for RDNA3/RADV.
+                if (op->src[1]->type != op->src[2]->type && !coopmat2 &&
+                    !ggml_vk_fa_scalar_mixed_q8_tbq4(op->src[1]->type, op->src[2]->type)) {
                     return false;
                 }
                 auto fa_kv_ok = [coopmat2](ggml_type t) {
@@ -15700,6 +15745,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_TQ3_0:
+                    case GGML_TYPE_TBQ4_0:
                         return true;
                     case GGML_TYPE_Q1_0:
                         return coopmat2;
@@ -15765,6 +15811,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_TQ3_0:
+                    case GGML_TYPE_TBQ4_0:
                     case GGML_TYPE_PLANAR3_0:
                     case GGML_TYPE_ISO3_0:
                         return true;

@@ -87,7 +87,10 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 
 #define BINDING_IDX_K 0
 #define BINDING_IDX_V 1
-#if defined(DATA_A_F32)
+#if defined(DATA_K_Q8_0) && defined(DATA_V_TBQ4_0)
+layout (binding = 1) readonly buffer K_PACKED16 {block_q8_0_packed16 k_data_packed16[];} k_packed;
+layout (binding = 2) readonly buffer V_PACKED16 {block_tbq4_0_packed16 v_data_packed16[];} v_packed;
+#elif defined(DATA_A_F32)
 layout (binding = 1) readonly buffer K_PACKED {vec4 k_data_packed[];} k_packed;
 layout (binding = 2) readonly buffer V_PACKED {vec4 v_data_packed[];} v_packed;
 #elif defined(A_TYPE_PACKED16)
@@ -102,6 +105,65 @@ layout (binding = 2) readonly buffer V_PACKED32 {A_TYPE_PACKED32 v_data_packed32
 
 #ifndef BLOCK_SIZE
 #define BLOCK_SIZE 1
+#endif
+
+#if defined(DATA_K_Q8_0) && defined(DATA_V_TBQ4_0)
+#undef BLOCK_SIZE
+#define BLOCK_SIZE 128
+#define K_BLOCK_SIZE 32
+#define V_BLOCK_SIZE 128
+#define K_BLOCK_BYTE_SIZE 34
+#define V_BLOCK_BYTE_SIZE 66
+
+const float tbq4_centroids_scalar_mixed[16] = float[16](
+    -0.241556f, -0.182907f, -0.143047f, -0.111065f,
+    -0.083317f, -0.058069f, -0.034311f, -0.011353f,
+     0.011353f,  0.034311f,  0.058069f,  0.083317f,
+     0.111065f,  0.143047f,  0.182907f,  0.241556f
+);
+
+const float tbq4_wht_s1_scalar_mixed[128] = float[128](
+    -1, 1, 1,-1,-1, 1,-1, 1,-1,-1, 1, 1, 1, 1, 1, 1, 1,-1, 1,-1, 1,-1,-1, 1, 1, 1,-1, 1, 1,-1,-1,-1,
+    -1, 1, 1,-1, 1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1, 1, 1, 1,-1,-1,-1,-1,-1, 1,-1, 1, 1, 1, 1,-1, 1,
+    -1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1, 1,-1,-1, 1, 1, 1,-1,-1, 1, 1,-1, 1, 1,-1, 1,-1,
+    -1, 1, 1,-1, 1,-1, 1,-1, 1, 1, 1, 1,-1, 1,-1, 1, 1,-1, 1, 1,-1,-1,-1,-1,-1, 1, 1,-1, 1, 1,-1, 1
+);
+
+const float tbq4_wht_s2_scalar_mixed[128] = float[128](
+     1, 1, 1, 1,-1, 1, 1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1,-1, 1, 1, 1,
+     1, 1,-1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1, 1,-1, 1,-1, 1, 1, 1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1,
+     1,-1, 1,-1,-1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1, 1,-1, 1,-1, 1, 1,-1, 1,-1,-1,-1,-1, 1,-1,-1, 1,-1,
+     1,-1, 1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1, 1,-1, 1,-1,-1,-1,-1,-1, 1,-1
+);
+
+uint tbq4_scalar_mixed_code(uint ib, uint j, uint a_offset) {
+    const uint byte_idx = j >> 1;
+    const uint word = uint(v_packed.v_data_packed16[a_offset + ib].qs[byte_idx >> 1]);
+    const uint byte_val = ((byte_idx & 1u) == 0u) ? (word & 0xFFu) : ((word >> 8) & 0xFFu);
+    return ((j & 1u) == 0u) ? (byte_val & 0xFu) : ((byte_val >> 4) & 0xFu);
+}
+
+FLOAT_TYPE tbq4_scalar_mixed_dequant_rot(uint ib, uint out_idx, uint a_offset) {
+    out_idx &= 127u;
+    const uint ci = tbq4_scalar_mixed_code(ib, out_idx, a_offset);
+    return FLOAT_TYPE(float(v_packed.v_data_packed16[a_offset + ib].d) * tbq4_centroids_scalar_mixed[ci] * tbq4_wht_s2_scalar_mixed[out_idx]);
+}
+
+FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    if (binding_idx == BINDING_IDX_K) {
+        const i8vec2 v0 = unpack8(int32_t(k_packed.k_data_packed16[a_offset + ib].qs[iqs / 2])).xy;
+        const i8vec2 v1 = unpack8(int32_t(k_packed.k_data_packed16[a_offset + ib].qs[iqs / 2 + 1])).xy;
+        return FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].d) * FLOAT_TYPEV4(v0.x, v0.y, v1.x, v1.y);
+    } else {
+        // Accumulate TBQ4 V in rotated space inside attention. The inverse FWHT is applied once
+        // to the final output vector, not for every KV row/value load.
+        return FLOAT_TYPEV4(
+            tbq4_scalar_mixed_dequant_rot(ib, iqs + 0u, a_offset),
+            tbq4_scalar_mixed_dequant_rot(ib, iqs + 1u, a_offset),
+            tbq4_scalar_mixed_dequant_rot(ib, iqs + 2u, a_offset),
+            tbq4_scalar_mixed_dequant_rot(ib, iqs + 3u, a_offset));
+    }
+}
 #endif
 
 #if defined(DATA_A_F32)
@@ -258,6 +320,19 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
         return FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].d) * FLOAT_TYPEV4(v0.x, v0.y, v1.x, v1.y);
     }
 }
+#endif
+
+#ifndef K_BLOCK_SIZE
+#define K_BLOCK_SIZE BLOCK_SIZE
+#endif
+#ifndef V_BLOCK_SIZE
+#define V_BLOCK_SIZE BLOCK_SIZE
+#endif
+#ifndef K_BLOCK_BYTE_SIZE
+#define K_BLOCK_BYTE_SIZE BLOCK_BYTE_SIZE
+#endif
+#ifndef V_BLOCK_BYTE_SIZE
+#define V_BLOCK_BYTE_SIZE BLOCK_BYTE_SIZE
 #endif
 
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))

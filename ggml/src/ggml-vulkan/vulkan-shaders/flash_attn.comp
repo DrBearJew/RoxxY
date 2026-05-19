@@ -100,6 +100,51 @@ const uint32_t tmpsh_size = (SubGroupSize > 0) ? (row_split == 1 ? num_subgroups
 shared float tmpsh[tmpsh_size];
 shared FLOAT_TYPEV4 tmpshv4[tmpsh_size];
 
+#if defined(DATA_K_Q8_0) && defined(DATA_V_TBQ4_0)
+shared FLOAT_TYPEV4 tbq4_ofsh[Br * (HSV / 4)];
+
+FLOAT_TYPE tbq4_inverse_rotated_of(uint row, uint out_idx) {
+    const uint local_out = out_idx & 127u;
+    const uint block_start = out_idx & ~127u;
+    float sum = 0.0f;
+    [[dont_unroll]]
+    for (uint j = 0u; j < 128u; ++j) {
+        const uint src_idx = block_start + j;
+        const FLOAT_TYPEV4 z4 = tbq4_ofsh[row * (HSV / 4) + src_idx / 4u];
+        float z = float(z4[src_idx & 3u]);
+        if ((bitCount(local_out & j) & 1) != 0) {
+            z = -z;
+        }
+        sum += z;
+    }
+    const float inv_sqrt_128 = 0.08838834764831845f;
+    return FLOAT_TYPE(sum * inv_sqrt_128 * tbq4_wht_s1_scalar_mixed[local_out]);
+}
+
+#define TBQ4_INVERSE_ROTATE_OF() \
+    [[unroll]] for (uint32_t tbq4_r = 0; tbq4_r < rows_per_thread; ++tbq4_r) { \
+        const uint tbq4_row = tile_row(tbq4_r); \
+        [[unroll]] for (uint32_t tbq4_d = 0; tbq4_d < HSV_per_thread / 4; ++tbq4_d) { \
+            tbq4_ofsh[tbq4_row * (HSV / 4) + tbq4_d * D_split + d_tid] = Of[tbq4_r][tbq4_d]; \
+        } \
+    } \
+    barrier(); \
+    [[unroll]] for (uint32_t tbq4_r = 0; tbq4_r < rows_per_thread; ++tbq4_r) { \
+        const uint tbq4_row = tile_row(tbq4_r); \
+        [[unroll]] for (uint32_t tbq4_d = 0; tbq4_d < HSV_per_thread / 4; ++tbq4_d) { \
+            const uint tbq4_out_base = (tbq4_d * D_split + d_tid) * 4u; \
+            Of[tbq4_r][tbq4_d] = FLOAT_TYPEV4( \
+                tbq4_inverse_rotated_of(tbq4_row, tbq4_out_base + 0u), \
+                tbq4_inverse_rotated_of(tbq4_row, tbq4_out_base + 1u), \
+                tbq4_inverse_rotated_of(tbq4_row, tbq4_out_base + 2u), \
+                tbq4_inverse_rotated_of(tbq4_row, tbq4_out_base + 3u)); \
+        } \
+    } \
+    barrier()
+#else
+#define TBQ4_INVERSE_ROTATE_OF()
+#endif
+
 const uint32_t masksh_stride = Br + 1;
 shared FLOAT_TYPE masksh[Bc * masksh_stride];
 
@@ -233,8 +278,8 @@ void main() {
     uint32_t mo_offset = mo_stride * i;
 
 #if BLOCK_SIZE > 1
-    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / BLOCK_BYTE_SIZE;
-    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / BLOCK_BYTE_SIZE;
+    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / K_BLOCK_BYTE_SIZE;
+    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / V_BLOCK_BYTE_SIZE;
 #else
     uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / 2;
     uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / 2;
@@ -314,9 +359,9 @@ void main() {
                     FLOAT_TYPEV4 K_Tf = FLOAT_TYPEV4(0);
                     if (!KV_bounds_check || j * Bc + c < KV) {
 #if BLOCK_SIZE > 1
-                        uint coord = (j * Bc + c) * k_stride * BLOCK_SIZE + 4 * d;
-                        uint ib = coord / BLOCK_SIZE;
-                        uint iqs = (coord % BLOCK_SIZE);
+                        uint coord = (j * Bc + c) * k_stride * K_BLOCK_SIZE + 4 * d;
+                        uint ib = coord / K_BLOCK_SIZE;
+                        uint iqs = (coord % K_BLOCK_SIZE);
                         K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
 #else
                         K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + c) * k_stride / 4 + d]);
@@ -366,9 +411,9 @@ void main() {
 
                     #ifdef USE_SEMI_QUANT
                     {
-                        uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
-                        uint ib = coord / BLOCK_SIZE;
-                        uint iqs = (coord % BLOCK_SIZE);
+                        uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * K_BLOCK_SIZE + 4 * (d * D_split + d_tid);
+                        uint ib = coord / K_BLOCK_SIZE;
+                        uint iqs = (coord % K_BLOCK_SIZE);
                         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                             Sf[r][c] += semi_quant_qk_dot(ib, iqs, k_offset, Q_cache[r]);
                         }
@@ -379,9 +424,9 @@ void main() {
                         K_Tf = kvsh[(c * cols_per_iter + col_tid) * kvsh_stride + (d * D_split + d_tid)];
                     } else {
 #if BLOCK_SIZE > 1
-                        uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
-                        uint ib = coord / BLOCK_SIZE;
-                        uint iqs = (coord % BLOCK_SIZE);
+                        uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * K_BLOCK_SIZE + 4 * (d * D_split + d_tid);
+                        uint ib = coord / K_BLOCK_SIZE;
+                        uint iqs = (coord % K_BLOCK_SIZE);
                         K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
 #else
                         K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * k_stride / 4 + d * D_split + d_tid]);
@@ -402,9 +447,9 @@ void main() {
                 [[unroll]] for (uint32_t d = 0; d < HSK_per_thread / 4; ++d) {
 #ifdef USE_SEMI_QUANT
                     {
-                        uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
-                        uint ib = coord / BLOCK_SIZE;
-                        uint iqs = (coord % BLOCK_SIZE);
+                        uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * K_BLOCK_SIZE + 4 * (d * D_split + d_tid);
+                        uint ib = coord / K_BLOCK_SIZE;
+                        uint iqs = (coord % K_BLOCK_SIZE);
                         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                             Sf[r][c] += semi_quant_qk_dot(ib, iqs, k_offset, Qf[tile_row(r) * qf_stride + d * D_split + d_tid]);
                         }
@@ -415,9 +460,9 @@ void main() {
                         K_Tf = kvsh[(c * cols_per_iter + col_tid) * kvsh_stride + (d * D_split + d_tid)];
                     } else {
 #if BLOCK_SIZE > 1
-                        uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
-                        uint ib = coord / BLOCK_SIZE;
-                        uint iqs = (coord % BLOCK_SIZE);
+                        uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * K_BLOCK_SIZE + 4 * (d * D_split + d_tid);
+                        uint ib = coord / K_BLOCK_SIZE;
+                        uint iqs = (coord % K_BLOCK_SIZE);
                         K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
 #else
                         K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * k_stride / 4 + d * D_split + d_tid]);
@@ -475,9 +520,9 @@ void main() {
                         }
                     }
                 } else {
-                    const uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * BLOCK_SIZE + 4 * (d_tid * (HSK_per_thread / 4) + d_block);
-                    const uint ib = coord / BLOCK_SIZE;
-                    const uint iqs = (coord % BLOCK_SIZE);
+                    const uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * K_BLOCK_SIZE + 4 * (d_tid * (HSK_per_thread / 4) + d_block);
+                    const uint ib = coord / K_BLOCK_SIZE;
+                    const uint iqs = (coord % K_BLOCK_SIZE);
 
 #if QUANT_AUXF == 1
                     k_dm = ACC_TYPEV2(get_k_d(ib, k_offset), 0.0);
@@ -597,9 +642,9 @@ void main() {
                     FLOAT_TYPEV4 V_Tf = FLOAT_TYPEV4(0);
                     if (!KV_bounds_check || j * Bc + c < KV) {
 #if BLOCK_SIZE > 1
-                        uint coord = (j * Bc + c) * v_stride * BLOCK_SIZE + 4 * d;
-                        uint ib = coord / BLOCK_SIZE;
-                        uint iqs = (coord % BLOCK_SIZE);
+                        uint coord = (j * Bc + c) * v_stride * V_BLOCK_SIZE + 4 * d;
+                        uint ib = coord / V_BLOCK_SIZE;
+                        uint iqs = (coord % V_BLOCK_SIZE);
                         V_Tf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
 #else
                         V_Tf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + c) * v_stride / 4 + d]);
@@ -627,9 +672,9 @@ void main() {
             [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
                 #ifdef USE_SEMI_QUANT
                 {
-                    uint coord = (j * Bc + c * cols_per_iter + col_tid) * v_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
-                    uint ib = coord / BLOCK_SIZE;
-                    uint iqs = (coord % BLOCK_SIZE);
+                    uint coord = (j * Bc + c * cols_per_iter + col_tid) * v_stride * V_BLOCK_SIZE + 4 * (d * D_split + d_tid);
+                    uint ib = coord / V_BLOCK_SIZE;
+                    uint iqs = (coord % V_BLOCK_SIZE);
                     [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                         semi_quant_pv_accum(ib, iqs, v_offset, Pf[r], Of[r][d]);
                     }
@@ -640,9 +685,9 @@ void main() {
                     Vf = kvsh[(c * cols_per_iter + col_tid) * kvsh_stride + (d * D_split + d_tid)];
                 } else {
 #if BLOCK_SIZE > 1
-                    uint coord = (j * Bc + c * cols_per_iter + col_tid) * v_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
-                    uint ib = coord / BLOCK_SIZE;
-                    uint iqs = (coord % BLOCK_SIZE);
+                    uint coord = (j * Bc + c * cols_per_iter + col_tid) * v_stride * V_BLOCK_SIZE + 4 * (d * D_split + d_tid);
+                    uint ib = coord / V_BLOCK_SIZE;
+                    uint iqs = (coord % V_BLOCK_SIZE);
                     Vf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
 #else
                     Vf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * v_stride / 4 + d * D_split + d_tid]);
@@ -777,6 +822,7 @@ void main() {
     // If there is split_k, then the split_k resolve shader does the final
     // division by L. Store the intermediate O value and per-row m and L values.
     if (p.k_num > 1) {
+        TBQ4_INVERSE_ROTATE_OF();
         if (p.gqa_ratio > 1) {
             // note: O and Q have swapped coord 1,2.
             uint32_t o_offset = HSV * p.ne1 * (split_k_index + p.k_num * (gqa_iq1 + p.ne2 * iq3)) / 4;
@@ -850,11 +896,18 @@ void main() {
     [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
             Of[r][d] *= FLOAT_TYPE(Lfrcp[r]);
-#if defined(FLOAT_TYPE_MAX)
-            Of[r][d] = clamp(Of[r][d], -FLOAT_TYPE_MAX, FLOAT_TYPE_MAX);
-#endif
         }
     }
+
+    TBQ4_INVERSE_ROTATE_OF();
+
+#if defined(FLOAT_TYPE_MAX)
+    [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
+        [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+            Of[r][d] = clamp(Of[r][d], -FLOAT_TYPE_MAX, FLOAT_TYPE_MAX);
+        }
+    }
+#endif
 
     uint32_t o_offset = (gqa_iq1*p.ne1*HSV + iq3*p.ne2*p.ne1*HSV) / 4;
 
