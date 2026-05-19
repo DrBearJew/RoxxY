@@ -16,6 +16,111 @@ The goal is simple:
 
 This is not a general "all AMD GPUs are supported" claim. The tested target is RDNA3 / RX 7900 XTX. RDNA3.5 and RDNA4 are compile/dispatch candidates, but still need real validation.
 
+## Start here
+
+### Who this is for
+
+Use this branch if you:
+
+- have an AMD RDNA3 GPU, especially RX 7900 XTX / `gfx1100`,
+- want long-context llama.cpp with compressed KV cache,
+- want the tested `q8_0` K + `tbq4_0` V setting,
+- are comfortable building llama.cpp from source.
+
+If you only need standard llama.cpp on CPU, CUDA, Metal, or a generic Vulkan backend, upstream llama.cpp is probably the simpler starting point.
+
+### Quick backend chooser
+
+| I want to... | Build this | Run with | Notes |
+|---|---|---|---|
+| Try the new Vulkan TBQ4 path | `build-vulkan` | `--device Vulkan0` | Smallest backend-specific build; validated for `q8_0/tbq4_0` on RX 7900 XTX/RADV |
+| Use the ROCm/HIP production path | `build-rocm` | `--device ROCm0` or default HIP device | Best path for the existing ROCm VEC compressed-KV work |
+| Keep one binary with both backends | `build-rocm-vulkan` | `--device Vulkan0` or `--device ROCm0` | Useful for A/B testing; always choose the backend explicitly |
+| Read old NVIDIA/CUDA notes | no AMD build needed | CUDA flags in the collapsed NVIDIA section | Inherited reference notes, not the focus of this branch |
+
+### Quick start: Vulkan native `q8_0/tbq4_0`
+
+This is the easiest way to check the new Vulkan path. Replace `MODEL` with a real GGUF path.
+
+```bash
+git clone https://github.com/DrBearJew/llama.cpp.git
+cd llama.cpp
+git checkout tbq4-rdna3-github
+
+cmake -B build-vulkan -DGGML_VULKAN=ON -DGGML_HIP=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build-vulkan --target llama-server -j8
+
+LD_LIBRARY_PATH=$PWD/build-vulkan/bin \
+  ./build-vulkan/bin/llama-server --list-devices
+
+MODEL=/path/to/model.gguf
+LD_LIBRARY_PATH=$PWD/build-vulkan/bin \
+  ./build-vulkan/bin/llama-server \
+  -m "$MODEL" --device Vulkan0 \
+  --cache-type-k q8_0 --cache-type-v tbq4_0 \
+  --flash-attn on --ctx-size 4096 \
+  --host 127.0.0.1 --port 8080 \
+  --no-webui --no-warmup -ngl 99
+```
+
+Success looks like this in the server log:
+
+- the device list includes `Vulkan0`,
+- model layers are offloaded to `Vulkan0`,
+- KV cache prints `K (q8_0)` and `V (tbq4_0)`,
+- there is no `SET_ROWS` abort and no `q4_0` substitution.
+
+### Quick start: ROCm/HIP
+
+Use this path when you want the existing ROCm VEC compressed-KV route.
+
+```bash
+git clone https://github.com/DrBearJew/llama.cpp.git
+cd llama.cpp
+git checkout tbq4-rdna3-github
+
+cmake -B build-rocm -DGGML_HIP=ON \
+  -DAMDGPU_TARGETS=gfx1100 \
+  -DCMAKE_HIP_COMPILER=/opt/rocm-7.2.3/bin/amdclang++ \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build-rocm --target llama-server -j8
+
+MODEL=/path/to/model.gguf
+./build-rocm/bin/llama-server \
+  -m "$MODEL" --device ROCm0 \
+  --cache-type-k q8_0 --cache-type-v tbq4_0 \
+  --flash-attn on --ctx-size 4096 \
+  --host 127.0.0.1 --port 8080 \
+  --no-webui --no-warmup -ngl 99
+```
+
+For MTP routes, add:
+
+```bash
+LLAMA_MTP_PREFILL_CHUNK=512 LLAMA_MTP_PREFILL_FORCE_MMQ=1
+```
+
+### Tiny glossary
+
+| Term | Plain-English meaning |
+|---|---|
+| KV cache | The model's attention memory for previous tokens; long context uses a lot of it |
+| `q8_0/tbq4_0` | Keep K cache at q8 quality/speed and compress V cache with TBQ4 |
+| TBQ4 / `tbq4_0` | A 4-bit TurboQuant-style block format with FWHT rotation, used here to reduce KV memory |
+| MTP | Multi-token prediction / speculative decoding; can improve decode speed when accepted drafts are high |
+| ROCm/HIP | AMD's compute stack and programming API, used by llama.cpp's HIP backend |
+| Vulkan/RADV | Cross-vendor graphics/compute API and Mesa AMD Vulkan driver |
+| `gfx1100` | AMD architecture code for RX 7900 XTX-class RDNA3 GPUs |
+| FlashAttention | Faster attention implementation; required here for quantized V cache |
+
+### Where to go next
+
+- New user: run one of the Quick Start blocks above, then read **Troubleshooting quick checks** if it fails.
+- ROCm user: read **Build (ROCm / RX 7900 XTX)** and **Current ROCm runtime summary**.
+- Vulkan user: read **Start Vulkan / ROCm+Vulkan 2-in-1**.
+- Contributor/reviewer: read **What changed**, **Validation**, and **Key files changed**.
+- Benchmark/history reader: see **ROCm result notes** and the collapsed NVIDIA section near the bottom.
+
 ## Branch map
 
 Structured from the upstream/fork README survey: **what works**, **what is deprecated**, **how to turn on the supported path**, and **what was actually tested**.
@@ -55,7 +160,7 @@ Use this README as runtime guidance first; detailed result notes are intentional
 | 35B MoE prompt-processing | `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48` | Works on the MTP-capable 35B model; MTP is a runtime mode, not a different selector |
 | rocWMMA compressed-KV | Do not enable | Deprecated for now; VEC FlashAttention is the production path |
 
-Use `--flash-attn on` for quantized V cache. The production AMD path is VEC FlashAttention; `TBQ4_WMMA_FATTN` and `COMPRESSED_KV_WMMA_FATTN` are not recommended toggles.
+Use `--flash-attn on` for quantized V cache. On ROCm, the production AMD path is VEC FlashAttention. On Vulkan/RADV, the validated path is scalar mixed FlashAttention for `q8_0/tbq4_0`. `TBQ4_WMMA_FATTN` and `COMPRESSED_KV_WMMA_FATTN` are not recommended toggles.
 
 ## What changed
 
@@ -72,6 +177,16 @@ Use `--flash-attn on` for quantized V cache. The production AMD path is VEC Flas
 | PlanarQuant / IsoQuant (`planar3_0`, `iso3_0`) | Fixed and gated | 3-bit original-domain formats; covered by Triton oracle + invariant gates; not default user path |
 | 35B MoE MMQ selector | Working, env-gated | Best current local setting: `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48`; use it for 35B with or without `--spec-type draft-mtp` |
 | Vulkan backend | Working for `q8_0/tbq4_0` | Separate `build-vulkan` verified; native TBQ4 `SET_ROWS`, dequant, and scalar mixed FA keep KV on GPU. Combined `build-rocm-vulkan` remains the 2-in-1 backend option. |
+
+## Tested configurations
+
+| Backend | Hardware / driver | Model class tested | Result |
+|---|---|---|---|
+| Vulkan/RADV | RX 7900 XTX (`gfx1100`), `Vulkan0` | 2B MTP, 35B MTP smokes | Native `q8_0/tbq4_0` KV offload works; no `SET_ROWS` abort or `q4_0` fallback |
+| ROCm/HIP | RX 7900 XTX (`gfx1100`), ROCm 7.2.3 path | Qwen3.6 27B MTP, 35B MoE | VEC compressed-KV route and MTP settings validated in local sweeps |
+| NVIDIA/CUDA | RTX 4090 notes inherited from base fork | Qwen3.6 27B MTP | Kept as reference documentation in the collapsed section; not the focus of this branch |
+
+Anything outside those rows should be treated as "may compile, needs validation" rather than guaranteed support.
 
 ## Why rocWMMA is deprecated for now
 
@@ -116,11 +231,13 @@ flowchart TD
     B -->|f16, q4_0, q8_0/q8_0, etc.| D[Existing llama.cpp FA paths]
 
     C -->|NVIDIA CUDA| E[CUDA MMA / TurboQuant path<br/>from upstream/fork]
-    C -->|AMD RDNA3 tested| F[ROCm VEC TurboQuant path<br/>working path]
+    C -->|AMD RDNA3 ROCm tested| F[ROCm VEC TurboQuant path<br/>working path]
+    C -->|AMD RDNA3 Vulkan tested| VVK[Vulkan scalar mixed FA<br/>q8_0/tbq4_0 path]
     C -->|AMD rocWMMA TBQ4| G[Deprecated path<br/>not user-facing]
     C -->|RDNA3.5 / RDNA4| H[Compile/dispatch candidate<br/>needs validation]
 
     F --> I[Coherence gate vs q8_0]
+    VVK --> I
     I --> J{Pass?}
     J -->|yes| K[Use q8K/tbq4V default]
     J -->|no| L[Fall back to tbq4/tbq4 or q8/q8 debug]
@@ -264,6 +381,20 @@ Vulkan validation on RX 7900 XTX/RADV:
 - 2B MTP 100k context / 80k prefill / 20 output precision run: `80000` prompt tokens at about `166 tok/s`, precision needle recovered, max VRAM about `5.5 GiB`.
 - 35B MTP c8k/c64k Vulkan server smokes returned HTTP 200 with `K (q8_0)` and `V (tbq4_0)` in the Vulkan KV buffer.
 
+### Troubleshooting quick checks
+
+| Symptom | First check | Likely fix |
+|---|---|---|
+| Server uses CPU or wrong GPU | Look for `using device ...` and `offloaded ... layers` in the log | Add `--device Vulkan0` or `--device ROCm0`, and keep `-ngl 99` |
+| Vulkan cannot find shared libraries | `llama-server --list-devices` fails before printing devices | Set `LD_LIBRARY_PATH=$PWD/build-vulkan/bin` or the combined-build library path shown above |
+| Old `SET_ROWS` crash with `tbq4_0` V | Log says `cannot run the operation (SET_ROWS)` | Rebuild this branch after the Vulkan TBQ4 patch; do not use older binaries |
+| Unexpected `q4_0` V cache | KV log does not say `V (tbq4_0)` | Check the command has `--cache-type-v tbq4_0`; this branch should not silently substitute `q4_0` |
+| ROCm build targets the wrong GPU | Build succeeds but performance/device behavior is odd | Set `-DAMDGPU_TARGETS=gfx1100` for RX 7900 XTX-class cards |
+| MTP route crashes or OOMs during prefill | Only happens with `--spec-type draft-mtp` | Add `LLAMA_MTP_PREFILL_CHUNK=512 LLAMA_MTP_PREFILL_FORCE_MMQ=1` |
+| Decode gets slower with MTP | Draft acceptance is low | Use `--spec-draft-n-max 3`; larger values were worse in these tests |
+
+When reporting a problem, include: GPU model, backend (`Vulkan0` or `ROCm0`), model name, full command, ROCm/Vulkan driver version, and the first KV-cache log line showing K/V types.
+
 Docker helper:
 
 ```bash
@@ -358,6 +489,13 @@ Results are written to `gate-summary.json`.
 | `src/llama-mtp.h` | Vector-backed hook batch storage |
 | `tools/server/server-context.cpp` | Releases speculative MTP state before freeing the target context |
 | `src/llama-kv-cache.cpp` | Disables generic `attn_rot_*` for TBQ4 |
+| `ggml/src/ggml-vulkan/ggml-vulkan.cpp` | Registers TBQ4 `SET_ROWS`, marks Vulkan FA support, and routes scalar mixed `q8_0/tbq4_0` FA |
+| `ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_base.glsl` | Adds mixed q8 K / TBQ4 V block handling and rotated-domain TBQ4 V loads |
+| `ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp` | Uses K/V-specific block geometry and inverse-rotates final TBQ4 output once |
+| `ggml/src/ggml-vulkan/vulkan-shaders/copy_to_quant.comp` | Adds Vulkan TBQ4 quantization for KV `SET_ROWS` |
+| `ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs_cm2.glsl` | Adds TBQ4 dequant helpers for cooperative-matrix paths where available |
+| `ggml/src/ggml-vulkan/vulkan-shaders/types.glsl` | Defines Vulkan TBQ4 block layouts |
+| `ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp` | Generates TBQ4 shaders and scalar mixed FA variants |
 | `ggml/src/ggml-cuda/fattn-wmma-tbq4.cu` | Deprecated rocWMMA prototype (not user-facing) |
 
 ### Bugs fixed
@@ -368,6 +506,8 @@ Results are written to `gate-summary.json`.
 4. **MTP request-time OOM**: draft-prefill hipBLAS temp allocation could request multi-GiB buffers; supported quantized MTP prefill matmuls can be routed through MMQ with `LLAMA_MTP_PREFILL_FORCE_MMQ=1`
 5. **MTP shutdown double-free**: server cleanup freed the target context before speculative MTP state detached from it; speculative state now resets first
 6. **MTP prompt-decode logits copy**: upstream PR #23198 avoids copying full logits for every prompt token when MTP only needs pre-norm embeddings; this fixes most of the old 8K MTP prefill slowdown
+7. **Vulkan TBQ4 KV offload**: older Vulkan builds failed on `SET_ROWS` for `tbq4_0` V cache; this branch adds native TBQ4 `SET_ROWS` plus mixed scalar FA for `q8_0/tbq4_0`
+8. **Vulkan TBQ4 prefill speed**: per-value inverse FWHT reconstruction was too slow; the Vulkan path now accumulates TBQ4 V in rotated domain and inverse-rotates final output once
 
 ## GPU architecture status
 
@@ -375,7 +515,7 @@ Emphasis: "enabled" means the code dispatches, not that the path has been tested
 
 | Family | Targets | Status |
 |---|---|---|
-| RDNA3 | gfx1100/1101/1102/1103 | **Tested on gfx1100** — VEC FA + MTP verified |
+| RDNA3 | gfx1100/1101/1102/1103 | **Tested on gfx1100** — ROCm VEC FA + MTP verified; Vulkan/RADV `q8_0/tbq4_0` KV verified |
 | RDNA3.5 | gfx1150/1151/1152 | Dispatch candidate — same VEC path, **untested** |
 | RDNA4 | gfx1200/1201+ | Dispatch candidate — `amd_wmma_available()` gate enabled, **untested** |
 | RDNA1/RDNA2 | gfx10xx | Not routed to TBQ4 VEC |
