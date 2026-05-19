@@ -1,8 +1,10 @@
 # llama.cpp ROCm + Vulkan TurboQuant KV Cache — Qwen MTP on RX 7900 XTX
 
-This branch targets AMD RDNA3 on an RX 7900 XTX (`gfx1100`) through both **ROCm/HIP** and **Vulkan/RADV**. The promoted TurboQuant KV setting is `q8_0` K + `tbq4_0` V for long-context Qwen MTP routes, plus a **35B MoE prompt-processing path** using the current best ROCm MMQ selector.
+This is a **2-in-1 ROCm + Vulkan branch** for AMD RDNA3 on an RX 7900 XTX (`gfx1100`). You can build one `llama-server` with both **ROCm/HIP** and **Vulkan/RADV** enabled, then choose the backend at runtime with `--device ROCm0` or `--device Vulkan0`. Backend-specific ROCm-only or Vulkan-only builds are also supported.
 
-**Current default:** use `--cache-type-k q8_0 --cache-type-v tbq4_0` with FlashAttention. ROCm uses the validated VEC compressed-KV path; Vulkan now has a native GPU TBQ4 path for `SET_ROWS` plus mixed `q8_0/tbq4_0` scalar FlashAttention. rocWMMA compressed-KV experiments are deprecated for now and should not be enabled in user-facing builds or wrappers. Short benchmark notes are kept near the bottom of this README.
+The promoted TurboQuant KV setting is `q8_0` K + `tbq4_0` V for long-context Qwen MTP routes, plus a **35B MoE prompt-processing path** using the current best ROCm MMQ selector.
+
+**Current default:** use `--cache-type-k q8_0 --cache-type-v tbq4_0` with FlashAttention. ROCm uses the validated VEC compressed-KV path; Vulkan now has a native GPU TBQ4 path for `SET_ROWS` plus mixed `q8_0/tbq4_0` scalar FlashAttention. In the combined 2-in-1 build, the same binary can run either path as long as you select the device explicitly. rocWMMA compressed-KV experiments are deprecated for now and should not be enabled in user-facing builds or wrappers. Short benchmark notes are kept near the bottom of this README.
 
 The goal is simple:
 
@@ -10,6 +12,7 @@ The goal is simple:
 - keep MTP/speculative decoding working,
 - keep the ROCm production Flash Attention route on the stable VEC path,
 - keep native Vulkan `q8_0/tbq4_0` KV cache offload on GPU without `q4_0` or CPU fallback,
+- support a 2-in-1 ROCm+Vulkan build where `--device` selects the active backend at runtime,
 - keep the 35B MoE prompt-processing selector `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48` usable with or without speculative MTP enabled,
 - deprecate the rocWMMA compressed-KV prototype for now,
 - keep `tbq4_0/tbq4_0` as the lowest-VRAM fallback when maximum context matters more than K quality/speed.
@@ -25,6 +28,7 @@ Use this branch if you:
 - have an AMD RDNA3 GPU, especially RX 7900 XTX / `gfx1100`,
 - want long-context llama.cpp with compressed KV cache,
 - want the tested `q8_0` K + `tbq4_0` V setting,
+- want either a ROCm-only, Vulkan-only, or one-binary ROCm+Vulkan build,
 - are comfortable building llama.cpp from source.
 
 If you only need standard llama.cpp on CPU, CUDA, Metal, or a generic Vulkan backend, upstream llama.cpp is probably the simpler starting point.
@@ -33,10 +37,50 @@ If you only need standard llama.cpp on CPU, CUDA, Metal, or a generic Vulkan bac
 
 | I want to... | Build this | Run with | Notes |
 |---|---|---|---|
-| Try the new Vulkan TBQ4 path | `build-vulkan` | `--device Vulkan0` | Smallest backend-specific build; validated for `q8_0/tbq4_0` on RX 7900 XTX/RADV |
-| Use the ROCm/HIP production path | `build-rocm` | `--device ROCm0` or default HIP device | Best path for the existing ROCm VEC compressed-KV work |
-| Keep one binary with both backends | `build-rocm-vulkan` | `--device Vulkan0` or `--device ROCm0` | Useful for A/B testing; always choose the backend explicitly |
+| Keep one binary with both ROCm and Vulkan | `build-rocm-vulkan` | `--device Vulkan0` or `--device ROCm0` | Recommended when you want the 2-in-1 build; always choose the backend explicitly |
+| Try the new Vulkan TBQ4 path only | `build-vulkan` | `--device Vulkan0` | Smallest Vulkan-specific build; validated for `q8_0/tbq4_0` on RX 7900 XTX/RADV |
+| Use the ROCm/HIP production path only | `build-rocm` | `--device ROCm0` or default HIP device | Best path for the existing ROCm VEC compressed-KV work |
 | Read old NVIDIA/CUDA notes | no AMD build needed | CUDA flags in the collapsed NVIDIA section | Inherited reference notes, not the focus of this branch |
+
+### Quick start: 2-in-1 ROCm + Vulkan build
+
+Use this when you want one `llama-server` binary that can run either backend. Build once, then select `ROCm0` or `Vulkan0` at launch time.
+
+```bash
+git clone https://github.com/DrBearJew/llama.cpp.git
+cd llama.cpp
+git checkout tbq4-rdna3-github
+
+cmake -B build-rocm-vulkan \
+  -DGGML_HIP=ON -DGGML_VULKAN=ON \
+  -DAMDGPU_TARGETS=gfx1100 \
+  -DCMAKE_HIP_COMPILER=/opt/rocm-7.2.3/bin/amdclang++ \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build-rocm-vulkan --target llama-server -j8
+
+LD_LIBRARY_PATH=$PWD/build-rocm-vulkan/bin:/opt/rocm-7.2.3/lib:/opt/amdgpu/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-} \
+  ./build-rocm-vulkan/bin/llama-server --list-devices
+```
+
+Then launch the same binary with either backend:
+
+```bash
+MODEL=/path/to/model.gguf
+
+# Vulkan/RADV path
+LD_LIBRARY_PATH=$PWD/build-rocm-vulkan/bin:/opt/rocm-7.2.3/lib:/opt/amdgpu/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-} \
+  ./build-rocm-vulkan/bin/llama-server \
+  -m "$MODEL" --device Vulkan0 \
+  --cache-type-k q8_0 --cache-type-v tbq4_0 \
+  --flash-attn on --ctx-size 4096 --no-webui -ngl 99
+
+# ROCm/HIP path
+LD_LIBRARY_PATH=$PWD/build-rocm-vulkan/bin:/opt/rocm-7.2.3/lib:/opt/amdgpu/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-} \
+  ./build-rocm-vulkan/bin/llama-server \
+  -m "$MODEL" --device ROCm0 \
+  --cache-type-k q8_0 --cache-type-v tbq4_0 \
+  --flash-attn on --ctx-size 4096 --no-webui -ngl 99
+```
 
 ### Quick start: Vulkan native `q8_0/tbq4_0`
 
