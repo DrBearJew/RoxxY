@@ -323,7 +323,6 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
-    res->t_embd = cur;
 
     ggml_tensor * logits = build_lora_mm(model.output, cur);
     cb(logits, "result_output", -1);
@@ -447,7 +446,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         }
 
         // TODO @ngxson : strip unused token right after the last KV layer to speed up prompt processing
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_pre_norm_masked) {
             cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
             inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
         }
@@ -547,7 +546,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             ggml_tensor * inp_this_layer = ggml_view_2d_slice(ctx0, inp_per_layer, il); // [n_embd_per_layer, n_tokens]
 
             // TODO @ngxson : improve this
-            if (il == n_layer - 1 && inp_out_ids) {
+            if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_pre_norm_masked) {
                 inp_this_layer = ggml_get_rows(ctx0, inp_this_layer, inp_out_ids);
             }
 
@@ -574,11 +573,11 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     }
     cur = inpL;
 
-    // Expose the last-layer hidden state before the output norm so that MTP
-    // draft contexts can read it via llama_get_embeddings_pre_norm_ith() as
-    // the recurrent h input. Without this, embd_pre_norm stays unfilled and
-    // pending_h is garbage — drafts then degrade rapidly on longer prompts.
     res->t_h_pre_norm = cur;
+
+    if (!cparams.embeddings_pre_norm_masked && inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
 
     cur = build_norm(cur,
             model.output_norm, nullptr,
