@@ -25,6 +25,44 @@ float16_t dequantFuncQ1_0(const in decodeBufQ1_0 bl, const in uint blockCoords[2
     return bit != 0u ? d : -d;
 }
 
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufTQ3_0 {
+   block_tq3_0_packed16 block;
+};
+
+const float16_t tq3_centroids_cm2[8] = {
+    float16_t(-2.1519454), float16_t(-1.3439092), float16_t(-0.7560052), float16_t(-0.2450942),
+    float16_t( 0.2450942), float16_t( 0.7560052), float16_t( 1.3439092), float16_t( 2.1519454)
+};
+
+float16_t dequantFuncTQ3_0(const in decodeBufTQ3_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const float16_t d = bl.block.d;
+    const uint idx = coordInBlock[1];
+
+    const uint group = idx >> 3;
+    const uint within = idx & 7;
+    const uint byte_off = group * 3;
+
+    uint b0, b1, b2;
+    uint word_idx = byte_off >> 1;
+    uint w0 = uint(bl.block.qs[word_idx]);
+    uint w1 = uint(bl.block.qs[word_idx + 1]);
+    if ((byte_off & 1) == 0) {
+        b0 = w0 & 0xFF;
+        b1 = (w0 >> 8) & 0xFF;
+        b2 = w1 & 0xFF;
+    } else {
+        b0 = (w0 >> 8) & 0xFF;
+        b1 = w1 & 0xFF;
+        b2 = (w1 >> 8) & 0xFF;
+    }
+
+    uint bits24 = b0 | (b1 << 8) | (b2 << 16);
+    uint ci = (bits24 >> (within * 3)) & 7;
+
+    return tq3_centroids_cm2[ci] * d;
+}
+
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufQ4_0 {
    block_q4_0_packed16 block;
 };
@@ -763,6 +801,8 @@ float16_t dequantFuncNVFP4(const in decodeBufNVFP4 bl, const in uint blockCoords
 #define dequantFuncA dequantFuncMXFP4
 #elif defined(DATA_A_NVFP4)
 #define dequantFuncA dequantFuncNVFP4
+#elif defined(DATA_A_TQ3_0)
+#define dequantFuncA dequantFuncTQ3_0
 #elif defined(DATA_A_F32)
 #define dequantFuncA dequantFuncF32
 #endif

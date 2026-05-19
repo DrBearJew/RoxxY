@@ -277,6 +277,18 @@ typedef struct {
 } block_tq2_0;
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
 
+//
+// TurboQuant-Lite quantization (Lloyd-Max optimal codebook)
+//
+
+// 3.5 bpw - 3-bit with Gaussian Lloyd-Max codebook
+#define QK_TQ3_0 32
+typedef struct {
+    ggml_half d;
+    uint8_t qs[QK_TQ3_0*3/8];
+} block_tq3_0;
+static_assert(sizeof(block_tq3_0) == sizeof(ggml_half) + QK_TQ3_0*3/8, "wrong tq3_0 block size/padding");
+
 // TurboQuant blocks
 
 // 3.0625 bpw (128-element blocks, FWHT rotation, 3-bit PolarQuant)

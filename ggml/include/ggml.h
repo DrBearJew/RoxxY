@@ -435,7 +435,8 @@ extern "C" {
         GGML_TYPE_ISO3_0    = 45, // IsoQuant 3-bit: quaternion 4D + 2-bit + 1-bit QJL
         GGML_TYPE_PLANAR4_0 = 46, // PlanarQuant 4-bit: 2D Givens + 4-bit nibble
         GGML_TYPE_ISO4_0    = 47, // IsoQuant 4-bit: quaternion 4D + 4-bit nibble
-        GGML_TYPE_COUNT   = 48,
+        GGML_TYPE_TQ3_0   = 48, // TurboQuant-Lite 3-bit (Lloyd-Max optimal codebook)
+        GGML_TYPE_COUNT   = 49,
     };
 
     // precision

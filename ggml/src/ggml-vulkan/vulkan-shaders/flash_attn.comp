@@ -23,6 +23,61 @@
 #include "types.glsl"
 #include "flash_attn_base.glsl"
 
+#if defined(DATA_A_TQ3_0) && !defined(SEMI_QUANT_DISABLE)
+#define USE_SEMI_QUANT
+#endif
+
+#ifdef USE_SEMI_QUANT
+const FLOAT_TYPE tq3_sq_centroids[8] = FLOAT_TYPE[8](
+    FLOAT_TYPE(-2.1519454), FLOAT_TYPE(-1.3439092), FLOAT_TYPE(-0.7560052), FLOAT_TYPE(-0.2450942),
+    FLOAT_TYPE( 0.2450942), FLOAT_TYPE( 0.7560052), FLOAT_TYPE( 1.3439092), FLOAT_TYPE( 2.1519454)
+);
+
+ACC_TYPE semi_quant_qk_dot(uint ib, uint iqs, uint a_offset, FLOAT_TYPEV4 q) {
+    uint group = iqs >> 3u;
+    uint within = iqs & 7u;
+    uint base = group * 3u;
+    uint w0 = uint(k_packed.k_data_packed16[a_offset + ib].qs[base / 2u]);
+    uint w1 = uint(k_packed.k_data_packed16[a_offset + ib].qs[base / 2u + 1u]);
+    uint b0, b1, b2;
+    if ((base & 1u) == 0u) {
+        b0 = w0 & 0xFFu; b1 = (w0 >> 8) & 0xFFu; b2 = w1 & 0xFFu;
+    } else {
+        b0 = (w0 >> 8) & 0xFFu; b1 = w1 & 0xFFu; b2 = (w1 >> 8) & 0xFFu;
+    }
+    uint bits24 = b0 | (b1 << 8) | (b2 << 16);
+    uint shift = (within == 0u) ? 0u : 12u;
+    ACC_TYPE k_sc = ACC_TYPE(k_packed.k_data_packed16[a_offset + ib].d);
+    ACC_TYPE acc = ACC_TYPE(0.0);
+    acc += ACC_TYPE(q.x) * ACC_TYPE(tq3_sq_centroids[(bits24 >> shift) & 7u]);
+    acc += ACC_TYPE(q.y) * ACC_TYPE(tq3_sq_centroids[(bits24 >> (shift + 3u)) & 7u]);
+    acc += ACC_TYPE(q.z) * ACC_TYPE(tq3_sq_centroids[(bits24 >> (shift + 6u)) & 7u]);
+    acc += ACC_TYPE(q.w) * ACC_TYPE(tq3_sq_centroids[(bits24 >> (shift + 9u)) & 7u]);
+    return k_sc * acc;
+}
+
+void semi_quant_pv_accum(uint ib, uint iqs, uint a_offset, FLOAT_TYPE p_val, inout FLOAT_TYPEV4 out_acc) {
+    uint group = iqs >> 3u;
+    uint within = iqs & 7u;
+    uint base = group * 3u;
+    uint w0 = uint(v_packed.v_data_packed16[a_offset + ib].qs[base / 2u]);
+    uint w1 = uint(v_packed.v_data_packed16[a_offset + ib].qs[base / 2u + 1u]);
+    uint b0, b1, b2;
+    if ((base & 1u) == 0u) {
+        b0 = w0 & 0xFFu; b1 = (w0 >> 8) & 0xFFu; b2 = w1 & 0xFFu;
+    } else {
+        b0 = (w0 >> 8) & 0xFFu; b1 = w1 & 0xFFu; b2 = (w1 >> 8) & 0xFFu;
+    }
+    uint bits24 = b0 | (b1 << 8) | (b2 << 16);
+    uint shift = (within == 0u) ? 0u : 12u;
+    FLOAT_TYPE sv = p_val * FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].d);
+    out_acc.x += sv * tq3_sq_centroids[(bits24 >> shift) & 7u];
+    out_acc.y += sv * tq3_sq_centroids[(bits24 >> (shift + 3u)) & 7u];
+    out_acc.z += sv * tq3_sq_centroids[(bits24 >> (shift + 6u)) & 7u];
+    out_acc.w += sv * tq3_sq_centroids[(bits24 >> (shift + 9u)) & 7u];
+}
+#endif
+
 const uint32_t HSK_per_thread = HSK / D_split;
 const uint32_t HSV_per_thread = HSV / D_split;
 
@@ -248,6 +303,7 @@ void main() {
             }
         }
 
+        #ifndef USE_SEMI_QUANT
         if (SHMEM_STAGING != 0) {
             barrier();
 #ifndef MMQ
@@ -291,6 +347,7 @@ void main() {
 #endif // MMQ
             barrier();
         }
+#endif // USE_SEMI_QUANT
 
 #ifndef MMQ
         // More d iterations means Q register caching becomes relevant
@@ -307,6 +364,16 @@ void main() {
                         continue;
                     }
 
+                    #ifdef USE_SEMI_QUANT
+                    {
+                        uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
+                        uint ib = coord / BLOCK_SIZE;
+                        uint iqs = (coord % BLOCK_SIZE);
+                        [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                            Sf[r][c] += semi_quant_qk_dot(ib, iqs, k_offset, Q_cache[r]);
+                        }
+                    }
+#else
                     FLOAT_TYPEV4 K_Tf;
                     if (SHMEM_STAGING != 0) {
                         K_Tf = kvsh[(c * cols_per_iter + col_tid) * kvsh_stride + (d * D_split + d_tid)];
@@ -323,6 +390,7 @@ void main() {
                     [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                         Sf[r][c] += dot(ACC_TYPEV4(Q_cache[r]), ACC_TYPEV4(K_Tf));
                     }
+#endif
                 }
             }
         } else {
@@ -332,6 +400,16 @@ void main() {
                 }
 
                 [[unroll]] for (uint32_t d = 0; d < HSK_per_thread / 4; ++d) {
+#ifdef USE_SEMI_QUANT
+                    {
+                        uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
+                        uint ib = coord / BLOCK_SIZE;
+                        uint iqs = (coord % BLOCK_SIZE);
+                        [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                            Sf[r][c] += semi_quant_qk_dot(ib, iqs, k_offset, Qf[tile_row(r) * qf_stride + d * D_split + d_tid]);
+                        }
+                    }
+#else
                     FLOAT_TYPEV4 K_Tf;
                     if (SHMEM_STAGING != 0) {
                         K_Tf = kvsh[(c * cols_per_iter + col_tid) * kvsh_stride + (d * D_split + d_tid)];
@@ -348,6 +426,7 @@ void main() {
                     [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                         Sf[r][c] += dot(ACC_TYPEV4(Qf[tile_row(r) * qf_stride + d * D_split + d_tid]), ACC_TYPEV4(K_Tf));
                     }
+#endif
                 }
             }
         }
@@ -508,6 +587,7 @@ void main() {
             }
         }
 
+        #ifndef USE_SEMI_QUANT
         if (SHMEM_STAGING != 0) {
             barrier();
             [[unroll]] for (uint32_t idx = 0; idx < Bc * HSV / 4; idx += gl_WorkGroupSize.x) {
@@ -531,6 +611,7 @@ void main() {
             }
             barrier();
         }
+#endif // USE_SEMI_QUANT
 
         [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
             if (KV_bounds_check && j * Bc + c * cols_per_iter + col_tid >= KV) {
@@ -544,6 +625,16 @@ void main() {
             }
 
             [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
+                #ifdef USE_SEMI_QUANT
+                {
+                    uint coord = (j * Bc + c * cols_per_iter + col_tid) * v_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
+                    uint ib = coord / BLOCK_SIZE;
+                    uint iqs = (coord % BLOCK_SIZE);
+                    [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                        semi_quant_pv_accum(ib, iqs, v_offset, Pf[r], Of[r][d]);
+                    }
+                }
+#else
                 FLOAT_TYPEV4 Vf;
                 if (SHMEM_STAGING != 0) {
                     Vf = kvsh[(c * cols_per_iter + col_tid) * kvsh_stride + (d * D_split + d_tid)];
@@ -560,6 +651,7 @@ void main() {
                 [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                     Of[r][d] += FLOAT_TYPEV4(Pf[r] * Vf);
                 }
+#endif
             }
         }
     }

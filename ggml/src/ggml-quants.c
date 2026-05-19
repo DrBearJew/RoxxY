@@ -2349,6 +2349,13 @@ size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     return nrow * row_size;
 }
 
+size_t quantize_tq3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights; // not used
+    const size_t row_size = ggml_row_size(GGML_TYPE_TQ3_0, n_per_row);
+    quantize_row_tq3_0_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * row_size;
+}
+
 void dequantize_row_tq1_0(const block_tq1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_K == 0);
     const int64_t nb = k / QK_K;
@@ -2403,6 +2410,131 @@ void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_REST
                     *y++ = (float) (q - 1) * d;
                 }
             }
+        }
+    }
+}
+
+// ====================== TurboQuant-Lite 3-bit quantization ======================
+//
+// Uses a Gaussian Lloyd-Max optimal codebook with 8 levels (3 bits).
+// Pre-computed centroids minimize MSE for zero-mean symmetric bell-shaped
+// distributions (typical of KV cache values after Hadamard rotation).
+//
+// Block format: 32 values -> fp16 scale + 12 bytes packed 3-bit indices = 14 bytes
+// Effective: 3.5 bits per value (vs q4_0 = 4.5 bpv)
+
+// Gaussian Lloyd-Max centroids for 3-bit (8 levels), unit variance
+static const float tq3_centroids[8] = {
+    -2.1519454f, -1.3439092f, -0.7560052f, -0.2450942f,
+     0.2450942f,  0.7560052f,  1.3439092f,  2.1519454f
+};
+
+// Decision boundaries (midpoints between adjacent centroids)
+static const float tq3_boundaries[7] = {
+    -1.7479273f, -1.0499572f, -0.5005497f, 0.0f,
+     0.5005497f,  1.0499572f,  1.7479273f
+};
+
+// Max centroid value (used for scale computation)
+#define TQ3_CENTROID_MAX 2.1519454f
+
+// 3-bit packing: 8 values (3 bits each) -> 3 bytes
+// byte0 = v0 | (v1 << 3) | (v2 << 6)
+// byte1 = (v2 >> 2) | (v3 << 1) | (v4 << 4) | (v5 << 7)
+// byte2 = (v5 >> 1) | (v6 << 2) | (v7 << 5)
+
+static inline uint8_t tq3_quantize_scalar(float x) {
+    // Binary search through 7 boundaries to find index [0..7]
+    // Unrolled for speed (3 comparisons instead of 7)
+    if (x < tq3_boundaries[3]) {       // x < 0
+        if (x < tq3_boundaries[1]) {   // x < -1.05
+            return (x < tq3_boundaries[0]) ? 0 : 1;
+        } else {                        // x >= -1.05
+            return (x < tq3_boundaries[2]) ? 2 : 3;
+        }
+    } else {                            // x >= 0
+        if (x < tq3_boundaries[5]) {   // x < 1.05
+            return (x < tq3_boundaries[4]) ? 4 : 5;
+        } else {                        // x >= 1.05
+            return (x < tq3_boundaries[6]) ? 6 : 7;
+        }
+    }
+}
+
+void quantize_row_tq3_0_ref(const float * GGML_RESTRICT x, block_tq3_0 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_TQ3_0;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f;
+
+        for (int j = 0; j < qk; j++) {
+            const float v = fabsf(x[i*qk + j]);
+            if (amax < v) {
+                amax = v;
+            }
+        }
+
+        // Scale: maps data range to codebook range
+        // d = amax / max_centroid, so that centroid[7] * d = amax
+        const float d  = amax / TQ3_CENTROID_MAX;
+        const float id = d > 0.0f ? 1.0f / d : 0.0f;
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+
+        // Quantize each value and pack 3-bit indices
+        // Process groups of 8 values -> 3 bytes
+        for (int g = 0; g < qk / 8; g++) {
+            uint8_t indices[8];
+            for (int j = 0; j < 8; j++) {
+                const float scaled = x[i*qk + g*8 + j] * id;
+                indices[j] = tq3_quantize_scalar(scaled);
+            }
+
+            // Pack 8 x 3-bit values into 3 bytes
+            y[i].qs[g*3 + 0] = (indices[0])       | (indices[1] << 3) | (indices[2] << 6);
+            y[i].qs[g*3 + 1] = (indices[2] >> 2)  | (indices[3] << 1) | (indices[4] << 4) | (indices[5] << 7);
+            y[i].qs[g*3 + 2] = (indices[5] >> 1)  | (indices[6] << 2) | (indices[7] << 5);
+        }
+    }
+}
+
+void dequantize_row_tq3_0(const block_tq3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_TQ3_0;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        // Unpack groups of 8 values from 3 bytes
+        for (int g = 0; g < qk / 8; g++) {
+            const uint8_t b0 = x[i].qs[g*3 + 0];
+            const uint8_t b1 = x[i].qs[g*3 + 1];
+            const uint8_t b2 = x[i].qs[g*3 + 2];
+
+            const uint8_t idx0 =  b0       & 7;
+            const uint8_t idx1 = (b0 >> 3) & 7;
+            const uint8_t idx2 = ((b0 >> 6) | (b1 << 2)) & 7;
+            const uint8_t idx3 = (b1 >> 1) & 7;
+            const uint8_t idx4 = (b1 >> 4) & 7;
+            const uint8_t idx5 = ((b1 >> 7) | (b2 << 1)) & 7;
+            const uint8_t idx6 = (b2 >> 2) & 7;
+            const uint8_t idx7 = (b2 >> 5) & 7;
+
+            y[i*qk + g*8 + 0] = tq3_centroids[idx0] * d;
+            y[i*qk + g*8 + 1] = tq3_centroids[idx1] * d;
+            y[i*qk + g*8 + 2] = tq3_centroids[idx2] * d;
+            y[i*qk + g*8 + 3] = tq3_centroids[idx3] * d;
+            y[i*qk + g*8 + 4] = tq3_centroids[idx4] * d;
+            y[i*qk + g*8 + 5] = tq3_centroids[idx5] * d;
+            y[i*qk + g*8 + 6] = tq3_centroids[idx6] * d;
+            y[i*qk + g*8 + 7] = tq3_centroids[idx7] * d;
         }
     }
 }

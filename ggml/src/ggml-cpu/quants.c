@@ -112,6 +112,14 @@ void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, 
     quantize_row_tq2_0_ref(x, y, k);
 }
 
+// ====================== TurboQuant-Lite 3-bit
+
+void quantize_row_tq3_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_TQ3_0 == 0);
+    block_tq3_0 * GGML_RESTRICT y = vy;
+    quantize_row_tq3_0_ref(x, y, k);
+}
+
 void quantize_row_tbq3_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
     assert(k % QK_K == 0);
     block_tbq3_0 * GGML_RESTRICT y = vy;
@@ -518,6 +526,66 @@ void ggml_vec_dot_tq2_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, 
         const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
 
         sumf += (float) sumi * d;
+    }
+
+    *s = sumf;
+}
+
+// Gaussian Lloyd-Max centroids for 3-bit quantization (unit variance)
+static const float tq3_centroids_vd[8] = {
+    -2.1519454f, -1.3439092f, -0.7560052f, -0.2450942f,
+     0.2450942f,  0.7560052f,  1.3439092f,  2.1519454f
+};
+
+void ggml_vec_dot_tq3_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK_TQ3_0;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(qk == QK8_0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_tq3_0 * GGML_RESTRICT x = vx;
+    const block_q8_0  * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d = GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d);
+
+        float sumi = 0.0f;
+
+        // Unpack groups of 8 values from 3 bytes, dot with q8_0
+        for (int g = 0; g < qk / 8; g++) {
+            const uint8_t b0 = x[ib].qs[g*3 + 0];
+            const uint8_t b1 = x[ib].qs[g*3 + 1];
+            const uint8_t b2 = x[ib].qs[g*3 + 2];
+
+            const uint8_t idx0 =  b0       & 7;
+            const uint8_t idx1 = (b0 >> 3) & 7;
+            const uint8_t idx2 = ((b0 >> 6) | (b1 << 2)) & 7;
+            const uint8_t idx3 = (b1 >> 1) & 7;
+            const uint8_t idx4 = (b1 >> 4) & 7;
+            const uint8_t idx5 = ((b1 >> 7) | (b2 << 1)) & 7;
+            const uint8_t idx6 = (b2 >> 2) & 7;
+            const uint8_t idx7 = (b2 >> 5) & 7;
+
+            const int base = g * 8;
+            sumi += tq3_centroids_vd[idx0] * y[ib].qs[base + 0];
+            sumi += tq3_centroids_vd[idx1] * y[ib].qs[base + 1];
+            sumi += tq3_centroids_vd[idx2] * y[ib].qs[base + 2];
+            sumi += tq3_centroids_vd[idx3] * y[ib].qs[base + 3];
+            sumi += tq3_centroids_vd[idx4] * y[ib].qs[base + 4];
+            sumi += tq3_centroids_vd[idx5] * y[ib].qs[base + 5];
+            sumi += tq3_centroids_vd[idx6] * y[ib].qs[base + 6];
+            sumi += tq3_centroids_vd[idx7] * y[ib].qs[base + 7];
+        }
+
+        sumf += sumi * d;
     }
 
     *s = sumf;

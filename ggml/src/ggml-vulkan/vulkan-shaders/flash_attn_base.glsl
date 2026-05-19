@@ -123,6 +123,8 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
 #define BLOCK_BYTE_SIZE 18
 #elif defined(DATA_A_Q4_1)
 #define BLOCK_BYTE_SIZE 20
+#elif defined(DATA_A_TQ3_0)
+#define BLOCK_BYTE_SIZE 14
 #endif
 
 #if defined(DATA_A_Q4_0) || defined(DATA_A_Q4_1)

@@ -499,6 +499,21 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "tbq4_0") {
         return GGML_TYPE_TBQ4_0;
     }
+    if (s == "planar3_0") {
+        return GGML_TYPE_PLANAR3_0;
+    }
+    if (s == "iso3_0") {
+        return GGML_TYPE_ISO3_0;
+    }
+    if (s == "planar4_0") {
+        return GGML_TYPE_PLANAR4_0;
+    }
+    if (s == "iso4_0") {
+        return GGML_TYPE_ISO4_0;
+    }
+    if (s == "tq3_0") {
+        return GGML_TYPE_TQ3_0;
+    }
 
     return GGML_TYPE_COUNT;
 }

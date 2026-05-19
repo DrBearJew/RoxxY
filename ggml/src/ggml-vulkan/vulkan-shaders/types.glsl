@@ -204,6 +204,29 @@ struct block_q1_0
 #define A_TYPE block_q1_0
 #endif
 
+#define QUANT_K_TQ3_0 32
+#define QUANT_R_TQ3_0 1
+
+struct block_tq3_0
+{
+    float16_t d;
+    uint8_t qs[12];
+};
+
+struct block_tq3_0_packed16
+{
+    float16_t d;
+    uint16_t qs[6];
+};
+
+#if defined(DATA_A_TQ3_0)
+#define QUANT_K QUANT_K_TQ3_0
+#define QUANT_R QUANT_R_TQ3_0
+#define QUANT_AUXF 1
+#define A_TYPE block_tq3_0
+#define A_TYPE_PACKED16 block_tq3_0_packed16
+#endif
+
 #define QUANT_K_Q8_1 32
 #define QUANT_R_Q8_1 1
 
@@ -458,6 +481,36 @@ struct block_iq1_m_packed64 {
 #define A_TYPE block_iq1_m
 #define A_TYPE_PACKED16 block_iq1_m_packed16
 #define A_TYPE_PACKED32 block_iq1_m_packed32
+#endif
+
+#define QUANT_K_PLANAR3_0 128
+#define QUANT_R_PLANAR3_0 1
+
+struct block_planar3_0 {
+    float16_t d;
+    uint8_t qs[32];
+    uint8_t signs[16];
+};
+
+#if defined(DATA_A_PLANAR3_0)
+#define QUANT_K QUANT_K_PLANAR3_0
+#define QUANT_R QUANT_R_PLANAR3_0
+#define A_TYPE block_planar3_0
+#endif
+
+#define QUANT_K_ISO3_0 128
+#define QUANT_R_ISO3_0 1
+
+struct block_iso3_0 {
+    float16_t d;
+    uint8_t qs[32];
+    uint8_t signs[16];
+};
+
+#if defined(DATA_A_ISO3_0)
+#define QUANT_K QUANT_K_ISO3_0
+#define QUANT_R QUANT_R_ISO3_0
+#define A_TYPE block_iso3_0
 #endif
 
 #if defined(DATA_A_IQ1_S) || defined(DATA_A_IQ1_M)

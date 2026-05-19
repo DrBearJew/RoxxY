@@ -1,0 +1,37 @@
+#version 450
+
+#include "dequant_head.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {block_tq3_0 data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+
+const float tq3_centroids_df[8] = float[8](
+    -2.1519454, -1.3439092, -0.7560052, -0.2450942,
+     0.2450942,  0.7560052,  1.3439092,  2.1519454
+);
+
+void main() {
+    const uint block_idx = gl_WorkGroupID.x * 8u + (gl_LocalInvocationID.x >> 5u);
+    const uint val_in_block = gl_LocalInvocationID.x & 31u;
+
+    if (block_idx >= p.nel / 32u) {
+        return;
+    }
+
+    const float d = float(data_a[block_idx].d);
+
+    const uint group = val_in_block >> 3u;
+    const uint within = val_in_block & 7u;
+
+    const uint byte_base = group * 3u;
+    const uint b0 = uint(data_a[block_idx].qs[byte_base]);
+    const uint b1 = uint(data_a[block_idx].qs[byte_base + 1u]);
+    const uint b2 = uint(data_a[block_idx].qs[byte_base + 2u]);
+
+    uint bits24 = b0 | (b1 << 8u) | (b2 << 16u);
+    uint idx = (bits24 >> (within * 3u)) & 7u;
+
+    data_b[block_idx * 32u + val_in_block] = D_TYPE(d * tq3_centroids_df[idx]);
+}

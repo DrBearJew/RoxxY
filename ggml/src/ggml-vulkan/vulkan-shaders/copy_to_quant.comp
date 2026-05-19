@@ -208,6 +208,61 @@ void quantize(uint dst_idx, uint src_idx)
 }
 #endif
 
+#if defined(DATA_A_TQ3_0)
+const float tq3_boundaries_q[7] = float[7](
+    -1.7479273, -1.0499572, -0.5005497, 0.0,
+     0.5005497,  1.0499572,  1.7479273
+);
+
+const float TQ3_CENTROID_MAX_Q = 2.1519454;
+
+uint tq3_quantize_val(float x) {
+    if (x < tq3_boundaries_q[3]) {
+        if (x < tq3_boundaries_q[1]) {
+            return (x < tq3_boundaries_q[0]) ? 0u : 1u;
+        } else {
+            return (x < tq3_boundaries_q[2]) ? 2u : 3u;
+        }
+    } else {
+        if (x < tq3_boundaries_q[5]) {
+            return (x < tq3_boundaries_q[4]) ? 4u : 5u;
+        } else {
+            return (x < tq3_boundaries_q[6]) ? 6u : 7u;
+        }
+    }
+}
+
+void quantize(uint dst_idx, uint src_idx)
+{
+    float amax = 0.0;
+
+    [[unroll]] for (int j = 0; j < QUANT_K_TQ3_0; j++) {
+        const float v = abs(data_s[src_idx + j]);
+        amax = max(amax, v);
+    }
+
+    const float d  = amax / TQ3_CENTROID_MAX_Q;
+    const float id = (d != 0.0) ? 1.0 / d : 0.0;
+
+    data_q[dst_idx].d = float16_t(d);
+
+    [[unroll]] for (int g = 0; g < QUANT_K_TQ3_0 / 8; g++) {
+        uint i0 = tq3_quantize_val(data_s[src_idx + g*8 + 0] * id);
+        uint i1 = tq3_quantize_val(data_s[src_idx + g*8 + 1] * id);
+        uint i2 = tq3_quantize_val(data_s[src_idx + g*8 + 2] * id);
+        uint i3 = tq3_quantize_val(data_s[src_idx + g*8 + 3] * id);
+        uint i4 = tq3_quantize_val(data_s[src_idx + g*8 + 4] * id);
+        uint i5 = tq3_quantize_val(data_s[src_idx + g*8 + 5] * id);
+        uint i6 = tq3_quantize_val(data_s[src_idx + g*8 + 6] * id);
+        uint i7 = tq3_quantize_val(data_s[src_idx + g*8 + 7] * id);
+
+        data_q[dst_idx].qs[g*3 + 0] = uint8_t( i0       | (i1 << 3) | (i2 << 6));
+        data_q[dst_idx].qs[g*3 + 1] = uint8_t((i2 >> 2) | (i3 << 1) | (i4 << 4) | (i5 << 7));
+        data_q[dst_idx].qs[g*3 + 2] = uint8_t((i5 >> 1) | (i6 << 2) | (i7 << 5));
+    }
+}
+#endif
+
 #if defined(DATA_A_IQ4_NL)
 uint best_index(float x) {
     if (x <= kvalues_iq4nl[0]) return 0;
@@ -256,18 +311,184 @@ void quantize(uint dst_idx, uint src_idx)
 }
 #endif
 
-#if defined(DATA_A_F32) || defined(DATA_A_F16)
+#if defined(DATA_A_PLANAR3_0)
+const float PI_COS[64] = float[](
+     0.7386546135f, 0.8607548475f,-0.7411674857f, 0.9674890637f,-0.7723053098f,-0.8056974411f,-0.0412844308f, 0.2707833052f,
+     0.9315500855f, 0.6698185802f, 0.9167487621f,-0.8320636749f, 0.6818146110f,-0.9108457565f,-0.0559285842f,-0.9032276273f,
+     0.7519487143f,-0.8941103816f,-0.1039871648f,-0.6961420774f,-0.1230370328f,-0.9328963161f,-0.2905603051f, 0.4910068214f,
+     0.7889407277f,-0.1221836656f,-0.6316579580f, 0.3128163815f,-0.9563610554f, 0.9992509484f, 0.9540294409f, 0.8902468085f,
+     0.7543080449f,-0.8664138913f,-0.5232898593f, 0.3621287644f,-0.8825117350f, 0.8234673142f,-0.9416025877f,-0.5480425358f,
+    -0.6644080281f,-0.6585279703f,-0.2460795939f, 0.9438471198f, 0.2427810431f,-0.1960992366f, 0.2403578013f,-0.8461306095f,
+     0.0246123374f, 0.3372744620f, 0.9994974732f,-0.3494733870f, 0.7438930869f, 0.8452339768f,-0.6177822948f,-0.2662552595f,
+    -0.5457068086f,-0.9985070229f, 0.7757105827f, 0.6141811609f,-0.9805000424f, 0.5425475240f,-0.5663578510f,-0.4696439803f
+);
+const float PI_SIN[64] = float[](
+    -0.6740840673f,-0.5090196729f, 0.6713201404f,-0.2529129684f, 0.6352515221f,-0.5923272967f, 0.9991474152f,-0.9626403451f,
+    -0.3636130989f, 0.7425247431f,-0.3994642496f,-0.5546801090f,-0.7315250039f,-0.4127469361f,-0.9984347820f, 0.4291617870f,
+    -0.6592215896f,-0.4478466809f, 0.9945786595f,-0.7179040313f, 0.9924020767f, 0.3601450622f, 0.9568566680f,-0.8711557388f,
+     0.6144692898f, 0.9925075173f, 0.7752471566f, 0.9498136044f,-0.2921875417f, 0.0386975110f,-0.2997128963f, 0.4554784000f,
+    -0.6565206647f,-0.4993265271f, 0.8521547318f,-0.9321280718f,-0.4702904224f,-0.5673637390f,-0.3367263079f, 0.8364504576f,
+    -0.7473700047f, 0.7525562644f,-0.9692496061f,-0.3303825557f,-0.9700810909f, 0.9805840850f,-0.9706843495f,-0.5329755545f,
+    -0.9996970892f, 0.9414063692f, 0.0316982083f, 0.9369462729f, 0.6682986617f,-0.5343964100f,-0.7863491774f,-0.9639025331f,
+    -0.8379761577f, 0.0546237342f,-0.6310887933f, 0.7891650796f,-0.1965190321f, 0.8400250673f,-0.8241594434f, 0.8828558922f
+);
+
+uint nearest_centroid_planar3(float val) {
+    float c[8];
+    c[0] = -0.190685f; c[1] = -0.117832f; c[2] = -0.065717f; c[3] = -0.021460f;
+    c[4] =  0.021460f; c[5] =  0.065717f; c[6] =  0.117832f; c[7] =  0.190685f;
+
+    uint best = 0;
+    float best_d = abs(val - c[0]);
+    [[unroll]] for (uint i = 1; i < 8; i++) {
+        float d = abs(val - c[i]);
+        if (d < best_d) { best_d = d; best = i; }
+    }
+    return best;
+}
+
+void quantize(uint dst_idx, uint src_idx)
+{
+    float c[8];
+    c[0] = -0.190685f; c[1] = -0.117832f; c[2] = -0.065717f; c[3] = -0.021460f;
+    c[4] =  0.021460f; c[5] =  0.065717f; c[6] =  0.117832f; c[7] =  0.190685f;
+
+    float norm_sq = 0.0f;
+    [[unroll]] for (int j = 0; j < QUANT_K_PLANAR3_0; j++) {
+        float v = data_s[src_idx + j];
+        norm_sq += v * v;
+    }
+    float grp_norm = sqrt(norm_sq);
+    float inv_norm = (grp_norm > 1e-10f) ? 1.0f / grp_norm : 0.0f;
+
+    [[unroll]] for (int j = 0; j < QUANT_K_PLANAR3_0 / 4; j++) {
+        data_q[dst_idx].qs[j] = uint8_t(0);
+    }
+    [[unroll]] for (int j = 0; j < QUANT_K_PLANAR3_0 / 8; j++) {
+        data_q[dst_idx].signs[j] = uint8_t(0);
+    }
+
+    float recon_sq = 0.0f;
+    [[unroll]] for (int p = 0; p < QUANT_K_PLANAR3_0 / 2; p++) {
+        float v0 = data_s[src_idx + p * 2] * inv_norm;
+        float v1 = data_s[src_idx + p * 2 + 1] * inv_norm;
+
+        float cos_val = PI_COS[p % 64];
+        float sin_val = PI_SIN[p % 64];
+        float r0 = cos_val * v0 - sin_val * v1;
+        float r1 = sin_val * v0 + cos_val * v1;
+
+        uint idx0 = nearest_centroid_planar3(r0);
+        uint idx1 = nearest_centroid_planar3(r1);
+
+        uint j0 = p * 2;
+        uint j1 = p * 2 + 1;
+
+        data_q[dst_idx].qs[j0 / 4] |= uint8_t((idx0 & 0x3u) << ((j0 % 4) * 2));
+        if ((idx0 & 0x4u) != 0) {
+            data_q[dst_idx].signs[j0 / 8] |= uint8_t(1u << (j0 % 8));
+        }
+
+        data_q[dst_idx].qs[j1 / 4] |= uint8_t((idx1 & 0x3u) << ((j1 % 4) * 2));
+        if ((idx1 & 0x4u) != 0) {
+            data_q[dst_idx].signs[j1 / 8] |= uint8_t(1u << (j1 % 8));
+        }
+
+        recon_sq += c[idx0] * c[idx0];
+        recon_sq += c[idx1] * c[idx1];
+    }
+
+    float recon_norm = sqrt(recon_sq);
+    float corrected = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
+    data_q[dst_idx].d = float16_t(corrected);
+}
+#endif
+
+#if defined(DATA_A_ISO3_0)
+const float PI_QW_ISO[32] = float[]( 0.8350809813f,-0.1648498178f, 0.1283752173f, 0.2897698581f,-0.1820549369f, 0.9549587369f,-0.8741137385f, 0.8988990188f,-0.1312584430f,-0.3990598321f,-0.2694816887f,-0.1181898862f, 0.1363395452f, 0.2665117681f,-0.8263269663f,-0.1834189594f, 0.3098247349f, 0.2804697454f,-0.5655074716f,-0.1627507508f, 0.8684155941f, 0.2233296037f,-0.1291671842f, 0.6606932878f,-0.5694432259f,-0.2782760859f, 0.5113853812f,-0.5139024258f, 0.7489815354f,-0.3037399948f,-0.4143463373f,-0.3524050117f);
+const float PI_QX_ISO[32] = float[]( 0.3547102809f,-0.5782636404f,-0.8299785256f, 0.5694668293f,-0.8199930191f, 0.1259543896f,-0.3090814352f,-0.2613596618f,-0.1660282463f,-0.5143862963f, 0.5898610353f,-0.8277072310f,-0.6826571226f,-0.1740629375f, 0.1416199356f, 0.4648889899f, 0.3485621810f, 0.8982698917f,-0.3015249372f, 0.4990116358f, 0.2398942262f,-0.7447698116f, 0.4783197045f, 0.0735855624f,-0.2975912094f,-0.0700704753f, 0.2975627482f,-0.2652103305f,-0.1539765000f, 0.0849994123f,-0.1069803685f,-0.5753474832f);
+const float PI_QY_ISO[32] = float[]( 0.2416850179f,-0.4488199651f, 0.3478420675f, 0.5024775267f, 0.1696543097f, 0.1760476083f, 0.0254505407f, 0.2389279008f,-0.9429193735f, 0.3925755024f,-0.2757458389f,-0.1485267133f, 0.5530825853f,-0.8936085105f, 0.2953715622f,-0.5285226703f, 0.7939327955f, 0.0139789311f,-0.2555710375f, 0.4543992281f,-0.2698826790f,-0.4736968279f, 0.4361720681f,-0.3461222053f, 0.0792116225f, 0.8827795386f, 0.7416539788f,-0.3826399446f,-0.3534849286f,-0.8696597815f,-0.6908422709f, 0.2082736641f);
+const float PI_QZ_ISO[32] = float[]( 0.3038694561f, 0.4734756052f,-0.3878843784f, 0.5831694603f,-0.5054479241f,-0.1731694490f,-0.3737666607f, 0.2328704894f, 0.2621760964f, 0.6239953637f,-0.7082104683f, 0.5308507681f,-0.4413037896f,-0.2802782655f,-0.4522367120f,-0.6698107123f,-0.3752456903f,-0.3359423280f, 0.7181019187f, 0.7106907368f, 0.3100073636f, 0.4016827941f, 0.7350437641f,-0.6607965231f, 0.7619289756f, 0.3648703992f,-0.3040413559f, 0.7213236690f, 0.5280022621f,-0.3742936850f,-0.5760775208f, 0.7015634775f);
+
+uint nearest_centroid_iso3(float val) {
+    float c[8];
+    c[0] = -0.190685f; c[1] = -0.117832f; c[2] = -0.065717f; c[3] = -0.021460f;
+    c[4] =  0.021460f; c[5] =  0.065717f; c[6] =  0.117832f; c[7] =  0.190685f;
+
+    uint best = 0;
+    float best_d = abs(val - c[0]);
+    [[unroll]] for (uint i = 1; i < 8; i++) {
+        float d = abs(val - c[i]);
+        if (d < best_d) { best_d = d; best = i; }
+    }
+    return best;
+}
+
+void quantize(uint dst_idx, uint src_idx)
+{
+    float c[8];
+    c[0] = -0.190685f; c[1] = -0.117832f; c[2] = -0.065717f; c[3] = -0.021460f;
+    c[4] =  0.021460f; c[5] =  0.065717f; c[6] =  0.117832f; c[7] =  0.190685f;
+
+    float norm_sq = 0.0f;
+    [[unroll]] for (int j = 0; j < QUANT_K_ISO3_0; j++) {
+        float v = data_s[src_idx + j];
+        norm_sq += v * v;
+    }
+    float grp_norm = sqrt(norm_sq);
+    float inv_norm = (grp_norm > 1e-10f) ? 1.0f / grp_norm : 0.0f;
+
+    [[unroll]] for (int j = 0; j < QUANT_K_ISO3_0 / 4; j++) {
+        data_q[dst_idx].qs[j] = uint8_t(0);
+    }
+    [[unroll]] for (int j = 0; j < QUANT_K_ISO3_0 / 8; j++) {
+        data_q[dst_idx].signs[j] = uint8_t(0);
+    }
+
+    float recon_sq = 0.0f;
+    [[unroll]] for (int g = 0; g < QUANT_K_ISO3_0 / 4; g++) {
+        float v0 = data_s[src_idx + g*4 + 0] * inv_norm;
+        float v1 = data_s[src_idx + g*4 + 1] * inv_norm;
+        float v2 = data_s[src_idx + g*4 + 2] * inv_norm;
+        float v3 = data_s[src_idx + g*4 + 3] * inv_norm;
+
+        float qw = PI_QW_ISO[g], qx = PI_QX_ISO[g], qy = PI_QY_ISO[g], qz = PI_QZ_ISO[g];
+        float rw = qw*v0 - qx*v1 - qy*v2 - qz*v3;
+        float rx = qw*v1 + qx*v0 + qy*v3 - qz*v2;
+        float ry = qw*v2 - qx*v3 + qy*v0 + qz*v1;
+        float rz = qw*v3 + qx*v2 - qy*v1 + qz*v0;
+
+        float rotated[4] = {rw, rx, ry, rz};
+        [[unroll]] for (int k = 0; k < 4; k++) {
+            int j = g * 4 + k;
+            uint idx = nearest_centroid_iso3(rotated[k]);
+            data_q[dst_idx].qs[j / 4] |= uint8_t((idx & 0x3u) << ((j % 4) * 2));
+            if ((idx & 0x4u) != 0) {
+                data_q[dst_idx].signs[j / 8] |= uint8_t(1u << (j % 8));
+            }
+            recon_sq += c[idx] * c[idx];
+        }
+    }
+
+    float recon_norm = sqrt(recon_sq);
+    float corrected = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
+    data_q[dst_idx].d = float16_t(corrected);
+}
+#endif
+
+#if defined(DATA_A_F32) || defined(DATA_A_F16) || defined(DATA_A_BF16)
+#if defined(DATA_A_BF16)
+void quantize(uint dst_idx, uint src_idx)
+{
+    data_q[dst_idx] = A_TYPE(fp32_to_bf16(data_s[src_idx]));
+}
+#else
 void quantize(uint dst_idx, uint src_idx)
 {
     data_q[dst_idx] = A_TYPE(data_s[src_idx]);
 }
 #endif
 
-#if defined(DATA_A_BF16)
-void quantize(uint dst_idx, uint src_idx)
-{
-    data_q[dst_idx] = A_TYPE(fp32_to_bf16(data_s[src_idx]));
-}
 #endif
 
 #if defined(SET_ROWS)
