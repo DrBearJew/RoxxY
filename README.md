@@ -201,7 +201,14 @@ Keep production boring. Flip these only when testing:
 |---|---|---|
 | 27B / explicit 35B MTP stability | `LLAMA_MTP_PREFILL_CHUNK=512 LLAMA_MTP_PREFILL_FORCE_MMQ=1` | Required for MTP routes; pair with `--spec-type draft-mtp --parallel 1`; default KV is `q8_0/tbq4_0` |
 | 35B MoE prefill boost | build with `-DRDNA2_MATMUL_OPT_V1=1`, run with `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48` | Best current 35B prompt-processing setting; not the MTP OOM workaround |
+| TBQ4 local experiment pair | `TBQ4_COOP_SET_ROWS=1 TBQ4_LAYER_ADAPTIVE=7` | Best current fixed-seed 8K MTP ablation pair; use for TBQ4 probes, not required for baseline correctness |
+| TBQ4 vec norm hoist probe | `GGML_CUDA_TBQ4_VEC_NORM_HOIST=1` | Probe only; single-run looked good, fixed-seed combo was worse than leaving it unset |
+| TBQ4 LDS route probe | `GGML_CUDA_TBQ4_LDS_ROUTE=D_K` | Probe only; not promoted |
+| TBQ4 inner-Q probe | `TBQ4_INNERQ=256` | Probe only; not promoted |
+| Sparse-V probe | `GGML_CUDA_SPARSE_V_DEQUANT=1` | Optional/default-off; short 8K probe was near-neutral |
+| Sparse-V tau probe | `GGML_CUDA_SPARSE_V_TAU_LEVEL=3` | Only meaningful with sparse-V enabled; tau alone is invalid/misleading |
 | Deprecated rocWMMA FA | `TBQ4_WMMA_FATTN=1`, `COMPRESSED_KV_WMMA_FATTN=1` | Do not use for now; VEC is the production path |
+| Compressed-KV FA logging | `COMPRESSED_KV_FATTN_LOG=1` | Diagnostic logging only; not a performance setting |
 | IQ4_XS scratch MMQ | `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_IQ4_XS_MMQ_SCRATCH16K=1` | Coherent, but slower so far |
 | Vulkan device check | `LD_LIBRARY_PATH=$PWD/build-vulkan/bin ./build-vulkan/bin/llama-server --list-devices` | Expect `Vulkan0` |
 | Use Vulkan in combined build | `--device Vulkan0` | Combined build also has `ROCm0` |
@@ -398,6 +405,15 @@ python convert.py base-model.gguf MTP-Q8_0.gguf output-mtp.gguf
 | `--jinja --chat-template-file <path>` | Qwen merged chat template |
 | `--parallel 1` | Required for MTP |
 | build `-DCMAKE_HIP_FLAGS="-DRDNA2_MATMUL_OPT_V1=1"` + runtime `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48` | Best current Qwen3.6-35B-A3B prompt-processing selector; compatible with MTP-capable models, but MTP still needs the `LLAMA_MTP_PREFILL_*` pair |
+| `TBQ4_COOP_SET_ROWS=1 TBQ4_LAYER_ADAPTIVE=7` | Preferred local TBQ4 experiment pair from fixed-seed 8K MTP ablation; keep separate from baseline/runtime-required flags |
+| `GGML_CUDA_TBQ4_VEC_NORM_HOIST=1` | TBQ4 probe only; leave unset unless explicitly testing |
+| `GGML_CUDA_TBQ4_LDS_ROUTE=D_K` | TBQ4 probe only; leave unset unless explicitly testing |
+| `TBQ4_INNERQ=256` | TBQ4 probe only; leave unset unless explicitly testing |
+| `GGML_CUDA_SPARSE_V_DEQUANT=1` | Optional sparse-V dequant probe; default-off |
+| `GGML_CUDA_SPARSE_V_TAU_LEVEL=3` | Sparse-V tau probe; use only together with `GGML_CUDA_SPARSE_V_DEQUANT=1` |
+| `TBQ4_WMMA_FATTN=1` | Deprecated rocWMMA compressed-KV path; avoid for production |
+| `COMPRESSED_KV_WMMA_FATTN=1` | Deprecated rocWMMA compressed-KV path; avoid for production |
+| `COMPRESSED_KV_FATTN_LOG=1` | Diagnostic logging only |
 | `--no-warmup` | Skip startup warmup |
 
 ## Credits
