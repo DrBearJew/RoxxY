@@ -40,6 +40,11 @@ function(test_shader_extension_support EXTENSION_NAME TEST_SHADER_FILE RESULT_VA
     if (${glslc_error} MATCHES ".*extension not supported: ${EXTENSION_NAME}.*")
         message(STATUS "${EXTENSION_NAME} not supported by glslc")
         set(${RESULT_VARIABLE} OFF PARENT_SCOPE)
+
+        # Explicitly forward OFF as well so an existing external-project cache cannot
+        # keep generating shaders for unsupported extensions after toolchain changes.
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -D${RESULT_VARIABLE}=OFF)
+        set(VULKAN_SHADER_GEN_CMAKE_ARGS "${VULKAN_SHADER_GEN_CMAKE_ARGS}" PARENT_SCOPE)
     else()
         message(STATUS "${EXTENSION_NAME} supported by glslc")
         set(${RESULT_VARIABLE} ON PARENT_SCOPE)

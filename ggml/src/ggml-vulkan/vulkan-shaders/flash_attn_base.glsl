@@ -322,6 +322,10 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
 }
 #endif
 
+#if defined(DATA_A_PLANAR3_0) || defined(DATA_A_ISO3_0)
+#include "flash_attn_planar_iso.glsl"
+#endif
+
 #ifndef K_BLOCK_SIZE
 #define K_BLOCK_SIZE BLOCK_SIZE
 #endif

@@ -3002,6 +3002,10 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
     if (kv_type == GGML_TYPE_TQ3_0) {
         result.shmem_staging = 0;
     }
+    // Planar/Iso dequant is heavier than legacy q4/q5/q8; staging amortizes K/V decode on RDNA/RADV.
+    if (result.shmem_staging == 0 && (kv_type == GGML_TYPE_PLANAR3_0 || kv_type == GGML_TYPE_ISO3_0)) {
+        result.shmem_staging = 1;
+    }
 
     if (!reduce_block_rows && !ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, kv_type)) {
         result.block_rows /= 2;
@@ -3131,7 +3135,9 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
         path = FA_COOPMAT2;
     }
 
-    if (k_type == GGML_TYPE_TQ3_0 || v_type == GGML_TYPE_TQ3_0) {
+    if (k_type == GGML_TYPE_TQ3_0 || v_type == GGML_TYPE_TQ3_0 ||
+        k_type == GGML_TYPE_PLANAR3_0 || v_type == GGML_TYPE_PLANAR3_0 ||
+        k_type == GGML_TYPE_ISO3_0 || v_type == GGML_TYPE_ISO3_0) {
         path = FA_SCALAR;
     }
 
@@ -3603,6 +3609,8 @@ static void ggml_vk_load_shaders(vk_device& device) {
             CREATE_FA(GGML_TYPE_Q5_1,     q5_1, FA_SCALAR, )
             CREATE_FA(GGML_TYPE_IQ4_NL, iq4_nl, FA_SCALAR, )
             CREATE_FA(GGML_TYPE_TQ3_0, tq3_0, FA_SCALAR, )
+            CREATE_FA(GGML_TYPE_PLANAR3_0, planar3_0, FA_SCALAR, )
+            CREATE_FA(GGML_TYPE_ISO3_0, iso3_0, FA_SCALAR, )
         }
     } else {
         CREATE_FA(GGML_TYPE_F32, f32, FA_SCALAR, _fp32)
@@ -3626,6 +3634,8 @@ static void ggml_vk_load_shaders(vk_device& device) {
             CREATE_FA(GGML_TYPE_Q5_1,     q5_1, FA_SCALAR, _fp32)
             CREATE_FA(GGML_TYPE_IQ4_NL, iq4_nl, FA_SCALAR, _fp32)
             CREATE_FA(GGML_TYPE_TQ3_0, tq3_0, FA_SCALAR, _fp32)
+            CREATE_FA(GGML_TYPE_PLANAR3_0, planar3_0, FA_SCALAR, _fp32)
+            CREATE_FA(GGML_TYPE_ISO3_0, iso3_0, FA_SCALAR, _fp32)
         }
     }
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
@@ -7535,6 +7545,8 @@ static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_TQ3_0:
+        case GGML_TYPE_PLANAR3_0:
+        case GGML_TYPE_ISO3_0:
             return ctx->device->pipeline_cpy_f32_quant[to];
         default:
             break;
@@ -7551,6 +7563,8 @@ static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_TQ3_0:
+        case GGML_TYPE_PLANAR3_0:
+        case GGML_TYPE_ISO3_0:
             return ctx->device->pipeline_cpy_quant_f32[src->type];
         default:
             break;
@@ -15746,6 +15760,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_TQ3_0:
                     case GGML_TYPE_TBQ4_0:
+                    case GGML_TYPE_PLANAR3_0:
+                    case GGML_TYPE_ISO3_0:
                         return true;
                     case GGML_TYPE_Q1_0:
                         return coopmat2;
@@ -15839,6 +15855,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_TQ3_0:
+                    case GGML_TYPE_PLANAR3_0:
+                    case GGML_TYPE_ISO3_0:
                         return true;
                     default:
                         break;
@@ -15855,6 +15873,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_TQ3_0:
+                    case GGML_TYPE_PLANAR3_0:
+                    case GGML_TYPE_ISO3_0:
                         return true;
                     default:
                         break;

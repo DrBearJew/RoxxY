@@ -652,7 +652,11 @@ void process_shaders() {
             string_to_spv("flash_attn_f32_f16_q8_0_tbq4_0", "flash_attn.comp",
                 merge_maps(fa_base_dict, {{"DATA_K_Q8_0", "1"}, {"DATA_V_TBQ4_0", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}}), fp16, false, false, f16acc);
 
-            for (const auto& tname : type_names) {
+            std::vector<std::string> flash_attn_type_names = type_names;
+            flash_attn_type_names.push_back("planar3_0");
+            flash_attn_type_names.push_back("iso3_0");
+
+            for (const auto& tname : flash_attn_type_names) {
                 if (tname == "bf16") continue;
 
                 if (fp16) {
@@ -671,7 +675,7 @@ void process_shaders() {
                 if (tname == "f16") {
                     string_to_spv("flash_attn_f32_f16_" + tname, "flash_attn.comp",
                         merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}}), fp16, false, false, f16acc);
-                } else if (tname == "q4_0" || tname == "q4_1" || tname == "q5_0" || tname == "q5_1" || tname == "iq4_nl" || tname == "q8_0" || tname == "f32" || tname == "tq3_0") {
+                } else if (tname == "q4_0" || tname == "q4_1" || tname == "q5_0" || tname == "q5_1" || tname == "iq4_nl" || tname == "q8_0" || tname == "f32" || tname == "tq3_0" || tname == "planar3_0" || tname == "iso3_0") {
                     std::string data_a_key = "DATA_A_" + to_uppercase(tname);
                     string_to_spv("flash_attn_f32_f16_" + tname, "flash_attn.comp",
                         merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(tname) }}), fp16, false, false, f16acc);
