@@ -158,7 +158,7 @@ The `-DRDNA2_MATMUL_OPT_V1=1` HIP compile flag only makes the RDNA2/RDNA3 MMQ se
 
 ### Run
 
-Set env per server entry or wrapper at runtime:
+Set env per server entry or wrapper at runtime. MTP examples use `--batch-size 512 --ubatch-size 512` to match `LLAMA_MTP_PREFILL_CHUNK=512`; the 35B no-MTP example keeps `--batch-size 1024 --ubatch-size 512` for prompt processing.
 
 | Route | Runtime env to set |
 |---|---|
@@ -187,7 +187,7 @@ LLAMA_MTP_PREFILL_FORCE_MMQ=1 \
   -m /path/to/Qwen3.6-35B-A3B-MTP-Q4_K_M.gguf \
   --cache-type-k q8_0 --cache-type-v tbq4_0 \
   --flash-attn on \
-  --batch-size 1024 --ubatch-size 512 --cache-ram 128 \
+  --batch-size 512 --ubatch-size 512 --cache-ram 128 \
   --spec-type draft-mtp --spec-draft-n-max 3 \
   --jinja --chat-template-file docs/rocm-tbq4-paths/qwen36-merged-template.jinja \
   -c 32768 --port 8080 --no-webui --no-warmup --parallel 1
@@ -390,7 +390,7 @@ python convert.py base-model.gguf MTP-Q8_0.gguf output-mtp.gguf
 | `--cache-type-k tbq4_0 --cache-type-v tbq4_0` | Lowest-VRAM fallback for maximum context fit |
 | `--cache-type-k q8_0 --cache-type-v q8_0` | Diagnostic/reference KV cache (highest VRAM) |
 | `--flash-attn on` | Required for quantized V cache |
-| `--batch-size 1024 --ubatch-size 512` | Validated MTP+TurboQuant server batch settings |
+| `--batch-size 512 --ubatch-size 512` | Validated MTP+TurboQuant server batch settings; matches `LLAMA_MTP_PREFILL_CHUNK=512` |
 | `--cache-ram 128` | Keeps host-side prompt/cache reuse bounded in the tested server setup |
 | `--spec-type draft-mtp --spec-draft-n-max 3` | MTP; `n_max=3` was best observed here; `mtp` alias still works |
 | `LLAMA_MTP_PREFILL_CHUNK=512` | Chunks target hidden-state transfer into draft-prefill decode calls |
