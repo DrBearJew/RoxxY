@@ -8,18 +8,12 @@ Keep the patched build for now and run 27B MTP with chunk/ubatch **1024**:
 LLAMA_MTP_PREFILL_CHUNK=1024
 LLAMA_MTP_PREFILL_FORCE_MMQ=1
 GGML_CUDA_ROCM_QUANT_PREFILL_F16=1
-GGML_CUDA_ROCM_QUANT_PREFILL_F16_MAX_MIB=1024
-GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_ALLOC=1
-GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_NKV=40960
-TBQ4_COOP_SET_ROWS=1
-TBQ4_LAYER_ADAPTIVE=7
-COMPRESSED_KV_FATTN_LOG=1
 ```
 
 Server shape used for the current 27B target:
 
 ```text
---spec-type draft-mtp --spec-draft-n-max 3 --parallel 1
+--spec-type draft-mtp --spec-default --spec-draft-n-max 3 --spec-draft-p-min 0 --parallel 1
 --cache-type-k q8_0 --cache-type-v tbq4_0
 --batch-size 1024 --ubatch-size 1024
 -c 40960
@@ -63,9 +57,9 @@ File:
 
 Changes:
 
-- Added opt-in stable f16 K/V temporary allocation for HIP/ROCm quantized K/V.
+- Added stable f16 K/V temporary allocation for HIP/ROCm quantized K/V when the f16 prefill gate is enabled.
 - The HIP legacy pool caches allocations by size. During MTP prefill, `nkv` grows chunk-by-chunk, so exact-sized f16 temps cause the pool to retain a ladder of intermediate buffer sizes.
-- `GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_ALLOC=1` rounds f16 temp allocation to a stable max-`nkv` size and lets the pool reuse one scratch size.
+- Stable allocation now defaults on under `GGML_CUDA_ROCM_QUANT_PREFILL_F16=1`; `GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_ALLOC=0` forces exact-size debug behavior.
 
 ### Harness
 
@@ -85,13 +79,13 @@ Changes:
 |---|---:|---|
 | `LLAMA_MTP_PREFILL_CHUNK` | `1024` | MTP draft prefill chunk size; must match `--ubatch-size`. |
 | `LLAMA_MTP_PREFILL_FORCE_MMQ` | `1` | Avoids large MTP draft-prefill matmul temp spikes on ROCm. |
-| `GGML_CUDA_ROCM_QUANT_PREFILL_F16` | `1` | Enables opt-in f16-temp FlashAttention prefill route for quantized K/V. |
-| `GGML_CUDA_ROCM_QUANT_PREFILL_F16_MAX_MIB` | `1024` | Per-op f16 temp cap for quantized-KV prefill route. |
-| `GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_ALLOC` | `1` | Reuses stable-sized f16 K/V temp buffers instead of caching every growing `nkv` size. |
-| `GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_NKV` | `40960` | Stable max `nkv` allocation target for the 40k context run. |
-| `TBQ4_COOP_SET_ROWS` | `1` | Existing TBQ4 set-rows tuning used in target artifacts. |
-| `TBQ4_LAYER_ADAPTIVE` | `7` | Existing layer-adaptive TBQ4 tuning used in target artifacts. |
-| `COMPRESSED_KV_FATTN_LOG` | `1` | Emits route selection logs for artifact validation. |
+| `GGML_CUDA_ROCM_QUANT_PREFILL_F16` | `1` | Enables opt-in f16-temp FlashAttention prefill route for quantized K/V; stable f16 temp allocation defaults on with this gate. |
+| `GGML_CUDA_ROCM_QUANT_PREFILL_F16_MAX_MIB` | optional | Debug override; per-op f16 temp cap defaults to `1024` MiB. |
+| `GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_ALLOC` | optional | Debug override; set `0` to force exact-size f16 temps. |
+| `GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_NKV` | optional | Debug override; stable `nkv` auto-detects from the full KV view when unset. |
+| `TBQ4_COOP_SET_ROWS` | optional | Existing TBQ4 set-rows tuning used in some artifacts. |
+| `TBQ4_LAYER_ADAPTIVE` | optional | Existing layer-adaptive TBQ4 tuning used in some artifacts. |
+| `COMPRESSED_KV_FATTN_LOG` | optional | Emits route selection logs for artifact validation. |
 
 ### Backward-compatible aliases accepted by the gate
 
@@ -115,13 +109,13 @@ These were either unsafe, unstable, or regressive in the tested ROCm stack.
    - Symptom: TBQ4 could not use the generic quantized-KV f16 conversion route cleanly.
    - Fix: add TBQ4 dequant hooks in `convert.cu` and templated TBQ4 dequant output in `tbq4-cuda.cuh`.
 
-2. **Quantized-KV f16 prefill is fast but unsafe as a default on HIP.**
+2. **Quantized-KV f16 prefill is fast but unsafe as an unconditional HIP default.**
    - Symptom: full f16 K/V temps can erase compressed-KV savings and OOM at long context.
-   - Fix: default remains vector route; f16 prefill requires explicit env gate and cap.
+   - Fix: default remains vector route; f16 prefill requires the single explicit env gate `GGML_CUDA_ROCM_QUANT_PREFILL_F16=1`; the cap defaults to 1024 MiB.
 
 3. **MTP f16 prefill showed apparent VRAM leak / high-water growth.**
    - Root cause: HIP legacy pool cached f16 temp allocations for each growing `nkv` size.
-   - Fix: opt-in stable f16 temp allocation rounded to max `nkv`.
+   - Fix: stable f16 temp allocation is automatically enabled by the f16 prefill gate and rounded to max `nkv`.
    - 27B chunk1024 peak delta dropped from `3.213 GiB` to `0.389 GiB`.
 
 4. **MMQ interaction matters for MTP draft prefill.**

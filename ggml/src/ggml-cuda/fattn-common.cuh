@@ -1274,16 +1274,36 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+static bool ggml_cuda_fattn_rocm_quant_prefill_f16_enabled() {
+#ifdef GGML_USE_HIP
+    const char * env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_F16");
+    if (!env) {
+        env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_MMA");
+    }
+    if (!env) {
+        env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_WMMA");
+    }
+    if (!env) {
+        env = getenv("TBQ4_PREFILL_WMMA");
+    }
+    return env && atoi(env) != 0;
+#else
+    return false;
+#endif // GGML_USE_HIP
+}
+
 static int64_t ggml_cuda_fattn_f16_tmp_alloc_nelements(const ggml_tensor * t) {
     int64_t ne = ggml_nelements(t);
 
 #ifdef GGML_USE_HIP
     // HIP legacy-pool allocations are cached by size. During MTP prefill, nkv
     // grows chunk-by-chunk, which can make the pool retain every intermediate
-    // f16 K/V temp size. This opt-in rounds quantized-KV f16 temps up to a
-    // stable nkv so repeated attention calls reuse one scratch size.
+    // f16 K/V temp size. When the ROCm quantized-KV f16 prefill route is
+    // enabled, round temps up to a stable nkv by default so repeated attention
+    // calls reuse one scratch size. Set STABLE_ALLOC=0 to force exact sizes.
     const char * stable_alloc_env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_ALLOC");
-    if (!stable_alloc_env || atoi(stable_alloc_env) == 0 || !ggml_is_quantized(t->type)) {
+    const bool stable_alloc = stable_alloc_env ? atoi(stable_alloc_env) != 0 : ggml_cuda_fattn_rocm_quant_prefill_f16_enabled();
+    if (!stable_alloc || !ggml_is_quantized(t->type)) {
         return ne;
     }
 

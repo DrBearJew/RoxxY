@@ -587,18 +587,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // and bounded by a per-op temp-buffer cap. This mirrors the TurboQuant HIP
     // prefill policy without making long-context OOMs the default.
     if ((ggml_is_quantized(K->type) || ggml_is_quantized(V->type)) && can_use_vector_kernel) {
-        const char * quant_prefill_f16_env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_F16");
-        if (!quant_prefill_f16_env) {
-            quant_prefill_f16_env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_MMA");
-        }
-        if (!quant_prefill_f16_env) {
-            quant_prefill_f16_env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_WMMA");
-        }
-        if (!quant_prefill_f16_env) {
-            quant_prefill_f16_env = getenv("TBQ4_PREFILL_WMMA");
-        }
-
-        bool allow_quant_prefill_f16 = quant_prefill_f16_env && atoi(quant_prefill_f16_env) != 0 && Q->ne[1] > 2;
+        bool allow_quant_prefill_f16 = ggml_cuda_fattn_rocm_quant_prefill_f16_enabled() && Q->ne[1] > 2;
 
         // TBQ4 full-block dequant-to-f16 currently supports contiguous tensors only.
         allow_quant_prefill_f16 = allow_quant_prefill_f16 &&
