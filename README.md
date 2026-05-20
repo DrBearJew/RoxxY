@@ -1,10 +1,10 @@
-# llama.cpp ROCm + Vulkan TurboQuant KV Cache — Qwen3.6 27B MTP + 35B MoE on RX 7900 XTX
+# llama.cpp ROCm TurboQuant + Vulkan KV Cache — Qwen3.6 27B MTP + 35B MoE on RX 7900 XTX
 
 This branch targets AMD RDNA3 on an RX 7900 XTX (`gfx1100`) as a **2-in-1 ROCm + Vulkan build**: you can build ROCm-only, Vulkan-only, or one combined `build-rocm-vulkan` `llama-server` that exposes both `ROCm0` and `Vulkan0`, then choose the backend at runtime with `--device ROCm0` or `--device Vulkan0`.
 
 The promoted ROCm path is **27B MTP long context** with the TurboQuant setting (`q8_0` K + `tbq4_0` V), plus a **35B MoE prompt-processing path** using the current best MMQ selector. Full long-fill prefill sweeps are still pending.
 
-**Current default:** use `--cache-type-k q8_0 --cache-type-v tbq4_0` with VEC FlashAttention on ROCm. Keep `q8_0/tbq4_0` as the promoted TurboQuant setting, but do **not** describe `q8_0/q4_0` as a ROCm/HIP slow path. The `q8_0/q4_0` caveat in this README is Vulkan/RADV-only: this branch's Vulkan path does not have the optimized mixed `q8_0` K + `q4_0` V FlashAttention route yet, so use `q8_0/tbq4_0`, `tbq4_0/tbq4_0`, or same-type `q4_0/q4_0` / `q8_0/q8_0` when debugging Vulkan. Vulkan is explicitly part of the build/device story here, including the combined ROCm+Vulkan binary; this older experiment branch does not claim Vulkan compressed-KV parity. rocWMMA compressed-KV experiments are deprecated for now and should not be enabled in user-facing builds or wrappers. Short benchmark notes are kept near the bottom of this README.
+**Current default:** use `--cache-type-k q8_0 --cache-type-v tbq4_0` with VEC FlashAttention on ROCm. Keep `q8_0/tbq4_0` as the promoted TurboQuant setting, but do **not** describe `q8_0/q4_0` as a ROCm/HIP slow path. Vulkan on this branch does **not** support TurboQuant/TBQ4 KV routes; use non-TurboQuant KV types such as `q8_0/q4_0`, `q4_0/q4_0`, or `q8_0/q8_0` when debugging Vulkan. Vulkan is explicitly part of the build/device story here, including the combined ROCm+Vulkan binary; this older experiment branch does not claim Vulkan compressed-KV parity. rocWMMA compressed-KV experiments are deprecated for now and should not be enabled in user-facing builds or wrappers. Short benchmark notes are kept near the bottom of this README.
 
 The goal is simple:
 
@@ -28,9 +28,9 @@ Read this branch like this:
 |---|---|---|
 | ROCm/HIP production path | Qwen3.6-27B MTP + `q8_0` K / `tbq4_0` V on RX 7900 XTX | Use `build-rocm`; default compressed-KV route stays VEC, not WMMA |
 | MTP/speculative decoding | Qwen MTP works via upstream-style `--spec-type draft-mtp`; legacy `mtp` alias is still accepted; PR #23198 prefill fix included | Keep `--parallel 1`; use bounded draft length; `n_max=3` is best observed here |
-| TurboQuant-style KV usage | `--cache-type-k/--cache-type-v` is the user-facing contract, same as upstream/forks | Best default is `q8_0/tbq4_0`; `tbq4_0/tbq4_0` is the lower-VRAM fallback; the `q8_0/q4_0` caveat is Vulkan/RADV-only, not a ROCm/HIP slow-path claim |
+| TurboQuant-style KV usage | `--cache-type-k/--cache-type-v` is the user-facing contract, same as upstream/forks | Best default is `q8_0/tbq4_0`; `tbq4_0/tbq4_0` is the lower-VRAM fallback on ROCm. Vulkan does not support TurboQuant/TBQ4 KV routes in this branch. |
 | 35B MoE prefill | 35B path requires build `-DRDNA2_MATMUL_OPT_V1=1` plus runtime `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48` | Current best pp selector; applies to prompt processing whether speculative MTP is enabled or not |
-| Vulkan | Vulkan build and device listing work; combined ROCm+Vulkan build also works | Vulkan compressed-KV parity is **not** claimed yet; treat it as backend availability, not TBQ4/Planar/Iso feature parity |
+| Vulkan | Vulkan build and device listing work; combined ROCm+Vulkan build also works | Vulkan TurboQuant/TBQ4 KV routes are **not supported** in this branch; treat Vulkan here as backend availability for non-TurboQuant KV types |
 | Deprecated/research kernels | rocWMMA compressed-KV variants are not a user path | Do not enable `TBQ4_WMMA_FATTN` / `COMPRESSED_KV_WMMA_FATTN` in production wrappers |
 
 ## Pick the path
@@ -40,7 +40,7 @@ Read this branch like this:
 | 27B long context + MTP | `q8_0` K + `tbq4_0` V, `--spec-type draft-mtp --spec-draft-n-max 3`, MTP env below | Promoted default for user experience; use `tbq4_0/tbq4_0` only when you need the lowest VRAM / maximum context fallback |
 | 35B MoE default | 35B IDs use a binary built with `-DRDNA2_MATMUL_OPT_V1=1` and runtime `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48`; speculative MTP optional | default llama-swap can use an MTP-capable model without enabling MTP |
 | 35B MTP | same 35B MTP-capable model plus `--spec-type draft-mtp --spec-draft-n-max 3` and MTP env below | experimental runtime mode; short result note is at the bottom |
-| Vulkan | `build-vulkan` or `--device Vulkan0` in combined build | device works; compressed-KV parity not claimed |
+| Vulkan | `build-vulkan` or `--device Vulkan0` in combined build | device works for non-TurboQuant KV types; TurboQuant/TBQ4 KV routes are not supported on Vulkan in this branch |
 
 **Do not mix up the env groups:** every MTP route should include `LLAMA_MTP_PREFILL_CHUNK=512 LLAMA_MTP_PREFILL_FORCE_MMQ=1`. The `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48` pair is the 35B MoE prompt-processing selector; it also requires a binary built with `-DRDNA2_MATMUL_OPT_V1=1`, and it is not a substitute for the MTP prefill allocator workaround.
 
@@ -52,20 +52,20 @@ Use this README as runtime guidance first; detailed result notes are intentional
 |---|---|---|
 | Best default user experience | `--cache-type-k q8_0 --cache-type-v tbq4_0` | Promoted TurboQuant setting: keep K fidelity/speed, compress V |
 | Lowest VRAM / maximum context fallback | `--cache-type-k tbq4_0 --cache-type-v tbq4_0` | Still useful when context fit matters more than K quality/speed |
-| `q8_0/q4_0` ROCm status | `--cache-type-k q8_0 --cache-type-v q4_0` | Not promoted over `q8_0/tbq4_0`, but do not document it as a ROCm/HIP slow path; the slow/unsupported caveat is Vulkan/RADV-only. |
+| `q8_0/q4_0` status | `--cache-type-k q8_0 --cache-type-v q4_0` | Not promoted over `q8_0/tbq4_0` on ROCm; valid as a non-TurboQuant Vulkan option. Vulkan TurboQuant/TBQ4 KV routes are not supported in this branch. |
 | 3-bit Planar/Iso formats | `planar3_0`, `iso3_0` | Registered and gated, but not promoted as defaults; use only for max-compression experiments |
 | 27B MTP | `--spec-type draft-mtp --spec-draft-n-max 3` plus `LLAMA_MTP_PREFILL_CHUNK=512 LLAMA_MTP_PREFILL_FORCE_MMQ=1` | Stable ROCm/MTP server setting |
 | 35B MoE prompt-processing | build with `-DCMAKE_HIP_FLAGS="-DRDNA2_MATMUL_OPT_V1=1"`, then run with `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48` | Works on the MTP-capable 35B model; MTP is a runtime mode, not a different selector |
 | rocWMMA compressed-KV | Do not enable | Deprecated for now; VEC FlashAttention is the production path |
 
-Use `--flash-attn on` for quantized V cache. The production AMD path is VEC FlashAttention. The `q8_0/q4_0` slow/unsupported caveat is **Vulkan/RADV-only** in this README; it should not be generalized to ROCm/HIP. `TBQ4_WMMA_FATTN` and `COMPRESSED_KV_WMMA_FATTN` are not recommended toggles.
+Use `--flash-attn on` for quantized V cache. The production AMD TurboQuant path in this branch is ROCm VEC FlashAttention. Vulkan does not support TurboQuant/TBQ4 KV routes here; use Vulkan only with non-TurboQuant KV types. `TBQ4_WMMA_FATTN` and `COMPRESSED_KV_WMMA_FATTN` are not recommended toggles.
 
 ## What changed
 
 | Area | Status | Notes |
 |---|---|---|
 | TurboQuant VEC Flash Attention | Working | Production path for `q8_0/tbq4_0` and fallback `tbq4_0/tbq4_0`; dequant happens inside the FA loop |
-| Vulkan `q8_0/q4_0` KV | Not supported/promoted on Vulkan | The mixed `q8_0` K + `q4_0` V warning belongs to Vulkan/RADV only; do not cite ROCm/HIP as failing this path. Same-type `q4_0/q4_0` remains the safer Vulkan q4 debug route |
+| Vulkan `q8_0/q4_0` KV | Working as non-TurboQuant Vulkan path | Use for Vulkan backend checks when needed; TurboQuant/TBQ4 KV routes on Vulkan are not supported in this branch |
 | MTP speculative decoding | Working | Use `--spec-type draft-mtp`; old `mtp` alias still works; best observed setting here: `--spec-draft-n-max 3` |
 | MTP prefill allocator stability | Working | `LLAMA_MTP_PREFILL_CHUNK=512` plus `LLAMA_MTP_PREFILL_FORCE_MMQ=1` avoids the hipBLAS temp-allocation OOM path |
 | MTP prompt-decode speed | Improved | PR #23198 avoids full-logit copies during MTP prompt decode; 35B n3 prefill improved 1376.82 → 1927.00 tok/s, 27B n3 506.34 → 632.04 tok/s in the 8K sweep |
@@ -75,7 +75,7 @@ Use `--flash-attn on` for quantized V cache. The production AMD path is VEC Flas
 | RotorQuant / `tbq4_0` | Production-smoked on gfx1100 | 32k/64k TBQ4+MTP server smokes pass cleanly |
 | PlanarQuant / IsoQuant (`planar3_0`, `iso3_0`) | Fixed and gated | 3-bit original-domain formats; covered by Triton oracle + invariant gates; not default user path |
 | 35B MoE MMQ selector | Working, compile+env gated | Build with `-DCMAKE_HIP_FLAGS="-DRDNA2_MATMUL_OPT_V1=1"`, then run with `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48`; use it for 35B with or without `--spec-type draft-mtp` |
-| Vulkan backend | Builds/list-devices | Separate `build-vulkan` and combined `build-rocm-vulkan` verified; compressed-KV Vulkan parity is not claimed |
+| Vulkan backend | Builds/list-devices | Separate `build-vulkan` and combined `build-rocm-vulkan` verified; Vulkan TurboQuant/TBQ4 KV routes are not supported in this branch |
 
 ## Why rocWMMA is deprecated for now
 
@@ -483,7 +483,7 @@ These are result summaries, not first-run instructions. Prefer the build/run com
 - **MTP after PR #23198:** `--spec-draft-n-max 3` remains the best observed draft length. The 8k sweep measured 27B MTP at ~632 prompt tok/s / ~47 decode tok/s and 35B MTP at ~1927 prompt tok/s / ~102 decode tok/s.
 - **35B MoE selector:** build with `-DCMAKE_HIP_FLAGS="-DRDNA2_MATMUL_OPT_V1=1"`, then run with `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48`. The selector is still useful on an MTP-capable 35B model; enabling MTP is a separate runtime choice. The selector sweep peaked around pp128 1781, pp256 2480, pp512 3150 tok/s.
 - **rocWMMA status:** compressed-KV rocWMMA prototypes are deprecated for now. They were useful for investigation, but the validated ROCm path is VEC FlashAttention.
-- **Vulkan q8K/q4V caveat:** `q8_0/q4_0` is not the Vulkan fallback recommendation. The slow/unsupported observation belongs to the Vulkan/RADV branch checks only; do not extend it to ROCm/HIP. Older upstream Vulkan `q8_0/q4_0` comparisons with `RADV_PERFTEST=nogttspill` should be treated as historical backend baselines only, not as guidance for this branch.
+- **Vulkan caveat:** TurboQuant/TBQ4 KV routes are not supported on Vulkan in this branch. Use non-TurboQuant KV types (for example `q8_0/q4_0`, `q4_0/q4_0`, or `q8_0/q8_0`) when running Vulkan comparisons. Older upstream Vulkan `q8_0/q4_0` comparisons with `RADV_PERFTEST=nogttspill` should be treated as historical backend baselines only, not as guidance for this branch.
 
 Artifacts referenced by these notes include `benches/rocm-rdna3/pr23198-mtp-prefill-check-20260518-001214/summary.md`, `benches/rocm-rdna3/ctx-fit-quant-sweep-20260516-004216/summary.json`, `benches/rocm-rdna3/q8k-tbq4v-vec-sparsev-20260516-041159/quality-summary.json`, `benches/rocm-rdna3/q8k-tbq4v-sparsev-quality-sweep-20260516-052442/ppl-kld-summary.md`, and `benches/rocm-rdna3/qwen35b-pp128-256-512-20260516-005350/summary.variants.clean.md`.
 
