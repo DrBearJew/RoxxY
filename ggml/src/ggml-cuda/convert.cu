@@ -1,5 +1,6 @@
 #include "convert.cuh"
 #include "dequantize.cuh"
+#include "tbq4-cuda.cuh"
 
 #include <cstdint>
 
@@ -698,6 +699,16 @@ static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k,
     convert_unary_cuda<src_t>(vx, y, k, 1, 1, 1, k, k, k, stream);
 }
 
+static void dequantize_tbq4_0_f16_cuda(const void * vx, half * y, const int64_t k, cudaStream_t stream) {
+    GGML_ASSERT(k % QK_TBQ4 == 0);
+    tbq4_dequant_full_cuda((const block_tbq4_0 *) vx, y, k / QK_TBQ4, stream);
+}
+
+static void dequantize_tbq4_0_f32_cuda(const void * vx, float * y, const int64_t k, cudaStream_t stream) {
+    GGML_ASSERT(k % QK_TBQ4 == 0);
+    tbq4_dequant_full_cuda((const block_tbq4_0 *) vx, y, k / QK_TBQ4, stream);
+}
+
 to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
@@ -758,6 +769,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
+        case GGML_TYPE_TBQ4_0:
+            return dequantize_tbq4_0_f16_cuda;
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
@@ -813,6 +826,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
+        case GGML_TYPE_TBQ4_0:
+            return dequantize_tbq4_0_f32_cuda;
         case GGML_TYPE_F16:
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:

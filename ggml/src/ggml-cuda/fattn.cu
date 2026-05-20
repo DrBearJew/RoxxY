@@ -581,14 +581,44 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
 #ifdef GGML_USE_HIP
-    // HIP/ROCm: keep quantized KV on VEC when possible. TILE/WMMA/MMA routes
-    // convert quantized K/V to full f16 temporary buffers in launch_fattn(),
-    // which can erase compression savings and OOM at long context. VEC handles
-    // TBQ4/Planar/Iso/Q8 inline with no full-cache temp buffer on RDNA3/3.5/4.
+    // HIP/ROCm: default quantized KV to VEC because TILE/WMMA/MMA routes
+    // convert quantized K/V to full f16 temporary buffers in launch_fattn().
+    // For large prefill, allow the f16-temp route only when explicitly enabled
+    // and bounded by a per-op temp-buffer cap. This mirrors the TurboQuant HIP
+    // prefill policy without making long-context OOMs the default.
     if ((ggml_is_quantized(K->type) || ggml_is_quantized(V->type)) && can_use_vector_kernel) {
-        return BEST_FATTN_KERNEL_VEC;
+        const char * quant_prefill_f16_env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_F16");
+        if (!quant_prefill_f16_env) {
+            quant_prefill_f16_env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_MMA");
+        }
+        if (!quant_prefill_f16_env) {
+            quant_prefill_f16_env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_WMMA");
+        }
+        if (!quant_prefill_f16_env) {
+            quant_prefill_f16_env = getenv("TBQ4_PREFILL_WMMA");
+        }
+
+        bool allow_quant_prefill_f16 = quant_prefill_f16_env && atoi(quant_prefill_f16_env) != 0 && Q->ne[1] > 2;
+
+        // TBQ4 full-block dequant-to-f16 currently supports contiguous tensors only.
+        allow_quant_prefill_f16 = allow_quant_prefill_f16 &&
+            (K->type != GGML_TYPE_TBQ4_0 || ggml_is_contiguously_allocated(K)) &&
+            (V->type != GGML_TYPE_TBQ4_0 || ggml_is_contiguously_allocated(V));
+
+        const char * max_mib_env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_F16_MAX_MIB");
+        if (!max_mib_env) {
+            max_mib_env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_MMA_MAX_MIB");
+        }
+        const int64_t max_mib = max_mib_env ? atoll(max_mib_env) : 1024;
+        const int64_t f16_tmp_bytes = ggml_cuda_fattn_f16_tmp_bytes(K, V);
+        allow_quant_prefill_f16 = allow_quant_prefill_f16 && (max_mib <= 0 || f16_tmp_bytes <= max_mib * 1024LL * 1024LL);
+
+        if (!allow_quant_prefill_f16) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
     }
 #endif // GGML_USE_HIP
+
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {

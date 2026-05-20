@@ -255,9 +255,10 @@ void dequantize_tbq4_0(const void * vx, const int64_t ib, const int iqs, float2 
 // Optimized: warp-shuffle butterfly for within-warp stages (h=1..16),
 // shared memory only for cross-warp stages (h=32,64). 7 barriers → 3 barriers.
 // All 128 threads active through all stages.
+template <typename dst_t>
 static __global__ void k_tbq4_dequant_full(
         const block_tbq4_0 * __restrict__ src,
-        float * __restrict__ dst,
+        dst_t * __restrict__ dst,
         const int64_t n_blocks) {
 
     const int64_t bid = blockIdx.x;
@@ -318,15 +319,22 @@ static __global__ void k_tbq4_dequant_full(
     constexpr float inv_sqrt_128 = 0.08838834764831845f;
     val *= inv_sqrt_128 * d_tbq4_wht_s1[tid];
 
-    dst[bid * 128 + tid] = val * norm;
+    dst[bid * 128 + tid] = ggml_cuda_cast<dst_t>(val * norm);
 }
 
-// Host launcher for full-block dequant
+// Host launchers for full-block dequant.
 static void tbq4_dequant_full_cuda(
         const block_tbq4_0 * src, float * dst,
         int64_t n_blocks, cudaStream_t stream) {
     if (n_blocks <= 0) return;
-    k_tbq4_dequant_full<<<(int)n_blocks, 128, 0, stream>>>(src, dst, n_blocks);
+    k_tbq4_dequant_full<float><<<(int)n_blocks, 128, 0, stream>>>(src, dst, n_blocks);
+}
+
+static void tbq4_dequant_full_cuda(
+        const block_tbq4_0 * src, half * dst,
+        int64_t n_blocks, cudaStream_t stream) {
+    if (n_blocks <= 0) return;
+    k_tbq4_dequant_full<half><<<(int)n_blocks, 128, 0, stream>>>(src, dst, n_blocks);
 }
 
 // ============================================================================

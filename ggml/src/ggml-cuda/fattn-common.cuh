@@ -1274,6 +1274,40 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+static int64_t ggml_cuda_fattn_f16_tmp_alloc_nelements(const ggml_tensor * t) {
+    int64_t ne = ggml_nelements(t);
+
+#ifdef GGML_USE_HIP
+    // HIP legacy-pool allocations are cached by size. During MTP prefill, nkv
+    // grows chunk-by-chunk, which can make the pool retain every intermediate
+    // f16 K/V temp size. This opt-in rounds quantized-KV f16 temps up to a
+    // stable nkv so repeated attention calls reuse one scratch size.
+    const char * stable_alloc_env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_ALLOC");
+    if (!stable_alloc_env || atoi(stable_alloc_env) == 0 || !ggml_is_quantized(t->type)) {
+        return ne;
+    }
+
+    const char * stable_nkv_env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_NKV");
+    int64_t stable_nkv = stable_nkv_env ? atoll(stable_nkv_env) : 0;
+    if (stable_nkv <= 0 && t->view_src) {
+        stable_nkv = t->view_src->ne[1];
+    }
+
+    if (stable_nkv > t->ne[1]) {
+        const int64_t stable_ne = t->ne[0] * stable_nkv * t->ne[2] * t->ne[3];
+        ne = std::max(ne, stable_ne);
+    }
+#endif // GGML_USE_HIP
+
+    return ne;
+}
+
+static int64_t ggml_cuda_fattn_f16_tmp_bytes(const ggml_tensor * K, const ggml_tensor * V) {
+    return
+        (K->type == GGML_TYPE_F16 ? 0 : ggml_cuda_fattn_f16_tmp_alloc_nelements(K) * (int64_t) sizeof(half)) +
+        (V->type == GGML_TYPE_F16 ? 0 : ggml_cuda_fattn_f16_tmp_alloc_nelements(V) * (int64_t) sizeof(half));
+}
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1327,7 +1361,7 @@ void launch_fattn(
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
 
-        K_f16.alloc(ggml_nelements(K));
+        K_f16.alloc(ggml_cuda_fattn_f16_tmp_alloc_nelements(K));
         if (ggml_is_contiguously_allocated(K)) {
             to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
             to_fp16(K_data, K_f16.ptr, ggml_nelements(K), main_stream);
@@ -1360,7 +1394,7 @@ void launch_fattn(
             const size_t bs = ggml_blck_size(V->type);
             const size_t ts = ggml_type_size(V->type);
 
-            V_f16.alloc(ggml_nelements(V));
+            V_f16.alloc(ggml_cuda_fattn_f16_tmp_alloc_nelements(V));
             if (ggml_is_contiguously_allocated(V)) {
                 to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
                 to_fp16(V_data, V_f16.ptr, ggml_nelements(V), main_stream);
