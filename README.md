@@ -224,6 +224,19 @@ LLAMA_MTP_PREFILL_FORCE_MMQ=1 \
 
 Vulkan is useful as a backend check and for the restored mixed `q8_0/q4_0` baseline route. Compressed-KV/TBQ4 Vulkan parity is **not** claimed yet in this experiment branch.
 
+On RDNA3/RADV, the Vulkan start environment is part of the benchmark contract. Always start Vulkan with `RADV_PERFTEST=nogttspill`; otherwise generation can look ~3x slower even when the model, KV cache, and MTP settings are unchanged. This is not a `SET_ROWS` regression. Do not use `LLAMA_SET_ROWS` as a control flag; it is not a Vulkan runtime switch here.
+
+Recommended Vulkan start parameters for RDNA3/RADV:
+
+| Parameter | Value | Why |
+|---|---|---|
+| `VK_ICD_FILENAMES` | `/usr/share/vulkan/icd.d/radeon_icd.json` | Select RADV explicitly on systems with multiple Vulkan ICDs |
+| `RADV_PERFTEST` | `nogttspill` | Avoid RADV GTT spill behavior that can crater generation speed |
+| `LD_LIBRARY_PATH` | `$PWD/build-vulkan/bin:...` | Load the matching local llama/ggml Vulkan libraries |
+| KV cache | `--cache-type-k q8_0 --cache-type-v q4_0` | Restored mixed-KV Vulkan baseline route |
+| MTP | `--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0` | Best observed Vulkan q8/q4 MTP setting in the 35B 8k+2k sweep |
+| Prompt cache | `--cache-ram 128` | Keeps prompt-cache accounting bounded in long-run comparisons |
+
 ```bash
 # Vulkan-only: check device name; expect Vulkan0 on this box
 LD_LIBRARY_PATH=$PWD/build-vulkan/bin \
@@ -282,6 +295,7 @@ Keep production boring. Flip these only when testing:
 |---|---|---|
 | 27B / explicit 35B MTP stability | `LLAMA_MTP_PREFILL_CHUNK=512 LLAMA_MTP_PREFILL_FORCE_MMQ=1` | Required for ROCm MTP routes; pair with `--spec-type draft-mtp --parallel 1`; default ROCm KV is `q8_0/tbq4_0` |
 | 35B MoE prefill boost | build with `-DRDNA2_MATMUL_OPT_V1=1`, run with `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48` | Best current 35B prompt-processing setting; not the MTP OOM workaround |
+| Vulkan/RADV start parameters | `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json RADV_PERFTEST=nogttspill` | Required for credible Vulkan speed checks on RDNA3; omitting `nogttspill` can make generation look much slower |
 | TBQ4 local experiment pair | `TBQ4_COOP_SET_ROWS=1 TBQ4_LAYER_ADAPTIVE=7` | Best current fixed-seed 8K MTP ablation pair; use for TBQ4 probes, not required for baseline correctness |
 | TBQ4 vec norm hoist probe | `GGML_CUDA_TBQ4_VEC_NORM_HOIST=1` | Probe only; single-run looked good, fixed-seed combo was worse than leaving it unset |
 | TBQ4 LDS route probe | `GGML_CUDA_TBQ4_LDS_ROUTE=D_K` | Probe only; not promoted |
