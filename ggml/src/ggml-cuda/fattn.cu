@@ -500,9 +500,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
+#ifdef GGML_USE_HIP
+    const bool rocm_q8q4_f16_prefill = K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0 && Q->ne[1] > 2;
+#else
+    const bool rocm_q8q4_f16_prefill = false;
+#endif // GGML_USE_HIP
     if (K->type != V->type &&
             !(K->type == GGML_TYPE_TBQ4_0 && V->type == GGML_TYPE_Q8_0) &&
-            !(K->type == GGML_TYPE_Q8_0   && V->type == GGML_TYPE_TBQ4_0)) {
+            !(K->type == GGML_TYPE_Q8_0   && V->type == GGML_TYPE_TBQ4_0) &&
+            !rocm_q8q4_f16_prefill) {
         return BEST_FATTN_KERNEL_NONE;
     }
 #endif // GGML_CUDA_FA_ALL_QUANTS
@@ -608,6 +614,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         allow_quant_prefill_f16 = allow_quant_prefill_f16 && (max_mib <= 0 || f16_tmp_bytes <= max_mib * 1024LL * 1024LL);
 
         if (!allow_quant_prefill_f16) {
+#ifndef GGML_CUDA_FA_ALL_QUANTS
+            // q8K/q4V mixed VEC is not compiled in the default build; if the
+            // bounded f16-temp route is disabled or over budget, report no FA
+            // support so the caller can use the non-FA fallback instead of
+            // dispatching an uninstantiated VEC case.
+            if (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+#endif // GGML_CUDA_FA_ALL_QUANTS
             return BEST_FATTN_KERNEL_VEC;
         }
     }
