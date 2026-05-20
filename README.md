@@ -224,18 +224,34 @@ LLAMA_MTP_PREFILL_FORCE_MMQ=1 \
 
 Vulkan is useful as a backend check today. Compressed-KV Vulkan parity is **not** claimed yet in this experiment branch.
 
+On RDNA3/RADV, the Vulkan start environment is part of the benchmark contract. Always start Vulkan with `RADV_PERFTEST=nogttspill`; otherwise generation can look ~3x slower even when the model, KV cache, and MTP settings are unchanged. In local 35B `q8_0/q4_0` MTP 8k+2k checks, omitting this flag produced ~39-43 tok/s, while the wrapper/RADV setting produced ~117-128 tok/s on this branch and ~148 tok/s on a clean upstream Vulkan build. This is not a `SET_ROWS` regression. Do not use `LLAMA_SET_ROWS` as a control flag; it is not a Vulkan runtime switch here.
+
+Recommended Vulkan start parameters for RDNA3/RADV:
+
+| Parameter | Value | Why |
+|---|---|---|
+| `VK_ICD_FILENAMES` | `/usr/share/vulkan/icd.d/radeon_icd.json` | Select RADV explicitly on systems with multiple Vulkan ICDs |
+| `RADV_PERFTEST` | `nogttspill` | Avoid RADV GTT spill behavior that can crater generation speed |
+| `LD_LIBRARY_PATH` | `$PWD/build-vulkan/bin:...` | Load the matching local llama/ggml Vulkan libraries |
+| KV cache | `--cache-type-k q8_0 --cache-type-v q4_0` | Valid non-TurboQuant Vulkan check path for this branch |
+| MTP | `--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0` | Current stable Vulkan MTP smoke setting; tune separately from ROCm/TBQ4 |
+| Prompt cache | `--cache-ram 128` | Keeps prompt-cache accounting bounded in long-run comparisons |
+
 ```bash
 # Vulkan-only: check device name; expect Vulkan0 on this box
-LD_LIBRARY_PATH=$PWD/build-vulkan/bin \
-  ./build-vulkan/bin/llama-server --list-devices
+export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json
+export RADV_PERFTEST=nogttspill
+export LD_LIBRARY_PATH=$PWD/build-vulkan/bin:${LD_LIBRARY_PATH:-}
+./build-vulkan/bin/llama-server --list-devices
 
-# Vulkan-only: start a small server smoke
+# Vulkan-only: start a q8_0/q4_0 MTP smoke
 MODEL=/path/to/model.gguf
-LD_LIBRARY_PATH=$PWD/build-vulkan/bin \
-  ./build-vulkan/bin/llama-server \
+./build-vulkan/bin/llama-server \
   -m "$MODEL" --device Vulkan0 \
-  --ctx-size 4096 --host 127.0.0.1 --port 8080 \
-  --no-webui --no-warmup -ngl 99
+  --flash-attn on --cache-type-k q8_0 --cache-type-v q4_0 \
+  --spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0 \
+  --ctx-size 10000 --batch-size 512 --ubatch-size 512 --cache-ram 128 \
+  --host 127.0.0.1 --port 8080 --no-webui --no-warmup -ngl 99
 
 # Combined build: list devices; expect both ROCm0 and Vulkan0 when both backends load
 LD_LIBRARY_PATH=$PWD/build-rocm-vulkan/bin:/opt/rocm-7.2.3/lib:/opt/amdgpu/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-} \
@@ -268,7 +284,8 @@ Keep production boring. Flip these only when testing:
 
 | Want | Toggle / command | Note |
 |---|---|---|
-| 27B / explicit 35B MTP stability | `LLAMA_MTP_PREFILL_CHUNK=512 LLAMA_MTP_PREFILL_FORCE_MMQ=1` | Required for MTP routes; pair with `--spec-type draft-mtp --parallel 1`; default KV is `q8_0/tbq4_0` |
+| 27B / explicit 35B MTP stability | `LLAMA_MTP_PREFILL_CHUNK=512 LLAMA_MTP_PREFILL_FORCE_MMQ=1` | Required for ROCm MTP routes; pair with `--spec-type draft-mtp --parallel 1`; default KV is `q8_0/tbq4_0` |
+| Vulkan/RADV start parameters | `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json RADV_PERFTEST=nogttspill` | Required for credible Vulkan speed checks on RDNA3; omitting `nogttspill` can make generation look ~3x slower |
 | 35B MoE prefill boost | build with `-DRDNA2_MATMUL_OPT_V1=1`, run with `RDNA2_MATMUL_OPT_V1=1 GGML_CUDA_MMQ_MAX_X=48` | Best current 35B prompt-processing setting; not the MTP OOM workaround |
 | TBQ4 local experiment pair | `TBQ4_COOP_SET_ROWS=1 TBQ4_LAYER_ADAPTIVE=7` | Best current fixed-seed 8K MTP ablation pair; use for TBQ4 probes, not required for baseline correctness |
 | TBQ4 vec norm hoist probe | `GGML_CUDA_TBQ4_VEC_NORM_HOIST=1` | Probe only; single-run looked good, fixed-seed combo was worse than leaving it unset |
