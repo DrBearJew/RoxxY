@@ -4,17 +4,36 @@
 #include "log.h"
 
 #include <cmath>
+#include <cctype>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <map>
 #include <regex>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 struct common_debug_cb_user_data::impl {
     std::vector<uint8_t>    data;
     std::vector<std::regex> tensor_filters;
+    std::string             dump_dir;
+    std::map<std::string, int> dump_counts;
     bool                    abort_on_nan{false};
 };
 
-common_debug_cb_user_data::common_debug_cb_user_data() : pimpl(std::make_unique<impl>()) {}
+static void common_debug_init_dump_dir(common_debug_cb_user_data::impl * pimpl) {
+    const char * dump_dir = std::getenv("LLAMA_DEBUG_TENSOR_DUMP_DIR");
+    if (dump_dir != nullptr && dump_dir[0] != '\0') {
+        pimpl->dump_dir = dump_dir;
+        std::filesystem::create_directories(pimpl->dump_dir);
+    }
+}
+
+common_debug_cb_user_data::common_debug_cb_user_data() : pimpl(std::make_unique<impl>()) {
+    common_debug_init_dump_dir(pimpl.get());
+}
 common_debug_cb_user_data::~common_debug_cb_user_data() = default;
 
 common_debug_cb_user_data::common_debug_cb_user_data(common_params & params, const std::vector<std::string> & filter_patterns, bool abort_on_nan)
@@ -29,6 +48,7 @@ common_debug_cb_user_data::common_debug_cb_user_data(common_params & params, con
         }
     }
     pimpl->abort_on_nan = abort_on_nan;
+    common_debug_init_dump_dir(pimpl.get());
 
     params.cb_eval           = common_debug_cb_eval;
     params.cb_eval_user_data = this;
@@ -130,6 +150,88 @@ static void common_debug_print_tensor(uint8_t * data, ggml_type type, const int6
     }
 }
 
+static std::string common_debug_json_escape(const char * s) {
+    std::ostringstream os;
+    for (const unsigned char c : std::string(s == nullptr ? "" : s)) {
+        switch (c) {
+            case '\\': os << "\\\\"; break;
+            case '"':  os << "\\\""; break;
+            case '\n': os << "\\n";  break;
+            case '\r': os << "\\r";  break;
+            case '\t': os << "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    os << "\\u00" << "0123456789abcdef"[(c >> 4) & 0xf] << "0123456789abcdef"[c & 0xf];
+                } else {
+                    os << c;
+                }
+        }
+    }
+    return os.str();
+}
+
+static std::string common_debug_safe_tensor_name(const char * name) {
+    std::string safe = name == nullptr ? "tensor" : name;
+    for (char & c : safe) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (!std::isalnum(uc) && c != '-' && c != '_' && c != '.') {
+            c = '_';
+        }
+    }
+    if (safe.empty()) {
+        safe = "tensor";
+    }
+    return safe;
+}
+
+static void common_debug_dump_tensor(common_debug_cb_user_data::impl * pimpl, const ggml_tensor * t, const uint8_t * data, size_t n_bytes) {
+    if (pimpl->dump_dir.empty() || data == nullptr) {
+        return;
+    }
+
+    const std::string safe_name = common_debug_safe_tensor_name(t->name);
+    const int index = pimpl->dump_counts[safe_name]++;
+    std::ostringstream stem;
+    stem << safe_name << "-" << index;
+
+    const auto base_path = std::filesystem::path(pimpl->dump_dir) / stem.str();
+    const auto bin_path  = std::filesystem::path(base_path.string() + ".bin");
+    const auto json_path = std::filesystem::path(base_path.string() + ".json");
+
+    {
+        std::ofstream file(bin_path, std::ios::binary);
+        if (!file) {
+            throw std::runtime_error("failed to open tensor dump binary file: " + bin_path.string());
+        }
+        file.write(reinterpret_cast<const char *>(data), n_bytes);
+    }
+
+    {
+        std::ofstream file(json_path);
+        if (!file) {
+            throw std::runtime_error("failed to open tensor dump metadata file: " + json_path.string());
+        }
+        file << "{\n";
+        file << "  \"name\": \"" << common_debug_json_escape(t->name) << "\",\n";
+        file << "  \"op\": \"" << common_debug_json_escape(ggml_op_name(t->op)) << "\",\n";
+        file << "  \"op_desc\": \"" << common_debug_json_escape(ggml_op_desc(t)) << "\",\n";
+        file << "  \"type\": \"" << common_debug_json_escape(ggml_type_name(t->type)) << "\",\n";
+        file << "  \"n_bytes\": " << n_bytes << ",\n";
+        file << "  \"ne\": [";
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            file << t->ne[i] << (i + 1 < GGML_MAX_DIMS ? ", " : "");
+        }
+        file << "],\n";
+        file << "  \"nb\": [";
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            file << t->nb[i] << (i + 1 < GGML_MAX_DIMS ? ", " : "");
+        }
+        file << "],\n";
+        file << "  \"bin\": \"" << common_debug_json_escape(bin_path.filename().string().c_str()) << "\"\n";
+        file << "}\n";
+    }
+}
+
 /**
  * GGML operations callback during the graph execution.
  *
@@ -148,7 +250,15 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     const struct ggml_tensor * src1 = t->src[1];
 
     if (ask) {
-        return true;  // Always retrieve data
+        if (pimpl->tensor_filters.empty()) {
+            return true;  // Unfiltered debug mode: retrieve all data.
+        }
+        for (const auto & filter : pimpl->tensor_filters) {
+            if (std::regex_search(t->name, filter)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     bool matches_filter = pimpl->tensor_filters.empty();
@@ -181,9 +291,12 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
         ggml_backend_tensor_get(t, pimpl->data.data(), 0, n_bytes);
     }
 
-    if (!ggml_is_quantized(t->type) && matches_filter) {
+    if (matches_filter) {
         uint8_t * data = is_host ? (uint8_t *) t->data : pimpl->data.data();
-        common_debug_print_tensor(data, t->type, t->ne, t->nb, 3, pimpl->abort_on_nan);
+        common_debug_dump_tensor(pimpl, t, data, ggml_nbytes(t));
+        if (!ggml_is_quantized(t->type)) {
+            common_debug_print_tensor(data, t->type, t->ne, t->nb, 3, pimpl->abort_on_nan);
+        }
     }
 
     return true;

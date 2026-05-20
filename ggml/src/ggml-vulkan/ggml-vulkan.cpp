@@ -425,7 +425,21 @@ enum FaCodePath {
     FA_SCALAR,
     FA_COOPMAT1,
     FA_COOPMAT2,
+    FA_Q8_TBQ4_VEC_NONMTP,
+    FA_Q8_TBQ4_VEC_TILEK_NONMTP,
+    FA_Q8_TBQ4_SAWQ128_DIAG_NONMTP,
+    FA_Q8_TBQ4_VEC_MTP,
 };
+
+static const char * ggml_vk_fa_q8_tbq4_route_name(FaCodePath path) {
+    switch (path) {
+    case FA_Q8_TBQ4_VEC_NONMTP:          return "vec_nonmtp";
+    case FA_Q8_TBQ4_VEC_TILEK_NONMTP:    return "vec_tilek_nonmtp";
+    case FA_Q8_TBQ4_SAWQ128_DIAG_NONMTP: return "sawq128_diag_nonmtp";
+    case FA_Q8_TBQ4_VEC_MTP:             return "vec_mtp";
+    default:                          return "accepted";
+    }
+}
 
 struct vk_fa_pipeline_state {
     uint32_t HSK, HSV;
@@ -681,6 +695,15 @@ struct vk_device_struct {
     bool mul_mat_id_m[GGML_TYPE_COUNT];
     bool mul_mat_id_s[GGML_TYPE_COUNT];
 
+    // Separate flags for the q8_1 (integer dot) mmq path, whose shader uses
+    // a different shared-memory layout than the float matmul shaders.
+    bool mul_mat_l_int[GGML_TYPE_COUNT];
+    bool mul_mat_m_int[GGML_TYPE_COUNT];
+    bool mul_mat_s_int[GGML_TYPE_COUNT];
+    bool mul_mat_id_l_int[GGML_TYPE_COUNT];
+    bool mul_mat_id_m_int[GGML_TYPE_COUNT];
+    bool mul_mat_id_s_int[GGML_TYPE_COUNT];
+
     vk::DescriptorSetLayout dsl;
 
     vk_matmul_pipeline pipeline_matmul_f32 {};
@@ -857,6 +880,12 @@ struct vk_device_struct {
 
     std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16[GGML_TYPE_COUNT];
     std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16_q8_0_tbq4_0;
+    std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16_q8_0_tbq4_0_vec_nonmtp;
+    std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16_q8_0_tbq4_0_vec_tilek_nonmtp;
+    std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16_q8_0_tbq4_0_sawq128_diag;
+    std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16_q8_0_tbq4_0_vec_mtp;
+    std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16_q8_0_q4_0;
+    std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16_q4_0_tbq4_0;
 
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
 
@@ -2151,11 +2180,11 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
 
     // Patch SPIR-V to enable RTE rounding for FP16, avoiding the need for
     // separate shader variants compiled with -DRTE16.
-    std::vector<uint32_t> spv;
+    std::vector<uint32_t> spv_bin;
     if (device->float_controls_rte_fp16) {
         const uint32_t* spv_words = reinterpret_cast<const uint32_t *>(spv_data);
         size_t word_count = spv_size / sizeof(uint32_t);
-        spv.assign(spv_words, spv_words + word_count);
+        spv_bin.assign(spv_words, spv_words + word_count);
 
         // Find insertion points respecting SPIR-V layout order:
         //   Header(5) -> OpCapability -> OpExtension -> ... -> OpEntryPoint -> OpExecutionMode -> ...
@@ -2165,9 +2194,9 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
         size_t exec_insert_pos = pos;
         uint32_t entry_point_id = 0;
 
-        while (pos < spv.size()) {
-            uint32_t opcode = spv[pos] & spv::OpCodeMask;
-            uint32_t len    = spv[pos] >> spv::WordCountShift;
+        while (pos < spv_bin.size()) {
+            uint32_t opcode = spv_bin[pos] & spv::OpCodeMask;
+            uint32_t len    = spv_bin[pos] >> spv::WordCountShift;
             if (len == 0) break;
 
             if (opcode == spv::OpCapability) {
@@ -2176,7 +2205,7 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
             } else if (opcode == spv::OpExtension) {
                 ext_insert_pos = pos + len;
             } else if (opcode == spv::OpEntryPoint) {
-                entry_point_id = spv[pos + 2];
+                entry_point_id = spv_bin[pos + 2];
                 exec_insert_pos = pos + len;
             } else if (opcode == spv::OpExecutionMode || opcode == spv::OpExecutionModeId) {
                 exec_insert_pos = pos + len;
@@ -2191,7 +2220,7 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
 
         // OpExecutionMode %entrypoint RoundingModeRTE 16
         uint32_t exec_mode[] = { (4u << spv::WordCountShift) | spv::OpExecutionMode, entry_point_id, spv::ExecutionModeRoundingModeRTE, 16 };
-        spv.insert(spv.begin() + exec_insert_pos, std::begin(exec_mode), std::end(exec_mode));
+        spv_bin.insert(spv_bin.begin() + exec_insert_pos, std::begin(exec_mode), std::end(exec_mode));
 
         // OpExtension "SPV_KHR_float_controls"
         const char ext_str[] = "SPV_KHR_float_controls";
@@ -2199,13 +2228,13 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
         std::vector<uint32_t> extension(1 + ext_str_words, 0);
         extension[0] = (uint32_t)((1 + ext_str_words) << spv::WordCountShift) | spv::OpExtension;
         memcpy(&extension[1], ext_str, sizeof(ext_str));
-        spv.insert(spv.begin() + ext_insert_pos, extension.begin(), extension.end());
+        spv_bin.insert(spv_bin.begin() + ext_insert_pos, extension.begin(), extension.end());
 
         // OpCapability RoundingModeRTE
         uint32_t capability[] = { (2u << spv::WordCountShift) | spv::OpCapability, spv::CapabilityRoundingModeRTE };
-        spv.insert(spv.begin() + cap_insert_pos, std::begin(capability), std::end(capability));
+        spv_bin.insert(spv_bin.begin() + cap_insert_pos, std::begin(capability), std::end(capability));
 
-        shader_module_create_info = vk::ShaderModuleCreateInfo({}, spv.size() * sizeof(uint32_t), spv.data());
+        shader_module_create_info = vk::ShaderModuleCreateInfo({}, spv_bin.size() * sizeof(uint32_t), spv_bin.data());
     }
 
     pipeline->shader_module = device->device.createShaderModule(shader_module_create_info);
@@ -2935,10 +2964,29 @@ struct vk_fa_tuning_params {
     }
 };
 
-static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type kv_type);
+static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type);
 static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc);
 
-static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type kv_type, bool f32acc) {
+// Whether scalar flash attention will use the MMQ path for the given K/V types.
+// Mixed scalar paths (q8_0/q4_0 and q8_0/tbq4_0) use dedicated non-MMQ shaders.
+static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type, ggml_type v_type) {
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+    if (k_type != v_type) {
+        return false;
+    }
+    return device->integer_dot_product && device->subgroup_clustered &&
+           (k_type == GGML_TYPE_Q4_0 || k_type == GGML_TYPE_Q4_1 ||
+            k_type == GGML_TYPE_Q5_0 || k_type == GGML_TYPE_Q5_1 ||
+            k_type == GGML_TYPE_Q8_0);
+#else
+    GGML_UNUSED(device);
+    GGML_UNUSED(k_type);
+    GGML_UNUSED(v_type);
+    return false;
+#endif
+}
+
+static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
 
     vk_fa_tuning_params result{};
     result.path = FA_SCALAR;
@@ -2985,7 +3033,7 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
     }
 
     if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture != AMD_GCN &&
-        kv_type == GGML_TYPE_TQ3_0 && n_kv >= 32768) {
+        (k_type == GGML_TYPE_TQ3_0 || v_type == GGML_TYPE_TQ3_0) && n_kv >= 32768) {
         if (n_rows == 1) {
             result.block_cols = 128;
         } else if (!(D & 8)) {
@@ -2999,15 +3047,16 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
 
     result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
     // Keep TQ3_0 on direct scalar loads; its semi-quant path bypasses shared-memory dequant staging.
-    if (kv_type == GGML_TYPE_TQ3_0) {
+    if (k_type == GGML_TYPE_TQ3_0 || v_type == GGML_TYPE_TQ3_0) {
         result.shmem_staging = 0;
     }
     // Planar/Iso dequant is heavier than legacy q4/q5/q8; staging amortizes K/V decode on RDNA/RADV.
-    if (result.shmem_staging == 0 && (kv_type == GGML_TYPE_PLANAR3_0 || kv_type == GGML_TYPE_ISO3_0)) {
+    if (result.shmem_staging == 0 && (k_type == GGML_TYPE_PLANAR3_0 || v_type == GGML_TYPE_PLANAR3_0 ||
+                                       k_type == GGML_TYPE_ISO3_0 || v_type == GGML_TYPE_ISO3_0)) {
         result.shmem_staging = 1;
     }
 
-    if (!reduce_block_rows && !ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, kv_type)) {
+    if (!reduce_block_rows && !ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
         result.block_rows /= 2;
     }
 
@@ -3030,10 +3079,9 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
     return result;
 }
 
-static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type kv_type, bool f32acc) {
+static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
     GGML_UNUSED(n_rows);
     GGML_UNUSED(n_kv);
-    GGML_UNUSED(kv_type);
     GGML_UNUSED(f32acc);
 
     vk_fa_tuning_params result{};
@@ -3056,7 +3104,8 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     result.d_split = std::min(std::min(result.subgroup_size, 8u), D_lsb / 4);
 
     result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
-    if (result.shmem_staging == 0 && (kv_type == GGML_TYPE_PLANAR3_0 || kv_type == GGML_TYPE_ISO3_0)) {
+    if (result.shmem_staging == 0 && (k_type == GGML_TYPE_PLANAR3_0 || v_type == GGML_TYPE_PLANAR3_0 ||
+                                      k_type == GGML_TYPE_ISO3_0 || v_type == GGML_TYPE_ISO3_0)) {
         result.shmem_staging = 1;
     }
 
@@ -3091,16 +3140,65 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat2(const vk_device& device
     return result;
 }
 
+static bool ggml_vk_fa_q8_tbq4_exact_base(ggml_type k_type, ggml_type v_type, uint32_t hsk, uint32_t hsv) {
+    return k_type == GGML_TYPE_Q8_0 && v_type == GGML_TYPE_TBQ4_0 && hsk == 256 && hsv == 256;
+}
+
+static bool ggml_vk_try_fa_q8_tbq4_vec_tuning(const vk_device& device, uint32_t hsk, uint32_t hsv,
+                                               ggml_type k_type, ggml_type v_type, bool has_sinks,
+                                               vk_fa_tuning_params & out) {
+    if (!ggml_vk_fa_q8_tbq4_exact_base(k_type, v_type, hsk, hsv)) {
+        return false;
+    }
+
+    // Dedicated Vulkan TBQ4 route currently targets RDNA-style subgroup=64 geometry.
+    if (device->subgroup_size < 64) {
+        return false;
+    }
+
+    out = {};
+    out.path = has_sinks ? FA_Q8_TBQ4_VEC_MTP : FA_Q8_TBQ4_VEC_NONMTP;
+    out.block_rows = 4;
+    out.block_cols = 32;
+    out.d_split = 8;
+    out.row_split = 4;
+    out.shmem_staging = 0;
+    out.subgroup_size = 64;
+    out.workgroup_size = 256;
+    out.disable_subgroups = false;
+    out.limit_occupancy_shmem = 0;
+    return true;
+}
+
 static bool ggml_vk_fa_scalar_mixed_q8_tbq4(ggml_type k_type, ggml_type v_type) {
     return k_type == GGML_TYPE_Q8_0 && v_type == GGML_TYPE_TBQ4_0;
 }
 
+static bool ggml_vk_d6_q4k_rot_k128_enabled() {
+    const char * e = getenv("GGML_VK_TBQ4_D6_Q4K_ROT_K128");
+    return e != nullptr && e[0] != '\0' && strcmp(e, "0") != 0;
+}
+
+static bool ggml_vk_fa_scalar_mixed_q4_tbq4_rotk128(ggml_type k_type, ggml_type v_type) {
+    return ggml_vk_d6_q4k_rot_k128_enabled() && k_type == GGML_TYPE_Q4_0 && v_type == GGML_TYPE_TBQ4_0;
+}
+
+static bool ggml_vk_fa_scalar_mixed_q8_q4(ggml_type k_type, ggml_type v_type) {
+    return k_type == GGML_TYPE_Q8_0 && v_type == GGML_TYPE_Q4_0;
+}
+
+static bool ggml_vk_fa_scalar_mixed_supported(ggml_type k_type, ggml_type v_type) {
+    return ggml_vk_fa_scalar_mixed_q8_tbq4(k_type, v_type) ||
+           ggml_vk_fa_scalar_mixed_q4_tbq4_rotk128(k_type, v_type) ||
+           ggml_vk_fa_scalar_mixed_q8_q4(k_type, v_type);
+}
+
 static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
-    // Generic mixed K/V is implemented on the coopmat2 (flash_attn_cm2) path.
-    // RDNA3/RADV lacks coopmat2, so keep the q8_0 K + tbq4_0 V KV path on scalar Vulkan instead of falling back to CPU.
-    if (k_type != v_type) {
-        if (ggml_vk_fa_scalar_mixed_q8_tbq4(k_type, v_type)) {
-            return get_fa_tuning_params_scalar(device, hsk, hsv, n_rows, n_kv, k_type, f32acc);
+    // Preserve upstream generic tuning for the default q8_0/q4_0 cache path so RDNA3 can use coopmat1.
+    // TBQ4/ROT_K128 mixed paths remain on their explicit scalar/dedicated routes.
+    if (k_type != v_type && !ggml_vk_fa_scalar_mixed_q8_q4(k_type, v_type)) {
+        if (ggml_vk_fa_scalar_mixed_q8_tbq4(k_type, v_type) || ggml_vk_fa_scalar_mixed_q4_tbq4_rotk128(k_type, v_type)) {
+            return get_fa_tuning_params_scalar(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
         }
         GGML_ASSERT(device->coopmat2);
         return get_fa_tuning_params_coopmat2(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
@@ -3117,7 +3215,7 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
     if (path == FA_COOPMAT1) {
         bool shape_ok = (f32acc && device->coopmat_support_16x16x16_f32acc) ||
                         (!f32acc && device->coopmat_support_16x16x16_f16acc);
-        const vk_fa_tuning_params params = get_fa_tuning_params_coopmat1(device, hsk, hsv, n_rows, n_kv, k_type, f32acc);
+        const vk_fa_tuning_params params = get_fa_tuning_params_coopmat1(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
         bool shmem_ok = ggml_vk_flash_attn_coopmat_shmem_support(device, params, hsk, hsv, f32acc);
 
         if (!shape_ok || !shmem_ok) {
@@ -3143,11 +3241,16 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
 
     switch (path) {
     case FA_SCALAR:
-        return get_fa_tuning_params_scalar(device, hsk, hsv, n_rows, n_kv, k_type, f32acc);
+        return get_fa_tuning_params_scalar(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
     case FA_COOPMAT1:
-        return get_fa_tuning_params_coopmat1(device, hsk, hsv, n_rows, n_kv, k_type, f32acc);
+        return get_fa_tuning_params_coopmat1(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
     case FA_COOPMAT2:
         return get_fa_tuning_params_coopmat2(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
+    case FA_Q8_TBQ4_VEC_NONMTP:
+    case FA_Q8_TBQ4_VEC_TILEK_NONMTP:
+    case FA_Q8_TBQ4_SAWQ128_DIAG_NONMTP:
+    case FA_Q8_TBQ4_VEC_MTP:
+        return get_fa_tuning_params_scalar(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
     default:
         throw std::runtime_error("unsupported FaCodePath");
     }
@@ -3244,6 +3347,73 @@ static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vec
 
     VK_LOG_DEBUG("ggml_vk_matmul_shmem_support(warptile=(" << warptile[0] << "," << warptile[1] << "," << warptile[2] << "), "
                  "mul_mat_id=" << mul_mat_id << ", src0_type=" << ggml_type_name(src0_type) << ", supported=" << supported);
+
+    return supported;
+}
+
+// Shmem usage for the q8_1 mmq shader (mul_mmq.comp), which uses
+// block_a_cache / block_b_cache layouts (see mul_mmq_shmem_types.glsl) rather
+// than the float load buffers checked by ggml_vk_matmul_shmem_support.
+// Sizes follow std430 rules. Returns false for types without a q8_1 pipeline.
+static bool ggml_vk_matmul_int_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type) {
+
+    // FLOAT_TYPE in the shader is float16_t with fp16 support, otherwise float.
+    const uint32_t fp_size   = device->fp16 ? 2u : 4u;
+    const uint32_t fp_align  = fp_size;
+    const uint32_t fp2_size  = 2u * fp_size;
+    const uint32_t fp2_align = device->fp16 ? 4u : 8u;
+
+    struct member { uint32_t size, align; };
+    auto std430_size = [](std::initializer_list<member> members) {
+        uint32_t off = 0, struct_align = 1;
+        for (const auto &m : members) {
+            off = (off + m.align - 1) & ~(m.align - 1);
+            off += m.size;
+            struct_align = std::max(struct_align, m.align);
+        }
+        return (off + struct_align - 1) & ~(struct_align - 1);
+    };
+
+    uint32_t block_a_size = 0;
+    switch (src0_type) {
+        case GGML_TYPE_Q4_0:    block_a_size = std430_size({{16, 4}, {fp_size,  fp_align}});                  break; // qs[16/4] + dm
+        case GGML_TYPE_Q4_1:    block_a_size = std430_size({{16, 4}, {fp2_size, fp2_align}});                 break; // qs[16/4] + dm(vec2)
+        case GGML_TYPE_Q5_0:    block_a_size = std430_size({{16, 4}, {4, 4}, {fp_size,  fp_align}});          break; // qs[16/4] + qh + dm
+        case GGML_TYPE_Q5_1:    block_a_size = std430_size({{16, 4}, {4, 4}, {fp2_size, fp2_align}});         break; // qs[16/4] + qh + dm(vec2)
+        case GGML_TYPE_Q8_0:    block_a_size = std430_size({{32, 4}, {fp_size,  fp_align}});                  break; // qs[8] + dm
+        case GGML_TYPE_MXFP4:   block_a_size = std430_size({{32, 4}, {fp_size,  fp_align}});                  break; // qs[8] + d
+        case GGML_TYPE_Q2_K:    block_a_size = std430_size({{ 8, 4}, {2, 2}, {fp2_size, fp2_align}});         break; // qs[2] + scales(u8vec2) + dm(vec2)
+        case GGML_TYPE_Q3_K:    block_a_size = std430_size({{16, 4}, {fp2_size, fp2_align}});                 break; // qs[4] + d_scales(vec2)
+        case GGML_TYPE_Q4_K:    block_a_size = std430_size({{16, 4}, {fp2_size, fp2_align}});                 break; // qs[4] + dm(vec2)
+        case GGML_TYPE_Q5_K:    block_a_size = std430_size({{32, 4}, {fp2_size, fp2_align}});                 break; // qs[8] + dm(vec2)
+        case GGML_TYPE_Q6_K:    block_a_size = std430_size({{32, 4}, {fp2_size, fp2_align}});                 break; // qs[8] + d_scales(vec2)
+        case GGML_TYPE_PLANAR3_0: block_a_size = std430_size({{32, 4}, {16, 4}, {fp_size, fp_align}});        break; // qs[32] + signs[16] + d
+        case GGML_TYPE_ISO3_0:    block_a_size = std430_size({{32, 4}, {16, 4}, {fp_size, fp_align}});        break; // qs[32] + signs[16] + d (same layout as planar3_0)
+        case GGML_TYPE_TQ3_0:    block_a_size = std430_size({{12, 4}, {fp_size, fp_align}});               break; // qs[12] + d
+        default:
+            return false;
+    }
+
+    // block_b_cache: { int32_t qs[8]; FLOAT_TYPEV2 ds; }
+    const uint32_t block_b_size = std430_size({{32, 4}, {fp2_size, fp2_align}});
+
+    const uint32_t BM = warptile[1];
+    const uint32_t BN = warptile[2];
+    // mul_mmq.comp: BK_STEP=1 for MUL_MAT_ID, 4 otherwise.
+    const uint32_t BK_STEP = mul_mat_id ? 1u : 4u;
+
+    const uint32_t buf_a_size = BM * BK_STEP * block_a_size;
+    const uint32_t buf_b_size = BN * BK_STEP * block_b_size;
+    const uint32_t mmid_row_ids = mul_mat_id ? (BN * 2u * (uint32_t)sizeof(uint16_t)) : 0u;
+
+    const uint32_t warps = warptile[0] / warptile[10];
+    const uint32_t ballots_sh = mul_mat_id ? (warps * 4u * (uint32_t)sizeof(uint32_t)) : 0u;
+
+    const uint32_t total_size = buf_a_size + buf_b_size + mmid_row_ids + ballots_sh;
+    const bool supported = total_size <= device->properties.limits.maxComputeSharedMemorySize;
+
+    VK_LOG_DEBUG("ggml_vk_matmul_int_shmem_support(warptile=(" << warptile[0] << "," << warptile[1] << "," << warptile[2] << "), "
+                 "mul_mat_id=" << mul_mat_id << ", src0_type=" << ggml_type_name(src0_type) << ", total=" << total_size << ", supported=" << supported);
 
     return supported;
 }
@@ -3480,6 +3650,40 @@ static void ggml_vk_load_shaders(vk_device& device) {
             } else if (!ggml_vk_matmul_shmem_support(device, l_warptile_mmqid, true, t)) {
                 device->mul_mat_id_l[i] = false;
             }
+
+            // The q8_1 mmq path has its own (larger) shmem layout, check it separately.
+            // K-quants use the _int_k warptiles, others use _int.
+            const bool is_k_quant = (t == GGML_TYPE_Q2_K || t == GGML_TYPE_Q3_K ||
+                                     t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K ||
+                                     t == GGML_TYPE_Q6_K);
+            const auto & s_int   = is_k_quant ? s_warptile_mmq_int_k   : s_warptile_mmq_int;
+            const auto & m_int   = is_k_quant ? m_warptile_mmq_int_k   : m_warptile_mmq_int;
+            const auto & l_int   = is_k_quant ? l_warptile_mmq_int_k   : l_warptile_mmq_int;
+            const auto & s_intid = is_k_quant ? s_warptile_mmqid_int_k : s_warptile_mmqid_int;
+            const auto & m_intid = is_k_quant ? m_warptile_mmqid_int_k : m_warptile_mmqid_int;
+            const auto & l_intid = is_k_quant ? l_warptile_mmqid_int_k : l_warptile_mmqid_int;
+
+            if (!ggml_vk_matmul_int_shmem_support(device, s_int, false, t)) {
+                device->mul_mat_s_int[i] = false;
+                device->mul_mat_m_int[i] = false;
+                device->mul_mat_l_int[i] = false;
+            } else if (!ggml_vk_matmul_int_shmem_support(device, m_int, false, t)) {
+                device->mul_mat_m_int[i] = false;
+                device->mul_mat_l_int[i] = false;
+            } else if (!ggml_vk_matmul_int_shmem_support(device, l_int, false, t)) {
+                device->mul_mat_l_int[i] = false;
+            }
+
+            if (!ggml_vk_matmul_int_shmem_support(device, s_intid, true, t)) {
+                device->mul_mat_id_s_int[i] = false;
+                device->mul_mat_id_m_int[i] = false;
+                device->mul_mat_id_l_int[i] = false;
+            } else if (!ggml_vk_matmul_int_shmem_support(device, m_intid, true, t)) {
+                device->mul_mat_id_m_int[i] = false;
+                device->mul_mat_id_l_int[i] = false;
+            } else if (!ggml_vk_matmul_int_shmem_support(device, l_intid, true, t)) {
+                device->mul_mat_id_l_int[i] = false;
+            }
         }
     }
 
@@ -3681,7 +3885,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
     }
 #undef CREATE_FA_CM2_MIXED
 #endif
-#define CREATE_FA_Q8_TBQ4(SUFFIX) \
+#define CREATE_FA_Q8_TBQ4_ACCEPTED(SUFFIX) \
         for (auto &fa : device->pipeline_flash_attn_f32_f16_q8_0_tbq4_0) { \
             FaCodePath path = fa.first.path; \
             uint32_t Br = fa.first.Br; \
@@ -3693,25 +3897,127 @@ static void ggml_vk_load_shaders(vk_device& device) {
             if (path == FA_SCALAR) { \
                 if (aligned) { \
                     if (f32acc) { \
-                        ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_q8_0_tbq4_0_aligned_f32acc", flash_attn_f32_f16_q8_0_tbq4_0 ## SUFFIX ## _len,  flash_attn_f32_f16_q8_0_tbq4_0 ## SUFFIX ## _data,  "main", 7, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), Bc, true, !fa_ds, (!fa_ds ? fa_sgs : 0)); \
+                        ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_q8_0_tbq4_0_aligned_f32acc", flash_attn_f32_f16_q8_0_tbq4_0 ## SUFFIX ## _len, flash_attn_f32_f16_q8_0_tbq4_0 ## SUFFIX ## _data, "main", 7, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), Bc, true, !fa_ds, (!fa_ds ? fa_sgs : 0)); \
                     } else { \
-                        ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_q8_0_tbq4_0_aligned_f16acc", flash_attn_f32_f16_q8_0_tbq4_0_f16acc ## SUFFIX ## _len,  flash_attn_f32_f16_q8_0_tbq4_0_f16acc ## SUFFIX ## _data,  "main", 7, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), Bc, true, !fa_ds, (!fa_ds ? fa_sgs : 0)); \
+                        ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_q8_0_tbq4_0_aligned_f16acc", flash_attn_f32_f16_q8_0_tbq4_0_f16acc ## SUFFIX ## _len, flash_attn_f32_f16_q8_0_tbq4_0_f16acc ## SUFFIX ## _data, "main", 7, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), Bc, true, !fa_ds, (!fa_ds ? fa_sgs : 0)); \
                     } \
                 } else { \
                     if (f32acc) { \
-                        ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_q8_0_tbq4_0_f32acc", flash_attn_f32_f16_q8_0_tbq4_0 ## SUFFIX ## _len,  flash_attn_f32_f16_q8_0_tbq4_0 ## SUFFIX ## _data,  "main", 7, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), 1, true, !fa_ds, (!fa_ds ? fa_sgs : 0)); \
+                        ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_q8_0_tbq4_0_f32acc", flash_attn_f32_f16_q8_0_tbq4_0 ## SUFFIX ## _len, flash_attn_f32_f16_q8_0_tbq4_0 ## SUFFIX ## _data, "main", 7, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), 1, true, !fa_ds, (!fa_ds ? fa_sgs : 0)); \
                     } else { \
-                        ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_q8_0_tbq4_0_f16acc", flash_attn_f32_f16_q8_0_tbq4_0_f16acc ## SUFFIX ## _len,  flash_attn_f32_f16_q8_0_tbq4_0_f16acc ## SUFFIX ## _data,  "main", 7, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), 1, true, !fa_ds, (!fa_ds ? fa_sgs : 0)); \
+                        ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_q8_0_tbq4_0_f16acc", flash_attn_f32_f16_q8_0_tbq4_0_f16acc ## SUFFIX ## _len, flash_attn_f32_f16_q8_0_tbq4_0_f16acc ## SUFFIX ## _data, "main", 7, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), 1, true, !fa_ds, (!fa_ds ? fa_sgs : 0)); \
+                    } \
+                } \
+            } \
+        }
+
+#define CREATE_FA_Q8_TBQ4_VEC(MAP_FIELD, PATH_ENUM, NAME_PREFIX, SUFFIX) \
+        for (auto &fa : device->MAP_FIELD) { \
+            FaCodePath path = fa.first.path; \
+            uint32_t Br = fa.first.Br; \
+            uint32_t Bc = fa.first.Bc; \
+            bool aligned = fa.first.aligned; \
+            bool f32acc = fa.first.f32acc; \
+            uint32_t fa_sgs = fa.first.subgroup_size; \
+            bool fa_ds = fa.first.subgroup_size == 0; \
+            if (path == PATH_ENUM) { \
+                if (aligned) { \
+                    if (f32acc) { \
+                        ggml_vk_create_pipeline(device, fa.second, #NAME_PREFIX "_aligned_f32acc", NAME_PREFIX ## SUFFIX ## _len, NAME_PREFIX ## SUFFIX ## _data, "main", 7, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), Bc, true, !fa_ds, (!fa_ds ? fa_sgs : 0)); \
+                    } else { \
+                        ggml_vk_create_pipeline(device, fa.second, #NAME_PREFIX "_aligned_f16acc", NAME_PREFIX ## _f16acc ## SUFFIX ## _len, NAME_PREFIX ## _f16acc ## SUFFIX ## _data, "main", 7, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), Bc, true, !fa_ds, (!fa_ds ? fa_sgs : 0)); \
+                    } \
+                } else { \
+                    if (f32acc) { \
+                        ggml_vk_create_pipeline(device, fa.second, #NAME_PREFIX "_f32acc", NAME_PREFIX ## SUFFIX ## _len, NAME_PREFIX ## SUFFIX ## _data, "main", 7, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), 1, true, !fa_ds, (!fa_ds ? fa_sgs : 0)); \
+                    } else { \
+                        ggml_vk_create_pipeline(device, fa.second, #NAME_PREFIX "_f16acc", NAME_PREFIX ## _f16acc ## SUFFIX ## _len, NAME_PREFIX ## _f16acc ## SUFFIX ## _data, "main", 7, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), 1, true, !fa_ds, (!fa_ds ? fa_sgs : 0)); \
+                    } \
+                } \
+            } \
+        }
+
+    if (device->fp16) {
+        CREATE_FA_Q8_TBQ4_ACCEPTED()
+        CREATE_FA_Q8_TBQ4_VEC(pipeline_flash_attn_f32_f16_q8_0_tbq4_0_vec_nonmtp, FA_Q8_TBQ4_VEC_NONMTP, flash_attn_f32_f16_q8_0_tbq4_0_vec_nonmtp, )
+        CREATE_FA_Q8_TBQ4_VEC(pipeline_flash_attn_f32_f16_q8_0_tbq4_0_vec_tilek_nonmtp, FA_Q8_TBQ4_VEC_TILEK_NONMTP, flash_attn_f32_f16_q8_0_tbq4_0_vec_nonmtp, )
+        CREATE_FA_Q8_TBQ4_VEC(pipeline_flash_attn_f32_f16_q8_0_tbq4_0_sawq128_diag, FA_Q8_TBQ4_SAWQ128_DIAG_NONMTP, flash_attn_f32_f16_q8_0_tbq4_0_sawq128_diag, )
+        CREATE_FA_Q8_TBQ4_VEC(pipeline_flash_attn_f32_f16_q8_0_tbq4_0_vec_mtp, FA_Q8_TBQ4_VEC_MTP, flash_attn_f32_f16_q8_0_tbq4_0_vec_mtp, )
+    } else {
+        CREATE_FA_Q8_TBQ4_ACCEPTED(_fp32)
+        CREATE_FA_Q8_TBQ4_VEC(pipeline_flash_attn_f32_f16_q8_0_tbq4_0_vec_nonmtp, FA_Q8_TBQ4_VEC_NONMTP, flash_attn_f32_f16_q8_0_tbq4_0_vec_nonmtp, _fp32)
+        CREATE_FA_Q8_TBQ4_VEC(pipeline_flash_attn_f32_f16_q8_0_tbq4_0_vec_tilek_nonmtp, FA_Q8_TBQ4_VEC_TILEK_NONMTP, flash_attn_f32_f16_q8_0_tbq4_0_vec_nonmtp, _fp32)
+        CREATE_FA_Q8_TBQ4_VEC(pipeline_flash_attn_f32_f16_q8_0_tbq4_0_sawq128_diag, FA_Q8_TBQ4_SAWQ128_DIAG_NONMTP, flash_attn_f32_f16_q8_0_tbq4_0_sawq128_diag, _fp32)
+        CREATE_FA_Q8_TBQ4_VEC(pipeline_flash_attn_f32_f16_q8_0_tbq4_0_vec_mtp, FA_Q8_TBQ4_VEC_MTP, flash_attn_f32_f16_q8_0_tbq4_0_vec_mtp, _fp32)
+    }
+#undef CREATE_FA_Q8_TBQ4_ACCEPTED
+#undef CREATE_FA_Q8_TBQ4_VEC
+
+#define CREATE_FA_MIXED_SCALAR(MAP_FIELD, NAME_PREFIX, SUFFIX) \
+        for (auto &fa : device->MAP_FIELD) { \
+            FaCodePath path = fa.first.path; \
+            uint32_t Br = fa.first.Br; \
+            uint32_t Bc = fa.first.Bc; \
+            bool aligned = fa.first.aligned; \
+            bool f32acc = fa.first.f32acc; \
+            uint32_t fa_sgs = fa.first.subgroup_size; \
+            bool fa_ds = fa.first.subgroup_size == 0; \
+            if (path == FA_SCALAR) { \
+                if (aligned) { \
+                    if (f32acc) { \
+                        ggml_vk_create_pipeline(device, fa.second, #NAME_PREFIX "_aligned_f32acc", NAME_PREFIX ## SUFFIX ## _len, NAME_PREFIX ## SUFFIX ## _data, "main", 7, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), Bc, true, !fa_ds, (!fa_ds ? fa_sgs : 0)); \
+                    } else { \
+                        ggml_vk_create_pipeline(device, fa.second, #NAME_PREFIX "_aligned_f16acc", NAME_PREFIX ## _f16acc ## SUFFIX ## _len, NAME_PREFIX ## _f16acc ## SUFFIX ## _data, "main", 7, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), Bc, true, !fa_ds, (!fa_ds ? fa_sgs : 0)); \
+                    } \
+                } else { \
+                    if (f32acc) { \
+                        ggml_vk_create_pipeline(device, fa.second, #NAME_PREFIX "_f32acc", NAME_PREFIX ## SUFFIX ## _len, NAME_PREFIX ## SUFFIX ## _data, "main", 7, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), 1, true, !fa_ds, (!fa_ds ? fa_sgs : 0)); \
+                    } else { \
+                        ggml_vk_create_pipeline(device, fa.second, #NAME_PREFIX "_f16acc", NAME_PREFIX ## _f16acc ## SUFFIX ## _len, NAME_PREFIX ## _f16acc ## SUFFIX ## _data, "main", 7, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), 1, true, !fa_ds, (!fa_ds ? fa_sgs : 0)); \
                     } \
                 } \
             } \
         }
     if (device->fp16) {
-        CREATE_FA_Q8_TBQ4()
+        CREATE_FA_MIXED_SCALAR(pipeline_flash_attn_f32_f16_q8_0_q4_0,   flash_attn_f32_f16_q8_0_q4_0, )
+        CREATE_FA_MIXED_SCALAR(pipeline_flash_attn_f32_f16_q4_0_tbq4_0, flash_attn_f32_f16_q4_0_tbq4_0, )
     } else {
-        CREATE_FA_Q8_TBQ4(_fp32)
+        CREATE_FA_MIXED_SCALAR(pipeline_flash_attn_f32_f16_q8_0_q4_0,   flash_attn_f32_f16_q8_0_q4_0, _fp32)
+        CREATE_FA_MIXED_SCALAR(pipeline_flash_attn_f32_f16_q4_0_tbq4_0, flash_attn_f32_f16_q4_0_tbq4_0, _fp32)
     }
-#undef CREATE_FA_Q8_TBQ4
+#undef CREATE_FA_MIXED_SCALAR
+
+#if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+#define CREATE_FA_Q8_Q4_CM1() \
+        for (auto &fa : device->pipeline_flash_attn_f32_f16_q8_0_q4_0) { \
+            FaCodePath path = fa.first.path; \
+            uint32_t Br = fa.first.Br; \
+            uint32_t Bc = fa.first.Bc; \
+            bool aligned = fa.first.aligned; \
+            bool f32acc = fa.first.f32acc; \
+            uint32_t fa_sgs = fa.first.subgroup_size; \
+            bool fa_ds = fa.first.subgroup_size == 0; \
+            if (path == FA_COOPMAT1) { \
+                if (aligned) { \
+                    if (f32acc) { \
+                        ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_q8_0_q4_0_aligned_f32acc_cm1", flash_attn_f32_f16_q8_0_q4_0_cm1_len, flash_attn_f32_f16_q8_0_q4_0_cm1_data, "main", 7, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), Bc, true, !fa_ds, (!fa_ds ? fa_sgs : 0)); \
+                    } else { \
+                        ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_q8_0_q4_0_aligned_f16acc_cm1", flash_attn_f32_f16_q8_0_q4_0_f16acc_cm1_len, flash_attn_f32_f16_q8_0_q4_0_f16acc_cm1_data, "main", 7, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), Bc, true, !fa_ds, (!fa_ds ? fa_sgs : 0)); \
+                    } \
+                } else { \
+                    if (f32acc) { \
+                        ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_q8_0_q4_0_f32acc_cm1", flash_attn_f32_f16_q8_0_q4_0_cm1_len, flash_attn_f32_f16_q8_0_q4_0_cm1_data, "main", 7, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), 1, true, !fa_ds, (!fa_ds ? fa_sgs : 0)); \
+                    } else { \
+                        ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_q8_0_q4_0_f16acc_cm1", flash_attn_f32_f16_q8_0_q4_0_f16acc_cm1_len, flash_attn_f32_f16_q8_0_q4_0_f16acc_cm1_data, "main", 7, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), 1, true, !fa_ds, (!fa_ds ? fa_sgs : 0)); \
+                    } \
+                } \
+            } \
+        }
+    if (device->fp16 && device->coopmat1_fa_support) {
+        CREATE_FA_Q8_Q4_CM1()
+    }
+#undef CREATE_FA_Q8_Q4_CM1
+#endif
 
 #undef CREATE_FA
 
@@ -5716,6 +6022,13 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 device->mul_mat_id_s[i] = true;
                 break;
             }
+
+            device->mul_mat_l_int[i]    = true;
+            device->mul_mat_m_int[i]    = true;
+            device->mul_mat_s_int[i]    = true;
+            device->mul_mat_id_l_int[i] = true;
+            device->mul_mat_id_m_int[i] = true;
+            device->mul_mat_id_s_int[i] = true;
         }
 
 
@@ -7324,6 +7637,13 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
 static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, uint32_t m, uint32_t n, bool aligned, ggml_type src0_type, ggml_type src1_type) {
     VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline(" << m << ", " << n << ", " << aligned << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
 
+    // The q8_1 (integer dot) mmq path uses a different shader with its own
+    // shared-memory layout, so use the int-specific availability flags.
+    const bool is_q8_1 = (src1_type == GGML_TYPE_Q8_1);
+    const bool mm_l = is_q8_1 ? ctx->device->mul_mat_l_int[src0_type] : ctx->device->mul_mat_l[src0_type];
+    const bool mm_m = is_q8_1 ? ctx->device->mul_mat_m_int[src0_type] : ctx->device->mul_mat_m[src0_type];
+    const bool mm_s = is_q8_1 ? ctx->device->mul_mat_s_int[src0_type] : ctx->device->mul_mat_s[src0_type];
+
     if (ctx->device->coopmat2) {
         const uint32_t shader_core_count = ctx->device->shader_core_count;
         const uint32_t tiles_l = CEIL_DIV(m, mmp->a_l->wg_denoms[0]) * CEIL_DIV(n, mmp->a_l->wg_denoms[1]);
@@ -7340,26 +7660,24 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
                             // split_k==3 with large tiles likely better than medium tiles with no split_k.
                             (tiles_l <= shader_core_count / 3 && tiles_m > shader_core_count / 2);
 
-        if ((ctx->device->mul_mat_l[src0_type] && (n > crossover_large && prefer_large)) || (!ctx->device->mul_mat_m[src0_type] && !ctx->device->mul_mat_s[src0_type])) {
+        if ((mm_l && (n > crossover_large && prefer_large)) || (!mm_m && !mm_s)) {
             return aligned ? mmp->a_l : mmp->l;
         }
         // Use medium shader when the N dimension is greater than the small shader's tile size
         uint32_t crossover_medium = mmp->s->wg_denoms[1];
-        if ((ctx->device->mul_mat_m[src0_type] && (n > crossover_medium)) || !ctx->device->mul_mat_s[src0_type]) {
+        if ((mm_m && (n > crossover_medium)) || !mm_s) {
             return aligned ? mmp->a_m : mmp->m;
         }
         return aligned ? mmp->a_s : mmp->s;
     }
 
-    if ((ctx->device->mul_mat_s[src0_type] && (m <= 32 || n <= 32)) || (!ctx->device->mul_mat_m[src0_type] && !ctx->device->mul_mat_l[src0_type])) {
+    if ((mm_s && (m <= 32 || n <= 32)) || (!mm_m && !mm_l)) {
         return aligned ? mmp->a_s : mmp->s;
     }
-    if ((ctx->device->mul_mat_m[src0_type] && (m <= 64 || n <= 64)) || !ctx->device->mul_mat_l[src0_type]) {
+    if ((mm_m && (m <= 64 || n <= 64)) || !mm_l) {
         return aligned ? mmp->a_m : mmp->m;
     }
     return aligned ? mmp->a_l : mmp->l;
-
-    GGML_UNUSED(src1_type);
 }
 
 static uint32_t ggml_vk_guess_matmul_pipeline_align(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, int m, int n, ggml_type src0_type, ggml_type src1_type) {
@@ -7416,35 +7734,42 @@ static void ggml_vk_matmul(
     ctx->prealloc_split_k_need_sync = true;
 }
 
-static vk_pipeline ggml_vk_guess_matmul_id_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, uint32_t m, uint32_t n, bool aligned, ggml_type src0_type) {
-    VK_LOG_DEBUG("ggml_vk_guess_matmul_id_pipeline(" << m << ", " << n << ", " << aligned << ", " << ggml_type_name(src0_type) << ")");
+static vk_pipeline ggml_vk_guess_matmul_id_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, uint32_t m, uint32_t n, bool aligned, ggml_type src0_type, ggml_type src1_type) {
+    VK_LOG_DEBUG("ggml_vk_guess_matmul_id_pipeline(" << m << ", " << n << ", " << aligned << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
+
+    // The q8_1 (integer dot) mmq path uses a different shader with its own
+    // shared-memory layout, so use the int-specific availability flags.
+    const bool is_q8_1 = (src1_type == GGML_TYPE_Q8_1);
+    const bool mm_l = is_q8_1 ? ctx->device->mul_mat_id_l_int[src0_type] : ctx->device->mul_mat_id_l[src0_type];
+    const bool mm_m = is_q8_1 ? ctx->device->mul_mat_id_m_int[src0_type] : ctx->device->mul_mat_id_m[src0_type];
+    const bool mm_s = is_q8_1 ? ctx->device->mul_mat_id_s_int[src0_type] : ctx->device->mul_mat_id_s[src0_type];
 
     if (ctx->device->coopmat2) {
         // Use large shader when the N dimension is greater than the medium shader's tile size
         uint32_t crossover_large = mmp->m->wg_denoms[1];
-        if ((ctx->device->mul_mat_id_l[src0_type] && (n > crossover_large)) || (!ctx->device->mul_mat_id_m[src0_type] && !ctx->device->mul_mat_id_s[src0_type])) {
+        if ((mm_l && (n > crossover_large)) || (!mm_m && !mm_s)) {
             return aligned ? mmp->a_l : mmp->l;
         }
         // Use medium shader when the N dimension is greater than the small shader's tile size
         uint32_t crossover_medium = mmp->s->wg_denoms[1];
-        if ((ctx->device->mul_mat_id_m[src0_type] && (n > crossover_medium)) || !ctx->device->mul_mat_id_s[src0_type]) {
+        if ((mm_m && (n > crossover_medium)) || !mm_s) {
             return aligned ? mmp->a_m : mmp->m;
         }
         return aligned ? mmp->a_s : mmp->s;
     }
 
-    if ((ctx->device->mul_mat_id_s[src0_type] && (m <= 32 || n <= 32)) || (!ctx->device->mul_mat_id_m[src0_type] && !ctx->device->mul_mat_id_l[src0_type])) {
+    if ((mm_s && (m <= 32 || n <= 32)) || (!mm_m && !mm_l)) {
         return aligned ? mmp->a_s : mmp->s;
     }
-    if ((ctx->device->mul_mat_id_m[src0_type] && (m <= 64 || n <= 64)) || !ctx->device->mul_mat_id_l[src0_type]) {
+    if ((mm_m && (m <= 64 || n <= 64)) || !mm_l) {
         return aligned ? mmp->a_m : mmp->m;
     }
     return aligned ? mmp->a_l : mmp->l;
 }
 
-static uint32_t ggml_vk_guess_matmul_id_pipeline_align(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, int m, int n, ggml_type src0_type) {
-    VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline_align(" << m << ", " << n << ", " << ggml_type_name(src0_type) << ")");
-    return ggml_vk_guess_matmul_id_pipeline(ctx, mmp, m, n, true, src0_type)->align;
+static uint32_t ggml_vk_guess_matmul_id_pipeline_align(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, int m, int n, ggml_type src0_type, ggml_type src1_type) {
+    VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline_align(" << m << ", " << n << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
+    return ggml_vk_guess_matmul_id_pipeline(ctx, mmp, m, n, true, src0_type, src1_type)->align;
 }
 
 static void ggml_vk_matmul_id(
@@ -8581,10 +8906,12 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     // Not implemented
     GGML_ASSERT(y_non_contig || !qy_needs_dequant);  // NOLINT
 
-    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_id_pipeline_align(ctx, mmp, ne01, nei1, qx_needs_dequant ? f16_type : src0->type));
+    const ggml_type effective_src1_type = quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type);
+
+    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_id_pipeline_align(ctx, mmp, ne01, nei1, qx_needs_dequant ? f16_type : src0->type, effective_src1_type));
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && nei1 > 8;
 
-    vk_pipeline pipeline = ggml_vk_guess_matmul_id_pipeline(ctx, mmp, ne01, nei1, aligned, qx_needs_dequant ? f16_type : src0->type);
+    vk_pipeline pipeline = ggml_vk_guess_matmul_id_pipeline(ctx, mmp, ne01, nei1, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
@@ -9034,8 +9361,9 @@ static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx
     }
 }
 
-static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type kv_type) {
+static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type) {
     GGML_UNUSED(f32acc);
+    GGML_UNUSED(v_type);
     // Needs to be kept up to date on shader changes
     const uint32_t wg_size = params.workgroup_size;
     const uint32_t Br = params.block_rows;
@@ -9043,10 +9371,7 @@ static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, con
 
     const uint32_t float_type_size = device->fp16 ? sizeof(ggml_fp16_t) : sizeof(float);
 
-    const bool mmq = device->integer_dot_product && device->subgroup_clustered &&
-                     (kv_type == GGML_TYPE_Q4_0 || kv_type == GGML_TYPE_Q4_1 ||
-                      kv_type == GGML_TYPE_Q5_0 || kv_type == GGML_TYPE_Q5_1 ||
-                      kv_type == GGML_TYPE_Q8_0 || kv_type == GGML_TYPE_IQ4_NL);
+    const bool mmq = ggml_vk_fa_scalar_uses_mmq(device, k_type, v_type);
 
     // tmpsh is overestimated slightly
     const uint32_t tmpsh = wg_size * sizeof(float);
@@ -9063,17 +9388,10 @@ static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, con
         // kvsh uses D = HSV (K goes through kblocksh instead)
         kvsh = params.shmem_staging ? Bc * (hsv / 4 + 1) * 4 * float_type_size : 4 * float_type_size;
 
-        // block_a_cache size depends on quant type
-        uint32_t block_a_size;
-        switch (kv_type) {
-            case GGML_TYPE_Q4_0:  block_a_size = 4 * sizeof(uint32_t) + float_type_size; break;
-            case GGML_TYPE_Q4_1:  block_a_size = 4 * sizeof(uint32_t) + 2 * float_type_size; break;
-            case GGML_TYPE_Q5_0:  block_a_size = 4 * sizeof(uint32_t) + sizeof(uint32_t) + float_type_size; break;
-            case GGML_TYPE_Q5_1:  block_a_size = 4 * sizeof(uint32_t) + sizeof(uint32_t) + 2 * float_type_size; break;
-            case GGML_TYPE_Q8_0:
-            case GGML_TYPE_IQ4_NL: block_a_size = 8 * sizeof(int32_t) + float_type_size; break;
-            default: block_a_size = 0; break;
-        }
+        // The mixed MMQ shader uses a superset block_a_cache that fits every
+        // FA-supported quant: int32_t qs[8] + uint32_t qh + FLOAT_TYPEV2 dm.
+        // Single-scale types leave dm.y unused; non-Q5_* leave qh unused.
+        const uint32_t block_a_size = 8 * sizeof(int32_t) + sizeof(uint32_t) + 2 * float_type_size;
         kblocksh_size = params.shmem_staging ? Bc * (hsk / 32) * block_a_size : block_a_size;
     } else {
         Qf = Br * (hsk / 4 + 1) * 4 * float_type_size;
@@ -9211,8 +9529,48 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k->type, v->type, f32acc);
 
+    const bool force_vec_mtp = [&]() {
+        const char * e = getenv("GGML_VK_TBQ4_FORCE_VEC_MTP");
+        return e != nullptr && e[0] != '\0' && strcmp(e, "0") != 0;
+    }();
+    const bool d5_tilek_nonmtp = [&]() {
+        const char * e = getenv("GGML_VK_TBQ4_D5_TILEK");
+        return e != nullptr && e[0] != '\0' && strcmp(e, "0") != 0;
+    }();
+    const bool d6_sawq128_diag_nonmtp = [&]() {
+        const char * e = getenv("GGML_VK_TBQ4_D6_SAW_Q128_DIAG");
+        return e != nullptr && e[0] != '\0' && strcmp(e, "0") != 0;
+    }();
+    const bool d6_q4k_rot_k128 = ggml_vk_d6_q4k_rot_k128_enabled();
+
+    if (d6_q4k_rot_k128 && k->type == GGML_TYPE_Q4_0 && v->type == GGML_TYPE_TBQ4_0) {
+        GGML_ASSERT(sinks == nullptr);
+        GGML_ASSERT(HSK == 256 && HSV == 256);
+    }
+
+    vk_fa_tuning_params dedicated_q8_tbq4{};
+    if (ggml_vk_try_fa_q8_tbq4_vec_tuning(ctx->device, HSK, HSV, k->type, v->type, sinks != nullptr, dedicated_q8_tbq4)) {
+        tuning_params = dedicated_q8_tbq4;
+    }
+
+    if (d5_tilek_nonmtp && sinks == nullptr && ggml_vk_try_fa_q8_tbq4_vec_tuning(ctx->device, HSK, HSV, k->type, v->type, false, dedicated_q8_tbq4)) {
+        dedicated_q8_tbq4.path = FA_Q8_TBQ4_VEC_TILEK_NONMTP;
+        dedicated_q8_tbq4.shmem_staging = 1;
+        tuning_params = dedicated_q8_tbq4;
+    }
+
+    if (d6_sawq128_diag_nonmtp && sinks == nullptr && ggml_vk_try_fa_q8_tbq4_vec_tuning(ctx->device, HSK, HSV, k->type, v->type, false, dedicated_q8_tbq4)) {
+        dedicated_q8_tbq4.path = FA_Q8_TBQ4_SAWQ128_DIAG_NONMTP;
+        dedicated_q8_tbq4.shmem_staging = 0;
+        tuning_params = dedicated_q8_tbq4;
+    }
+
+    if (force_vec_mtp && ggml_vk_try_fa_q8_tbq4_vec_tuning(ctx->device, HSK, HSV, k->type, v->type, true, dedicated_q8_tbq4)) {
+        tuning_params = dedicated_q8_tbq4;
+    }
+
     if (tuning_params.path != FA_COOPMAT2) {
-        GGML_ASSERT(k->type == v->type || ggml_vk_fa_scalar_mixed_q8_tbq4(k->type, v->type));
+        GGML_ASSERT(k->type == v->type || ggml_vk_fa_scalar_mixed_supported(k->type, v->type));
     }
 
     const uint32_t q_stride = (uint32_t)(nbq1 / ggml_type_size(q->type));
@@ -9256,11 +9614,52 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     vk_pipeline pipeline = nullptr;
 
+    if (k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_TBQ4_0) {
+        std::cerr << "ggml_vulkan: q8_tbq4_route=" << ggml_vk_fa_q8_tbq4_route_name(tuning_params.path)
+                  << " shape=HSK" << HSK << "_HSV" << HSV << "_N" << N << "_KV" << KV
+                  << " Br=" << fa_pipeline_state.Br << " Bc=" << fa_pipeline_state.Bc
+                  << " row_split=" << fa_pipeline_state.row_split
+                  << " subgroup=" << fa_pipeline_state.subgroup_size
+                  << " shmem=" << (fa_pipeline_state.shmem_staging ? 1 : 0)
+                  << " sinks=" << (sinks ? 1 : 0)
+                  << " d5_layout=" << (tuning_params.path == FA_Q8_TBQ4_VEC_TILEK_NONMTP ? "tilek" : "none")
+                  << " saw_k128=" << (tuning_params.path == FA_Q8_TBQ4_SAWQ128_DIAG_NONMTP ? "diag_q_only" : "none")
+                  << " force_vec_mtp=" << (force_vec_mtp ? 1 : 0)
+                  << " d5_tilek=" << (d5_tilek_nonmtp ? 1 : 0)
+                  << " d6_sawq128_diag=" << (d6_sawq128_diag_nonmtp ? 1 : 0) << std::endl;
+    }
+
+    if (k->type == GGML_TYPE_Q4_0 && v->type == GGML_TYPE_TBQ4_0) {
+        std::cerr << "ggml_vulkan: q4_rotk128_tbq4v_route=" << (d6_q4k_rot_k128 ? "scalar_nonmtp" : "disabled")
+                  << " shape=HSK" << HSK << "_HSV" << HSV << "_N" << N << "_KV" << KV
+                  << " Br=" << fa_pipeline_state.Br << " Bc=" << fa_pipeline_state.Bc
+                  << " row_split=" << fa_pipeline_state.row_split
+                  << " subgroup=" << fa_pipeline_state.subgroup_size
+                  << " shmem=" << (fa_pipeline_state.shmem_staging ? 1 : 0)
+                  << " sinks=" << (sinks ? 1 : 0)
+                  << " k_domain=" << (d6_q4k_rot_k128 ? "ROT_K128" : "POST_ROPE")
+                  << " k_rot_order=" << (d6_q4k_rot_k128 ? 128 : 0)
+                  << std::endl;
+    }
+
     {
         std::lock_guard<std::recursive_mutex> guard(ctx->device->mutex);
-        auto &pipelines = ggml_vk_fa_scalar_mixed_q8_tbq4(k->type, v->type) && tuning_params.path == FA_SCALAR ?
-                ctx->device->pipeline_flash_attn_f32_f16_q8_0_tbq4_0 :
-                ctx->device->pipeline_flash_attn_f32_f16[k->type];
+        auto &pipelines =
+                (tuning_params.path == FA_Q8_TBQ4_VEC_NONMTP) ?
+                    ctx->device->pipeline_flash_attn_f32_f16_q8_0_tbq4_0_vec_nonmtp :
+                (tuning_params.path == FA_Q8_TBQ4_VEC_TILEK_NONMTP) ?
+                    ctx->device->pipeline_flash_attn_f32_f16_q8_0_tbq4_0_vec_tilek_nonmtp :
+                (tuning_params.path == FA_Q8_TBQ4_SAWQ128_DIAG_NONMTP) ?
+                    ctx->device->pipeline_flash_attn_f32_f16_q8_0_tbq4_0_sawq128_diag :
+                (tuning_params.path == FA_Q8_TBQ4_VEC_MTP) ?
+                    ctx->device->pipeline_flash_attn_f32_f16_q8_0_tbq4_0_vec_mtp :
+                (tuning_params.path == FA_SCALAR && ggml_vk_fa_scalar_mixed_q8_tbq4(k->type, v->type)) ?
+                    ctx->device->pipeline_flash_attn_f32_f16_q8_0_tbq4_0 :
+                (tuning_params.path == FA_SCALAR && ggml_vk_fa_scalar_mixed_q4_tbq4_rotk128(k->type, v->type)) ?
+                    ctx->device->pipeline_flash_attn_f32_f16_q4_0_tbq4_0 :
+                ((tuning_params.path == FA_SCALAR || tuning_params.path == FA_COOPMAT1) && ggml_vk_fa_scalar_mixed_q8_q4(k->type, v->type)) ?
+                    ctx->device->pipeline_flash_attn_f32_f16_q8_0_q4_0 :
+                    ctx->device->pipeline_flash_attn_f32_f16[k->type];
         auto it = pipelines.find(fa_pipeline_state);
         if (it != pipelines.end()) {
             pipeline = it->second;
@@ -15744,9 +16143,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (op->src[3] && op->src[3]->type != GGML_TYPE_F16) {
                     return false;
                 }
-                // Generic mismatching K/V type is supported for coopmat2 only; q8_0 K + tbq4_0 V has a scalar Vulkan path for RDNA3/RADV.
+                // Generic mismatching K/V type is supported for coopmat2 only;
+                // scalar Vulkan keeps explicit mixed RDNA3/RADV routes.
                 if (op->src[1]->type != op->src[2]->type && !coopmat2 &&
-                    !ggml_vk_fa_scalar_mixed_q8_tbq4(op->src[1]->type, op->src[2]->type)) {
+                    !ggml_vk_fa_scalar_mixed_supported(op->src[1]->type, op->src[2]->type)) {
                     return false;
                 }
                 auto fa_kv_ok = [coopmat2](ggml_type t) {

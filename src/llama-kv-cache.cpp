@@ -318,6 +318,24 @@ llama_kv_cache::llama_kv_cache(
         LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
     }
 
+    const char * GGML_VK_TBQ4_D6_Q4K_ROT_K128 = getenv("GGML_VK_TBQ4_D6_Q4K_ROT_K128");
+    d6_q4k_rot_k128 = GGML_VK_TBQ4_D6_Q4K_ROT_K128 ? atoi(GGML_VK_TBQ4_D6_Q4K_ROT_K128) : false;
+    if (d6_q4k_rot_k128) {
+        const bool ok =
+            !attn_rot_disable &&
+            type_k == GGML_TYPE_Q4_0 &&
+            n_embd_head_k_all == 256 &&
+            hparams.n_embd_head_k() == 256;
+
+        if (!ok) {
+            LLAMA_LOG_ERROR("%s: GGML_VK_TBQ4_D6_Q4K_ROT_K128 requires type_k=q4_0, n_embd_head_k_all=256, n_embd_head_k=256, LLAMA_ATTN_ROT_DISABLE=0; got type_k=%s, n_embd_head_k_all=%d, n_embd_head_k=%u, attn_rot_disable=%d\n",
+                    __func__, ggml_type_name(type_k), n_embd_head_k_all, hparams.n_embd_head_k(), attn_rot_disable);
+            throw std::runtime_error("unsupported GGML_VK_TBQ4_D6_Q4K_ROT_K128 cache configuration");
+        }
+
+        attn_rot_k_order = 128;
+    }
+
     attn_rot_k =
         !attn_rot_disable &&
         n_embd_head_k_all > 0 &&
@@ -332,7 +350,8 @@ llama_kv_cache::llama_kv_cache(
         type_v != GGML_TYPE_TBQ4_0 &&
         hparams.n_embd_head_v() % 64 == 0;
 
-    LLAMA_LOG_INFO("%s: attn_rot_k = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_k, n_embd_head_k_all);
+    LLAMA_LOG_INFO("%s: attn_rot_k = %d, n_embd_head_k_all = %d, k_domain = %s, k_rot_order = %d\n", __func__, attn_rot_k, n_embd_head_k_all,
+            d6_q4k_rot_k128 ? "ROT_K128" : "AUTO", attn_rot_k_order);
     LLAMA_LOG_INFO("%s: attn_rot_v = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_v, n_embd_head_v_all);
 
     // pre-compute the haramard matrices and keep them in host memory
@@ -1364,18 +1383,24 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
     if (attn_rot_k) {
-        int nrot = 64;
+        int nrot = attn_rot_k_order;
 
-        // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
-        // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
-        do {
-            nrot *= 2;
-        } while (n_embd_head_k_all % nrot == 0);
-        nrot /= 2;
+        if (nrot == 0) {
+            nrot = 64;
+
+            // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
+            // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
+            do {
+                nrot *= 2;
+            } while (n_embd_head_k_all % nrot == 0);
+            nrot /= 2;
+        }
+
+        GGML_ASSERT(n_embd_head_k_all % nrot == 0);
 
         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
         ggml_set_input(res);
-        ggml_set_name(res, "attn_inp_k_rot");
+        ggml_set_name(res, d6_q4k_rot_k128 ? "attn_inp_k_rot_d6_q4k_rot128" : "attn_inp_k_rot");
     }
 
     return res;

@@ -7,6 +7,7 @@ This directory is a ROCm/Triton validation lane for compressed-KV FlashAttention
 - A correctness harness for compressed KV formats: `planar3_0`, `iso3_0`, and `tbq4_0`.
 - A place to test materialization, paged row mapping, QK/QKV loops, masks, varlen metadata, and segmented long-context reductions.
 - A design oracle for C++/HIP refactors: prove the contract here first, then port only the minimal validated idea.
+- A CPU reference lane for BDR128 K-only experiments (`bdr128_konly_reference.py`): compare original-domain K quantization against post-RoPE `H128(K)` quantization with matching `H128(Q)` before attention.
 
 ## What this is not
 
@@ -28,6 +29,44 @@ Optional aggregate JSON report:
 
 ```bash
 /home/mrtrent/miniconda3/envs/LLM/bin/python experiments/compressed_kv_triton/run_all_json.py
+```
+
+BDR128 K-only CPU oracle smoke:
+
+```bash
+/home/mrtrent/miniconda3/envs/LLM/bin/python \
+  experiments/compressed_kv_triton/bdr128_konly_reference.py --spiky
+```
+
+Post-RoPE Q/K capture conversion from `llama-debug` tensor dumps:
+
+```bash
+LLAMA_DEBUG_TENSOR_DUMP_DIR=/tmp/qk-dump \
+  ./build-vulkan-tq3-localdeps/bin/llama-debug -m model.gguf -p "..." \
+  --tensor-filter 'Qcur-0$|Kcur-0$'
+/home/mrtrent/miniconda3/envs/LLM/bin/python \
+  experiments/compressed_kv_triton/qk_tensor_dump_to_npz.py \
+  --dump-dir /tmp/qk-dump --layer 0 --out /tmp/qk-capture.npz
+```
+
+SAWQ128 diagnostic shader-equivalent vector check:
+
+```bash
+/home/mrtrent/miniconda3/envs/LLM/bin/python \
+  experiments/compressed_kv_triton/sawq128_shader_equiv_check.py \
+  --vectors benches/vulkan-tbq4-dedicated-route-design-20260519/d6-saw-k128-v0-fwht128-oracle-20260519-231402/q-rotate-test-vectors.json \
+  --out /tmp/sawq128-shader-equiv.json --tsv /tmp/sawq128-shader-equiv.tsv
+```
+
+Offline ROT_K128 cache materialization from a captured post-RoPE Q/K NPZ:
+
+```bash
+/home/mrtrent/miniconda3/envs/LLM/bin/python \
+  experiments/compressed_kv_triton/rotk_cache_materialize.py \
+  --npz /tmp/qk-capture.npz \
+  --out-cache /tmp/rotated-k-cache.npz \
+  --out-json /tmp/qk-reference.json \
+  --label smoke
 ```
 
 Known-good local environment:

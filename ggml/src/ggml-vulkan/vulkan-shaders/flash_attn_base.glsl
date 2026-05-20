@@ -87,9 +87,16 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 
 #define BINDING_IDX_K 0
 #define BINDING_IDX_V 1
-#if defined(DATA_K_Q8_0) && defined(DATA_V_TBQ4_0)
+#if (defined(DATA_K_Q8_0) || defined(DATA_K_Q4_0)) && defined(DATA_V_TBQ4_0)
+#if defined(DATA_K_Q8_0)
 layout (binding = 1) readonly buffer K_PACKED16 {block_q8_0_packed16 k_data_packed16[];} k_packed;
+#else
+layout (binding = 1) readonly buffer K_PACKED16 {block_q4_0_packed16 k_data_packed16[];} k_packed;
+#endif
 layout (binding = 2) readonly buffer V_PACKED16 {block_tbq4_0_packed16 v_data_packed16[];} v_packed;
+#elif defined(DATA_K_Q8_0) && defined(DATA_V_Q4_0)
+layout (binding = 1) readonly buffer K_PACKED16 {block_q8_0_packed16 k_data_packed16[];} k_packed;
+layout (binding = 2) readonly buffer V_PACKED16 {block_q4_0_packed16 v_data_packed16[];} v_packed;
 #elif defined(DATA_A_F32)
 layout (binding = 1) readonly buffer K_PACKED {vec4 k_data_packed[];} k_packed;
 layout (binding = 2) readonly buffer V_PACKED {vec4 v_data_packed[];} v_packed;
@@ -107,12 +114,16 @@ layout (binding = 2) readonly buffer V_PACKED32 {A_TYPE_PACKED32 v_data_packed32
 #define BLOCK_SIZE 1
 #endif
 
-#if defined(DATA_K_Q8_0) && defined(DATA_V_TBQ4_0)
+#if (defined(DATA_K_Q8_0) || defined(DATA_K_Q4_0)) && defined(DATA_V_TBQ4_0)
 #undef BLOCK_SIZE
 #define BLOCK_SIZE 128
 #define K_BLOCK_SIZE 32
 #define V_BLOCK_SIZE 128
+#if defined(DATA_K_Q8_0)
 #define K_BLOCK_BYTE_SIZE 34
+#else
+#define K_BLOCK_BYTE_SIZE 18
+#endif
 #define V_BLOCK_BYTE_SIZE 66
 
 const float tbq4_centroids_scalar_mixed[16] = float[16](
@@ -136,18 +147,65 @@ const float tbq4_wht_s2_scalar_mixed[128] = float[128](
      1,-1, 1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1, 1,-1, 1,-1,-1,-1,-1,-1, 1,-1
 );
 
-uint tbq4_scalar_mixed_code(uint ib, uint j, uint a_offset) {
-    const uint byte_idx = j >> 1;
+uint tbq4_scalar_mixed_byte(uint ib, uint byte_idx, uint a_offset) {
     const uint word = uint(v_packed.v_data_packed16[a_offset + ib].qs[byte_idx >> 1]);
-    const uint byte_val = ((byte_idx & 1u) == 0u) ? (word & 0xFFu) : ((word >> 8) & 0xFFu);
-    return ((j & 1u) == 0u) ? (byte_val & 0xFu) : ((byte_val >> 4) & 0xFu);
+    return ((byte_idx & 1u) == 0u) ? (word & 0xFFu) : ((word >> 8) & 0xFFu);
 }
 
-FLOAT_TYPE tbq4_scalar_mixed_dequant_rot(uint ib, uint out_idx, uint a_offset) {
-    out_idx &= 127u;
-    const uint ci = tbq4_scalar_mixed_code(ib, out_idx, a_offset);
-    return FLOAT_TYPE(float(v_packed.v_data_packed16[a_offset + ib].d) * tbq4_centroids_scalar_mixed[ci] * tbq4_wht_s2_scalar_mixed[out_idx]);
+FLOAT_TYPEV4 tbq4_scalar_mixed_dequant4_rot(uint ib, uint iqs, uint a_offset) {
+    // flash-attn passes iqs in 4-value chunks for quantized paths (iqs = 0,4,8,...)
+    const uint j0 = iqs & 127u;
+    const uint byte_idx0 = j0 >> 1;
+    const uint b0 = tbq4_scalar_mixed_byte(ib, byte_idx0 + 0u, a_offset);
+    const uint b1 = tbq4_scalar_mixed_byte(ib, byte_idx0 + 1u, a_offset);
+
+    const uvec4 ci = uvec4(
+        b0 & 0xFu,
+        (b0 >> 4) & 0xFu,
+        b1 & 0xFu,
+        (b1 >> 4) & 0xFu
+    );
+
+    const uvec4 out_idx = (uvec4(iqs + 0u, iqs + 1u, iqs + 2u, iqs + 3u) & uvec4(127u));
+    const float v_scale = float(v_packed.v_data_packed16[a_offset + ib].d);
+
+    return FLOAT_TYPEV4(
+        v_scale * tbq4_centroids_scalar_mixed[ci.x] * tbq4_wht_s2_scalar_mixed[out_idx.x],
+        v_scale * tbq4_centroids_scalar_mixed[ci.y] * tbq4_wht_s2_scalar_mixed[out_idx.y],
+        v_scale * tbq4_centroids_scalar_mixed[ci.z] * tbq4_wht_s2_scalar_mixed[out_idx.z],
+        v_scale * tbq4_centroids_scalar_mixed[ci.w] * tbq4_wht_s2_scalar_mixed[out_idx.w]
+    );
 }
+
+FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    if (binding_idx == BINDING_IDX_K) {
+#if defined(DATA_K_Q8_0)
+        const i8vec2 v0 = unpack8(int32_t(k_packed.k_data_packed16[a_offset + ib].qs[iqs / 2])).xy;
+        const i8vec2 v1 = unpack8(int32_t(k_packed.k_data_packed16[a_offset + ib].qs[iqs / 2 + 1])).xy;
+        return FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].d) * FLOAT_TYPEV4(v0.x, v0.y, v1.x, v1.y);
+#else
+        uint vui_lo = uint(k_packed.k_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 0]);
+        uint vui_hi = uint(k_packed.k_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]);
+        uint shift = (iqs & 0x10) >> 2;
+        vui_lo >>= shift;
+        vui_hi >>= shift;
+
+        FLOAT_TYPEV4 nibbles = FLOAT_TYPEV4(vui_lo & 0xF, (vui_lo >> 8) & 0xF, vui_hi & 0xF, (vui_hi >> 8) & 0xF);
+        return FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].d) * (nibbles - FLOAT_TYPE(8.0f));
+#endif
+    } else {
+        // Accumulate TBQ4 V in rotated space inside attention. The inverse FWHT is applied once
+        // to the final output vector, not for every KV row/value load.
+        return tbq4_scalar_mixed_dequant4_rot(ib, iqs, a_offset);
+    }
+}
+#elif defined(DATA_K_Q8_0) && defined(DATA_V_Q4_0)
+#undef BLOCK_SIZE
+#define BLOCK_SIZE 32
+#define K_BLOCK_SIZE 32
+#define V_BLOCK_SIZE 32
+#define K_BLOCK_BYTE_SIZE 34
+#define V_BLOCK_BYTE_SIZE 18
 
 FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
     if (binding_idx == BINDING_IDX_K) {
@@ -155,13 +213,14 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
         const i8vec2 v1 = unpack8(int32_t(k_packed.k_data_packed16[a_offset + ib].qs[iqs / 2 + 1])).xy;
         return FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].d) * FLOAT_TYPEV4(v0.x, v0.y, v1.x, v1.y);
     } else {
-        // Accumulate TBQ4 V in rotated space inside attention. The inverse FWHT is applied once
-        // to the final output vector, not for every KV row/value load.
-        return FLOAT_TYPEV4(
-            tbq4_scalar_mixed_dequant_rot(ib, iqs + 0u, a_offset),
-            tbq4_scalar_mixed_dequant_rot(ib, iqs + 1u, a_offset),
-            tbq4_scalar_mixed_dequant_rot(ib, iqs + 2u, a_offset),
-            tbq4_scalar_mixed_dequant_rot(ib, iqs + 3u, a_offset));
+        uint vui_lo = uint(v_packed.v_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 0]);
+        uint vui_hi = uint(v_packed.v_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]);
+        uint shift = (iqs & 0x10) >> 2;
+        vui_lo >>= shift;
+        vui_hi >>= shift;
+
+        FLOAT_TYPEV4 nibbles = FLOAT_TYPEV4(vui_lo & 0xF, (vui_lo >> 8) & 0xF, vui_hi & 0xF, (vui_hi >> 8) & 0xF);
+        return FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].d) * (nibbles - FLOAT_TYPE(8.0f));
     }
 }
 #endif

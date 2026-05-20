@@ -100,59 +100,145 @@ const uint32_t tmpsh_size = (SubGroupSize > 0) ? (row_split == 1 ? num_subgroups
 shared float tmpsh[tmpsh_size];
 shared FLOAT_TYPEV4 tmpshv4[tmpsh_size];
 
-#if (defined(DATA_K_Q8_0) || defined(DATA_K_Q4_0)) && defined(DATA_V_TBQ4_0)
+#if defined(DATA_K_Q8_0) && defined(DATA_V_TBQ4_0)
+#if !defined(TBQ4_VEC_NONMTP) && !defined(TBQ4_VEC_MTP) && !defined(TBQ4_SAWQ128_DIAG)
+#error "flash_attn_q8_tbq4_vec.comp requires TBQ4_VEC_NONMTP, TBQ4_VEC_MTP, or TBQ4_SAWQ128_DIAG"
+#endif
 
-shared FLOAT_TYPEV4 tbq4_ofsh[Br * (HSV / 4)];
+const uint32_t tbq4_stage_stride = HSV + 1u;
+shared float tbq4_stage[Br * tbq4_stage_stride];
 
-float tbq4_ofsh_read(uint row, uint idx) {
-    const FLOAT_TYPEV4 z4 = tbq4_ofsh[row * (HSV / 4) + idx / 4u];
-    return float(z4[int(idx & 3u)]);
+uint tbq4_stage_idx(uint row, uint idx) {
+    return row * tbq4_stage_stride + idx;
 }
 
-FLOAT_TYPEV4 tbq4_inverse_rotated_of4(uint row, uint out_base) {
-    const uvec4 local_out = (uvec4(out_base + 0u, out_base + 1u, out_base + 2u, out_base + 3u) & uvec4(127u));
-    const uint block_start = out_base & ~127u;
+void tbq4_stage_write4(uint row, uint base, FLOAT_TYPEV4 v4) {
+    tbq4_stage[tbq4_stage_idx(row, base + 0u)] = float(v4.x);
+    tbq4_stage[tbq4_stage_idx(row, base + 1u)] = float(v4.y);
+    tbq4_stage[tbq4_stage_idx(row, base + 2u)] = float(v4.z);
+    tbq4_stage[tbq4_stage_idx(row, base + 3u)] = float(v4.w);
+}
 
-    vec4 sum = vec4(0.0f);
-    [[dont_unroll]]
-    for (uint j = 0u; j < 128u; ++j) {
-        const uint src_idx = block_start + j;
-        const float z = tbq4_ofsh_read(row, src_idx);
+FLOAT_TYPEV4 tbq4_stage_read4(uint row, uint base) {
+    return FLOAT_TYPEV4(
+        tbq4_stage[tbq4_stage_idx(row, base + 0u)],
+        tbq4_stage[tbq4_stage_idx(row, base + 1u)],
+        tbq4_stage[tbq4_stage_idx(row, base + 2u)],
+        tbq4_stage[tbq4_stage_idx(row, base + 3u)]
+    );
+}
 
-        const uvec4 parity = bitCount(local_out & uvec4(j)) & uvec4(1u);
-        const vec4 signs = vec4(1.0f) - vec4(2.0f) * vec4(parity);
-        sum += signs * z;
+void tbq4_fwht128_row_block(uint row, uint block_start, uint lane) {
+    [[unroll]]
+    for (uint step = 1u; step < 128u; step <<= 1u) {
+        if (lane < 64u) {
+            const uint group = lane / step;
+            const uint off = lane - group * step;
+            const uint a = block_start + group * (step << 1u) + off;
+            const uint b = a + step;
+
+            const float va = tbq4_stage[tbq4_stage_idx(row, a)];
+            const float vb = tbq4_stage[tbq4_stage_idx(row, b)];
+            tbq4_stage[tbq4_stage_idx(row, a)] = va + vb;
+            tbq4_stage[tbq4_stage_idx(row, b)] = va - vb;
+        }
+        barrier();
     }
 
-    const float inv_sqrt_128 = 0.08838834764831845f;
-    const vec4 s1 = vec4(
-        tbq4_wht_s1_scalar_mixed[local_out.x],
-        tbq4_wht_s1_scalar_mixed[local_out.y],
-        tbq4_wht_s1_scalar_mixed[local_out.z],
-        tbq4_wht_s1_scalar_mixed[local_out.w]
-    );
-
-    return FLOAT_TYPEV4(sum * (inv_sqrt_128 * s1));
+    if (lane < 64u) {
+        const float inv_sqrt_128 = 0.08838834764831845f;
+        const uint lo = block_start + lane;
+        const uint hi = block_start + lane + 64u;
+        tbq4_stage[tbq4_stage_idx(row, lo)] *= inv_sqrt_128 * tbq4_wht_s1_scalar_mixed[lane];
+        tbq4_stage[tbq4_stage_idx(row, hi)] *= inv_sqrt_128 * tbq4_wht_s1_scalar_mixed[lane + 64u];
+    }
+    barrier();
 }
 
 #define TBQ4_INVERSE_ROTATE_OF() \
     [[unroll]] for (uint32_t tbq4_r = 0; tbq4_r < rows_per_thread; ++tbq4_r) { \
         const uint tbq4_row = tile_row(tbq4_r); \
-        [[unroll]] for (uint32_t tbq4_d = 0; tbq4_d < HSV_per_thread / 4; ++tbq4_d) { \
-            tbq4_ofsh[tbq4_row * (HSV / 4) + tbq4_d * D_split + d_tid] = Of[tbq4_r][tbq4_d]; \
+        if (col_tid == 0u) { \
+            [[unroll]] for (uint32_t tbq4_d = 0; tbq4_d < HSV_per_thread / 4; ++tbq4_d) { \
+                const uint base = (tbq4_d * D_split + d_tid) * 4u; \
+                tbq4_stage_write4(tbq4_row, base, Of[tbq4_r][tbq4_d]); \
+            } \
         } \
     } \
     barrier(); \
     [[unroll]] for (uint32_t tbq4_r = 0; tbq4_r < rows_per_thread; ++tbq4_r) { \
         const uint tbq4_row = tile_row(tbq4_r); \
+        tbq4_fwht128_row_block(tbq4_row, 0u, rowgroup_tid); \
+        tbq4_fwht128_row_block(tbq4_row, 128u, rowgroup_tid); \
+    } \
+    [[unroll]] for (uint32_t tbq4_r = 0; tbq4_r < rows_per_thread; ++tbq4_r) { \
+        const uint tbq4_row = tile_row(tbq4_r); \
         [[unroll]] for (uint32_t tbq4_d = 0; tbq4_d < HSV_per_thread / 4; ++tbq4_d) { \
-            const uint tbq4_out_base = (tbq4_d * D_split + d_tid) * 4u; \
-            Of[tbq4_r][tbq4_d] = tbq4_inverse_rotated_of4(tbq4_row, tbq4_out_base); \
+            const uint base = (tbq4_d * D_split + d_tid) * 4u; \
+            Of[tbq4_r][tbq4_d] = tbq4_stage_read4(tbq4_row, base); \
+        } \
+    } \
+    barrier()
+#ifdef TBQ4_SAWQ128_DIAG
+#ifndef MMQ
+void sawq128_fwht_row_block(uint row, uint block_start, uint lane) {
+    [[unroll]]
+    for (uint step = 1u; step < 128u; step <<= 1u) {
+        if (lane < 64u) {
+            const uint group = lane / step;
+            const uint off = lane - group * step;
+            const uint a = block_start + group * (step << 1u) + off;
+            const uint b = a + step;
+
+            const float va = tbq4_stage[tbq4_stage_idx(row, a)];
+            const float vb = tbq4_stage[tbq4_stage_idx(row, b)];
+            tbq4_stage[tbq4_stage_idx(row, a)] = va + vb;
+            tbq4_stage[tbq4_stage_idx(row, b)] = va - vb;
+        }
+        barrier();
+    }
+
+    if (lane < 64u) {
+        const float inv_sqrt_128 = 0.08838834764831845f;
+        const uint lo = block_start + lane;
+        const uint hi = block_start + lane + 64u;
+        tbq4_stage[tbq4_stage_idx(row, lo)] *= inv_sqrt_128;
+        tbq4_stage[tbq4_stage_idx(row, hi)] *= inv_sqrt_128;
+    }
+    barrier();
+}
+
+#define SAWQ128_DIAG_ROTATE_QF() \
+    barrier(); \
+    [[unroll]] for (uint32_t saw_r = 0; saw_r < rows_per_thread; ++saw_r) { \
+        const uint saw_row = tile_row(saw_r); \
+        if (rowgroup_tid < HSK / 4u) { \
+            tbq4_stage_write4(saw_row, rowgroup_tid * 4u, Qf[saw_row * qf_stride + rowgroup_tid]); \
+        } \
+    } \
+    barrier(); \
+    [[unroll]] for (uint32_t saw_r = 0; saw_r < rows_per_thread; ++saw_r) { \
+        const uint saw_row = tile_row(saw_r); \
+        sawq128_fwht_row_block(saw_row, 0u, rowgroup_tid); \
+        sawq128_fwht_row_block(saw_row, 128u, rowgroup_tid); \
+    } \
+    [[unroll]] for (uint32_t saw_r = 0; saw_r < rows_per_thread; ++saw_r) { \
+        const uint saw_row = tile_row(saw_r); \
+        if (rowgroup_tid < HSK / 4u) { \
+            Qf[saw_row * qf_stride + rowgroup_tid] = tbq4_stage_read4(saw_row, rowgroup_tid * 4u); \
         } \
     } \
     barrier()
 #else
+#define SAWQ128_DIAG_ROTATE_QF()
+#endif
+#else
+#define SAWQ128_DIAG_ROTATE_QF()
+#endif
+
+#else
 #define TBQ4_INVERSE_ROTATE_OF()
+#define SAWQ128_DIAG_ROTATE_QF()
 #endif
 
 const uint32_t masksh_stride = Br + 1;
@@ -253,6 +339,8 @@ void main() {
 #endif
     }
     barrier();
+
+    SAWQ128_DIAG_ROTATE_QF();
 
     FLOAT_TYPEV4 Of[rows_per_thread][HSV_per_thread / 4];
     [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {

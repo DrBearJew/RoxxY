@@ -649,8 +649,37 @@ void process_shaders() {
 #endif
             }
 
-            string_to_spv("flash_attn_f32_f16_q8_0_tbq4_0", "flash_attn.comp",
-                merge_maps(fa_base_dict, {{"DATA_K_Q8_0", "1"}, {"DATA_V_TBQ4_0", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}}), fp16, false, false, f16acc);
+            std::map<std::string, std::string> fa_q8_tbq4_dict = merge_maps(fa_base_dict,
+                {{"DATA_K_Q8_0", "1"}, {"DATA_V_TBQ4_0", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}});
+            string_to_spv("flash_attn_f32_f16_q8_0_tbq4_0", "flash_attn.comp", fa_q8_tbq4_dict, fp16, false, false, f16acc);
+
+            std::map<std::string, std::string> fa_q8_tbq4_vec_nonmtp_dict = merge_maps(fa_base_dict,
+                {{"DATA_K_Q8_0", "1"}, {"DATA_V_TBQ4_0", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"TBQ4_VEC_NONMTP", "1"}});
+            string_to_spv("flash_attn_f32_f16_q8_0_tbq4_0_vec_nonmtp", "flash_attn_q8_tbq4_vec.comp", fa_q8_tbq4_vec_nonmtp_dict, fp16, false, false, f16acc);
+
+            std::map<std::string, std::string> fa_q8_tbq4_vec_mtp_dict = merge_maps(fa_base_dict,
+                {{"DATA_K_Q8_0", "1"}, {"DATA_V_TBQ4_0", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"TBQ4_VEC_MTP", "1"}});
+            string_to_spv("flash_attn_f32_f16_q8_0_tbq4_0_vec_mtp", "flash_attn_q8_tbq4_vec.comp", fa_q8_tbq4_vec_mtp_dict, fp16, false, false, f16acc);
+
+            std::map<std::string, std::string> fa_q8_tbq4_sawq128_diag_dict = merge_maps(fa_base_dict,
+                {{"DATA_K_Q8_0", "1"}, {"DATA_V_TBQ4_0", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"TBQ4_SAWQ128_DIAG", "1"}});
+            string_to_spv("flash_attn_f32_f16_q8_0_tbq4_0_sawq128_diag", "flash_attn_q8_tbq4_vec.comp", fa_q8_tbq4_sawq128_diag_dict, fp16, false, false, f16acc);
+
+            // Keep the default Vulkan q8_0/q4_0 cache path on upstream FA sources.
+            // TBQ4/TQ3 experiments mutate flash_attn*.comp for gated routes; q8/q4 must not inherit those changes.
+            std::map<std::string, std::string> fa_q8_q4_dict = merge_maps(fa_base_dict,
+                {{"DATA_K_Q8_0", "1"}, {"DATA_V_Q4_0", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}});
+            string_to_spv("flash_attn_f32_f16_q8_0_q4_0", "flash_attn_q8_q4_upstream.comp",
+                fa_q8_q4_dict, fp16, false, false, f16acc);
+            if (fp16) {
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+                string_to_spv("flash_attn_f32_f16_q8_0_q4_0", "flash_attn_q8_q4_upstream_cm1.comp",
+                    merge_maps(fa_q8_q4_dict, {{"COOPMAT", "1"}}), fp16, true, false, f16acc);
+#endif
+            }
+
+            string_to_spv("flash_attn_f32_f16_q4_0_tbq4_0", "flash_attn.comp",
+                merge_maps(fa_base_dict, {{"DATA_K_Q4_0", "1"}, {"DATA_V_TBQ4_0", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}}), fp16, false, false, f16acc);
 
             std::vector<std::string> flash_attn_type_names = type_names;
             flash_attn_type_names.push_back("planar3_0");
