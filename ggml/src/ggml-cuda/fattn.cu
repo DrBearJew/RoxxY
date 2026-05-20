@@ -581,13 +581,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
 #ifdef GGML_USE_HIP
-    // HIP/ROCm: default quantized KV to VEC because TILE/WMMA/MMA routes
-    // convert quantized K/V to full f16 temporary buffers in launch_fattn().
-    // For large prefill, allow the f16-temp route only when explicitly enabled
-    // and bounded by a per-op temp-buffer cap. This mirrors the TurboQuant HIP
-    // prefill policy without making long-context OOMs the default.
+    // HIP/ROCm: keep quantized KV one/two-token decode on VEC, but avoid the
+    // pathological 35B long-fill/small-draft route where D=256 q8K/q4V-style
+    // VEC scales badly with depth. For that narrow shape, automatically fall
+    // through to the f16-temp TILE/MMA selector when scratch fits the bounded
+    // cap. Explicit GGML_CUDA_ROCM_QUANT_PREFILL_F16=0 keeps the old VEC route
+    // for A/B tests.
     if ((ggml_is_quantized(K->type) || ggml_is_quantized(V->type)) && can_use_vector_kernel) {
-        bool allow_quant_prefill_f16 = ggml_cuda_fattn_rocm_quant_prefill_f16_enabled() && Q->ne[1] > 2;
+        const bool forced_quant_prefill_f16 = ggml_cuda_fattn_rocm_quant_prefill_f16_enabled() && Q->ne[1] > 2;
+        const bool auto_quant_prefill_f16 = ggml_cuda_fattn_rocm_quant_prefill_f16_auto_enabled() &&
+            Q->ne[0] == 256 && Q->ne[1] > 2 && K->ne[1] >= 1024 && K->type == GGML_TYPE_Q8_0 &&
+            (V->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_TBQ4_0 || V->type == GGML_TYPE_Q8_0);
+        bool allow_quant_prefill_f16 = forced_quant_prefill_f16 || auto_quant_prefill_f16;
 
         // TBQ4 full-block dequant-to-f16 currently supports contiguous tensors only.
         allow_quant_prefill_f16 = allow_quant_prefill_f16 &&

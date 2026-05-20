@@ -1274,7 +1274,7 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
-static bool ggml_cuda_fattn_rocm_quant_prefill_f16_enabled() {
+static const char * ggml_cuda_fattn_rocm_quant_prefill_f16_env() {
 #ifdef GGML_USE_HIP
     const char * env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_F16");
     if (!env) {
@@ -1286,7 +1286,29 @@ static bool ggml_cuda_fattn_rocm_quant_prefill_f16_enabled() {
     if (!env) {
         env = getenv("TBQ4_PREFILL_WMMA");
     }
+    return env;
+#else
+    return nullptr;
+#endif // GGML_USE_HIP
+}
+
+static bool ggml_cuda_fattn_rocm_quant_prefill_f16_enabled() {
+    const char * env = ggml_cuda_fattn_rocm_quant_prefill_f16_env();
     return env && atoi(env) != 0;
+}
+
+static bool ggml_cuda_fattn_rocm_quant_prefill_f16_disabled() {
+    const char * env = ggml_cuda_fattn_rocm_quant_prefill_f16_env();
+    return env && atoi(env) == 0;
+}
+
+static bool ggml_cuda_fattn_rocm_quant_prefill_f16_auto_enabled() {
+#ifdef GGML_USE_HIP
+    if (ggml_cuda_fattn_rocm_quant_prefill_f16_disabled()) {
+        return false;
+    }
+    const char * env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_F16_AUTO");
+    return !env || atoi(env) != 0;
 #else
     return false;
 #endif // GGML_USE_HIP
@@ -1302,7 +1324,8 @@ static int64_t ggml_cuda_fattn_f16_tmp_alloc_nelements(const ggml_tensor * t) {
     // enabled, round temps up to a stable nkv by default so repeated attention
     // calls reuse one scratch size. Set STABLE_ALLOC=0 to force exact sizes.
     const char * stable_alloc_env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_ALLOC");
-    const bool stable_alloc = stable_alloc_env ? atoi(stable_alloc_env) != 0 : ggml_cuda_fattn_rocm_quant_prefill_f16_enabled();
+    const bool stable_alloc = stable_alloc_env ? atoi(stable_alloc_env) != 0 :
+        (ggml_cuda_fattn_rocm_quant_prefill_f16_enabled() || ggml_cuda_fattn_rocm_quant_prefill_f16_auto_enabled());
     if (!stable_alloc || !ggml_is_quantized(t->type)) {
         return ne;
     }
