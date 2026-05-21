@@ -34,6 +34,13 @@ LLAMA_MTP_PREFILL_FORCE_MMQ=1
 
 `LLAMA_MTP_PREFILL_CHUNK` should match `--ubatch-size`.
 
+MTP has separate draft-context KV flags. Set them explicitly; otherwise the draft
+context defaults to f16 KV:
+
+```bash
+--cache-type-k-draft q8_0 --cache-type-v-draft tbq4_0
+```
+
 ### ROCm quantized-KV f16 prefill
 
 ```bash
@@ -90,6 +97,7 @@ GGML_CUDA_ROCM_QUANT_PREFILL_F16=1 \
   --model /path/to/Qwen3.6-27B-Q4_K_M-mtp.gguf \
   --flash-attn on \
   --cache-type-k q8_0 --cache-type-v tbq4_0 \
+  --cache-type-k-draft q8_0 --cache-type-v-draft tbq4_0 \
   --batch-size 1024 --ubatch-size 1024 \
   --spec-type draft-mtp --spec-default \
   --spec-draft-n-max 3 --spec-draft-p-min 0 \
@@ -124,6 +132,7 @@ GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_NKV=40960 \
   --ctx-size 40960 \
   --flash-attn on \
   --cache-type-k q8_0 --cache-type-v tbq4_0 \
+  --cache-type-k-draft q8_0 --cache-type-v-draft tbq4_0 \
   --batch-size 1024 --ubatch-size 1024 \
   --spec-type draft-mtp --spec-default \
   --spec-draft-n-max 2 --spec-draft-p-min 0 \
