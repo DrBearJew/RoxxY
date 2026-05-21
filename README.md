@@ -202,8 +202,28 @@ runtime generation parity is proven.
 
 ## Credits
 
-This branch builds on llama.cpp, TurboQuant-style compressed KV work, Qwen3.6
-MTP support, and local RX 7900 XTX ROCm/Vulkan testing.
+This branch is integration work on top of several upstream projects and public
+references:
+
+- [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) — base runtime,
+  ggml backends, FlashAttention, MTP/TBQ upstream work.
+- [Indras-Mirror/llama.cpp-mtp](https://github.com/Indras-Mirror/llama.cpp-mtp)
+  — MTP/TurboQuant fork foundation, RotorQuant, tensor sharing, CUDA TBQ4 FA.
+- [Stormrage34/llama.cpp-turboquant-hip](https://github.com/Stormrage34/llama.cpp-turboquant-hip)
+  — first working AMD VEC TurboQuant-style path; this branch follows the same
+  inline-dequant-inside-FA pattern for RDNA3 `q8_0/tbq4_0`.
+- [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant)
+  — original TurboQuant block-format/FWHT/centroid reference.
+- [adelj88/rocm_wmma_gemm](https://github.com/adelj88/rocm_wmma_gemm) and
+  [Kaden-Schutt/hipfire](https://github.com/Kaden-Schutt/hipfire) — ROCm/WMMA
+  and dispatch-screening references used during lab-route work.
+- [llmfan46](https://huggingface.co/llmfan46), [HauhauCS](https://huggingface.co/HauhauCS),
+  [havenoammo](https://huggingface.co/havenoammo), and
+  [Radamanthys11](https://huggingface.co/Radamanthys11) — Qwen3.6/MTP GGUFs,
+  model releases, and extraction/grafting references used in validation.
+- [allanchan339/vLLM Qwen chat-template fix](https://github.com/allanchan339/vLLM-Qwen3-3.5-3.6-chat-template-fix)
+  and [froggeric/Qwen Fixed Chat Templates](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates)
+  — Qwen chat-template fixes used by local serving wrappers.
 
 ## License
 
