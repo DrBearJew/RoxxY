@@ -272,9 +272,18 @@ class Server:
         if os.path.exists(CHAT_TEMPLATE):
             cmd.extend(["--jinja", "--chat-template-file", CHAT_TEMPLATE])
         if self.spec_type:
-            cmd.extend(["--spec-type", self.spec_type])
-            # PR #22673: optimal MTP draft depth is 3; default 16 severely degrades acceptance
-            cmd.extend(["--spec-draft-n-max", "3"])
+            spec_type = "draft-mtp" if self.spec_type == "mtp" else self.spec_type
+            cmd.extend(["--spec-type", spec_type])
+            if spec_type == "draft-mtp":
+                # Keep MTP smokes on the current PR #23269 chained-spec defaults.
+                # PR #22673: optimal 27B ROCm/TBQ4 draft depth is 3; default 16 severely degrades acceptance.
+                cmd.extend([
+                    "--spec-default",
+                    "--spec-draft-n-max", "3",
+                    "--spec-draft-p-min", "0",
+                    "--spec-draft-prio", "2",
+                    "--spec-draft-prio-batch", "2",
+                ])
 
         logf = open(self.log_path, "w")
         self.process = subprocess.Popen(

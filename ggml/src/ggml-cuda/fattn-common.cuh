@@ -1308,7 +1308,7 @@ static bool ggml_cuda_fattn_rocm_quant_prefill_f16_auto_enabled() {
         return false;
     }
     const char * env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_F16_AUTO");
-    return !env || atoi(env) != 0;
+    return env && atoi(env) != 0;
 #else
     return false;
 #endif // GGML_USE_HIP

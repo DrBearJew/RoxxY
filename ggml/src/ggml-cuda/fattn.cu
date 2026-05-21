@@ -5,6 +5,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn-wmma-f16.cuh"
+#include "fattn-wmma-q8q4-i8.cuh"
 void ggml_cuda_flash_attn_ext_wmma_tbq4(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_flash_attn_ext_wmma_compressed_kv(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 #include "cpy-planar-iso.cuh"
@@ -354,6 +355,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_MMA_TBQ4 = 500,
     BEST_FATTN_KERNEL_WMMA_TBQ4 = 550, // AMD rocWMMA TBQ4 path (experimental, disabled in favor of VEC)
     BEST_FATTN_KERNEL_WMMA_COMPRESSED_KV = 560, // experimental Planar/Iso compressed-KV WMMA path
+    BEST_FATTN_KERNEL_Q8Q4_WMMA_I8 = 570, // experimental ROCm q8_0 K + q4_0 V direct i8-WMMA path
 };
 
 static const char * ggml_cuda_fattn_kernel_name(const best_fattn_kernel kernel) {
@@ -366,6 +368,7 @@ static const char * ggml_cuda_fattn_kernel_name(const best_fattn_kernel kernel) 
         case BEST_FATTN_KERNEL_MMA_TBQ4:           return "mma_tbq4";
         case BEST_FATTN_KERNEL_WMMA_TBQ4:          return "wmma_tbq4";
         case BEST_FATTN_KERNEL_WMMA_COMPRESSED_KV: return "wmma_compressed_kv";
+        case BEST_FATTN_KERNEL_Q8Q4_WMMA_I8:       return "q8q4_wmma_i8";
     }
     return "unknown";
 }
@@ -439,7 +442,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
 
     float max_bias = 0.0f;
-    memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
+    float logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) KQV->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
     // The effective batch size for the kernel can be increased by gqa_ratio.
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
@@ -587,13 +592,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
 #ifdef GGML_USE_HIP
-    // HIP/ROCm: keep quantized KV one/two-token decode on VEC, but avoid the
-    // pathological 35B long-fill/small-draft route where D=256 q8K/q4V-style
-    // VEC scales badly with depth. For that narrow shape, automatically fall
-    // through to the f16-temp TILE/MMA selector when scratch fits the bounded
-    // cap. Explicit GGML_CUDA_ROCM_QUANT_PREFILL_F16=0 keeps the old VEC route
-    // for A/B tests.
+    // HIP/ROCm: keep quantized KV one/two-token decode on VEC. The f16-temp
+    // TILE/MMA selector is opt-in only: GGML_CUDA_ROCM_QUANT_PREFILL_F16=1
+    // for promoted paths such as 27B MTP, or GGML_CUDA_ROCM_QUANT_PREFILL_F16_AUTO=1
+    // for explicit A/B probes. Absence of both envs must preserve q8K/tbq4V VEC
+    // so 35B prefill cannot silently sink into the f16-temp path.
     if ((ggml_is_quantized(K->type) || ggml_is_quantized(V->type)) && can_use_vector_kernel) {
+        if (ggml_cuda_q8q4_wmma_i8_supported(cc, dst, max_bias, logit_softcap)) {
+            return BEST_FATTN_KERNEL_Q8Q4_WMMA_I8;
+        }
+
         const bool forced_quant_prefill_f16 = ggml_cuda_fattn_rocm_quant_prefill_f16_enabled() && Q->ne[1] > 2;
         const bool auto_quant_prefill_f16 = ggml_cuda_fattn_rocm_quant_prefill_f16_auto_enabled() &&
             Q->ne[0] == 256 && Q->ne[1] > 2 && K->ne[1] >= 1024 && K->type == GGML_TYPE_Q8_0 &&
@@ -852,6 +860,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_WMMA_COMPRESSED_KV:
             ggml_cuda_flash_attn_ext_wmma_compressed_kv(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_Q8Q4_WMMA_I8:
+            ggml_cuda_flash_attn_ext_q8q4_wmma_i8(ctx, dst);
             break;
     }
 }

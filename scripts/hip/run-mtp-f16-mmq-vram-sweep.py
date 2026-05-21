@@ -245,7 +245,11 @@ def run_case(args: argparse.Namespace, case: Case, case_index: int, out_dir: Pat
         "--cache-type-k", "q8_0",
         "--cache-type-v", "tbq4_0",
         "--spec-type", "draft-mtp",
+        "--spec-default",
         "--spec-draft-n-max", str(args.spec_draft_n_max),
+        "--spec-draft-p-min", str(args.spec_draft_p_min),
+        "--spec-draft-prio", str(args.spec_draft_prio),
+        "--spec-draft-prio-batch", str(args.spec_draft_prio_batch),
         "--parallel", "1",
         "--cache-prompt",
         "--fit", "off",
@@ -341,6 +345,9 @@ def main() -> int:
     ap.add_argument("--stable-f16-alloc", action="store_true", help="Set GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_ALLOC=1")
     ap.add_argument("--stable-nkv", type=int, default=0, help="Set GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_NKV when >0")
     ap.add_argument("--spec-draft-n-max", type=int, default=3)
+    ap.add_argument("--spec-draft-p-min", type=float, default=0.0)
+    ap.add_argument("--spec-draft-prio", type=int, default=2)
+    ap.add_argument("--spec-draft-prio-batch", type=int, default=2)
     ap.add_argument("--threads", type=int, default=12)
     ap.add_argument("--base-port", type=int, default=18450)
     ap.add_argument("--health-timeout", type=float, default=600)
@@ -381,10 +388,14 @@ def main() -> int:
         "pp_tokens": args.pp_tokens,
         "cases": [c.__dict__ for c in cases],
         "dry_run": args.dry_run,
+        "spec_draft_n_max": args.spec_draft_n_max,
+        "spec_draft_p_min": args.spec_draft_p_min,
+        "spec_draft_prio": args.spec_draft_prio,
+        "spec_draft_prio_batch": args.spec_draft_prio_batch,
         "stable_f16_alloc": args.stable_f16_alloc,
         "stable_nkv": args.stable_nkv,
         "contract": {
-            "mtp_required": "--spec-type draft-mtp --spec-draft-n-max 3 --parallel 1",
+            "mtp_required": "--spec-type draft-mtp --spec-default --spec-draft-n-max <N> --spec-draft-p-min 0 --spec-draft-prio 2 --spec-draft-prio-batch 2 --parallel 1",
             "chunk_equals_ubatch_required": True,
             "vram_sampling_required": True,
             "route_log_required": True,

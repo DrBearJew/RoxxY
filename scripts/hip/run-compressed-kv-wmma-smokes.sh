@@ -151,8 +151,12 @@ run_one() {
         --cache-type-k "$cache_type" \
         --cache-type-v "$cache_type" \
         --cache-ram 128 \
-        --spec-type mtp \
+        --spec-type draft-mtp \
+        --spec-default \
         --spec-draft-n-max 3 \
+        --spec-draft-p-min 0 \
+        --spec-draft-prio 2 \
+        --spec-draft-prio-batch 2 \
         --parallel 1 \
         --no-warmup \
         >"$log" 2>&1 &
