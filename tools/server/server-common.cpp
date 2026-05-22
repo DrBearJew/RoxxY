@@ -1181,7 +1181,7 @@ json oaicompat_chat_params_parse(
             { "pos",  span.pos  },
             { "len",  span.len  },
         });
-}
+    }
 
     // Reasoning budget: pass parameters through to sampling layer
     {
