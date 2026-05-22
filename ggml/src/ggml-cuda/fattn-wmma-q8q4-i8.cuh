@@ -75,17 +75,62 @@ static inline int ggml_cuda_q8q4_wmma_i8_layer_id(const ggml_tensor * dst) {
     return end && *end == '\0' ? (int) id : -1;
 }
 
+static inline bool ggml_cuda_q8q4_wmma_i8_layer_list_contains(const char * list, const int id) {
+    if (!list || id < 0) {
+        return false;
+    }
+
+    const char * p = list;
+    while (*p) {
+        while (*p == ',' || *p == ';' || *p == ' ' || *p == '\t') {
+            ++p;
+        }
+        if (!*p) {
+            break;
+        }
+
+        char * end = nullptr;
+        const long first = strtol(p, &end, 10);
+        if (end == p) {
+            while (*p && *p != ',' && *p != ';' && *p != ' ' && *p != '\t') {
+                ++p;
+            }
+            continue;
+        }
+
+        long last = first;
+        if (*end == '-') {
+            char * range_end = nullptr;
+            const long parsed_last = strtol(end + 1, &range_end, 10);
+            if (range_end != end + 1) {
+                last = parsed_last;
+                end = range_end;
+            }
+        }
+        if ((first <= id && id <= last) || (last <= id && id <= first)) {
+            return true;
+        }
+        p = end;
+    }
+    return false;
+}
+
 static inline bool ggml_cuda_q8q4_wmma_i8_layer_filter_allows(const ggml_tensor * dst) {
-    const char * one_env = getenv("GGML_CUDA_ROCM_Q8Q4_WMMA_I8_LAYER");
-    const char * min_env = getenv("GGML_CUDA_ROCM_Q8Q4_WMMA_I8_LAYER_MIN");
-    const char * max_env = getenv("GGML_CUDA_ROCM_Q8Q4_WMMA_I8_LAYER_MAX");
-    if (!one_env && !min_env && !max_env) {
+    const char * one_env       = getenv("GGML_CUDA_ROCM_Q8Q4_WMMA_I8_LAYER");
+    const char * min_env       = getenv("GGML_CUDA_ROCM_Q8Q4_WMMA_I8_LAYER_MIN");
+    const char * max_env       = getenv("GGML_CUDA_ROCM_Q8Q4_WMMA_I8_LAYER_MAX");
+    const char * skip_one_env  = getenv("GGML_CUDA_ROCM_Q8Q4_WMMA_I8_SKIP_LAYER");
+    const char * skip_list_env = getenv("GGML_CUDA_ROCM_Q8Q4_WMMA_I8_SKIP_LAYERS");
+
+    const bool has_include_filter = one_env || min_env || max_env;
+    const bool has_skip_filter = skip_one_env || skip_list_env;
+    if (!has_include_filter && !has_skip_filter) {
         return true;
     }
 
     const int id = ggml_cuda_q8q4_wmma_i8_layer_id(dst);
     if (id < 0) {
-        return false;
+        return !has_include_filter;
     }
     if (one_env && id != atoi(one_env)) {
         return false;
@@ -94,6 +139,12 @@ static inline bool ggml_cuda_q8q4_wmma_i8_layer_filter_allows(const ggml_tensor 
         return false;
     }
     if (max_env && id > atoi(max_env)) {
+        return false;
+    }
+    if (skip_one_env && id == atoi(skip_one_env)) {
+        return false;
+    }
+    if (ggml_cuda_q8q4_wmma_i8_layer_list_contains(skip_list_env, id)) {
         return false;
     }
     return true;

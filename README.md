@@ -96,13 +96,20 @@ policy without importing TheTom's Turbo/TQ enum architecture.
 ```bash
 GGML_CUDA_ROCM_Q8Q4_WMMA_I8=1
 GGML_CUDA_ROCM_Q8Q4_WMMA_I8_UNSAFE=1
-GGML_CUDA_ROCM_Q8Q4_WMMA_I8_QSCALE16=1  # optional quality probe: per-WMMA-K Q scales
+GGML_CUDA_ROCM_Q8Q4_WMMA_I8_QSCALE16=1       # optional quality probe: per-WMMA-K Q scales
+GGML_CUDA_ROCM_Q8Q4_WMMA_I8_LAYER_MIN=27      # optional conservative diagnostic include range
+GGML_CUDA_ROCM_Q8Q4_WMMA_I8_LAYER_MAX=39
+GGML_CUDA_ROCM_Q8Q4_WMMA_I8_SKIP_LAYER=7      # optional diagnostic layer exclusion
+GGML_CUDA_ROCM_Q8Q4_WMMA_I8_SKIP_LAYERS=7,11  # optional comma/range list, e.g. 7,11-13
 ```
 
 Keep this lab-only. Backend-op tests pass, but greedy generation parity is not
-proven. `QSCALE16` is an opt-in stabilization probe that quantizes Q per 16-wide
-WMMA K tile instead of per q8_0 block; it should be validated with layer-filtered
-logit/top1 checks before broad use.
+proven for unrestricted routing. `QSCALE16` is an opt-in stabilization probe that
+quantizes Q per 16-wide WMMA K tile instead of per q8_0 block. `LAYER_MIN/MAX`
+and `SKIP_LAYER(S)` are diagnostic safety knobs for layer-filtered logit/top1
+checks only; do not use them as a default policy without an artifact-backed
+prompt and long-shape sweep. Current Qwen3.6-35B evidence rejects `LAYER_MIN=23`
+for long/multi-chunk prompts and favors the more conservative `LAYER_MIN=27`.
 
 ## Run recipes
 
