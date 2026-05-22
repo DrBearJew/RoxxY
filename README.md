@@ -114,6 +114,9 @@ on `11d51958` did not reproduce the earlier dirty-tree `LAYER_MIN=23` failure
 (`min23` was deterministic, rel RMS ~= 0.0295, top1 matched), so treat stale
 `*-dirty` artifacts as investigation evidence rather than current policy proof.
 Re-run `scripts/hip/run-q8q4-wmma-i8-long384-repro.sh` after route changes.
+See `docs/rocm-tbq4-paths/08-q8q4-wmma-i8-min27-validation.md` for the
+current min27 validation summary, including rel RMS, KLD/JS/TVD, perf, and
+thinking-leak caveats.
 
 ## Run recipes
 
