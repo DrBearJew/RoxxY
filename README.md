@@ -108,8 +108,12 @@ proven for unrestricted routing. `QSCALE16` is an opt-in stabilization probe tha
 quantizes Q per 16-wide WMMA K tile instead of per q8_0 block. `LAYER_MIN/MAX`
 and `SKIP_LAYER(S)` are diagnostic safety knobs for layer-filtered logit/top1
 checks only; do not use them as a default policy without an artifact-backed
-prompt and long-shape sweep. Current Qwen3.6-35B evidence rejects `LAYER_MIN=23`
-for long/multi-chunk prompts and favors the more conservative `LAYER_MIN=27`.
+prompt and long-shape sweep. For current Qwen3.6-35B lab runs, `LAYER_MIN=27`
+remains the conservative example. A clean long_384_notes reproducibility matrix
+on `11d51958` did not reproduce the earlier dirty-tree `LAYER_MIN=23` failure
+(`min23` was deterministic, rel RMS ~= 0.0295, top1 matched), so treat stale
+`*-dirty` artifacts as investigation evidence rather than current policy proof.
+Re-run `scripts/hip/run-q8q4-wmma-i8-long384-repro.sh` after route changes.
 
 ## Run recipes
 
