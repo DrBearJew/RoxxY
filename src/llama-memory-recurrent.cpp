@@ -13,6 +13,23 @@
 #include <map>
 #include <stdexcept>
 
+namespace {
+
+void llama_copy_tensor_row(ggml_tensor * tensor, size_t row_size, uint32_t dst_row, uint32_t src_row, std::vector<uint8_t> & tmp) {
+    if (tensor == nullptr || dst_row == src_row) {
+        return;
+    }
+
+    const size_t dst_offset = (size_t) dst_row * tensor->nb[1];
+    const size_t src_offset = (size_t) src_row * tensor->nb[1];
+
+    tmp.resize(row_size);
+    ggml_backend_tensor_get(tensor, tmp.data(), src_offset, row_size);
+    ggml_backend_tensor_set(tensor, tmp.data(), dst_offset, row_size);
+}
+
+}
+
 //
 // llama_memory_recurrent
 //
@@ -172,8 +189,10 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
             // partial rollback via per-token snapshot index (bounded by n_rs_seq)
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
                 const llama_pos rollback = cell.pos - (p0 - 1);
-                if (rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
-                    set_rs_idx(seq_id, (uint32_t) rollback);
+                const uint32_t  pending  = (seq_id >= 0 && (size_t) seq_id < rs_idx.size()) ? rs_idx[seq_id] : 0;
+                const llama_pos rollback_total = rollback + pending;
+                if (rollback >= 1 && rollback_total <= (llama_pos) n_rs_seq) {
+                    set_rs_idx(seq_id, (uint32_t) rollback_total);
                     cell.pos = p0 - 1;
                     return true;
                 }
@@ -386,6 +405,98 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
         return;
     }
     rs_idx[seq_id] = (idx > n_rs_seq) ? n_rs_seq : idx;
+}
+
+uint32_t llama_memory_recurrent::get_cell_rs_idx(uint32_t cell_id, llama_seq_id seq_id) const {
+    if (n_rs_seq == 0 || cell_id >= cells.size()) {
+        return 0;
+    }
+
+    auto get_seq_rs_idx = [this](llama_seq_id id) -> uint32_t {
+        if (id < 0 || (size_t) id >= rs_idx.size()) {
+            return 0;
+        }
+        return rs_idx[id];
+    };
+
+    const auto & cell = cells[cell_id];
+    if (seq_id >= 0) {
+        const uint32_t idx = get_seq_rs_idx(seq_id);
+        if (idx == 0) {
+            return 0;
+        }
+
+        // A shared recurrent cell can only be materialized to one row. Divergent
+        // rollback indices would corrupt one of the aliases, so fail before
+        // writing an inconsistent checkpoint.
+        for (const llama_seq_id id : cell.seq_id) {
+            if (get_seq_rs_idx(id) != idx) {
+                GGML_ABORT("cannot save recurrent state with divergent partial rollback in a shared cell");
+            }
+        }
+        return idx;
+    }
+
+    uint32_t idx = 0;
+    bool have_idx = false;
+    for (const llama_seq_id id : cell.seq_id) {
+        const uint32_t cur = get_seq_rs_idx(id);
+        if (!have_idx) {
+            idx = cur;
+            have_idx = true;
+            continue;
+        }
+        if (cur != idx) {
+            GGML_ABORT("cannot save recurrent state with divergent partial rollback in a shared cell");
+        }
+    }
+
+    return idx;
+}
+
+void llama_memory_recurrent::materialize_pending_rs_rollback(
+        const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
+        llama_seq_id seq_id) const {
+    if (n_rs_seq == 0) {
+        return;
+    }
+
+    std::vector<std::pair<uint32_t, uint32_t>> pending;
+    for (const auto & range : cell_ranges) {
+        for (uint32_t cell_id = range.first; cell_id < range.second; ++cell_id) {
+            const uint32_t idx = get_cell_rs_idx(cell_id, seq_id);
+            if (idx != 0) {
+                pending.emplace_back(cell_id, idx);
+            }
+        }
+    }
+
+    if (pending.empty()) {
+        return;
+    }
+
+    LLAMA_LOG_DEBUG("%s: materializing %zu pending recurrent rollback rows before state write\n", __func__, pending.size());
+
+    std::vector<uint8_t> tmp;
+    for (const auto & [cell_id, idx] : pending) {
+        const uint32_t src_row = idx * size + cell_id;
+
+        for (auto * r : r_l) {
+            if (r == nullptr) {
+                continue;
+            }
+            const size_t row_size = ggml_row_size(r->type, r->ne[0]);
+            llama_copy_tensor_row(r, row_size, cell_id, src_row, tmp);
+        }
+
+        for (auto * s : s_l) {
+            if (s == nullptr) {
+                continue;
+            }
+            const size_t row_size = ggml_row_size(s->type, s->ne[0]);
+            llama_copy_tensor_row(s, row_size, cell_id, src_row, tmp);
+        }
+    }
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
@@ -722,15 +833,6 @@ size_t llama_memory_recurrent::size_s_bytes() const {
 void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     GGML_UNUSED(flags);
 
-    // [TAG_RS_STATE_ROLLBACK_SUPPORT]
-    if (n_rs_seq != 0) {
-        for (uint32_t i = 0; i < rs_idx.size(); ++i) {
-            if (rs_idx[i] != 0) {
-                GGML_ABORT("recurrent state read/write is not supported with partial rollback");
-            }
-        }
-    }
-
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges; // ranges, from inclusive, to exclusive
     uint32_t cell_count = 0;
 
@@ -765,6 +867,8 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
         cell_count_check += range.second - range.first;
     }
     GGML_ASSERT(cell_count == cell_count_check);
+
+    materialize_pending_rs_rollback(cell_ranges, seq_id);
 
     io.write(&cell_count, sizeof(cell_count));
 

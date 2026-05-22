@@ -77,6 +77,9 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    uint32_t get_cell_rs_idx(uint32_t cell_id, llama_seq_id seq_id) const;
+    void materialize_pending_rs_rollback(const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id) const;
+
     // computed before each graph build
     uint32_t n = 0;
 
