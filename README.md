@@ -71,9 +71,25 @@ Useful f16-temp controls:
 GGML_CUDA_ROCM_QUANT_PREFILL_F16_MAX_MIB=1024
 GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_ALLOC=1
 GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_NKV=<ctx>
+GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_BUCKET_NKV=4096
 ```
 
 `STABLE_ALLOC` avoids HIP pool growth by reusing one rounded temp allocation.
+`STABLE_NKV` is the manual override and wins over bucketed sizing. `STABLE_BUCKET_NKV`
+rounds f16 temps to nkv buckets when full-context stable scratch is too large.
+`COMPRESSED_KV_FATTN_LOG=1` emits a one-shot f16-prefill decision line.
+
+### TBQ/RDNA3 policy helpers
+
+```bash
+TBQ_AUTO_ASYMMETRIC=0        # opt out of high-GQA tbq4/tbq4 -> q8/tbq4 K promotion
+GGML_CUDA_MMQ_MAX_X=48       # preferred manual RDNA3/gfx1100 cap
+GGML_CUDA_MMQ_MAX_X_AUTO=1   # opt-in helper; manual MAX_X still wins
+```
+
+If symmetric `tbq4_0` K+V is requested on high-GQA models, K is promoted to
+`q8_0` by default while V remains `tbq4_0`. This mirrors the local quality
+policy without importing TheTom's Turbo/TQ enum architecture.
 
 ### q8/q4 WMMA-I8 lab route
 

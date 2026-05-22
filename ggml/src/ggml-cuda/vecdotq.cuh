@@ -4,7 +4,12 @@
 
 #include <cstdint>
 
-static __device__ __forceinline__ int get_int_b1(const void * x, const int & i32) {
+// Unaligned 4-byte load helpers. AMD GPUs handle unaligned global_load_dword
+// natively, avoiding byte/word shift+OR sequences in vecdot hot paths.
+static __device__ __forceinline__ int get_int_b1(const void * x, const int i32) {
+#if defined(GGML_USE_HIP)
+    return ((const int *) x)[i32];
+#else
     const uint8_t * x8 = (const uint8_t *) x;
 
     int x32  = x8[4*i32 + 0] <<  0;
@@ -13,18 +18,23 @@ static __device__ __forceinline__ int get_int_b1(const void * x, const int & i32
     x32     |= x8[4*i32 + 3] << 24;
 
     return x32;
+#endif // defined(GGML_USE_HIP)
 }
 
-static __device__ __forceinline__ int get_int_b2(const void * x, const int & i32) {
+static __device__ __forceinline__ int get_int_b2(const void * x, const int i32) {
+#if defined(GGML_USE_HIP)
+    return ((const int *) x)[i32];
+#else
     const uint16_t * x16 = (const uint16_t *) x; // assume at least 2 byte alignment
 
     int x32  = x16[2*i32 + 0] <<  0;
     x32     |= x16[2*i32 + 1] << 16;
 
     return x32;
+#endif // defined(GGML_USE_HIP)
 }
 
-static __device__ __forceinline__ int get_int_b4(const void * x, const int & i32) {
+static __device__ __forceinline__ int get_int_b4(const void * x, const int i32) {
     return ((const int *) x)[i32]; // assume at least 4 byte alignment
 }
 
@@ -363,7 +373,7 @@ static __device__ __forceinline__ float vec_dot_nvfp4_q8_1(
 // contiguous v/x values
 static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmvq(
     const int & v, const int * __restrict__ u, const uint8_t * __restrict__ scales,
-    const half2 & dm2, const float * __restrict__ d8) {
+    const half2 & dm2, const half * __restrict__ d8) {
 
     float sumf_d = 0.0f;
     float sumf_m = 0.0f;
@@ -371,16 +381,17 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmvq(
 #pragma unroll
     for (int i = 0; i < QR2_K; ++i) {
         const int sc = scales[2*i];
+        const float d8f = __half2float(d8[i]);
 
         const int vi = (v >> (2*i)) & 0x03030303;
 
-        sumf_d += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * (sc & 0xF)); // SIMD dot product
+        sumf_d += d8f * (ggml_cuda_dp4a(vi, u[i], 0) * (sc & 0xF)); // SIMD dot product
 
         // fill int with 4x m
         int m = sc >> 4;
         m |= m <<  8;
         m |= m << 16;
-        sumf_m += d8[i] * ggml_cuda_dp4a(m, u[i], 0); // multiply constant q2_K part with sum of q8_1 values
+        sumf_m += d8f * ggml_cuda_dp4a(m, u[i], 0); // multiply constant q2_K part with sum of q8_1 values
     }
 
     const float2 dm2f = __half22float2(dm2);
@@ -446,7 +457,7 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmq(
 // contiguous v/x values
 static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
     const int & vl, const int & vh, const int * __restrict__ u, const uint8_t * __restrict__ scales,
-    const int & scale_offset, const float & d3, const float * __restrict__ d8) {
+    const int & scale_offset, const float & d3, const half * __restrict__ d8) {
 
     float sumf = 0.0f;
 
@@ -470,7 +481,7 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
 
         const int vi = __vsubss4(vil, vih);
 
-        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
+        sumf += __half2float(d8[i]) * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
     }
 
     return d3 * sumf;
@@ -504,7 +515,7 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmq(
 // contiguous v/x values
 static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
     const int * __restrict__ v, const int * __restrict__ u, const uint8_t * __restrict__ sc,
-    const uint8_t * __restrict__ m, const half2 & dm4, const float * __restrict__ d8) {
+    const uint8_t * __restrict__ m, const half2 & dm4, const half * __restrict__ d8) {
 
     float sumf_d = 0.0f;
     float sumf_m = 0.0f;
@@ -516,9 +527,10 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
 
         const int dot1 = ggml_cuda_dp4a(v1i, u[2*i+1], ggml_cuda_dp4a(v0i, u[2*i+0], 0)); // SIMD dot product
         const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+1], ggml_cuda_dp4a(0x01010101, u[2*i+0], 0)); // sum of u
+        const float d8f = __half2float(d8[i]);
 
-        sumf_d += d8[i] * (dot1 * sc[i]);
-        sumf_m += d8[i] * (dot2 * m[i]);  // multiply constant part of q4_K with sum of q8_1 values
+        sumf_d += d8f * (dot1 * sc[i]);
+        sumf_m += d8f * (dot2 * m[i]);  // multiply constant part of q4_K with sum of q8_1 values
     }
 
     const float2 dm4f = __half22float2(dm4);
@@ -560,7 +572,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
 // contiguous v/x values
 static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_vmmq(
     const int * __restrict__ vl, const int * __restrict__ vh, const int * __restrict__ u, const uint8_t * __restrict__ sc,
-    const uint8_t * __restrict__ m, const half2 & dm5, const float * __restrict__ d8) {
+    const uint8_t * __restrict__ m, const half2 & dm5, const half * __restrict__ d8) {
 
     float sumf_d = 0.0f;
     float sumf_m = 0.0f;
@@ -578,9 +590,10 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_vmmq(
 
         const int dot1 = ggml_cuda_dp4a(v0i, u[2*i+0], ggml_cuda_dp4a(v1i, u[2*i+1], 0)); // SIMD dot product
         const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+0], ggml_cuda_dp4a(0x01010101, u[2*i+1], 0)); // sum of u
+        const float d8f = __half2float(d8[i]);
 
-        sumf_d += d8[i] * (dot1 * sc[i]);
-        sumf_m += d8[i] * (dot2 * m[i]);
+        sumf_d += d8f * (dot1 * sc[i]);
+        sumf_m += d8f * (dot2 * m[i]);
 
     }
 
@@ -623,7 +636,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
 // contiguous v/x values
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
     const int & vl, const int & vh, const int * __restrict__ u, const int8_t * __restrict__ scales,
-    const float & d, const float * __restrict__ d8) {
+    const float & d, const half * __restrict__ d8) {
 
     float sumf = 0.0f;
 
@@ -637,7 +650,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
 
         const int vi = __vsubss4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
 
-        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
+        sumf += __half2float(d8[i]) * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
     }
 
     return d*sumf;
@@ -687,9 +700,7 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
     const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
 
     // Load 32 bits (4 bytes) for this chunk from Q1_0
-    const int offset = iqs * 4;
-    const int v = bq1_0->qs[offset + 0] | (bq1_0->qs[offset + 1] << 8) |
-                  (bq1_0->qs[offset + 2] << 16) | (bq1_0->qs[offset + 3] << 24);
+    const int v = get_int_b1(bq1_0->qs, iqs);
 
     // Unpack 32 bits into 32 signed values (-1 or +1)
     int vi_bytes[8];
@@ -823,12 +834,12 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
 
     const int v = get_int_b4(bq2_K->qs, iqs);
     int    u[QR2_K];
-    float d8[QR2_K];
+    half d8[QR2_K];
 
 #pragma unroll
     for (int i = 0; i < QR2_K; ++ i) {
         u[i]  = get_int_b4(bq8_1[bq8_offset + i].qs, iqs % QI8_1);
-        d8[i] = __low2float(bq8_1[bq8_offset + i].ds);
+        d8[i] = ((const half *)&bq8_1[bq8_offset + i].ds)[0];
     }
 
     return vec_dot_q2_K_q8_1_impl_mmvq(v, u, scales, bq2_K->dm, d8);
@@ -850,12 +861,12 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1(
     const int vh = ~get_int_b2(bq3_K->hmask, iqs % (QI3_K/2)) >> bq8_offset;
 
     int    u[QR3_K];
-    float d8[QR3_K];
+    half d8[QR3_K];
 
 #pragma unroll
     for (int i = 0; i < QR3_K; ++i) {
         u[i]  = get_int_b4(bq8_1[bq8_offset + i].qs, iqs % QI8_1);
-        d8[i] = __low2float(bq8_1[bq8_offset + i].ds);
+        d8[i] = ((const half *)&bq8_1[bq8_offset + i].ds)[0];
     }
 
     return vec_dot_q3_K_q8_1_impl_mmvq(vl, vh, u, bq3_K->scales, scale_offset, d, d8);
@@ -868,7 +879,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
 
     int    v[2];
     int    u[2*QR4_K];
-    float d8[QR4_K];
+    half d8[QR4_K];
 
     // iqs is in 0,2..30. bq8_offset = iqs/4 -> bq8_offset = 0, 2, 4, 6
     const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
@@ -897,7 +908,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
 
     for (int i = 0; i < QR4_K; ++i) {
         const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
-        d8[i] = __low2float(bq8i->ds);
+        d8[i] = ((const half *)&bq8i->ds)[0];
 
         const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
         u[2*i+0] = q8[0];
@@ -915,7 +926,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     int   vl[2];
     int   vh[2];
     int    u[2*QR5_K];
-    float d8[QR5_K];
+    half d8[QR5_K];
 
     const int bq8_offset = QR5_K * ((iqs/2) / (QI8_1/2));
     const int * ql = (const int *)(bq5_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
@@ -943,7 +954,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
 #pragma unroll
     for (int i = 0; i < QR5_K; ++i) {
         const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
-        d8[i] = __low2float(bq8i->ds);
+        d8[i] = ((const half *)&bq8i->ds)[0];
 
         const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
         u[2*i+0] = q8[0];
@@ -968,12 +979,12 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     const int8_t * scales = bq6_K->scales + scale_offset;
 
     int    u[QR6_K];
-    float d8[QR6_K];
+    half d8[QR6_K];
 
 #pragma unroll
     for (int i = 0; i < QR6_K; ++i) {
         u[i]  = get_int_b4(bq8_1[bq8_offset + 2*i].qs, iqs % QI8_1);
-        d8[i] = __low2float(bq8_1[bq8_offset + 2*i].ds);
+        d8[i] = ((const half *)&bq8_1[bq8_offset + 2*i].ds)[0];
     }
 
     return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);

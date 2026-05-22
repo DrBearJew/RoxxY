@@ -1314,6 +1314,46 @@ static bool ggml_cuda_fattn_rocm_quant_prefill_f16_auto_enabled() {
 #endif // GGML_USE_HIP
 }
 
+static int64_t ggml_cuda_round_up_i64(const int64_t x, const int64_t multiple) {
+    if (x <= 0 || multiple <= 0) {
+        return x;
+    }
+    return ((x + multiple - 1) / multiple) * multiple;
+}
+
+static int64_t ggml_cuda_fattn_f16_tmp_stable_bucket_nkv() {
+#ifdef GGML_USE_HIP
+    const char * env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_BUCKET_NKV");
+    return env ? atoll(env) : 0;
+#else
+    return 0;
+#endif // GGML_USE_HIP
+}
+
+static int64_t ggml_cuda_fattn_f16_tmp_stable_nkv(const ggml_tensor * t) {
+#ifdef GGML_USE_HIP
+    const char * stable_nkv_env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_NKV");
+    const int64_t stable_nkv = stable_nkv_env ? atoll(stable_nkv_env) : 0;
+    if (stable_nkv > 0) {
+        return stable_nkv;
+    }
+
+    const int64_t bucket_nkv = ggml_cuda_fattn_f16_tmp_stable_bucket_nkv();
+    if (bucket_nkv > 0) {
+        int64_t rounded_nkv = ggml_cuda_round_up_i64(t->ne[1], bucket_nkv);
+        if (t->view_src && t->view_src->ne[1] > 0) {
+            rounded_nkv = std::min(rounded_nkv, t->view_src->ne[1]);
+        }
+        return rounded_nkv;
+    }
+
+    return t->view_src ? t->view_src->ne[1] : 0;
+#else
+    GGML_UNUSED(t);
+    return 0;
+#endif // GGML_USE_HIP
+}
+
 static int64_t ggml_cuda_fattn_f16_tmp_alloc_nelements(const ggml_tensor * t) {
     int64_t ne = ggml_nelements(t);
 
@@ -1323,6 +1363,8 @@ static int64_t ggml_cuda_fattn_f16_tmp_alloc_nelements(const ggml_tensor * t) {
     // f16 K/V temp size. When the ROCm quantized-KV f16 prefill route is
     // enabled, round temps up to a stable nkv by default so repeated attention
     // calls reuse one scratch size. Set STABLE_ALLOC=0 to force exact sizes.
+    // Optional STABLE_BUCKET_NKV=<n> rounds to nkv buckets instead of the full
+    // backing KV view, reducing over-allocation while still avoiding ladders.
     const char * stable_alloc_env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_ALLOC");
     const bool stable_alloc = stable_alloc_env ? atoi(stable_alloc_env) != 0 :
         (ggml_cuda_fattn_rocm_quant_prefill_f16_enabled() || ggml_cuda_fattn_rocm_quant_prefill_f16_auto_enabled());
@@ -1330,12 +1372,7 @@ static int64_t ggml_cuda_fattn_f16_tmp_alloc_nelements(const ggml_tensor * t) {
         return ne;
     }
 
-    const char * stable_nkv_env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_NKV");
-    int64_t stable_nkv = stable_nkv_env ? atoll(stable_nkv_env) : 0;
-    if (stable_nkv <= 0 && t->view_src) {
-        stable_nkv = t->view_src->ne[1];
-    }
-
+    const int64_t stable_nkv = ggml_cuda_fattn_f16_tmp_stable_nkv(t);
     if (stable_nkv > t->ne[1]) {
         const int64_t stable_ne = t->ne[0] * stable_nkv * t->ne[2] * t->ne[3];
         ne = std::max(ne, stable_ne);
@@ -1349,6 +1386,52 @@ static int64_t ggml_cuda_fattn_f16_tmp_bytes(const ggml_tensor * K, const ggml_t
     return
         (K->type == GGML_TYPE_F16 ? 0 : ggml_cuda_fattn_f16_tmp_alloc_nelements(K) * (int64_t) sizeof(half)) +
         (V->type == GGML_TYPE_F16 ? 0 : ggml_cuda_fattn_f16_tmp_alloc_nelements(V) * (int64_t) sizeof(half));
+}
+
+static int64_t ggml_cuda_fattn_rocm_quant_prefill_f16_max_mib() {
+#ifdef GGML_USE_HIP
+    const char * max_mib_env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_F16_MAX_MIB");
+    if (!max_mib_env) {
+        max_mib_env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_MMA_MAX_MIB");
+    }
+    return max_mib_env ? atoll(max_mib_env) : 1024;
+#else
+    return 0;
+#endif // GGML_USE_HIP
+}
+
+struct ggml_cuda_rocm_quant_prefill_f16_policy {
+    bool forced;
+    bool automatic;
+    bool contiguous_ok;
+    int64_t max_mib;
+    int64_t tmp_bytes;
+    bool under_budget;
+    bool allowed;
+};
+
+static ggml_cuda_rocm_quant_prefill_f16_policy ggml_cuda_fattn_rocm_quant_prefill_f16_policy(
+        const ggml_tensor * Q, const ggml_tensor * K, const ggml_tensor * V) {
+#ifdef GGML_USE_HIP
+    const bool forced = ggml_cuda_fattn_rocm_quant_prefill_f16_enabled() && Q->ne[1] > 2;
+    const bool automatic = ggml_cuda_fattn_rocm_quant_prefill_f16_auto_enabled() &&
+        Q->ne[0] == 256 && Q->ne[1] > 2 && K->ne[1] >= 1024 && K->type == GGML_TYPE_Q8_0 &&
+        (V->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_TBQ4_0 || V->type == GGML_TYPE_Q8_0);
+
+    const bool contiguous_ok =
+        (K->type != GGML_TYPE_TBQ4_0 || ggml_is_contiguously_allocated(K)) &&
+        (V->type != GGML_TYPE_TBQ4_0 || ggml_is_contiguously_allocated(V));
+
+    const int64_t max_mib = ggml_cuda_fattn_rocm_quant_prefill_f16_max_mib();
+    const int64_t tmp_bytes = ggml_cuda_fattn_f16_tmp_bytes(K, V);
+    const bool under_budget = max_mib <= 0 || tmp_bytes <= max_mib * 1024LL * 1024LL;
+    const bool allowed = (forced || automatic) && contiguous_ok && under_budget;
+
+    return { forced, automatic, contiguous_ok, max_mib, tmp_bytes, under_budget, allowed };
+#else
+    GGML_UNUSED(Q); GGML_UNUSED(K); GGML_UNUSED(V);
+    return { false, false, true, 0, 0, true, false };
+#endif // GGML_USE_HIP
 }
 
 template <int DV, int ncols1, int ncols2>

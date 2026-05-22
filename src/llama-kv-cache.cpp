@@ -96,6 +96,25 @@ llama_kv_cache::llama_kv_cache(
 
     GGML_ASSERT(kv_size % n_pad == 0);
 
+    // TBQ-native auto-asymmetric guard: symmetric TBQ4 K+V is compact, but
+    // high-GQA models amplify K quantization error across many Q heads. Keep
+    // V compressed and promote only K to q8_0 unless explicitly disabled.
+    {
+        const char * env = getenv("TBQ_AUTO_ASYMMETRIC");
+        const bool disabled = env && env[0] == '0';
+        const uint32_t n_head    = hparams.n_head(0);
+        const uint32_t n_head_kv = hparams.n_head_kv(0);
+        const uint32_t gqa_ratio = n_head_kv > 0 ? n_head / n_head_kv : 1;
+
+        if (!disabled && type_k == GGML_TYPE_TBQ4_0 && type_v == GGML_TYPE_TBQ4_0 && gqa_ratio >= 6) {
+            LLAMA_LOG_WARN("%s: TBQ auto-asymmetric: GQA ratio %u:1 (n_head=%u, n_head_kv=%u) — "
+                    "upgrading K from %s to q8_0 while keeping V=%s. "
+                    "Disable with TBQ_AUTO_ASYMMETRIC=0\n",
+                    __func__, gqa_ratio, n_head, n_head_kv, ggml_type_name(type_k), ggml_type_name(type_v));
+            type_k = GGML_TYPE_Q8_0;
+        }
+    }
+
     uint32_t n_layer_kv = 0;
     for (uint32_t il = 0; il < hparams.n_layer; ++il) {
         const bool included_by_filter = filter && filter(il);

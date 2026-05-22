@@ -425,6 +425,42 @@ static void ggml_cuda_fattn_log_selection(const best_fattn_kernel kernel, const 
         (long long) Q->ne[0], (long long) V->ne[0], sparse_v_tau_level);
 }
 
+static void ggml_cuda_fattn_log_rocm_quant_prefill_f16_once(
+        const ggml_tensor * Q, const ggml_tensor * K, const ggml_tensor * V,
+        const ggml_cuda_rocm_quant_prefill_f16_policy & policy) {
+#ifdef GGML_USE_HIP
+    const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG");
+    if (!log_env || atoi(log_env) == 0 || !policy.allowed) {
+        return;
+    }
+
+    static bool logged_forced = false;
+    static bool logged_auto   = false;
+    bool & logged = policy.forced ? logged_forced : logged_auto;
+    if (logged) {
+        return;
+    }
+    logged = true;
+
+    const char * mode = policy.forced ? "forced" : (policy.automatic ? "auto" : "candidate");
+    GGML_LOG_INFO("%s: rocm_quant_prefill_f16=%s K=%s V=%s nq=%lld nkv=%lld d_q=%lld d_v=%lld "
+            "tmp=%.2f MiB max=%lld MiB stable_nkv_k=%lld stable_nkv_v=%lld bucket_nkv=%lld contiguous_ok=%d under_budget=%d\n",
+            __func__, mode,
+            ggml_type_name(K->type), ggml_type_name(V->type),
+            (long long) Q->ne[1], (long long) K->ne[1],
+            (long long) Q->ne[0], (long long) V->ne[0],
+            (double) policy.tmp_bytes / (1024.0 * 1024.0),
+            (long long) policy.max_mib,
+            (long long) ggml_cuda_fattn_f16_tmp_stable_nkv(K),
+            (long long) ggml_cuda_fattn_f16_tmp_stable_nkv(V),
+            (long long) ggml_cuda_fattn_f16_tmp_stable_bucket_nkv(),
+            policy.contiguous_ok ? 1 : 0,
+            policy.under_budget ? 1 : 0);
+#else
+    GGML_UNUSED(Q); GGML_UNUSED(K); GGML_UNUSED(V); GGML_UNUSED(policy);
+#endif // GGML_USE_HIP
+}
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
@@ -602,24 +638,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_Q8Q4_WMMA_I8;
         }
 
-        const bool forced_quant_prefill_f16 = ggml_cuda_fattn_rocm_quant_prefill_f16_enabled() && Q->ne[1] > 2;
-        const bool auto_quant_prefill_f16 = ggml_cuda_fattn_rocm_quant_prefill_f16_auto_enabled() &&
-            Q->ne[0] == 256 && Q->ne[1] > 2 && K->ne[1] >= 1024 && K->type == GGML_TYPE_Q8_0 &&
-            (V->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_TBQ4_0 || V->type == GGML_TYPE_Q8_0);
-        bool allow_quant_prefill_f16 = forced_quant_prefill_f16 || auto_quant_prefill_f16;
-
-        // TBQ4 full-block dequant-to-f16 currently supports contiguous tensors only.
-        allow_quant_prefill_f16 = allow_quant_prefill_f16 &&
-            (K->type != GGML_TYPE_TBQ4_0 || ggml_is_contiguously_allocated(K)) &&
-            (V->type != GGML_TYPE_TBQ4_0 || ggml_is_contiguously_allocated(V));
-
-        const char * max_mib_env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_F16_MAX_MIB");
-        if (!max_mib_env) {
-            max_mib_env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_MMA_MAX_MIB");
+        const ggml_cuda_rocm_quant_prefill_f16_policy f16_policy =
+            ggml_cuda_fattn_rocm_quant_prefill_f16_policy(Q, K, V);
+        const bool allow_quant_prefill_f16 = f16_policy.allowed;
+        if (allow_quant_prefill_f16) {
+            ggml_cuda_fattn_log_rocm_quant_prefill_f16_once(Q, K, V, f16_policy);
         }
-        const int64_t max_mib = max_mib_env ? atoll(max_mib_env) : 1024;
-        const int64_t f16_tmp_bytes = ggml_cuda_fattn_f16_tmp_bytes(K, V);
-        allow_quant_prefill_f16 = allow_quant_prefill_f16 && (max_mib <= 0 || f16_tmp_bytes <= max_mib * 1024LL * 1024LL);
 
         if (!allow_quant_prefill_f16) {
 #ifndef GGML_CUDA_FA_ALL_QUANTS

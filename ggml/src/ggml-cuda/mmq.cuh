@@ -125,6 +125,14 @@ static int ggml_cuda_mmq_x_max_env() {
     return env_cap;
 }
 
+static bool ggml_cuda_mmq_x_max_auto_env() {
+    static const bool env_auto = []() {
+        const char * env = getenv("GGML_CUDA_MMQ_MAX_X_AUTO");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return env_auto;
+}
+
 static int get_mmq_x_max_host(const int cc) {
     const int native_max = (turing_mma_available(cc) || amd_wmma_available(cc)) ? 128 :
         GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA ?
@@ -134,7 +142,13 @@ static int get_mmq_x_max_host(const int cc) {
             MMQ_DP4A_MAX_BATCH_SIZE : 64;
 #endif // GGML_CUDA_FORCE_MMQ
 
-    const int env_cap = ggml_cuda_mmq_x_max_env();
+    int env_cap = ggml_cuda_mmq_x_max_env();
+    if (env_cap == 0 && ggml_cuda_mmq_x_max_auto_env() && GGML_CUDA_CC_IS_RDNA3_0(cc)) {
+        // Local RDNA3/gfx1100 policy: x48 has tested best for the 35B IQ4_XS path
+        // while staying under the soft accumulator/register budget. Manual
+        // GGML_CUDA_MMQ_MAX_X always takes precedence over this opt-in helper.
+        env_cap = 48;
+    }
     if (env_cap == 0 || env_cap >= native_max) {
         return native_max;
     }
@@ -375,9 +389,7 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
         }
 
         const block_q1_0 * bxi = (const block_q1_0 *) x + kbx0 + i*stride + kbx;
-        const int qs_offset = 4*kqsx;
-        const int qs0 = bxi->qs[qs_offset + 0] | (bxi->qs[qs_offset + 1] << 8) |
-                        (bxi->qs[qs_offset + 2] << 16) | (bxi->qs[qs_offset + 3] << 24);
+        const int qs0 = get_int_b1(bxi->qs, kqsx);
 
         int unpacked_bytes[8];
 #pragma unroll
