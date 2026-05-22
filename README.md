@@ -96,10 +96,13 @@ policy without importing TheTom's Turbo/TQ enum architecture.
 ```bash
 GGML_CUDA_ROCM_Q8Q4_WMMA_I8=1
 GGML_CUDA_ROCM_Q8Q4_WMMA_I8_UNSAFE=1
+GGML_CUDA_ROCM_Q8Q4_WMMA_I8_QSCALE16=1  # optional quality probe: per-WMMA-K Q scales
 ```
 
 Keep this lab-only. Backend-op tests pass, but greedy generation parity is not
-proven.
+proven. `QSCALE16` is an opt-in stabilization probe that quantizes Q per 16-wide
+WMMA K tile instead of per q8_0 block; it should be validated with layer-filtered
+logit/top1 checks before broad use.
 
 ## Run recipes
 

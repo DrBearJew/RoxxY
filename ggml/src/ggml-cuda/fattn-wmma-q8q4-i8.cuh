@@ -23,6 +23,15 @@ static inline bool ggml_cuda_q8q4_wmma_i8_unsafe_enabled() {
 #endif
 }
 
+static inline bool ggml_cuda_q8q4_wmma_i8_qscale16_enabled() {
+#ifdef GGML_USE_HIP
+    const char * env = getenv("GGML_CUDA_ROCM_Q8Q4_WMMA_I8_QSCALE16");
+    return env && atoi(env) != 0;
+#else
+    return false;
+#endif
+}
+
 static constexpr int64_t GGML_CUDA_Q8Q4_WMMA_I8_KV_CHUNK = 256;
 
 static inline bool ggml_cuda_q8q4_wmma_i8_has_attn_sinks(const ggml_tensor * dst) {
@@ -42,8 +51,9 @@ static inline int64_t ggml_cuda_q8q4_wmma_i8_scratch_bytes_per_head(const ggml_t
     const int64_t n_chunks = (ggml_cuda_q8q4_wmma_i8_real_kv_len(dst) + GGML_CUDA_Q8Q4_WMMA_I8_KV_CHUNK - 1) / GGML_CUDA_Q8Q4_WMMA_I8_KV_CHUNK;
     const int64_t nq = Q->ne[1];
     const int64_t d = Q->ne[0];
+    const int64_t q_scale_width = ggml_cuda_q8q4_wmma_i8_qscale16_enabled() ? 16 : 32;
     return n_chunks * nq * d * (int64_t) sizeof(float) + 2 * n_chunks * nq * (int64_t) sizeof(float) +
-           nq * d * (int64_t) sizeof(int8_t) + nq * (d / 32) * (int64_t) sizeof(float);
+           nq * d * (int64_t) sizeof(int8_t) + nq * (d / q_scale_width) * (int64_t) sizeof(float);
 }
 
 static inline int64_t ggml_cuda_q8q4_wmma_i8_max_mib() {
@@ -153,7 +163,9 @@ void ggml_cuda_flash_attn_ext_q8q4_wmma_i8(ggml_backend_cuda_context & ctx, ggml
 
 static constexpr int GGML_CUDA_Q8Q4_I8_D = 256;
 static constexpr int GGML_CUDA_Q8Q4_I8_QK = 32;
+static constexpr int GGML_CUDA_Q8Q4_I8_QSCALE16_QK = 16;
 static constexpr int GGML_CUDA_Q8Q4_I8_BLOCKS = GGML_CUDA_Q8Q4_I8_D / GGML_CUDA_Q8Q4_I8_QK;
+static constexpr int GGML_CUDA_Q8Q4_I8_QSCALE16_BLOCKS = GGML_CUDA_Q8Q4_I8_D / GGML_CUDA_Q8Q4_I8_QSCALE16_QK;
 static constexpr int GGML_CUDA_Q8Q4_I8_WMMA_M = 16;
 static constexpr int GGML_CUDA_Q8Q4_I8_WMMA_N = 16;
 static constexpr int GGML_CUDA_Q8Q4_I8_WMMA_K = 16;
@@ -195,7 +207,7 @@ static __device__ __forceinline__ void ggml_cuda_q8q4_i8_apply_attn_sink(
     row_max = next_max;
 }
 
-static __global__ __launch_bounds__(32, 4) void ggml_cuda_q8q4_i8_quant_q32_kernel(
+static __global__ __launch_bounds__(32, 4) void ggml_cuda_q8q4_i8_quant_q_kernel(
         const char * __restrict__ Q,
         int8_t     * __restrict__ q_i8,
         float      * __restrict__ q_scales,
@@ -203,7 +215,8 @@ static __global__ __launch_bounds__(32, 4) void ggml_cuda_q8q4_i8_quant_q32_kern
         int nq,
         int hq0,
         int ib0,
-        int n_heads_q) {
+        int n_heads_q,
+        int q_scale_blocks) {
     const int tid = threadIdx.x;
     const int q = blockIdx.x;
     const int qb = blockIdx.y;
@@ -211,25 +224,27 @@ static __global__ __launch_bounds__(32, 4) void ggml_cuda_q8q4_i8_quant_q32_kern
     const int linear_head = hq0 + instance;
     const int hq = linear_head % n_heads_q;
     const int ib = ib0 + linear_head / n_heads_q;
-    if (tid >= GGML_CUDA_Q8Q4_I8_QK || q >= nq) {
+    if (q >= nq) {
         return;
     }
 
+    const int q_scale_width = GGML_CUDA_Q8Q4_I8_D / q_scale_blocks;
     const char * q_row = Q + int64_t(q) * nb01 + int64_t(hq) * nb02 + int64_t(ib) * nb03;
-    const int d = qb * GGML_CUDA_Q8Q4_I8_QK + tid;
-    const float x = *(const float *) (q_row + int64_t(d) * nb00);
-    float amax = fabsf(x);
-#pragma unroll
-    for (int mask = GGML_CUDA_Q8Q4_I8_QK / 2; mask > 0; mask >>= 1) {
-        amax = fmaxf(amax, __shfl_xor(amax, mask, GGML_CUDA_Q8Q4_I8_QK));
+    const int d = qb * q_scale_width + tid;
+    const float x = tid < q_scale_width ? *(const float *) (q_row + int64_t(d) * nb00) : 0.0f;
+    float amax = tid < q_scale_width ? fabsf(x) : 0.0f;
+    for (int mask = q_scale_width / 2; mask > 0; mask >>= 1) {
+        amax = fmaxf(amax, __shfl_xor(amax, mask, q_scale_width));
     }
     const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
-    const size_t q_scale_offset = size_t(instance) * nq * GGML_CUDA_Q8Q4_I8_BLOCKS;
+    const size_t q_scale_offset = size_t(instance) * nq * q_scale_blocks;
     const size_t q_i8_offset = size_t(instance) * nq * GGML_CUDA_Q8Q4_I8_D;
     if (tid == 0) {
-        q_scales[q_scale_offset + size_t(q) * GGML_CUDA_Q8Q4_I8_BLOCKS + qb] = scale;
+        q_scales[q_scale_offset + size_t(q) * q_scale_blocks + qb] = scale;
     }
-    q_i8[q_i8_offset + size_t(q) * GGML_CUDA_Q8Q4_I8_D + d] = ggml_cuda_q8q4_i8_clamp(x / scale);
+    if (tid < q_scale_width) {
+        q_i8[q_i8_offset + size_t(q) * GGML_CUDA_Q8Q4_I8_D + d] = ggml_cuda_q8q4_i8_clamp(x / scale);
+    }
 }
 
 static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8q4_i8_splitk_stage1_kernel(
@@ -250,7 +265,8 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8q4_i8_splitk_stage1
         int ib0,
         int n_heads_q,
         int gqa_ratio,
-        float softmax_scale) {
+        float softmax_scale,
+        int q_scale_blocks) {
     __shared__ int8_t  q_tile[GGML_CUDA_Q8Q4_I8_WMMA_M * GGML_CUDA_Q8Q4_I8_WMMA_K];
     __shared__ int8_t  k_tile[GGML_CUDA_Q8Q4_I8_WMMA_K * GGML_CUDA_Q8Q4_I8_WMMA_N];
     __shared__ int32_t partial[GGML_CUDA_Q8Q4_I8_WMMA_M * GGML_CUDA_Q8Q4_I8_WMMA_N];
@@ -269,7 +285,7 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8q4_i8_splitk_stage1
     const int v_scale_block = d >> 5;
     const int hkv = hq / gqa_ratio;
     const size_t q_i8_offset = size_t(instance) * nq * GGML_CUDA_Q8Q4_I8_D;
-    const size_t q_scale_offset = size_t(instance) * nq * GGML_CUDA_Q8Q4_I8_BLOCKS;
+    const size_t q_scale_offset = size_t(instance) * nq * q_scale_blocks;
     const size_t partial_base = size_t(instance) * size_t(gridDim.y) * nq;
 
     float row_max[GGML_CUDA_Q8Q4_I8_WMMA_M];
@@ -289,21 +305,71 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8q4_i8_splitk_stage1
         const int k_row = k_base + lane_col;
         float logit = 0.0f;
 
+        if (q_scale_blocks == GGML_CUDA_Q8Q4_I8_BLOCKS) {
 #pragma unroll
-        for (int kb = 0; kb < GGML_CUDA_Q8Q4_I8_BLOCKS; ++kb) {
-            rocwmma::fragment<rocwmma::accumulator, GGML_CUDA_Q8Q4_I8_WMMA_M, GGML_CUDA_Q8Q4_I8_WMMA_N, GGML_CUDA_Q8Q4_I8_WMMA_K, int32_t> acc_i32;
-            if (tid < 32) {
-                rocwmma::fill_fragment(acc_i32, 0);
-            }
+            for (int kb = 0; kb < GGML_CUDA_Q8Q4_I8_BLOCKS; ++kb) {
+                rocwmma::fragment<rocwmma::accumulator, GGML_CUDA_Q8Q4_I8_WMMA_M, GGML_CUDA_Q8Q4_I8_WMMA_N, GGML_CUDA_Q8Q4_I8_WMMA_K, int32_t> acc_i32;
+                if (tid < 32) {
+                    rocwmma::fill_fragment(acc_i32, 0);
+                }
 
 #pragma unroll
-            for (int inner = 0; inner < 2; ++inner) {
-                const int step = kb * 2 + inner;
+                for (int inner = 0; inner < 2; ++inner) {
+                    const int step = kb * 2 + inner;
+                    if (tid < GGML_CUDA_Q8Q4_I8_WMMA_M * GGML_CUDA_Q8Q4_I8_WMMA_K) {
+                        const int d_q = step * GGML_CUDA_Q8Q4_I8_WMMA_K + lane_col;
+                        q_tile[lane_row * GGML_CUDA_Q8Q4_I8_WMMA_K + lane_col] = (q_row < nq) ? q_i8[q_i8_offset + size_t(q_row) * GGML_CUDA_Q8Q4_I8_D + d_q] : 0;
+
+                        const int d_k = step * GGML_CUDA_Q8Q4_I8_WMMA_K + lane_row;
+                        const block_q8_0 * kb_ptr = nullptr;
+                        if (k_row < nk) {
+                            const char * k_row_ptr = K + int64_t(k_row) * nb11 + int64_t(hkv) * nb12 + int64_t(ib) * nb13;
+                            kb_ptr = (const block_q8_0 *) (k_row_ptr + int64_t(kb) * nb10);
+                        }
+                        k_tile[lane_row + lane_col * GGML_CUDA_Q8Q4_I8_WMMA_K] = (k_row < nk) ? kb_ptr->qs[d_k - kb * GGML_CUDA_Q8Q4_I8_QK] : 0;
+                    }
+                    __syncthreads();
+
+                    if (tid < 32) {
+                        rocwmma::fragment<rocwmma::matrix_a, GGML_CUDA_Q8Q4_I8_WMMA_M, GGML_CUDA_Q8Q4_I8_WMMA_N, GGML_CUDA_Q8Q4_I8_WMMA_K, int8_t, rocwmma::row_major> q_frag;
+                        rocwmma::fragment<rocwmma::matrix_b, GGML_CUDA_Q8Q4_I8_WMMA_M, GGML_CUDA_Q8Q4_I8_WMMA_N, GGML_CUDA_Q8Q4_I8_WMMA_K, int8_t, rocwmma::col_major> k_frag;
+                        rocwmma::load_matrix_sync(q_frag, q_tile, GGML_CUDA_Q8Q4_I8_WMMA_K);
+                        rocwmma::load_matrix_sync(k_frag, k_tile, GGML_CUDA_Q8Q4_I8_WMMA_K);
+                        rocwmma::mma_sync(acc_i32, q_frag, k_frag, acc_i32);
+                    }
+                    if (inner == 0) {
+                        __syncthreads();
+                    }
+                }
+
+                if (tid < 32) {
+                    rocwmma::store_matrix_sync(partial, acc_i32, GGML_CUDA_Q8Q4_I8_WMMA_N, rocwmma::mem_row_major);
+                }
+                __syncthreads();
+
+                if (tid < GGML_CUDA_Q8Q4_I8_WMMA_M * GGML_CUDA_Q8Q4_I8_WMMA_N && q_row < nq && k_row < nk) {
+                    const char * k_row_ptr = K + int64_t(k_row) * nb11 + int64_t(hkv) * nb12 + int64_t(ib) * nb13;
+                    const block_q8_0 * kb_ptr = (const block_q8_0 *) (k_row_ptr + int64_t(kb) * nb10);
+                    const float qs = q_scales[q_scale_offset + size_t(q_row) * q_scale_blocks + kb];
+                    const float ks = float(kb_ptr->d);
+                    logit += float(partial[lane_row * GGML_CUDA_Q8Q4_I8_WMMA_N + lane_col]) * qs * ks;
+                }
+                __syncthreads();
+            }
+        } else {
+#pragma unroll
+            for (int qsb = 0; qsb < GGML_CUDA_Q8Q4_I8_QSCALE16_BLOCKS; ++qsb) {
+                const int kb = qsb >> 1;
+                rocwmma::fragment<rocwmma::accumulator, GGML_CUDA_Q8Q4_I8_WMMA_M, GGML_CUDA_Q8Q4_I8_WMMA_N, GGML_CUDA_Q8Q4_I8_WMMA_K, int32_t> acc_i32;
+                if (tid < 32) {
+                    rocwmma::fill_fragment(acc_i32, 0);
+                }
+
                 if (tid < GGML_CUDA_Q8Q4_I8_WMMA_M * GGML_CUDA_Q8Q4_I8_WMMA_K) {
-                    const int d_q = step * GGML_CUDA_Q8Q4_I8_WMMA_K + lane_col;
+                    const int d_q = qsb * GGML_CUDA_Q8Q4_I8_WMMA_K + lane_col;
                     q_tile[lane_row * GGML_CUDA_Q8Q4_I8_WMMA_K + lane_col] = (q_row < nq) ? q_i8[q_i8_offset + size_t(q_row) * GGML_CUDA_Q8Q4_I8_D + d_q] : 0;
 
-                    const int d_k = step * GGML_CUDA_Q8Q4_I8_WMMA_K + lane_row;
+                    const int d_k = qsb * GGML_CUDA_Q8Q4_I8_WMMA_K + lane_row;
                     const block_q8_0 * kb_ptr = nullptr;
                     if (k_row < nk) {
                         const char * k_row_ptr = K + int64_t(k_row) * nb11 + int64_t(hkv) * nb12 + int64_t(ib) * nb13;
@@ -319,25 +385,19 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8q4_i8_splitk_stage1
                     rocwmma::load_matrix_sync(q_frag, q_tile, GGML_CUDA_Q8Q4_I8_WMMA_K);
                     rocwmma::load_matrix_sync(k_frag, k_tile, GGML_CUDA_Q8Q4_I8_WMMA_K);
                     rocwmma::mma_sync(acc_i32, q_frag, k_frag, acc_i32);
+                    rocwmma::store_matrix_sync(partial, acc_i32, GGML_CUDA_Q8Q4_I8_WMMA_N, rocwmma::mem_row_major);
                 }
-                if (inner == 0) {
-                    __syncthreads();
+                __syncthreads();
+
+                if (tid < GGML_CUDA_Q8Q4_I8_WMMA_M * GGML_CUDA_Q8Q4_I8_WMMA_N && q_row < nq && k_row < nk) {
+                    const char * k_row_ptr = K + int64_t(k_row) * nb11 + int64_t(hkv) * nb12 + int64_t(ib) * nb13;
+                    const block_q8_0 * kb_ptr = (const block_q8_0 *) (k_row_ptr + int64_t(kb) * nb10);
+                    const float qs = q_scales[q_scale_offset + size_t(q_row) * q_scale_blocks + qsb];
+                    const float ks = float(kb_ptr->d);
+                    logit += float(partial[lane_row * GGML_CUDA_Q8Q4_I8_WMMA_N + lane_col]) * qs * ks;
                 }
+                __syncthreads();
             }
-
-            if (tid < 32) {
-                rocwmma::store_matrix_sync(partial, acc_i32, GGML_CUDA_Q8Q4_I8_WMMA_N, rocwmma::mem_row_major);
-            }
-            __syncthreads();
-
-            if (tid < GGML_CUDA_Q8Q4_I8_WMMA_M * GGML_CUDA_Q8Q4_I8_WMMA_N && q_row < nq && k_row < nk) {
-                const char * k_row_ptr = K + int64_t(k_row) * nb11 + int64_t(hkv) * nb12 + int64_t(ib) * nb13;
-                const block_q8_0 * kb_ptr = (const block_q8_0 *) (k_row_ptr + int64_t(kb) * nb10);
-                const float qs = q_scales[q_scale_offset + size_t(q_row) * GGML_CUDA_Q8Q4_I8_BLOCKS + kb];
-                const float ks = float(kb_ptr->d);
-                logit += float(partial[lane_row * GGML_CUDA_Q8Q4_I8_WMMA_N + lane_col]) * qs * ks;
-            }
-            __syncthreads();
         }
 
         if (tid < GGML_CUDA_Q8Q4_I8_WMMA_M * GGML_CUDA_Q8Q4_I8_WMMA_N) {
@@ -461,6 +521,7 @@ inline void ggml_cuda_flash_attn_ext_q8q4_wmma_i8(ggml_backend_cuda_context & ct
     const int n_batch = Q->ne[3];
     const int gqa_ratio = Q->ne[2] / K->ne[2];
     const int n_chunks = (nk + GGML_CUDA_Q8Q4_I8_CHUNK - 1) / GGML_CUDA_Q8Q4_I8_CHUNK;
+    const int q_scale_blocks = ggml_cuda_q8q4_wmma_i8_qscale16_enabled() ? GGML_CUDA_Q8Q4_I8_QSCALE16_BLOCKS : GGML_CUDA_Q8Q4_I8_BLOCKS;
 
     const int n_instances_total = n_heads_q * n_batch;
     const int64_t scratch_per_head = ggml_cuda_q8q4_wmma_i8_scratch_bytes_per_head(dst);
@@ -472,7 +533,7 @@ inline void ggml_cuda_flash_attn_ext_q8q4_wmma_i8(ggml_backend_cuda_context & ct
 
     ggml_cuda_pool & pool = ctx.pool();
     ggml_cuda_pool_alloc<int8_t> q_i8(pool, size_t(active_instances) * nq * GGML_CUDA_Q8Q4_I8_D);
-    ggml_cuda_pool_alloc<float> q_scales(pool, size_t(active_instances) * nq * GGML_CUDA_Q8Q4_I8_BLOCKS);
+    ggml_cuda_pool_alloc<float> q_scales(pool, size_t(active_instances) * nq * q_scale_blocks);
     ggml_cuda_pool_alloc<float> partial_acc(pool, size_t(active_instances) * n_chunks * nq * GGML_CUDA_Q8Q4_I8_D);
     ggml_cuda_pool_alloc<float> partial_m(pool, size_t(active_instances) * n_chunks * nq);
     ggml_cuda_pool_alloc<float> partial_l(pool, size_t(active_instances) * n_chunks * nq);
@@ -481,8 +542,8 @@ inline void ggml_cuda_flash_attn_ext_q8q4_wmma_i8(ggml_backend_cuda_context & ct
     if (log_env && atoi(log_env) != 0) {
         const double scratch_mib = double(scratch_per_head) / (1024.0 * 1024.0);
         const double active_scratch_mib = double(scratch_per_head * int64_t(active_instances)) / (1024.0 * 1024.0);
-        GGML_LOG_INFO("%s: route=q8q4_wmma_i8 nq=%d nk=%d heads=%d batch=%d gqa=%d chunks=%d scratch_per_head=%.3f MiB active_scratch=%.3f MiB batch_heads=%d mask=1 sinks=%d\n",
-            __func__, nq, nk, n_heads_q, n_batch, gqa_ratio, n_chunks, scratch_mib, active_scratch_mib, batch_heads, sinks != nullptr);
+        GGML_LOG_INFO("%s: route=q8q4_wmma_i8 nq=%d nk=%d heads=%d batch=%d gqa=%d chunks=%d q_scale_width=%d scratch_per_head=%.3f MiB active_scratch=%.3f MiB batch_heads=%d mask=1 sinks=%d\n",
+            __func__, nq, nk, n_heads_q, n_batch, gqa_ratio, n_chunks, GGML_CUDA_Q8Q4_I8_D / q_scale_blocks, scratch_mib, active_scratch_mib, batch_heads, sinks != nullptr);
     }
 
     const dim3 quant_block(32);
@@ -490,38 +551,38 @@ inline void ggml_cuda_flash_attn_ext_q8q4_wmma_i8(ggml_backend_cuda_context & ct
     cudaStream_t stream = ctx.stream();
 
     if (batch_heads) {
-        const dim3 quant_grid(nq, GGML_CUDA_Q8Q4_I8_BLOCKS, active_instances);
+        const dim3 quant_grid(nq, q_scale_blocks, active_instances);
         const dim3 stage_grid((nq + GGML_CUDA_Q8Q4_I8_WMMA_M - 1) / GGML_CUDA_Q8Q4_I8_WMMA_M, n_chunks, active_instances);
         const dim3 reduce_grid(nq, 1, active_instances);
-        ggml_cuda_q8q4_i8_quant_q32_kernel<<<quant_grid, quant_block, 0, stream>>>(
+        ggml_cuda_q8q4_i8_quant_q_kernel<<<quant_grid, quant_block, 0, stream>>>(
             (const char *) Q->data, q_i8.ptr, q_scales.ptr,
-            Q->nb[0], Q->nb[1], Q->nb[2], Q->nb[3], nq, 0, 0, n_heads_q);
+            Q->nb[0], Q->nb[1], Q->nb[2], Q->nb[3], nq, 0, 0, n_heads_q, q_scale_blocks);
         ggml_cuda_q8q4_i8_splitk_stage1_kernel<<<stage_grid, block, 0, stream>>>(
             q_i8.ptr, q_scales.ptr, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
             partial_acc.ptr, partial_m.ptr, partial_l.ptr,
             K->nb[0], K->nb[1], K->nb[2], K->nb[3],
             V->nb[0], V->nb[1], V->nb[2], V->nb[3],
             mask->nb[0], mask->nb[1], mask->nb[3], mask->ne[3],
-            nq, nk, 0, 0, n_heads_q, gqa_ratio, scale);
+            nq, nk, 0, 0, n_heads_q, gqa_ratio, scale, q_scale_blocks);
         ggml_cuda_q8q4_i8_reduce_kernel<<<reduce_grid, block, 0, stream>>>(
             partial_acc.ptr, partial_m.ptr, partial_l.ptr, sinks_data, (char *) dst->data,
             dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3], nq, n_chunks, 0, 0, n_heads_q);
     } else {
-        const dim3 quant_grid(nq, GGML_CUDA_Q8Q4_I8_BLOCKS, 1);
+        const dim3 quant_grid(nq, q_scale_blocks, 1);
         const dim3 stage_grid((nq + GGML_CUDA_Q8Q4_I8_WMMA_M - 1) / GGML_CUDA_Q8Q4_I8_WMMA_M, n_chunks, 1);
         const dim3 reduce_grid(nq, 1, 1);
         for (int ib = 0; ib < n_batch; ++ib) {
             for (int hq = 0; hq < n_heads_q; ++hq) {
-                ggml_cuda_q8q4_i8_quant_q32_kernel<<<quant_grid, quant_block, 0, stream>>>(
+                ggml_cuda_q8q4_i8_quant_q_kernel<<<quant_grid, quant_block, 0, stream>>>(
                     (const char *) Q->data, q_i8.ptr, q_scales.ptr,
-                    Q->nb[0], Q->nb[1], Q->nb[2], Q->nb[3], nq, hq, ib, n_heads_q);
+                    Q->nb[0], Q->nb[1], Q->nb[2], Q->nb[3], nq, hq, ib, n_heads_q, q_scale_blocks);
                 ggml_cuda_q8q4_i8_splitk_stage1_kernel<<<stage_grid, block, 0, stream>>>(
                     q_i8.ptr, q_scales.ptr, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
                     partial_acc.ptr, partial_m.ptr, partial_l.ptr,
                     K->nb[0], K->nb[1], K->nb[2], K->nb[3],
                     V->nb[0], V->nb[1], V->nb[2], V->nb[3],
                     mask->nb[0], mask->nb[1], mask->nb[3], mask->ne[3],
-                    nq, nk, hq, ib, n_heads_q, gqa_ratio, scale);
+                    nq, nk, hq, ib, n_heads_q, gqa_ratio, scale, q_scale_blocks);
                 ggml_cuda_q8q4_i8_reduce_kernel<<<reduce_grid, block, 0, stream>>>(
                     partial_acc.ptr, partial_m.ptr, partial_l.ptr, sinks_data, (char *) dst->data,
                     dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3], nq, n_chunks, hq, ib, n_heads_q);
