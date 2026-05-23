@@ -140,11 +140,25 @@ void llama_model_gemma4_assistant::load_arch_hparams(llama_model_loader & ml) {
     hparams.f_attention_scale     = 1.0f;
 
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,         hparams.nextn_predict_layers, false);
+    if (hparams.nextn_predict_layers == 0) {
+        // compatibility: some Gemma 4 assistant GGUFs omit nextn_predict_layers
+        // even though the whole assistant file is an MTP head.
+        hparams.nextn_predict_layers = hparams.n_layer;
+    }
     ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA,           hparams.rope_freq_base_train_swa, false);
     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,     hparams.n_swa);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,  hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_SWA,     hparams.n_embd_head_k_swa);
     ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,   hparams.n_embd_head_v_swa);
+
+    // Compatibility: some Gemma 4 assistant GGUFs expose only n_embd_backbone
+    // (no embedding_length_out). Populate n_embd_out_impl from either separator style.
+    if (hparams.n_embd_out_impl == 0) {
+        ml.get_key("gemma4_assistant.n_embd_backbone", hparams.n_embd_out_impl, false);
+        if (hparams.n_embd_out_impl == 0) {
+            ml.get_key("gemma4-assistant.n_embd_backbone", hparams.n_embd_out_impl, false);
+        }
+    }
 
     if (hparams.n_layer == 4) {
         type = LLM_TYPE_31B;

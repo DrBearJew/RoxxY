@@ -777,10 +777,12 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_FFN_LATENT_UP,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
 };
 
-LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}
+LLM_KV::LLM_KV(llm_arch arch, const char * suffix, const char * arch_name_override)
+    : arch(arch), suffix(suffix), arch_name_override(arch_name_override ? arch_name_override : "") {}
 
 std::string LLM_KV::operator()(llm_kv kv) const {
-    std::string name = ::format(LLM_KV_NAMES.at(kv), LLM_ARCH_NAMES.at(arch));
+    const char * arch_name = arch_name_override.empty() ? LLM_ARCH_NAMES.at(arch) : arch_name_override.c_str();
+    std::string name = ::format(LLM_KV_NAMES.at(kv), arch_name);
 
     if (suffix != nullptr) {
         name += ".";
@@ -829,6 +831,11 @@ llm_arch llm_arch_from_string(const std::string & name) {
         if (kv.second == name) {
             return kv.first;
         }
+    }
+
+    // compatibility alias used by some third-party Gemma 4 assistant GGUFs
+    if (name == "gemma4_assistant") {
+        return LLM_ARCH_GEMMA4_ASSISTANT;
     }
 
     return LLM_ARCH_UNKNOWN;
