@@ -126,7 +126,8 @@ thinking-leak caveats.
 LLAMA_MTP_PREFILL_CHUNK=1024 \
 LLAMA_MTP_PREFILL_FORCE_MMQ=1 \
 GGML_CUDA_ROCM_QUANT_PREFILL_F16=1 \
-./build-rocm/bin/llama-server \
+./build-rocm-vulkan/bin/llama-server \
+  --device ROCm0 \
   --model /path/to/Qwen3.6-27B-Q4_K_M-mtp.gguf \
   --flash-attn on \
   --cache-type-k q8_0 --cache-type-v tbq4_0 \
@@ -143,7 +144,8 @@ GGML_CUDA_ROCM_QUANT_PREFILL_F16=1 \
 ```bash
 RDNA2_MATMUL_OPT_V1=1 \
 GGML_CUDA_MMQ_MAX_X=48 \
-./build-rocm/bin/llama-server \
+./build-rocm-vulkan/bin/llama-server \
+  --device ROCm0 \
   --model /path/to/Qwen3.6-35B-A3B-IQ4_XS-00001-of-00002.gguf \
   --flash-attn on \
   --cache-type-k q8_0 --cache-type-v tbq4_0 \
@@ -160,7 +162,8 @@ LLAMA_MTP_PREFILL_CHUNK=1024 \
 LLAMA_MTP_PREFILL_FORCE_MMQ=1 \
 GGML_CUDA_ROCM_QUANT_PREFILL_F16=1 \
 GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_NKV=40960 \
-./build-rocm/bin/llama-server \
+./build-rocm-vulkan/bin/llama-server \
+  --device ROCm0 \
   --model /path/to/Qwen3.6-35B-A3B-IQ4_XS-00001-of-00002.gguf \
   --ctx-size 40960 \
   --flash-attn on \
@@ -175,48 +178,21 @@ GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_NKV=40960 \
 
 ## Build
 
-ROCm:
+Single multi-backend build (ROCm + Vulkan):
 
 ```bash
-cmake -S . -B build-rocm -DGGML_HIP=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build-rocm --target llama-server llama-bench test-backend-ops -j
-```
-
-35B MMQ selector build:
-
-```bash
-cmake -S . -B build-rocm-rdna2-fa \
+cmake -S . -B build-rocm-vulkan \
   -DGGML_HIP=ON \
+  -DGGML_VULKAN=ON \
   -DCMAKE_HIP_FLAGS="-DRDNA2_MATMUL_OPT_V1=1" \
   -DCMAKE_BUILD_TYPE=Release
-cmake --build build-rocm-rdna2-fa --target llama-server llama-bench test-backend-ops -j
+cmake --build build-rocm-vulkan --target llama-server llama-bench test-backend-ops -j
 ```
 
-Vulkan comparison build:
+Backend selection is runtime-only:
 
-```bash
-cmake -S . -B build-vulkan -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build-vulkan --target llama-server llama-bench -j
-```
-
-## Validation evidence
-
-Recent local evidence on RX 7900 XTX:
-
-| Artifact | Result |
-|---|---|
-| `benches/rocm-rdna3/35b-iq4xs-coherence-temp06-32k-8k-f16fix-20260521-061142` | IQ4_XS, temp 0.6 long-prose canary passed; `prompt_n=36103` at `2032 tok/s`; `predicted_n=1505` at `58.5 tok/s`; peak delta from loaded `0.339 GiB`; no repeated 120-char chunk |
-| `benches/rocm-rdna3/35b-server-depth0-prompt32k-decode8k-f16fix-20260521-054546` | Q4_K_M stress run was too VRAM-tight for default use, but f16-stable prefill avoided the sink; use smaller 35B quant for 24 GB |
-| `benches/rocm-rdna3/q8q4-wmma-i8-finalization-20260521-050103` | q8/q4 WMMA-I8 backend sweep passes eligible rows; still lab-only due generation drift |
-
-Pass gate for 35B f16-temp prefill:
-
-- no OOM;
-- no request-time sleep/stall;
-- route logs show TILE/MMA prefill when explicitly enabled;
-- VEC remains fallback when f16 envs are absent;
-- peak VRAM delta remains bounded;
-- long-prose coherence does not collapse into obvious repetition.
+- ROCm path: add `--device ROCm0`
+- Vulkan path: add `--device Vulkan0`
 
 ## Files to know
 
