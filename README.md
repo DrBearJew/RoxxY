@@ -10,6 +10,20 @@ The default goal is simple:
 - keep unstable kernels env-gated;
 - prefer small, reversible mitigations over broad kernel rewrites.
 
+## Gemma 4 support
+
+This branch includes Gemma 4 MTP assistant support on top of the TBQ4 RDNA3
+stack.
+
+### Included
+
+- GGUF arch + tensor mapping for `gemma4-assistant` (`nextn.pre_projection`,
+  `nextn.post_projection`).
+- Shared-KV MTP draft wiring via `llama_set_mtp_source(ctx_dft, ctx_tgt)`.
+- Gemma 4 assistant draft graph path in `src/models/gemma4.cpp`.
+- Server-side source wiring for Gemma 4 assistant MTP contexts.
+- Placement checks/guardrails for draft/target shared-KV device compatibility.
+
 ## Current recommendation
 
 | Target | Status | Use |
