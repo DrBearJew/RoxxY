@@ -32,12 +32,11 @@ stack.
 | 35B ROCm no-MTP | stable prompt path | `q8_0` K + `tbq4_0` V, MMQ selector on, no speculative MTP |
 | 35B ROCm MTP | experimental but usable | MTP n2 plus explicit f16-temp prefill |
 | Vulkan | baseline / comparison | q8/q4 is restored; TBQ4 Vulkan parity is not claimed |
-| q8/q4 INT8 WMMA | lab only | explicit unsafe gate only; not production/default |
 
-For 35B on 24 GB, use an IQ4_XS / Q4_K_S-class model for long context. Q4_K_M is
-too tight for the current 35B 40k-context + f16-temp experiments.
+Q4_K_M works for both 27B and 35B. Context length, MTP depth, KV format, and
+batch/ubatch sizing determine the practical VRAM budget.
 
-## Important env gates
+## Runtime knobs
 
 ### MTP prefill stability
 
@@ -48,8 +47,8 @@ LLAMA_MTP_PREFILL_FORCE_MMQ=1
 
 `LLAMA_MTP_PREFILL_CHUNK` should match `--ubatch-size`.
 
-MTP has separate draft-context KV flags. Set them explicitly; otherwise the draft
-context defaults to f16 KV:
+MTP has separate draft-context KV flags. Use these when draft KV should match
+the target q8/tbq4 KV format:
 
 ```bash
 --cache-type-k-draft q8_0 --cache-type-v-draft tbq4_0
@@ -61,23 +60,13 @@ context defaults to f16 KV:
 GGML_CUDA_ROCM_QUANT_PREFILL_F16=1
 ```
 
-This explicitly routes quantized-KV prefill through bounded f16-temp TILE/MMA.
-It is required for the promoted 27B MTP path and for 35B MTP experiments.
+Use this for the promoted ROCm q8/tbq4 prefill path. It routes quantized-KV
+prefill through the bounded f16-temp TILE/MMA selector used by the 27B MTP path
+and 35B MTP experiments.
 
-Default behavior when the f16 env is absent:
-
-```text
-q8K/tbq4V VEC stays the fallback/default.
-```
-
-A/B-only auto probe:
-
-```bash
-GGML_CUDA_ROCM_QUANT_PREFILL_F16_AUTO=1
-```
-
-`_AUTO` is intentionally **not** default-on. This prevents 35B prefill from
-silently falling into the f16-temp route.
+Without this opt-in, q8K/tbq4V uses the quantized-KV vector fallback. For A/B
+sweeps, `GGML_CUDA_ROCM_QUANT_PREFILL_F16_AUTO=1` lets supported long-prefill
+q8/tbq4 shapes choose f16-temp when they fit the configured budget.
 
 Useful f16-temp controls:
 
@@ -104,69 +93,6 @@ GGML_CUDA_MMQ_MAX_X_AUTO=1   # opt-in helper; manual MAX_X still wins
 If symmetric `tbq4_0` K+V is requested on high-GQA models, K is promoted to
 `q8_0` by default while V remains `tbq4_0`. This mirrors the local quality
 policy without importing TheTom's Turbo/TQ enum architecture.
-
-### q8/q4 WMMA-I8 lab route
-
-```bash
-GGML_CUDA_ROCM_Q8Q4_WMMA_I8=1               # lab-only; never set in normal serving env
-GGML_CUDA_ROCM_Q8Q4_WMMA_I8_UNSAFE=1          # second lab-only acknowledgement gate
-GGML_CUDA_ROCM_Q8Q4_WMMA_I8_QSCALE16=1       # optional quality probe: per-WMMA-K Q scales
-GGML_CUDA_ROCM_Q8Q4_WMMA_I8_ALLOW_GQA6=1      # optional Qwen3.6-27B GQA=6 lab reopen gate
-GGML_CUDA_ROCM_Q8Q4_WMMA_I8_LAYER_MIN=27      # required for bounded experiments; do not route all layers
-GGML_CUDA_ROCM_Q8Q4_WMMA_I8_LAYER_MAX=38      # current weird-prefix isolation candidate: skip final full-attn layer
-GGML_CUDA_ROCM_Q8Q4_WMMA_I8_SKIP_LAYER=7      # optional diagnostic layer exclusion
-GGML_CUDA_ROCM_Q8Q4_WMMA_I8_SKIP_LAYERS=7,11  # optional comma/range list, e.g. 7,11-13
-GGML_CUDA_ROCM_Q8Q4_WMMA_I8_REQUIRE_SELECTED=1 # fail if an included layer cannot select this route
-```
-
-Keep this lab-only and keep it out of normal launch environments. On 27B, the
-normal fast baseline is f16/f16 or the promoted q8/tbq4 path; q8_0/q4_0 WMMA-I8
-is a correctness/selector experiment and can be drastically slower than that
-baseline. It is not a q8/tbq4 f16-temp replacement: the current prototype only
-accelerates QK with i8 WMMA and still pays Q quantization, float softmax, q4 V
-dequant/PV, split-K scratch/reduce traffic, and layer-filter overhead. Do not
-repeat this as a serving optimization unless benchmark stderr proves the route
-selected and the result beats the q8/tbq4 f16-temp bar. Only use it in bounded
-A/B runs with explicit `LAYER_MIN/MAX`, `REQUIRE_SELECTED=1`, and
-artifact-backed checks. Backend-op tests pass, but greedy generation parity is
-not proven for unrestricted routing. `QSCALE16` is an opt-in stabilization probe that
-quantizes Q per 16-wide WMMA K tile instead of per q8_0 block. `LAYER_MIN/MAX`
-and `SKIP_LAYER(S)` are diagnostic safety knobs for layer-filtered logit/top1
-checks only; do not use them as a default policy without an artifact-backed
-prompt, long-shape, and generation/coherence sweep. `REQUIRE_SELECTED=1` is
-layer-scoped and q8/q4-only: it only applies after the include/skip policy allows
-a `q8_0` K / `q4_0` V D=256 prefill layer, so `LAYER_MIN=27` can fail fast for
-intended routed layers without requiring earlier layers or unrelated q8/tbq4
-lanes. The base support gate covers the already validated GQA=4/8 shapes;
-Qwen3.6-27B's GQA=6 shape additionally requires
-`GGML_CUDA_ROCM_Q8Q4_WMMA_I8_ALLOW_GQA6=1`, and that remains a separate lab
-reopen gate. For current Qwen3.6-35B lab runs, `LAYER_MIN=27` is the
-conservative starting point, and `LAYER_MAX=38` is the current weird-prefix
-isolation candidate. The 2026-05-24 generation sweep used the Qwen3.6 merged chat template
-and `<|think_off|>`; the recurring Arabic `فاق` prefix was not a fixed text bug
-but one bad sampled first-token mode. It appeared when the routed full-attention
-set included layer 23, while a related `无影` prefix appeared intermittently when
-layer 39 was included. Route-off was 12/12 stable; single routed layers were
-stable; meta policy hunts repeated `min27_max38` 12/12 stable, while `min27`,
-`min23`, and `min23_skip24` failed with weird prefixes/hash splits. Follow-up
-one-layer-removal hunts showed every passing candidate removed layer 39. The
-candidate-only target broad logits matrix passed for `off` vs `min27_max38`, and
-the broader generation/coherence smoke passed 5/5 for `min27_max38` with no
-unexpected non-ASCII or marker leakage. Do not promote `min23` or
-`min23_skip24` despite prompt-throughput wins. Treat `LAYER_MIN=27 LAYER_MAX=38`
-as the current opt-in lab candidate, not a default. To keep 35B validation
-bounded, the broad-matrix and generation/coherence scripts now default to the
-candidate pair only (`off min27_max38`); set `MODE_PROFILE=full` or explicit
-`MODE_LIST=...` for diagnostic sweeps. Use `CASE_LIST=...` or `CASE_LIMIT=1`
-for 2-4 run 35B smoke checks. Use `scripts/hip/run-q8q4-wmma-i8-policy-hunt.sh`
-for replicated weird-prefix/hash-split delta debugging instead of one-off manual
-needle hunts; it defaults to a 4-run candidate smoke and requires
-`POLICY_PROFILE=full` for the old multi-policy repeat hunt. Re-run
-`scripts/hip/run-q8q4-wmma-i8-long384-repro.sh` and
-`scripts/hip/run-q8q4-wmma-i8-generation-coherence.sh` after route changes. See
-`docs/rocm-tbq4-paths/08-q8q4-wmma-i8-min27-validation.md` for the current
-validation summary, including rel RMS, KLD/JS/TVD, perf, generation/coherence,
-and thinking-leak caveats.
 
 ## Run recipes
 
@@ -250,7 +176,6 @@ Backend selection is runtime-only:
 |---|---|
 | `ggml/src/ggml-cuda/fattn.cu` | FlashAttention route selection |
 | `ggml/src/ggml-cuda/fattn-common.cuh` | f16-temp env gates and stable allocation sizing |
-| `ggml/src/ggml-cuda/fattn-wmma-q8q4-i8.cuh` | lab q8/q4 WMMA-I8 route |
 | `tests/test-backend-ops.cpp` | FA backend-op coverage, mask/sink variants |
 | `scripts/hip/run-mtp-f16-mmq-vram-sweep.py` | server VRAM/speed sweep harness |
 | `docs/rocm-tbq4-paths/harness.py` | ROCm/TBQ4 smoke harness |
@@ -262,11 +187,9 @@ Do not enable these in user-facing wrappers:
 ```bash
 TBQ4_WMMA_FATTN
 COMPRESSED_KV_WMMA_FATTN
-GGML_CUDA_ROCM_Q8Q4_WMMA_I8 without _UNSAFE
 ```
 
-rocWMMA compressed-KV and INT8 WMMA work remains research/lab material until
-runtime generation parity is proven.
+rocWMMA compressed-KV work remains research/lab material.
 
 ## Credits
 
