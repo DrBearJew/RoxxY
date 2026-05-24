@@ -373,6 +373,214 @@ static const char * ggml_cuda_fattn_kernel_name(const best_fattn_kernel kernel) 
     return "unknown";
 }
 
+static bool ggml_cuda_fattn_route_contract_matches(const char * required, const best_fattn_kernel kernel) {
+    if (!required || required[0] == '\0' || strcmp(required, "any") == 0) {
+        return true;
+    }
+    const char * got = ggml_cuda_fattn_kernel_name(kernel);
+    if (strcmp(required, got) == 0) {
+        return true;
+    }
+    if ((strcmp(required, "rocm_q8_tbq4_f16_temp") == 0 ||
+         strcmp(required, "rocm_q8q4_f16_temp") == 0 ||
+         strcmp(required, "rocm_quant_prefill_f16") == 0 ||
+         strcmp(required, "f16_temp") == 0) &&
+            (kernel == BEST_FATTN_KERNEL_MMA_F16 || kernel == BEST_FATTN_KERNEL_WMMA_F16)) {
+        return true;
+    }
+    if ((strcmp(required, "rocm_q8q4_dot4") == 0 || strcmp(required, "q8q4_dot4") == 0) &&
+            kernel == BEST_FATTN_KERNEL_Q8Q4_DOT4_PREFILL) {
+        return true;
+    }
+    if ((strcmp(required, "rocm_q8_tbq4_dot4") == 0 || strcmp(required, "q8tbq4_dot4") == 0) &&
+            kernel == BEST_FATTN_KERNEL_Q8TBQ4_DOT4_PREFILL) {
+        return true;
+    }
+    if ((strcmp(required, "rocm_q8q4_wmma_i8") == 0 || strcmp(required, "q8q4_wmma_i8") == 0) &&
+            kernel == BEST_FATTN_KERNEL_Q8Q4_WMMA_I8) {
+        return true;
+    }
+    return false;
+}
+
+static bool ggml_cuda_fattn_route_contract_is_f16_temp(const char * required) {
+    return required && (strcmp(required, "rocm_q8_tbq4_f16_temp") == 0 ||
+        strcmp(required, "rocm_q8q4_f16_temp") == 0 ||
+        strcmp(required, "rocm_quant_prefill_f16") == 0 ||
+        strcmp(required, "f16_temp") == 0);
+}
+
+static bool ggml_cuda_fattn_route_contract_is_i8(const char * required) {
+    return required && (strcmp(required, "rocm_q8k_dot4_kq") == 0 ||
+        strcmp(required, "q8q4_dot4_prefill") == 0 ||
+        strcmp(required, "q8tbq4_dot4_prefill") == 0 ||
+        strcmp(required, "q8q4_wmma_i8") == 0 ||
+        strcmp(required, "rocm_q8q4_dot4") == 0 ||
+        strcmp(required, "q8q4_dot4") == 0 ||
+        strcmp(required, "rocm_q8_tbq4_dot4") == 0 ||
+        strcmp(required, "q8tbq4_dot4") == 0 ||
+        strcmp(required, "rocm_q8q4_wmma_i8") == 0);
+}
+
+static bool ggml_cuda_q8q4_wmma_i8_require_selected_enabled() {
+#ifdef GGML_USE_HIP
+    const char * env = getenv("GGML_CUDA_ROCM_Q8Q4_WMMA_I8_REQUIRE_SELECTED");
+    return env && atoi(env) != 0;
+#else
+    return false;
+#endif // GGML_USE_HIP
+}
+
+static bool ggml_cuda_q8q4_wmma_i8_require_selected_applies(const ggml_tensor * dst) {
+#ifdef GGML_USE_HIP
+    if (!ggml_cuda_q8q4_wmma_i8_require_selected_enabled() ||
+            !ggml_cuda_q8q4_wmma_i8_enabled() ||
+            !ggml_cuda_q8q4_wmma_i8_unsafe_enabled() ||
+            !ggml_cuda_q8q4_wmma_i8_layer_filter_allows(dst)) {
+        return false;
+    }
+
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    if (!Q || !K || !V) {
+        return false;
+    }
+
+    // Layer-scoped fail-fast is only for the q8_0 K / q4_0 V WMMA-I8 lab lane.
+    // Other quantized routes (notably q8_0/tbq4_0) must remain free to use their
+    // own I8/DOT4/fallback policy without tripping this contract.
+    return Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0 &&
+        dst->type == GGML_TYPE_F32 && Q->ne[0] == 256 && K->ne[0] == 256 && V->ne[0] == 256 &&
+        Q->ne[1] > 2;
+#else
+    GGML_UNUSED(dst);
+    return false;
+#endif // GGML_USE_HIP
+}
+
+static bool ggml_cuda_fattn_route_contract_applicable(
+        const char * required,
+        const ggml_tensor * dst,
+        const ggml_cuda_rocm_quant_prefill_f16_policy * f16_policy) {
+    if (!ggml_cuda_fattn_route_contract_is_f16_temp(required)) {
+        return true;
+    }
+    if (!f16_policy) {
+        return false;
+    }
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_Q8_0 || Q->ne[1] <= 2) {
+        return false;
+    }
+    if (strcmp(required, "rocm_q8_tbq4_f16_temp") == 0) {
+        return V->type == GGML_TYPE_TBQ4_0;
+    }
+    if (strcmp(required, "rocm_q8q4_f16_temp") == 0) {
+        return V->type == GGML_TYPE_Q4_0;
+    }
+    return V->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_TBQ4_0 || V->type == GGML_TYPE_Q8_0;
+}
+
+static best_fattn_kernel ggml_cuda_fattn_select_rocm_quant_prefill_f16_backend(
+        const int cc,
+        const ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+
+    // Match the existing full f16 FlashAttention selector. This helper is only
+    // a selector for the quantized-KV f16-temp route; do not add a stricter
+    // shape gate here or GGML_CUDA_ROCM_QUANT_PREFILL_F16=1 silently falls back
+    // to the slower q8/tbq4 VEC path for RDNA3 D=256/GQA=6 prefill.
+    if (ggml_cuda_should_use_wmma_fattn(cc) && K->ne[1] % FATTN_KQ_STRIDE == 0 &&
+            Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 512 && Q->ne[0] != 576) {
+        return BEST_FATTN_KERNEL_WMMA_F16;
+    }
+
+    if (amd_mfma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 512 && Q->ne[0] != 576) {
+        return BEST_FATTN_KERNEL_MMA_F16;
+    }
+
+    return BEST_FATTN_KERNEL_NONE;
+}
+
+static const char * ggml_cuda_rocm_quant_prefill_f16_policy_reason_name(
+        const ggml_cuda_rocm_quant_prefill_f16_policy & policy) {
+    if (policy.allowed) {
+        return "ok";
+    }
+    if (!policy.forced && !policy.automatic) {
+        return "disabled";
+    }
+    if (!policy.contiguous_ok) {
+        return "noncontig_tbq4";
+    }
+    if (!policy.under_budget) {
+        return "exact_tmp_over_budget";
+    }
+    return "rejected";
+}
+
+static void ggml_cuda_fattn_log_route_contract(
+        const char * required,
+        const char * status,
+        const best_fattn_kernel selected,
+        const ggml_tensor * dst,
+        const ggml_cuda_rocm_quant_prefill_f16_policy * f16_policy) {
+    const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG");
+    if (!log_env || atoi(log_env) == 0) {
+        return;
+    }
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const char * reason = f16_policy ? ggml_cuda_rocm_quant_prefill_f16_policy_reason_name(*f16_policy) : "none";
+    const double exact_mib  = f16_policy ? (double) f16_policy->tmp_bytes  / (1024.0 * 1024.0) : 0.0;
+    const double stable_mib = exact_mib;
+    GGML_LOG_INFO("%s: fa_route_contract require=%s status=%s selected=%s f16_allowed=%d reason=%s Q=[%lld,%lld,%lld,%lld] K=%s V=%s exact=%.2fMiB stable=%.2fMiB\n",
+            __func__, required, status, ggml_cuda_fattn_kernel_name(selected),
+            f16_policy && f16_policy->allowed ? 1 : 0, reason,
+            (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3],
+            ggml_type_name(K->type), ggml_type_name(V->type), exact_mib, stable_mib);
+}
+
+static best_fattn_kernel ggml_cuda_fattn_apply_route_contract(
+        const ggml_tensor * dst,
+        const best_fattn_kernel selected,
+        const ggml_cuda_rocm_quant_prefill_f16_policy * f16_policy) {
+#ifdef GGML_USE_HIP
+    const char * required = getenv("GGML_CUDA_FA_ROUTE_REQUIRE");
+    if (!required || required[0] == '\0') {
+        return selected;
+    }
+    if (!ggml_cuda_fattn_route_contract_applicable(required, dst, f16_policy)) {
+        ggml_cuda_fattn_log_route_contract(required, "not_applicable", selected, dst, f16_policy);
+        return selected;
+    }
+    if (ggml_cuda_fattn_route_contract_matches(required, selected)) {
+        ggml_cuda_fattn_log_route_contract(required, "selected", selected, dst, f16_policy);
+        return selected;
+    }
+
+    ggml_cuda_fattn_log_route_contract(required, "rejected", selected, dst, f16_policy);
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const char * reason = f16_policy ? ggml_cuda_rocm_quant_prefill_f16_policy_reason_name(*f16_policy) : "none";
+    const double exact_mib  = f16_policy ? (double) f16_policy->tmp_bytes  / (1024.0 * 1024.0) : 0.0;
+    const double stable_mib = exact_mib;
+    GGML_ABORT("required FA route %s not selected; got %s; applicable=1 f16_reason=%s; Q=[%lld,%lld,%lld,%lld] K=%s V=%s exact_tmp=%.2fMiB stable_tmp=%.2fMiB",
+            required, ggml_cuda_fattn_kernel_name(selected), reason,
+            (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3],
+            ggml_type_name(K->type), ggml_type_name(V->type), exact_mib, stable_mib);
+#else
+    GGML_UNUSED(dst); GGML_UNUSED(f16_policy);
+    return selected;
+#endif // GGML_USE_HIP
+}
+
 static void ggml_cuda_fattn_log_selection(const best_fattn_kernel kernel, const ggml_tensor * dst) {
     const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG");
     if (!log_env || atoi(log_env) == 0) {
@@ -430,35 +638,68 @@ static void ggml_cuda_fattn_log_rocm_quant_prefill_f16_once(
         const ggml_cuda_rocm_quant_prefill_f16_policy & policy) {
 #ifdef GGML_USE_HIP
     const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG");
-    if (!log_env || atoi(log_env) == 0 || !policy.allowed) {
+    if (!log_env || atoi(log_env) == 0) {
         return;
     }
 
-    static bool logged_forced = false;
-    static bool logged_auto   = false;
-    bool & logged = policy.forced ? logged_forced : logged_auto;
+    static bool logged_forced_allowed = false;
+    static bool logged_auto_allowed   = false;
+    static bool logged_reject         = false;
+    bool & logged = policy.allowed ? (policy.forced ? logged_forced_allowed : logged_auto_allowed) : logged_reject;
     if (logged) {
         return;
     }
     logged = true;
 
     const char * mode = policy.forced ? "forced" : (policy.automatic ? "auto" : "candidate");
-    GGML_LOG_INFO("%s: rocm_quant_prefill_f16=%s K=%s V=%s nq=%lld nkv=%lld d_q=%lld d_v=%lld "
-            "tmp=%.2f MiB max=%lld MiB stable_nkv_k=%lld stable_nkv_v=%lld bucket_nkv=%lld contiguous_ok=%d under_budget=%d\n",
-            __func__, mode,
+    GGML_LOG_INFO("%s: rocm_quant_prefill_f16=%s allowed=%d reason=%s K=%s V=%s nq=%lld nkv=%lld d_q=%lld d_v=%lld "
+            "exact=%.2f MiB route_max=%lld MiB contiguous_ok=%d route_under_budget=%d\n",
+            __func__, mode, policy.allowed ? 1 : 0,
+            ggml_cuda_rocm_quant_prefill_f16_policy_reason_name(policy),
             ggml_type_name(K->type), ggml_type_name(V->type),
             (long long) Q->ne[1], (long long) K->ne[1],
             (long long) Q->ne[0], (long long) V->ne[0],
             (double) policy.tmp_bytes / (1024.0 * 1024.0),
             (long long) policy.max_mib,
-            (long long) ggml_cuda_fattn_f16_tmp_stable_nkv(K),
-            (long long) ggml_cuda_fattn_f16_tmp_stable_nkv(V),
-            (long long) ggml_cuda_fattn_f16_tmp_stable_bucket_nkv(),
             policy.contiguous_ok ? 1 : 0,
             policy.under_budget ? 1 : 0);
 #else
     GGML_UNUSED(Q); GGML_UNUSED(K); GGML_UNUSED(V); GGML_UNUSED(policy);
 #endif // GGML_USE_HIP
+}
+
+enum ggml_cuda_rocm_quant_prefill_f16_mode {
+    GGML_CUDA_ROCM_QUANT_PREFILL_F16_OFF,
+    GGML_CUDA_ROCM_QUANT_PREFILL_F16_ALLOW,
+    GGML_CUDA_ROCM_QUANT_PREFILL_F16_PREFER,
+    GGML_CUDA_ROCM_QUANT_PREFILL_F16_REQUIRE,
+};
+
+static ggml_cuda_rocm_quant_prefill_f16_mode ggml_cuda_rocm_quant_prefill_f16_mode_from_env() {
+#ifdef GGML_USE_HIP
+    const char * env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_MODE");
+    if (!env) {
+        env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_F16_MODE");
+    }
+    if (env) {
+        if (strcmp(env, "off") == 0 || strcmp(env, "OFF") == 0) {
+            return GGML_CUDA_ROCM_QUANT_PREFILL_F16_OFF;
+        }
+        if (strcmp(env, "allow") == 0 || strcmp(env, "ALLOW") == 0 ||
+                strcmp(env, "allow_f16_temp") == 0 || strcmp(env, "allow-f16-temp") == 0) {
+            return GGML_CUDA_ROCM_QUANT_PREFILL_F16_ALLOW;
+        }
+        if (strcmp(env, "prefer") == 0 || strcmp(env, "PREFER") == 0 ||
+                strcmp(env, "prefer_f16_temp") == 0 || strcmp(env, "prefer-f16-temp") == 0) {
+            return GGML_CUDA_ROCM_QUANT_PREFILL_F16_PREFER;
+        }
+        if (strcmp(env, "require") == 0 || strcmp(env, "REQUIRE") == 0 ||
+                strcmp(env, "require_f16_temp") == 0 || strcmp(env, "require-f16-temp") == 0) {
+            return GGML_CUDA_ROCM_QUANT_PREFILL_F16_REQUIRE;
+        }
+    }
+#endif // GGML_USE_HIP
+    return GGML_CUDA_ROCM_QUANT_PREFILL_F16_ALLOW;
 }
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
@@ -540,19 +781,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_NONE;
     }
 
-#ifndef GGML_CUDA_FA_ALL_QUANTS
-#ifdef GGML_USE_HIP
-    const bool rocm_q8q4_f16_prefill = K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0 && Q->ne[1] > 2;
-#else
-    const bool rocm_q8q4_f16_prefill = false;
-#endif // GGML_USE_HIP
-    if (K->type != V->type &&
-            !(K->type == GGML_TYPE_TBQ4_0 && V->type == GGML_TYPE_Q8_0) &&
-            !(K->type == GGML_TYPE_Q8_0   && V->type == GGML_TYPE_TBQ4_0) &&
-            !rocm_q8q4_f16_prefill) {
+    if (!ggml_cuda_fattn_mixed_kv_supported(Q, K, V)) {
+        ggml_cuda_fattn_log_mixed_kv_reject(Q, K, V);
         return BEST_FATTN_KERNEL_NONE;
     }
-#endif // GGML_CUDA_FA_ALL_QUANTS
 
     switch (K->type) {
         case GGML_TYPE_F32:
@@ -578,13 +810,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 return BEST_FATTN_KERNEL_NONE;
             }
 #ifdef GGML_USE_HIP
-            // Experimental prefill path: direct TBQ4->rocWMMA FlashAttention.
-            // Keep default decode/quantized-KV route on VEC; enable only with
-            // TBQ4_WMMA_FATTN=1 and only for pure TBQ4 V. Mixed TBQ4/Q8_0
-            // layer-adaptive layers remain on VEC because the WMMA launcher is
-            // instantiated only for compressed TBQ4 K + compressed TBQ4 V.
-            const char * tbq4_wmma_fattn_env = getenv("TBQ4_WMMA_FATTN");
-            if (v_is_tbq4 && Q->ne[1] > 2 && tbq4_wmma_fattn_env && atoi(tbq4_wmma_fattn_env) != 0 && amd_wmma_available(cc)) {
+            // Experimental prefill paths. Keep default decode/quantized-KV route
+            // on VEC; enable only with explicit env vars and pure TBQ4 V.
+            if (v_is_tbq4 && ggml_cuda_tbq4_dot4_prefill_supported(cc, dst)) {
+                return BEST_FATTN_KERNEL_TBQ4_DOT4_PREFILL;
+            }
+            if (v_is_tbq4 && ggml_cuda_tbq4_wmma_fattn_supported(cc, dst, max_bias, logit_softcap)) {
                 return BEST_FATTN_KERNEL_WMMA_TBQ4;
             }
 #endif // GGML_USE_HIP
@@ -634,15 +865,67 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // for explicit A/B probes. Absence of both envs must preserve q8K/tbq4V VEC
     // so 35B prefill cannot silently sink into the f16-temp path.
     if ((ggml_is_quantized(K->type) || ggml_is_quantized(V->type)) && can_use_vector_kernel) {
-        if (ggml_cuda_q8q4_wmma_i8_supported(cc, dst, max_bias, logit_softcap)) {
-            return BEST_FATTN_KERNEL_Q8Q4_WMMA_I8;
-        }
-
-        const ggml_cuda_rocm_quant_prefill_f16_policy f16_policy =
+        ggml_cuda_rocm_quant_prefill_f16_policy f16_policy =
             ggml_cuda_fattn_rocm_quant_prefill_f16_policy(Q, K, V);
-        const bool allow_quant_prefill_f16 = f16_policy.allowed;
+        const ggml_cuda_rocm_quant_prefill_f16_mode f16_mode = ggml_cuda_rocm_quant_prefill_f16_mode_from_env();
+        const char * required_route = getenv("GGML_CUDA_FA_ROUTE_REQUIRE");
+        const bool require_i8_route  = ggml_cuda_fattn_route_contract_is_i8(required_route);
+        const bool require_f16_route = ggml_cuda_fattn_route_contract_is_f16_temp(required_route);
+        const bool f16_prefill_applicable = ggml_cuda_fattn_route_contract_applicable("f16_temp", dst, &f16_policy);
+        if ((require_f16_route || f16_mode == GGML_CUDA_ROCM_QUANT_PREFILL_F16_REQUIRE ||
+             f16_mode == GGML_CUDA_ROCM_QUANT_PREFILL_F16_PREFER) && f16_prefill_applicable) {
+            f16_policy.forced = require_f16_route || f16_mode == GGML_CUDA_ROCM_QUANT_PREFILL_F16_REQUIRE;
+            f16_policy.automatic = !f16_policy.forced && f16_mode == GGML_CUDA_ROCM_QUANT_PREFILL_F16_PREFER;
+            f16_policy.allowed = f16_policy.contiguous_ok && f16_policy.under_budget;
+        }
+        const bool allow_quant_prefill_f16 = f16_mode != GGML_CUDA_ROCM_QUANT_PREFILL_F16_OFF && f16_policy.allowed;
         if (allow_quant_prefill_f16) {
             ggml_cuda_fattn_log_rocm_quant_prefill_f16_once(Q, K, V, f16_policy);
+        } else {
+            ggml_cuda_fattn_log_rocm_quant_prefill_f16_once(Q, K, V, f16_policy);
+        }
+        const auto return_quantized_route = [&](best_fattn_kernel selected) {
+            return ggml_cuda_fattn_apply_route_contract(dst, selected, &f16_policy);
+        };
+
+        if (ggml_cuda_q8q4_wmma_i8_require_selected_applies(dst)) {
+            if (ggml_cuda_q8q4_wmma_i8_supported(cc, dst, max_bias, logit_softcap)) {
+                return return_quantized_route(BEST_FATTN_KERNEL_Q8Q4_WMMA_I8);
+            }
+            GGML_ABORT("required selected ROCm q8q4_wmma_i8 route was not selected; layer=%d selected_policy=applies K=%s V=%s Q=[%lld,%lld,%lld,%lld]",
+                    ggml_cuda_q8q4_wmma_i8_layer_id(dst), ggml_type_name(K->type), ggml_type_name(V->type),
+                    (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3]);
+        }
+
+        if (require_f16_route && f16_prefill_applicable) {
+            if (!allow_quant_prefill_f16) {
+                GGML_ABORT("requested ROCm f16 prefill route was rejected: %s",
+                        ggml_cuda_rocm_quant_prefill_f16_policy_reason_name(f16_policy));
+            }
+        }
+
+        if (!require_f16_route && !require_i8_route && f16_mode == GGML_CUDA_ROCM_QUANT_PREFILL_F16_PREFER &&
+                f16_prefill_applicable && allow_quant_prefill_f16) {
+            // prefer/require modes are explicit selector overrides; choose a
+            // launchable f16 backend immediately instead of just falling through.
+            best_fattn_kernel f16_backend = ggml_cuda_fattn_select_rocm_quant_prefill_f16_backend(cc, dst);
+            if (f16_backend == BEST_FATTN_KERNEL_NONE) {
+                GGML_ABORT("requested ROCm f16 prefill route was rejected: no_launchable_f16_backend");
+            }
+            return return_quantized_route(f16_backend);
+        }
+
+        if (ggml_cuda_q8q4_dot4_prefill_supported(cc, dst)) {
+            return return_quantized_route(BEST_FATTN_KERNEL_Q8Q4_DOT4_PREFILL);
+        }
+        if (ggml_cuda_q8tbq4_dot4_prefill_supported(cc, dst)) {
+            return return_quantized_route(BEST_FATTN_KERNEL_Q8TBQ4_DOT4_PREFILL);
+        }
+
+        const int64_t q8q4_wmma_prefill_max_nq = ggml_cuda_q8q4_wmma_i8_prefill_max_nq();
+        const bool prefer_f16_prefill = allow_quant_prefill_f16 && Q->ne[1] > q8q4_wmma_prefill_max_nq;
+        if (!prefer_f16_prefill && ggml_cuda_q8q4_wmma_i8_supported(cc, dst, max_bias, logit_softcap)) {
+            return return_quantized_route(BEST_FATTN_KERNEL_Q8Q4_WMMA_I8);
         }
 
         if (!allow_quant_prefill_f16) {
@@ -652,11 +935,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             // support so the caller can use the non-FA fallback instead of
             // dispatching an uninstantiated VEC case.
             if (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0) {
-                return BEST_FATTN_KERNEL_NONE;
+                return return_quantized_route(BEST_FATTN_KERNEL_NONE);
             }
 #endif // GGML_CUDA_FA_ALL_QUANTS
-            return BEST_FATTN_KERNEL_VEC;
+            return return_quantized_route(BEST_FATTN_KERNEL_VEC);
         }
+
+        // allow mode with GGML_CUDA_ROCM_QUANT_PREFILL_F16=1 restores the old
+        // behavior: skip quantized VEC for long prefill and fall through to the
+        // existing full f16 FlashAttention selector below.
     }
 #endif // GGML_USE_HIP
 
