@@ -8942,6 +8942,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 257, 17, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 257, 17, true, true,  0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 256, 3,  true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true));
+    // Qwen3.6-27B-style GQA=6 coverage for the extra opt-in WMMA-I8 gate.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, 8,  true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, 8,  true, true,  0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {4, 1}, 512, 8,  true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TBQ4_0, {0, 1, 2, 3}, true));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {4, 1}, 512, 8,  true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TBQ4_0, GGML_TYPE_TBQ4_0, {0, 1, 2, 3}, true));
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));

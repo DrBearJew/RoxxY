@@ -108,29 +108,60 @@ policy without importing TheTom's Turbo/TQ enum architecture.
 ### q8/q4 WMMA-I8 lab route
 
 ```bash
-GGML_CUDA_ROCM_Q8Q4_WMMA_I8=1
-GGML_CUDA_ROCM_Q8Q4_WMMA_I8_UNSAFE=1
+GGML_CUDA_ROCM_Q8Q4_WMMA_I8=1               # lab-only; never set in normal serving env
+GGML_CUDA_ROCM_Q8Q4_WMMA_I8_UNSAFE=1          # second lab-only acknowledgement gate
 GGML_CUDA_ROCM_Q8Q4_WMMA_I8_QSCALE16=1       # optional quality probe: per-WMMA-K Q scales
-GGML_CUDA_ROCM_Q8Q4_WMMA_I8_LAYER_MIN=27      # optional conservative diagnostic include range
-GGML_CUDA_ROCM_Q8Q4_WMMA_I8_LAYER_MAX=39
+GGML_CUDA_ROCM_Q8Q4_WMMA_I8_ALLOW_GQA6=1      # optional Qwen3.6-27B GQA=6 lab reopen gate
+GGML_CUDA_ROCM_Q8Q4_WMMA_I8_LAYER_MIN=27      # required for bounded experiments; do not route all layers
+GGML_CUDA_ROCM_Q8Q4_WMMA_I8_LAYER_MAX=38      # current weird-prefix isolation candidate: skip final full-attn layer
 GGML_CUDA_ROCM_Q8Q4_WMMA_I8_SKIP_LAYER=7      # optional diagnostic layer exclusion
 GGML_CUDA_ROCM_Q8Q4_WMMA_I8_SKIP_LAYERS=7,11  # optional comma/range list, e.g. 7,11-13
+GGML_CUDA_ROCM_Q8Q4_WMMA_I8_REQUIRE_SELECTED=1 # fail if an included layer cannot select this route
 ```
 
-Keep this lab-only. Backend-op tests pass, but greedy generation parity is not
-proven for unrestricted routing. `QSCALE16` is an opt-in stabilization probe that
+Keep this lab-only and keep it out of normal launch environments. On 27B, the
+normal fast baseline is f16/f16 or the promoted q8/tbq4 path; q8_0/q4_0 WMMA-I8
+is a correctness/selector experiment and can be drastically slower than that
+baseline. Only use it in bounded A/B runs with explicit `LAYER_MIN/MAX`,
+`REQUIRE_SELECTED=1`, and artifact-backed checks. Backend-op tests pass, but
+greedy generation parity is not proven for unrestricted routing. `QSCALE16` is an opt-in stabilization probe that
 quantizes Q per 16-wide WMMA K tile instead of per q8_0 block. `LAYER_MIN/MAX`
 and `SKIP_LAYER(S)` are diagnostic safety knobs for layer-filtered logit/top1
 checks only; do not use them as a default policy without an artifact-backed
-prompt and long-shape sweep. For current Qwen3.6-35B lab runs, `LAYER_MIN=27`
-remains the conservative example. A clean long_384_notes reproducibility matrix
-on `11d51958` did not reproduce the earlier dirty-tree `LAYER_MIN=23` failure
-(`min23` was deterministic, rel RMS ~= 0.0295, top1 matched), so treat stale
-`*-dirty` artifacts as investigation evidence rather than current policy proof.
-Re-run `scripts/hip/run-q8q4-wmma-i8-long384-repro.sh` after route changes.
-See `docs/rocm-tbq4-paths/08-q8q4-wmma-i8-min27-validation.md` for the
-current min27 validation summary, including rel RMS, KLD/JS/TVD, perf, and
-thinking-leak caveats.
+prompt, long-shape, and generation/coherence sweep. `REQUIRE_SELECTED=1` is
+layer-scoped and q8/q4-only: it only applies after the include/skip policy allows
+a `q8_0` K / `q4_0` V D=256 prefill layer, so `LAYER_MIN=27` can fail fast for
+intended routed layers without requiring earlier layers or unrelated q8/tbq4
+lanes. The base support gate covers the already validated GQA=4/8 shapes;
+Qwen3.6-27B's GQA=6 shape additionally requires
+`GGML_CUDA_ROCM_Q8Q4_WMMA_I8_ALLOW_GQA6=1`, and that remains a separate lab
+reopen gate. For current Qwen3.6-35B lab runs, `LAYER_MIN=27` is the
+conservative starting point, and `LAYER_MAX=38` is the current weird-prefix
+isolation candidate. The 2026-05-24 generation sweep used the Qwen3.6 merged chat template
+and `<|think_off|>`; the recurring Arabic `فاق` prefix was not a fixed text bug
+but one bad sampled first-token mode. It appeared when the routed full-attention
+set included layer 23, while a related `无影` prefix appeared intermittently when
+layer 39 was included. Route-off was 12/12 stable; single routed layers were
+stable; meta policy hunts repeated `min27_max38` 12/12 stable, while `min27`,
+`min23`, and `min23_skip24` failed with weird prefixes/hash splits. Follow-up
+one-layer-removal hunts showed every passing candidate removed layer 39. The
+candidate-only target broad logits matrix passed for `off` vs `min27_max38`, and
+the broader generation/coherence smoke passed 5/5 for `min27_max38` with no
+unexpected non-ASCII or marker leakage. Do not promote `min23` or
+`min23_skip24` despite prompt-throughput wins. Treat `LAYER_MIN=27 LAYER_MAX=38`
+as the current opt-in lab candidate, not a default. To keep 35B validation
+bounded, the broad-matrix and generation/coherence scripts now default to the
+candidate pair only (`off min27_max38`); set `MODE_PROFILE=full` or explicit
+`MODE_LIST=...` for diagnostic sweeps. Use `CASE_LIST=...` or `CASE_LIMIT=1`
+for 2-4 run 35B smoke checks. Use `scripts/hip/run-q8q4-wmma-i8-policy-hunt.sh`
+for replicated weird-prefix/hash-split delta debugging instead of one-off manual
+needle hunts; it defaults to a 4-run candidate smoke and requires
+`POLICY_PROFILE=full` for the old multi-policy repeat hunt. Re-run
+`scripts/hip/run-q8q4-wmma-i8-long384-repro.sh` and
+`scripts/hip/run-q8q4-wmma-i8-generation-coherence.sh` after route changes. See
+`docs/rocm-tbq4-paths/08-q8q4-wmma-i8-min27-validation.md` for the current
+validation summary, including rel RMS, KLD/JS/TVD, perf, generation/coherence,
+and thinking-leak caveats.
 
 ## Run recipes
 

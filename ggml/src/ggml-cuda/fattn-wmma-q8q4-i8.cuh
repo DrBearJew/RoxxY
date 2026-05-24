@@ -32,6 +32,33 @@ static inline bool ggml_cuda_q8q4_wmma_i8_qscale16_enabled() {
 #endif
 }
 
+static inline bool ggml_cuda_q8q4_wmma_i8_flash_prefill_enabled() {
+#ifdef GGML_USE_HIP
+    const char * env = getenv("GGML_CUDA_ROCM_Q8Q4_WMMA_I8_FLASH_PREFILL");
+    return env && atoi(env) != 0;
+#else
+    return false;
+#endif
+}
+
+static inline bool ggml_cuda_q8q4_wmma_i8_allow_gqa6_enabled() {
+#ifdef GGML_USE_HIP
+    const char * env = getenv("GGML_CUDA_ROCM_Q8Q4_WMMA_I8_ALLOW_GQA6");
+    return env && atoi(env) != 0;
+#else
+    return false;
+#endif
+}
+
+static inline int64_t ggml_cuda_q8q4_wmma_i8_flash_prefill_min_nq() {
+#ifdef GGML_USE_HIP
+    const char * env = getenv("GGML_CUDA_ROCM_Q8Q4_WMMA_I8_FLASH_PREFILL_MIN_NQ");
+    return env ? atoll(env) : 256;
+#else
+    return 0;
+#endif
+}
+
 static constexpr int64_t GGML_CUDA_Q8Q4_WMMA_I8_KV_CHUNK = 256;
 
 static inline bool ggml_cuda_q8q4_wmma_i8_has_attn_sinks(const ggml_tensor * dst) {
@@ -46,14 +73,48 @@ static inline bool ggml_cuda_q8q4_wmma_i8_real_kv_aligned(const ggml_tensor * ds
     return ggml_cuda_q8q4_wmma_i8_real_kv_len(dst) % GGML_CUDA_Q8Q4_WMMA_I8_KV_CHUNK == 0;
 }
 
-static inline int64_t ggml_cuda_q8q4_wmma_i8_scratch_bytes_per_head(const ggml_tensor * dst) {
+static inline int64_t ggml_cuda_q8q4_wmma_i8_n_chunks_for_kv(const int64_t nk) {
+    return (nk + GGML_CUDA_Q8Q4_WMMA_I8_KV_CHUNK - 1) / GGML_CUDA_Q8Q4_WMMA_I8_KV_CHUNK;
+}
+
+static inline int64_t ggml_cuda_q8q4_wmma_i8_scratch_alloc_chunks(const int64_t n_chunks) {
+    // During long prefill nk grows by micro-batch. Allocating exact-size
+    // partial buffers for every new nk makes the CUDA pool retain a staircase
+    // of old partial_acc buffers. Bucket the allocation so one cached buffer is
+    // reused instead of accumulating O(sum(nk)) scratch across the request.
+    const char * stable_nkv_env = getenv("GGML_CUDA_ROCM_Q8Q4_WMMA_I8_STABLE_NKV");
+    if (!stable_nkv_env) {
+        // Reuse the existing stable-NKV knob used by the ROCm quant-prefill path
+        // when callers already set it for long-context server runs.
+        stable_nkv_env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_NKV");
+    }
+    if (stable_nkv_env) {
+        const int64_t stable_nkv = atoll(stable_nkv_env);
+        if (stable_nkv > 0) {
+            const int64_t stable_chunks = ggml_cuda_q8q4_wmma_i8_n_chunks_for_kv(stable_nkv);
+            return stable_chunks > n_chunks ? stable_chunks : n_chunks;
+        }
+    }
+
+    int64_t bucket = 1;
+    while (bucket < n_chunks) {
+        bucket <<= 1;
+    }
+    return bucket;
+}
+
+static inline int64_t ggml_cuda_q8q4_wmma_i8_scratch_bytes_per_head_chunks(const ggml_tensor * dst, const int64_t n_chunks) {
     const ggml_tensor * Q = dst->src[0];
-    const int64_t n_chunks = (ggml_cuda_q8q4_wmma_i8_real_kv_len(dst) + GGML_CUDA_Q8Q4_WMMA_I8_KV_CHUNK - 1) / GGML_CUDA_Q8Q4_WMMA_I8_KV_CHUNK;
     const int64_t nq = Q->ne[1];
     const int64_t d = Q->ne[0];
     const int64_t q_scale_width = ggml_cuda_q8q4_wmma_i8_qscale16_enabled() ? 16 : 32;
     return n_chunks * nq * d * (int64_t) sizeof(float) + 2 * n_chunks * nq * (int64_t) sizeof(float) +
            nq * d * (int64_t) sizeof(int8_t) + nq * (d / q_scale_width) * (int64_t) sizeof(float);
+}
+
+static inline int64_t ggml_cuda_q8q4_wmma_i8_scratch_bytes_per_head(const ggml_tensor * dst) {
+    const int64_t n_chunks = ggml_cuda_q8q4_wmma_i8_n_chunks_for_kv(ggml_cuda_q8q4_wmma_i8_real_kv_len(dst));
+    return ggml_cuda_q8q4_wmma_i8_scratch_bytes_per_head_chunks(dst, ggml_cuda_q8q4_wmma_i8_scratch_alloc_chunks(n_chunks));
 }
 
 static inline int64_t ggml_cuda_q8q4_wmma_i8_max_mib() {
@@ -164,38 +225,33 @@ static inline bool ggml_cuda_q8q4_wmma_i8_supported(const int cc, const ggml_ten
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = ggml_cuda_q8q4_wmma_i8_has_attn_sinks(dst) ? dst->src[4] : nullptr;
 
-    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_Q8_0 || V->type != GGML_TYPE_Q4_0 || dst->type != GGML_TYPE_F32) {
+    if (!Q || !K || !V) {
         return false;
     }
-    if (Q->ne[0] != 256 || K->ne[0] != 256 || V->ne[0] != 256 || dst->ne[0] != 256) {
+
+    const bool dtype_ok = Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0 && dst->type == GGML_TYPE_F32;
+    const bool d_ok = Q->ne[0] == 256 && K->ne[0] == 256 && V->ne[0] == 256 && dst->ne[0] == 256;
+    const bool seq_ok = Q->ne[1] > 2 && K->ne[1] >= Q->ne[1] && V->ne[1] == K->ne[1];
+    const bool head_ok = K->ne[2] > 0 && Q->ne[2] % K->ne[2] == 0 && V->ne[2] == K->ne[2] &&
+        Q->ne[3] == K->ne[3] && V->ne[3] == K->ne[3];
+    const int64_t gqa_ratio = head_ok ? Q->ne[2] / K->ne[2] : 0;
+    // GQA=6 is the Qwen3.6-27B lab-reopen shape. Keep it behind an extra
+    // explicit gate until it has the same coverage as the original GQA=4/8 set.
+    const bool gqa_ok = gqa_ratio == 4 || gqa_ratio == 8 ||
+        (gqa_ratio == 6 && ggml_cuda_q8q4_wmma_i8_allow_gqa6_enabled());
+    const bool dst_ok = dst->ne[0] == V->ne[0] && dst->ne[1] == Q->ne[2] && dst->ne[2] == Q->ne[1] && dst->ne[3] == Q->ne[3];
+    const bool mask_ok = mask && mask->type == GGML_TYPE_F16 && mask->ne[0] == K->ne[1] && mask->ne[1] == Q->ne[1] &&
+        mask->ne[2] == 1 && mask->ne[3] == Q->ne[3] && max_bias == 0.0f;
+    const bool softcap_ok = logit_softcap == 0.0f;
+    const bool sinks_ok = !sinks || (sinks->type == GGML_TYPE_F32 && sinks->ne[0] >= Q->ne[2]);
+    const bool kv_aligned_ok = ggml_cuda_q8q4_wmma_i8_real_kv_aligned(dst);
+
+    if (!(dtype_ok && d_ok && seq_ok && head_ok && gqa_ok && dst_ok && mask_ok && softcap_ok && sinks_ok && kv_aligned_ok)) {
         return false;
     }
-    if (Q->ne[1] <= 2 || K->ne[1] < Q->ne[1] || Q->ne[2] % K->ne[2] != 0 || V->ne[2] != K->ne[2]) {
-        return false;
-    }
-    if (V->ne[1] != K->ne[1] || Q->ne[3] != K->ne[3] || V->ne[3] != K->ne[3]) {
-        return false;
-    }
-    if (dst->ne[0] != V->ne[0] || dst->ne[1] != Q->ne[2] || dst->ne[2] != Q->ne[1] || dst->ne[3] != Q->ne[3]) {
-        return false;
-    }
-    const int64_t gqa_ratio = Q->ne[2] / K->ne[2];
-    if (gqa_ratio != 4 && gqa_ratio != 8) {
-        return false;
-    }
-    if (!ggml_cuda_q8q4_wmma_i8_real_kv_aligned(dst)) {
-        return false;
-    }
-    // Runtime prototype consumes the real F16 mask tensor; keep shape gates strict
-    // until logits-level generation parity is proven for broader mask layouts.
-    if (!mask || mask->type != GGML_TYPE_F16 || mask->ne[0] != K->ne[1] || mask->ne[1] != Q->ne[1] || mask->ne[2] != 1 || mask->ne[3] != Q->ne[3] || max_bias != 0.0f) {
-        return false;
-    }
-    if (logit_softcap != 0.0f) {
-        return false;
-    }
-    if (sinks && (sinks->type != GGML_TYPE_F32 || sinks->ne[0] < Q->ne[2])) {
-        return false;
+
+    if (ggml_cuda_q8q4_wmma_i8_flash_prefill_enabled() && Q->ne[1] >= ggml_cuda_q8q4_wmma_i8_flash_prefill_min_nq()) {
+        return true;
     }
 
     const int64_t max_mib = ggml_cuda_q8q4_wmma_i8_max_mib();
@@ -551,6 +607,284 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8q4_i8_reduce_kernel
     *out = denom > 0.0f ? acc / denom : 0.0f;
 }
 
+static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8q4_i8_flash_kernel(
+        const int8_t * __restrict__ q_i8,
+        const float  * __restrict__ q_scales,
+        const char   * __restrict__ K,
+        const char   * __restrict__ V,
+        const char   * __restrict__ mask,
+        const float  * __restrict__ sinks,
+        char         * __restrict__ dst,
+        int64_t nb10, int64_t nb11, int64_t nb12, int64_t nb13,
+        int64_t nb20, int64_t nb21, int64_t nb22, int64_t nb23,
+        int64_t nb30, int64_t nb31, int64_t nb33, int64_t ne33,
+        int64_t nb0, int64_t nb1, int64_t nb2, int64_t nb3,
+        int nq,
+        int nk,
+        int hq0,
+        int ib0,
+        int n_heads_q,
+        int gqa_ratio,
+        float softmax_scale,
+        int q_scale_blocks) {
+    __shared__ int8_t  q_hoist[GGML_CUDA_Q8Q4_I8_WMMA_M * GGML_CUDA_Q8Q4_I8_D];
+    __shared__ float   q_scale_hoist[GGML_CUDA_Q8Q4_I8_WMMA_M * GGML_CUDA_Q8Q4_I8_QSCALE16_BLOCKS];
+    __shared__ int8_t  k_hoist[GGML_CUDA_Q8Q4_I8_WMMA_N * GGML_CUDA_Q8Q4_I8_D];
+    __shared__ float   k_scale_hoist[GGML_CUDA_Q8Q4_I8_WMMA_N * GGML_CUDA_Q8Q4_I8_BLOCKS];
+    __shared__ int8_t  q_tile[GGML_CUDA_Q8Q4_I8_BLOCKS * GGML_CUDA_Q8Q4_I8_WMMA_M * GGML_CUDA_Q8Q4_I8_WMMA_K];
+    __shared__ int8_t  k_tile[GGML_CUDA_Q8Q4_I8_BLOCKS * GGML_CUDA_Q8Q4_I8_WMMA_K * GGML_CUDA_Q8Q4_I8_WMMA_N];
+    __shared__ int32_t partial[GGML_CUDA_Q8Q4_I8_BLOCKS * GGML_CUDA_Q8Q4_I8_WMMA_M * GGML_CUDA_Q8Q4_I8_WMMA_N];
+    // After QK, this tile is reused for masked logits and then for the
+    // unnormalized softmax probabilities shared by all output-D threads.
+    __shared__ float   logits[GGML_CUDA_Q8Q4_I8_WMMA_M * GGML_CUDA_Q8Q4_I8_WMMA_N];
+    __shared__ float   row_max_s[GGML_CUDA_Q8Q4_I8_WMMA_M];
+    __shared__ float   denom_s[GGML_CUDA_Q8Q4_I8_WMMA_M];
+    __shared__ float   old_scale_s[GGML_CUDA_Q8Q4_I8_WMMA_M];
+
+    const int tid = threadIdx.x;
+    const int q_base = blockIdx.x * GGML_CUDA_Q8Q4_I8_WMMA_M;
+    const int instance = blockIdx.z;
+    const int linear_head = hq0 + instance;
+    const int hq = linear_head % n_heads_q;
+    const int ib = ib0 + linear_head / n_heads_q;
+    const int d = tid;
+    const int v_scale_block = d >> 5;
+    const int hkv = hq / gqa_ratio;
+    const size_t q_i8_offset = size_t(instance) * nq * GGML_CUDA_Q8Q4_I8_D;
+    const size_t q_scale_offset = size_t(instance) * nq * q_scale_blocks;
+
+    // Hoist the whole Q tile once. The previous flash prototype rebuilt q_tile
+    // from global memory for every K tile and every 16-wide D step. Flash-style
+    // attention should keep Q resident while streaming K/V.
+    for (int off = tid; off < GGML_CUDA_Q8Q4_I8_WMMA_M * GGML_CUDA_Q8Q4_I8_D; off += blockDim.x) {
+        const int r = off / GGML_CUDA_Q8Q4_I8_D;
+        const int dd = off - r * GGML_CUDA_Q8Q4_I8_D;
+        const int q_row = q_base + r;
+        q_hoist[off] = q_row < nq ? q_i8[q_i8_offset + size_t(q_row) * GGML_CUDA_Q8Q4_I8_D + dd] : 0;
+    }
+    for (int off = tid; off < GGML_CUDA_Q8Q4_I8_WMMA_M * GGML_CUDA_Q8Q4_I8_QSCALE16_BLOCKS; off += blockDim.x) {
+        const int r = off / GGML_CUDA_Q8Q4_I8_QSCALE16_BLOCKS;
+        const int b = off - r * GGML_CUDA_Q8Q4_I8_QSCALE16_BLOCKS;
+        const int q_row = q_base + r;
+        q_scale_hoist[off] = (q_row < nq && b < q_scale_blocks) ? q_scales[q_scale_offset + size_t(q_row) * q_scale_blocks + b] : 1.0f;
+    }
+    __syncthreads();
+
+    if (tid < GGML_CUDA_Q8Q4_I8_WMMA_M) {
+        row_max_s[tid] = -3.402823466e+38F;
+        denom_s[tid] = 0.0f;
+        old_scale_s[tid] = 0.0f;
+    }
+
+    float acc[GGML_CUDA_Q8Q4_I8_WMMA_M];
+#pragma unroll
+    for (int r = 0; r < GGML_CUDA_Q8Q4_I8_WMMA_M; ++r) {
+        acc[r] = 0.0f;
+    }
+    __syncthreads();
+
+    for (int k_base = 0; k_base < nk; k_base += GGML_CUDA_Q8Q4_I8_WMMA_N) {
+        const int lane_row = tid >> 4;
+        const int lane_col = tid & 15;
+        const int q_row = q_base + lane_row;
+        const int k_row = k_base + lane_col;
+
+        // Hoist one K tile (16 rows x D) and its q8 scales. This keeps the
+        // WMMA inner loop on LDS/register data instead of redoing row pointer
+        // arithmetic and scattered global reads for every 16-wide D step.
+        for (int off = tid; off < GGML_CUDA_Q8Q4_I8_WMMA_N * GGML_CUDA_Q8Q4_I8_D; off += blockDim.x) {
+            const int c = off / GGML_CUDA_Q8Q4_I8_D;
+            const int dd = off - c * GGML_CUDA_Q8Q4_I8_D;
+            const int k_row_load = k_base + c;
+            if (k_row_load < nk) {
+                const char * k_row_ptr = K + int64_t(k_row_load) * nb11 + int64_t(hkv) * nb12 + int64_t(ib) * nb13;
+                const block_q8_0 * kb_ptr = (const block_q8_0 *) (k_row_ptr + int64_t(dd >> 5) * nb10);
+                k_hoist[off] = kb_ptr->qs[dd & 31];
+            } else {
+                k_hoist[off] = 0;
+            }
+        }
+        for (int off = tid; off < GGML_CUDA_Q8Q4_I8_WMMA_N * GGML_CUDA_Q8Q4_I8_BLOCKS; off += blockDim.x) {
+            const int c = off / GGML_CUDA_Q8Q4_I8_BLOCKS;
+            const int kb = off - c * GGML_CUDA_Q8Q4_I8_BLOCKS;
+            const int k_row_load = k_base + c;
+            if (k_row_load < nk) {
+                const char * k_row_ptr = K + int64_t(k_row_load) * nb11 + int64_t(hkv) * nb12 + int64_t(ib) * nb13;
+                const block_q8_0 * kb_ptr = (const block_q8_0 *) (k_row_ptr + int64_t(kb) * nb10);
+                k_scale_hoist[off] = float(kb_ptr->d);
+            } else {
+                k_scale_hoist[off] = 1.0f;
+            }
+        }
+        __syncthreads();
+
+        float logit = 0.0f;
+        if (q_scale_blocks == GGML_CUDA_Q8Q4_I8_BLOCKS) {
+            // Keep the q8_0 scale-width-32 path as the known-good single-wave
+            // WMMA sequence. A previous 8-wave-per-CTA variant improved QK
+            // parallelism but regressed end-to-end prefill because the flash
+            // prototype is dominated by the softmax/PV tail, not by QK.
+#pragma unroll
+            for (int kb = 0; kb < GGML_CUDA_Q8Q4_I8_BLOCKS; ++kb) {
+                rocwmma::fragment<rocwmma::accumulator, GGML_CUDA_Q8Q4_I8_WMMA_M, GGML_CUDA_Q8Q4_I8_WMMA_N, GGML_CUDA_Q8Q4_I8_WMMA_K, int32_t> acc_i32;
+                if (tid < 32) {
+                    rocwmma::fill_fragment(acc_i32, 0);
+                }
+
+#pragma unroll
+                for (int inner = 0; inner < 2; ++inner) {
+                    const int step = kb * 2 + inner;
+                    if (tid < GGML_CUDA_Q8Q4_I8_WMMA_M * GGML_CUDA_Q8Q4_I8_WMMA_K) {
+                        const int d_q = step * GGML_CUDA_Q8Q4_I8_WMMA_K + lane_col;
+                        q_tile[lane_row * GGML_CUDA_Q8Q4_I8_WMMA_K + lane_col] = q_hoist[lane_row * GGML_CUDA_Q8Q4_I8_D + d_q];
+
+                        const int d_k = step * GGML_CUDA_Q8Q4_I8_WMMA_K + lane_row;
+                        k_tile[lane_row + lane_col * GGML_CUDA_Q8Q4_I8_WMMA_K] = k_hoist[lane_col * GGML_CUDA_Q8Q4_I8_D + d_k];
+                    }
+                    __syncthreads();
+
+                    if (tid < 32) {
+                        rocwmma::fragment<rocwmma::matrix_a, GGML_CUDA_Q8Q4_I8_WMMA_M, GGML_CUDA_Q8Q4_I8_WMMA_N, GGML_CUDA_Q8Q4_I8_WMMA_K, int8_t, rocwmma::row_major> q_frag;
+                        rocwmma::fragment<rocwmma::matrix_b, GGML_CUDA_Q8Q4_I8_WMMA_M, GGML_CUDA_Q8Q4_I8_WMMA_N, GGML_CUDA_Q8Q4_I8_WMMA_K, int8_t, rocwmma::col_major> k_frag;
+                        rocwmma::load_matrix_sync(q_frag, q_tile, GGML_CUDA_Q8Q4_I8_WMMA_K);
+                        rocwmma::load_matrix_sync(k_frag, k_tile, GGML_CUDA_Q8Q4_I8_WMMA_K);
+                        rocwmma::mma_sync(acc_i32, q_frag, k_frag, acc_i32);
+                    }
+                    if (inner == 0) {
+                        __syncthreads();
+                    }
+                }
+
+                if (tid < 32) {
+                    rocwmma::store_matrix_sync(partial, acc_i32, GGML_CUDA_Q8Q4_I8_WMMA_N, rocwmma::mem_row_major);
+                }
+                __syncthreads();
+
+                if (tid < GGML_CUDA_Q8Q4_I8_WMMA_M * GGML_CUDA_Q8Q4_I8_WMMA_N && q_row < nq && k_row < nk) {
+                    const float qs = q_scale_hoist[lane_row * GGML_CUDA_Q8Q4_I8_QSCALE16_BLOCKS + kb];
+                    const float ks = k_scale_hoist[lane_col * GGML_CUDA_Q8Q4_I8_BLOCKS + kb];
+                    logit += float(partial[lane_row * GGML_CUDA_Q8Q4_I8_WMMA_N + lane_col]) * qs * ks;
+                }
+                __syncthreads();
+            }
+        } else {
+#pragma unroll
+            for (int qsb = 0; qsb < GGML_CUDA_Q8Q4_I8_QSCALE16_BLOCKS; ++qsb) {
+                const int kb = qsb >> 1;
+                rocwmma::fragment<rocwmma::accumulator, GGML_CUDA_Q8Q4_I8_WMMA_M, GGML_CUDA_Q8Q4_I8_WMMA_N, GGML_CUDA_Q8Q4_I8_WMMA_K, int32_t> acc_i32;
+                if (tid < 32) {
+                    rocwmma::fill_fragment(acc_i32, 0);
+                }
+
+                if (tid < GGML_CUDA_Q8Q4_I8_WMMA_M * GGML_CUDA_Q8Q4_I8_WMMA_K) {
+                    const int d_q = qsb * GGML_CUDA_Q8Q4_I8_WMMA_K + lane_col;
+                    q_tile[lane_row * GGML_CUDA_Q8Q4_I8_WMMA_K + lane_col] = q_hoist[lane_row * GGML_CUDA_Q8Q4_I8_D + d_q];
+
+                    const int d_k = qsb * GGML_CUDA_Q8Q4_I8_WMMA_K + lane_row;
+                    k_tile[lane_row + lane_col * GGML_CUDA_Q8Q4_I8_WMMA_K] = k_hoist[lane_col * GGML_CUDA_Q8Q4_I8_D + d_k];
+                }
+                __syncthreads();
+
+                if (tid < 32) {
+                    rocwmma::fragment<rocwmma::matrix_a, GGML_CUDA_Q8Q4_I8_WMMA_M, GGML_CUDA_Q8Q4_I8_WMMA_N, GGML_CUDA_Q8Q4_I8_WMMA_K, int8_t, rocwmma::row_major> q_frag;
+                    rocwmma::fragment<rocwmma::matrix_b, GGML_CUDA_Q8Q4_I8_WMMA_M, GGML_CUDA_Q8Q4_I8_WMMA_N, GGML_CUDA_Q8Q4_I8_WMMA_K, int8_t, rocwmma::col_major> k_frag;
+                    rocwmma::load_matrix_sync(q_frag, q_tile, GGML_CUDA_Q8Q4_I8_WMMA_K);
+                    rocwmma::load_matrix_sync(k_frag, k_tile, GGML_CUDA_Q8Q4_I8_WMMA_K);
+                    rocwmma::mma_sync(acc_i32, q_frag, k_frag, acc_i32);
+                    rocwmma::store_matrix_sync(partial, acc_i32, GGML_CUDA_Q8Q4_I8_WMMA_N, rocwmma::mem_row_major);
+                }
+                __syncthreads();
+
+                if (tid < GGML_CUDA_Q8Q4_I8_WMMA_M * GGML_CUDA_Q8Q4_I8_WMMA_N && q_row < nq && k_row < nk) {
+                    const float qs = q_scale_hoist[lane_row * GGML_CUDA_Q8Q4_I8_QSCALE16_BLOCKS + qsb];
+                    const float ks = k_scale_hoist[lane_col * GGML_CUDA_Q8Q4_I8_BLOCKS + kb];
+                    logit += float(partial[lane_row * GGML_CUDA_Q8Q4_I8_WMMA_N + lane_col]) * qs * ks;
+                }
+                __syncthreads();
+            }
+        }
+
+        if (tid < GGML_CUDA_Q8Q4_I8_WMMA_M * GGML_CUDA_Q8Q4_I8_WMMA_N) {
+            const int r = tid >> 4;
+            const int c = tid & 15;
+            const int q_row_r = q_base + r;
+            const int k_row_c = k_base + c;
+            logits[tid] = (q_row_r < nq && k_row_c < nk) ?
+                logit * softmax_scale + ggml_cuda_q8q4_i8_mask_value(mask, nb30, nb31, nb33, ne33, q_row_r, k_row_c, ib) :
+                -3.402823466e+38F;
+        }
+        __syncthreads();
+
+        // Compute row max/denominator and the current tile probabilities once
+        // per Q row, then share them across all 256 output-D threads. The first
+        // flash prototype updated online softmax independently in every D
+        // thread, paying 256x redundant expf/max work for identical row stats.
+        if (tid < GGML_CUDA_Q8Q4_I8_WMMA_M) {
+            const int r = tid;
+            const int q_row_r = q_base + r;
+            float tile_max = -3.402823466e+38F;
+#pragma unroll
+            for (int c = 0; c < GGML_CUDA_Q8Q4_I8_WMMA_N; ++c) {
+                tile_max = fmaxf(tile_max, logits[r * GGML_CUDA_Q8Q4_I8_WMMA_N + c]);
+            }
+
+            const float next_max = fmaxf(row_max_s[r], tile_max);
+            const float old_scale = denom_s[r] > 0.0f ? expf(row_max_s[r] - next_max) : 0.0f;
+            float tile_sum = 0.0f;
+#pragma unroll
+            for (int c = 0; c < GGML_CUDA_Q8Q4_I8_WMMA_N; ++c) {
+                const int k_row_c = k_base + c;
+                const float p = (q_row_r < nq && k_row_c < nk) ? expf(logits[r * GGML_CUDA_Q8Q4_I8_WMMA_N + c] - next_max) : 0.0f;
+                logits[r * GGML_CUDA_Q8Q4_I8_WMMA_N + c] = p;
+                tile_sum += p;
+            }
+            old_scale_s[r] = old_scale;
+            denom_s[r] = denom_s[r] * old_scale + tile_sum;
+            row_max_s[r] = next_max;
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int r = 0; r < GGML_CUDA_Q8Q4_I8_WMMA_M; ++r) {
+            acc[r] *= old_scale_s[r];
+        }
+#pragma unroll
+        for (int c = 0; c < GGML_CUDA_Q8Q4_I8_WMMA_N; ++c) {
+            const int k_row_c = k_base + c;
+            if (k_row_c >= nk) {
+                continue;
+            }
+            const char * v_row_ptr = V + int64_t(k_row_c) * nb21 + int64_t(hkv) * nb22 + int64_t(ib) * nb23;
+            const block_q4_0 * vb = (const block_q4_0 *) (v_row_ptr + int64_t(v_scale_block) * nb20);
+            const int iqs = d & 15;
+            const int shift = (d & 31) >= 16 ? 4 : 0;
+            const uint8_t packed = vb->qs[iqs];
+            const int nibble = int((packed >> shift) & 0x0f);
+            const float v = float(nibble - 8) * float(vb->d);
+#pragma unroll
+            for (int r = 0; r < GGML_CUDA_Q8Q4_I8_WMMA_M; ++r) {
+                acc[r] += logits[r * GGML_CUDA_Q8Q4_I8_WMMA_N + c] * v;
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int r = 0; r < GGML_CUDA_Q8Q4_I8_WMMA_M; ++r) {
+        const int q_row = q_base + r;
+        if (q_row < nq) {
+            float row_max_r = row_max_s[r];
+            float denom_r = denom_s[r];
+            float acc_r = acc[r];
+            if (sinks) {
+                ggml_cuda_q8q4_i8_apply_attn_sink(sinks[hq], row_max_r, denom_r, acc_r);
+            }
+            float * out = (float *) (dst + int64_t(d) * nb0 + int64_t(hq) * nb1 + int64_t(q_row) * nb2 + int64_t(ib) * nb3);
+            *out = denom_r > 0.0f ? acc_r / denom_r : 0.0f;
+        }
+    }
+}
+
 inline void ggml_cuda_flash_attn_ext_q8q4_wmma_i8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q     = dst->src[0];
     const ggml_tensor * K     = dst->src[1];
@@ -572,10 +906,15 @@ inline void ggml_cuda_flash_attn_ext_q8q4_wmma_i8(ggml_backend_cuda_context & ct
     const int n_batch = Q->ne[3];
     const int gqa_ratio = Q->ne[2] / K->ne[2];
     const int n_chunks = (nk + GGML_CUDA_Q8Q4_I8_CHUNK - 1) / GGML_CUDA_Q8Q4_I8_CHUNK;
+    const bool flash_prefill = ggml_cuda_q8q4_wmma_i8_flash_prefill_enabled() && nq >= ggml_cuda_q8q4_wmma_i8_flash_prefill_min_nq();
+    const int alloc_chunks = flash_prefill ? 0 : (int) ggml_cuda_q8q4_wmma_i8_scratch_alloc_chunks(n_chunks);
     const int q_scale_blocks = ggml_cuda_q8q4_wmma_i8_qscale16_enabled() ? GGML_CUDA_Q8Q4_I8_QSCALE16_BLOCKS : GGML_CUDA_Q8Q4_I8_BLOCKS;
 
     const int n_instances_total = n_heads_q * n_batch;
-    const int64_t scratch_per_head = ggml_cuda_q8q4_wmma_i8_scratch_bytes_per_head(dst);
+    const int64_t scratch_per_head = flash_prefill ?
+        (nq * GGML_CUDA_Q8Q4_I8_D * (int64_t) sizeof(int8_t) + nq * q_scale_blocks * (int64_t) sizeof(float)) :
+        ggml_cuda_q8q4_wmma_i8_scratch_bytes_per_head_chunks(dst, alloc_chunks);
+    const int64_t exact_scratch_per_head = flash_prefill ? scratch_per_head : ggml_cuda_q8q4_wmma_i8_scratch_bytes_per_head_chunks(dst, n_chunks);
     const int64_t max_mib = ggml_cuda_q8q4_wmma_i8_max_mib();
     const int64_t batch_scratch = scratch_per_head * int64_t(n_instances_total);
     const bool batch_heads = max_mib <= 0 || batch_scratch <= max_mib * 1024LL * 1024LL;
@@ -585,16 +924,17 @@ inline void ggml_cuda_flash_attn_ext_q8q4_wmma_i8(ggml_backend_cuda_context & ct
     ggml_cuda_pool & pool = ctx.pool();
     ggml_cuda_pool_alloc<int8_t> q_i8(pool, size_t(active_instances) * nq * GGML_CUDA_Q8Q4_I8_D);
     ggml_cuda_pool_alloc<float> q_scales(pool, size_t(active_instances) * nq * q_scale_blocks);
-    ggml_cuda_pool_alloc<float> partial_acc(pool, size_t(active_instances) * n_chunks * nq * GGML_CUDA_Q8Q4_I8_D);
-    ggml_cuda_pool_alloc<float> partial_m(pool, size_t(active_instances) * n_chunks * nq);
-    ggml_cuda_pool_alloc<float> partial_l(pool, size_t(active_instances) * n_chunks * nq);
+    ggml_cuda_pool_alloc<float> partial_acc(pool, size_t(active_instances) * alloc_chunks * nq * GGML_CUDA_Q8Q4_I8_D);
+    ggml_cuda_pool_alloc<float> partial_m(pool, size_t(active_instances) * alloc_chunks * nq);
+    ggml_cuda_pool_alloc<float> partial_l(pool, size_t(active_instances) * alloc_chunks * nq);
 
     const char * log_env = getenv("GGML_CUDA_ROCM_Q8Q4_WMMA_I8_LOG");
     if (log_env && atoi(log_env) != 0) {
-        const double scratch_mib = double(scratch_per_head) / (1024.0 * 1024.0);
+        const double exact_scratch_mib = double(exact_scratch_per_head) / (1024.0 * 1024.0);
+        const double alloc_scratch_mib = double(scratch_per_head) / (1024.0 * 1024.0);
         const double active_scratch_mib = double(scratch_per_head * int64_t(active_instances)) / (1024.0 * 1024.0);
-        GGML_LOG_INFO("%s: route=q8q4_wmma_i8 nq=%d nk=%d heads=%d batch=%d gqa=%d chunks=%d q_scale_width=%d scratch_per_head=%.3f MiB active_scratch=%.3f MiB batch_heads=%d mask=1 sinks=%d\n",
-            __func__, nq, nk, n_heads_q, n_batch, gqa_ratio, n_chunks, GGML_CUDA_Q8Q4_I8_D / q_scale_blocks, scratch_mib, active_scratch_mib, batch_heads, sinks != nullptr);
+        GGML_LOG_INFO("%s: route=q8q4_wmma_i8%s nq=%d nk=%d heads=%d batch=%d gqa=%d chunks=%d alloc_chunks=%d q_scale_width=%d exact_scratch_per_head=%.3f MiB alloc_scratch_per_head=%.3f MiB active_scratch=%.3f MiB batch_heads=%d mask=1 sinks=%d\n",
+            __func__, flash_prefill ? "_flash" : "", nq, nk, n_heads_q, n_batch, gqa_ratio, n_chunks, alloc_chunks, GGML_CUDA_Q8Q4_I8_D / q_scale_blocks, exact_scratch_mib, alloc_scratch_mib, active_scratch_mib, batch_heads, sinks != nullptr);
     }
 
     const dim3 quant_block(32);
@@ -608,16 +948,27 @@ inline void ggml_cuda_flash_attn_ext_q8q4_wmma_i8(ggml_backend_cuda_context & ct
         ggml_cuda_q8q4_i8_quant_q_kernel<<<quant_grid, quant_block, 0, stream>>>(
             (const char *) Q->data, q_i8.ptr, q_scales.ptr,
             Q->nb[0], Q->nb[1], Q->nb[2], Q->nb[3], nq, 0, 0, n_heads_q, q_scale_blocks);
-        ggml_cuda_q8q4_i8_splitk_stage1_kernel<<<stage_grid, block, 0, stream>>>(
-            q_i8.ptr, q_scales.ptr, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
-            partial_acc.ptr, partial_m.ptr, partial_l.ptr,
-            K->nb[0], K->nb[1], K->nb[2], K->nb[3],
-            V->nb[0], V->nb[1], V->nb[2], V->nb[3],
-            mask->nb[0], mask->nb[1], mask->nb[3], mask->ne[3],
-            nq, nk, 0, 0, n_heads_q, gqa_ratio, scale, q_scale_blocks);
-        ggml_cuda_q8q4_i8_reduce_kernel<<<reduce_grid, block, 0, stream>>>(
-            partial_acc.ptr, partial_m.ptr, partial_l.ptr, sinks_data, (char *) dst->data,
-            dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3], nq, n_chunks, 0, 0, n_heads_q);
+        if (flash_prefill) {
+            const dim3 flash_grid((nq + GGML_CUDA_Q8Q4_I8_WMMA_M - 1) / GGML_CUDA_Q8Q4_I8_WMMA_M, 1, active_instances);
+            ggml_cuda_q8q4_i8_flash_kernel<<<flash_grid, block, 0, stream>>>(
+                q_i8.ptr, q_scales.ptr, (const char *) K->data, (const char *) V->data, (const char *) mask->data, sinks_data, (char *) dst->data,
+                K->nb[0], K->nb[1], K->nb[2], K->nb[3],
+                V->nb[0], V->nb[1], V->nb[2], V->nb[3],
+                mask->nb[0], mask->nb[1], mask->nb[3], mask->ne[3],
+                dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3],
+                nq, nk, 0, 0, n_heads_q, gqa_ratio, scale, q_scale_blocks);
+        } else {
+            ggml_cuda_q8q4_i8_splitk_stage1_kernel<<<stage_grid, block, 0, stream>>>(
+                q_i8.ptr, q_scales.ptr, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
+                partial_acc.ptr, partial_m.ptr, partial_l.ptr,
+                K->nb[0], K->nb[1], K->nb[2], K->nb[3],
+                V->nb[0], V->nb[1], V->nb[2], V->nb[3],
+                mask->nb[0], mask->nb[1], mask->nb[3], mask->ne[3],
+                nq, nk, 0, 0, n_heads_q, gqa_ratio, scale, q_scale_blocks);
+            ggml_cuda_q8q4_i8_reduce_kernel<<<reduce_grid, block, 0, stream>>>(
+                partial_acc.ptr, partial_m.ptr, partial_l.ptr, sinks_data, (char *) dst->data,
+                dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3], nq, n_chunks, 0, 0, n_heads_q);
+        }
     } else {
         const dim3 quant_grid(nq, q_scale_blocks, 1);
         const dim3 stage_grid((nq + GGML_CUDA_Q8Q4_I8_WMMA_M - 1) / GGML_CUDA_Q8Q4_I8_WMMA_M, n_chunks, 1);
@@ -627,16 +978,27 @@ inline void ggml_cuda_flash_attn_ext_q8q4_wmma_i8(ggml_backend_cuda_context & ct
                 ggml_cuda_q8q4_i8_quant_q_kernel<<<quant_grid, quant_block, 0, stream>>>(
                     (const char *) Q->data, q_i8.ptr, q_scales.ptr,
                     Q->nb[0], Q->nb[1], Q->nb[2], Q->nb[3], nq, hq, ib, n_heads_q, q_scale_blocks);
-                ggml_cuda_q8q4_i8_splitk_stage1_kernel<<<stage_grid, block, 0, stream>>>(
-                    q_i8.ptr, q_scales.ptr, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
-                    partial_acc.ptr, partial_m.ptr, partial_l.ptr,
-                    K->nb[0], K->nb[1], K->nb[2], K->nb[3],
-                    V->nb[0], V->nb[1], V->nb[2], V->nb[3],
-                    mask->nb[0], mask->nb[1], mask->nb[3], mask->ne[3],
-                    nq, nk, hq, ib, n_heads_q, gqa_ratio, scale, q_scale_blocks);
-                ggml_cuda_q8q4_i8_reduce_kernel<<<reduce_grid, block, 0, stream>>>(
-                    partial_acc.ptr, partial_m.ptr, partial_l.ptr, sinks_data, (char *) dst->data,
-                    dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3], nq, n_chunks, hq, ib, n_heads_q);
+                if (flash_prefill) {
+                    const dim3 flash_grid((nq + GGML_CUDA_Q8Q4_I8_WMMA_M - 1) / GGML_CUDA_Q8Q4_I8_WMMA_M, 1, 1);
+                    ggml_cuda_q8q4_i8_flash_kernel<<<flash_grid, block, 0, stream>>>(
+                        q_i8.ptr, q_scales.ptr, (const char *) K->data, (const char *) V->data, (const char *) mask->data, sinks_data, (char *) dst->data,
+                        K->nb[0], K->nb[1], K->nb[2], K->nb[3],
+                        V->nb[0], V->nb[1], V->nb[2], V->nb[3],
+                        mask->nb[0], mask->nb[1], mask->nb[3], mask->ne[3],
+                        dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3],
+                        nq, nk, hq, ib, n_heads_q, gqa_ratio, scale, q_scale_blocks);
+                } else {
+                    ggml_cuda_q8q4_i8_splitk_stage1_kernel<<<stage_grid, block, 0, stream>>>(
+                        q_i8.ptr, q_scales.ptr, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
+                        partial_acc.ptr, partial_m.ptr, partial_l.ptr,
+                        K->nb[0], K->nb[1], K->nb[2], K->nb[3],
+                        V->nb[0], V->nb[1], V->nb[2], V->nb[3],
+                        mask->nb[0], mask->nb[1], mask->nb[3], mask->ne[3],
+                        nq, nk, hq, ib, n_heads_q, gqa_ratio, scale, q_scale_blocks);
+                    ggml_cuda_q8q4_i8_reduce_kernel<<<reduce_grid, block, 0, stream>>>(
+                        partial_acc.ptr, partial_m.ptr, partial_l.ptr, sinks_data, (char *) dst->data,
+                        dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3], nq, n_chunks, hq, ib, n_heads_q);
+                }
             }
         }
     }
