@@ -122,9 +122,14 @@ GGML_CUDA_ROCM_Q8Q4_WMMA_I8_REQUIRE_SELECTED=1 # fail if an included layer canno
 Keep this lab-only and keep it out of normal launch environments. On 27B, the
 normal fast baseline is f16/f16 or the promoted q8/tbq4 path; q8_0/q4_0 WMMA-I8
 is a correctness/selector experiment and can be drastically slower than that
-baseline. Only use it in bounded A/B runs with explicit `LAYER_MIN/MAX`,
-`REQUIRE_SELECTED=1`, and artifact-backed checks. Backend-op tests pass, but
-greedy generation parity is not proven for unrestricted routing. `QSCALE16` is an opt-in stabilization probe that
+baseline. It is not a q8/tbq4 f16-temp replacement: the current prototype only
+accelerates QK with i8 WMMA and still pays Q quantization, float softmax, q4 V
+dequant/PV, split-K scratch/reduce traffic, and layer-filter overhead. Do not
+repeat this as a serving optimization unless benchmark stderr proves the route
+selected and the result beats the q8/tbq4 f16-temp bar. Only use it in bounded
+A/B runs with explicit `LAYER_MIN/MAX`, `REQUIRE_SELECTED=1`, and
+artifact-backed checks. Backend-op tests pass, but greedy generation parity is
+not proven for unrestricted routing. `QSCALE16` is an opt-in stabilization probe that
 quantizes Q per 16-wide WMMA K tile instead of per q8_0 block. `LAYER_MIN/MAX`
 and `SKIP_LAYER(S)` are diagnostic safety knobs for layer-filtered logit/top1
 checks only; do not use them as a default policy without an artifact-backed

@@ -119,10 +119,19 @@ coverage match the GQA=4/8 path.
 Do not use this as a normal 27B serving path. A follow-up speed sanity exposed a
 baseline mistake: normal f16/f16 27B prefill was about 905 tok/s for pp4096,
 and promoted q8/tbq4 with f16-temp was about 766 tok/s, while the q8_0/q4_0
-WMMA-I8 lab lane was only about 118 tok/s in the same 4k shape. The WMMA-I8
-lane can be faster than the broken q8_0/q4_0 fallback it replaces, but it is
-not a replacement for the normal fast baseline. Keep `GGML_CUDA_ROCM_Q8Q4_WMMA_I8*`
-out of default env files and recipes.
+WMMA-I8 lab lane was only about 118 tok/s in the same 4k shape. A post-f16-fix
+q8_0/q4_0 rerun at pp4096+tg1024 produced only about 120.47 prefill tok/s and
+24.07 decode tok/s, while route logs from `llama-bench` did not prove selected
+WMMA-I8. The WMMA-I8 lane can be faster than the broken q8_0/q4_0 fallback it
+replaces, but it is not a replacement for the normal fast baseline.
+
+Root cause/lesson: the prototype only replaced the QK dot-product with i8 WMMA.
+It still pays Q fp32->i8 quantization and scale traffic, float softmax, q4 V
+dequant/PV in scalar/float code, split-K partial scratch/reduce traffic, and
+layer-filter overhead. QK-only acceleration is not enough; do not repeat this
+as a serving optimization unless the design also accelerates/fuses softmax+PV,
+proves selected routes in benchmark stderr, and beats the q8/tbq4 f16-temp bar.
+Keep `GGML_CUDA_ROCM_Q8Q4_WMMA_I8*` out of default env files and recipes.
 
 ## Why min27
 
