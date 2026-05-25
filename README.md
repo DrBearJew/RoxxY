@@ -233,6 +233,14 @@ Current DOT4 outcome and next-plan guardrails are in
 promote the standalone tile8/split-KV probes; any next prototype should reuse
 the stable `launch_fattn` tiled/GQA/combine scaffolding before adding DOT4.
 
+A separate q8_0-K/q4_0-V VEC scaffold A/B knob keeps the stable VEC kernel and
+only changes Q columns per block. It is also unsafe/opt-in:
+
+```bash
+GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE=1
+GGML_CUDA_ROCM_Q8K_Q4V_VEC_COLS=4
+```
+
 The stable no-TBQ q8/q4 path does not use these flags.
 
 ## Credits

@@ -721,6 +721,32 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
         return;
     }
 
+#ifdef GGML_USE_HIP
+    // Unsafe A/B probe for q8_0-K/q4_0-V prefill that keeps the stable VEC
+    // launch_fattn/parallel-block/combine path but groups four Q columns per
+    // block. This is intentionally opt-in so default quantized-KV behavior and
+    // long-context serving stay on the validated cols=2 VEC route.
+    if constexpr (D == 256 && type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q4_0) {
+        const char * unsafe = getenv("GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE");
+        if (!unsafe) {
+            unsafe = getenv("GGML_CUDA_ROCM_UNSAFE_EXPERIMENTS");
+        }
+        const char * cols_env = getenv("GGML_CUDA_ROCM_Q8K_Q4V_VEC_COLS");
+        const int cols_override = (unsafe && atoi(unsafe) != 0 && cols_env) ? atoi(cols_env) : 0;
+        if (cols_override == 4) {
+            constexpr int cols_per_block = 4;
+            if (logit_softcap == 0.0f) {
+                constexpr bool use_logit_softcap = false;
+                ggml_cuda_flash_attn_ext_vec_case_dispatch<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+            } else {
+                constexpr bool use_logit_softcap = true;
+                ggml_cuda_flash_attn_ext_vec_case_dispatch<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+            }
+            return;
+        }
+    }
+#endif // GGML_USE_HIP
+
     constexpr int cols_per_block = 2;
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
