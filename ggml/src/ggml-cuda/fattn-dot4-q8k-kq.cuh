@@ -7,6 +7,11 @@
 
 #ifdef GGML_USE_HIP
 
+// Lab-only ROCm q8K DOT4 KQ/FA route. Keep this behind both the generic unsafe
+// gate and an explicit route contract; standalone fused/tile8 probes currently
+// underperform stable tiled/GQA FA. See
+// docs/rocm-tbq4-paths/23-q8k-dot4-fa-root-cause-and-next-plan.md before
+// changing these gates or promoting variants.
 static inline bool ggml_cuda_q8k_dot4_kq_route_required() {
     const char * required = getenv("GGML_CUDA_FA_ROUTE_REQUIRE");
     return required && strcmp(required, "rocm_q8k_dot4_kq") == 0;

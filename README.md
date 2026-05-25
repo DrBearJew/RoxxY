@@ -216,6 +216,23 @@ TBQ4_WMMA_FATTN=1                  # or GGML_CUDA_ROCM_TBQ4_WMMA_FATTN=1
 COMPRESSED_KV_WMMA_FATTN=1
 ```
 
+The q8K DOT4 KQ/FA probe route is also lab-only. It is not a default
+optimization path; leave these unset in user-facing wrappers unless deliberately
+reproducing the DOT4 experiments:
+
+```bash
+GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE=1
+GGML_CUDA_ROCM_Q8K_DOT4_KQ=1
+GGML_CUDA_FA_ROUTE_REQUIRE=rocm_q8k_dot4_kq
+GGML_CUDA_ROCM_Q8K_DOT4_KQ_FULL_FA=1      # only for full-FA/fused probes
+GGML_CUDA_ROCM_Q8K_DOT4_KQ_VARIANT=fused_tile8_parallel
+```
+
+Current DOT4 outcome and next-plan guardrails are in
+`docs/rocm-tbq4-paths/23-q8k-dot4-fa-root-cause-and-next-plan.md`: do not
+promote the standalone tile8/split-KV probes; any next prototype should reuse
+the stable `launch_fattn` tiled/GQA/combine scaffolding before adding DOT4.
+
 The stable no-TBQ q8/q4 path does not use these flags.
 
 ## Credits
