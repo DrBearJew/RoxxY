@@ -43,10 +43,12 @@ batch/ubatch sizing determine the practical VRAM budget.
 
 ```bash
 LLAMA_MTP_PREFILL_CHUNK=1024
-LLAMA_MTP_PREFILL_FORCE_MMQ=1
+# LLAMA_MTP_PREFILL_FORCE_MMQ=1   # diagnostic only; not recommended by default
 ```
 
-`LLAMA_MTP_PREFILL_CHUNK` should match `--ubatch-size`.
+`LLAMA_MTP_PREFILL_CHUNK` should match `--ubatch-size`. `LLAMA_MTP_PREFILL_FORCE_MMQ=1`
+forces supported quantized matmuls through MMQ and is useful for A/B diagnostics,
+but it reduced 35B MoE temp-0.6 generation throughput in local ROCm/gfx1100 tests.
 
 MTP has separate draft-context KV flags. Use these when draft KV should match
 the target q8/tbq4 KV format:
@@ -87,8 +89,8 @@ rounds f16 temps to nkv buckets when full-context stable scratch is too large.
 
 ```bash
 TBQ_AUTO_ASYMMETRIC=0        # opt out of high-GQA tbq4/tbq4 -> q8/tbq4 K promotion
-GGML_CUDA_MMQ_MAX_X=48       # preferred manual RDNA3/gfx1100 cap
 GGML_CUDA_MMQ_MAX_X_AUTO=1   # opt-in helper; manual MAX_X still wins
+GGML_CUDA_MMQ_MAX_X=48       # manual fallback/override for RDNA3/gfx1100 A/Bs
 ```
 
 If symmetric `tbq4_0` K+V is requested on high-GQA models, K is promoted to
@@ -134,23 +136,30 @@ GGML_CUDA_ROCM_QUANT_PREFILL_F16=1 \
 
 ```bash
 RDNA2_MATMUL_OPT_V1=1 \
-GGML_CUDA_MMQ_MAX_X=48 \
+GGML_CUDA_MMQ_MAX_X_AUTO=1 \
+GGML_CUDA_ROCM_QUANT_PREFILL_F16=1 \
+GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_NKV=40960 \
 ./build-rocm-vulkan/bin/llama-server \
   --device ROCm0 \
   --model /path/to/Qwen3.6-35B-A3B-IQ4_XS-00001-of-00002.gguf \
+  --ctx-size 40960 \
   --flash-attn on \
   --cache-type-k q8_0 --cache-type-v tbq4_0 \
   --batch-size 1024 --ubatch-size 1024 \
   --parallel 1
 ```
 
-### 35B ROCm MTP
+### 35B ROCm MTP recommended
+
+Local gfx1100 temp-0.6 validation favored draft depth 3 without force-MMQ:
+`mtp_n3` reached 2677 prompt tok/s and 98.8 generation tok/s with 3192/4044
+draft acceptance and ~21.23 GiB peak VRAM. `LLAMA_MTP_PREFILL_FORCE_MMQ=1` was
+worse as a force-control (75.9 generation tok/s), so leave it unset by default.
 
 ```bash
 RDNA2_MATMUL_OPT_V1=1 \
 GGML_CUDA_MMQ_MAX_X_AUTO=1 \
 LLAMA_MTP_PREFILL_CHUNK=1024 \
-LLAMA_MTP_PREFILL_FORCE_MMQ=1 \
 GGML_CUDA_ROCM_QUANT_PREFILL_F16=1 \
 GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_NKV=40960 \
 ./build-rocm-vulkan/bin/llama-server \
@@ -161,8 +170,9 @@ GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_NKV=40960 \
   --cache-type-k q8_0 --cache-type-v tbq4_0 \
   --cache-type-k-draft q8_0 --cache-type-v-draft tbq4_0 \
   --batch-size 1024 --ubatch-size 1024 \
+  --temp 0.6 --top-p 0.95 \
   --spec-type draft-mtp --spec-default \
-  --spec-draft-n-max 2 --spec-draft-p-min 0 \
+  --spec-draft-n-max 3 --spec-draft-p-min 0 \
   --spec-draft-prio 2 --spec-draft-prio-batch 2 \
   --parallel 1
 ```
