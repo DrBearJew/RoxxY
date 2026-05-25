@@ -9,6 +9,7 @@ static constexpr int GGML_CUDA_Q8K_DOT4_KQ_BLOCKS = GGML_CUDA_Q8K_DOT4_KQ_D / QK
 static constexpr int GGML_CUDA_Q8K_DOT4_KQ_PACKED16_PER_ROW = GGML_CUDA_Q8K_DOT4_KQ_D / 16;
 static constexpr int GGML_CUDA_Q8K_DOT4_KQ_TILE_M = 8;
 static constexpr int GGML_CUDA_Q8K_DOT4_KQ_TILE_N = 16;
+static constexpr int GGML_CUDA_Q8K_DOT4_KQ_PAR_TILE_K = 8;
 
 static inline bool ggml_cuda_q8k_dot4_kq_env_enabled(const char * name) {
     const char * env = getenv(name);
@@ -417,6 +418,137 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_fused_online
     GGML_UNUSED(n_heads_k);
 }
 
+static __device__ __forceinline__ float ggml_cuda_q8k_dot4_kq_dot_tile8_parallel(
+        const int   * __restrict__ q_payload,
+        const float * __restrict__ q_scales,
+        const int   * __restrict__ k_payload,
+        const half  * __restrict__ k_scales,
+        float       * __restrict__ logits,
+        int tile_n,
+        int tile_lane) {
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int k_lane = tile_lane;
+    float partial = 0.0f;
+
+    if (k_lane < tile_n && lane < 8) {
+        const int * k_row_payload = k_payload + k_lane * (GGML_CUDA_Q8K_DOT4_KQ_D / 4);
+        const half * k_row_scales = k_scales + k_lane * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS;
+#pragma unroll
+        for (int qb = 0; qb < GGML_CUDA_Q8K_DOT4_KQ_BLOCKS; ++qb) {
+            const int idx = qb * (QK8_0 / 4) + lane;
+            const int acc = ggml_cuda_q8k_dot4_i8_i8(q_payload[idx], k_row_payload[idx], 0);
+            partial += float(acc) * q_scales[qb] * __half2float(k_row_scales[qb]);
+        }
+    }
+
+#pragma unroll
+    for (int offset = 4; offset > 0; offset >>= 1) {
+        partial += __shfl_down(partial, offset, 32);
+    }
+    if (lane == 0 && k_lane < tile_n) {
+        logits[k_lane] = partial;
+    }
+    __syncthreads();
+    return k_lane < tile_n ? logits[k_lane] : -INFINITY;
+}
+
+static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_fused_tile8_parallel_fattn_q4_0_kernel(
+        const int   * __restrict__ q_payload,
+        const float * __restrict__ q_scales,
+        const int   * __restrict__ k_payload,
+        const half  * __restrict__ k_scales,
+        const char  * __restrict__ V,
+        const char  * __restrict__ mask,
+        float       * __restrict__ dst,
+        float scale,
+        int64_t nb20,
+        int64_t nb21,
+        int64_t nb22,
+        int64_t nb23,
+        int64_t nb30,
+        int64_t nb31,
+        int64_t nb33,
+        int64_t ne33,
+        int nq,
+        int nk,
+        int n_heads_q,
+        int n_heads_k,
+        int gqa_ratio,
+        int batch) {
+    const int tid = threadIdx.x;
+    const int q_row = blockIdx.x;
+    const int hq = blockIdx.y;
+    const int b = blockIdx.z;
+    const int tile_lane = tid >> 5;
+    __shared__ float logits[GGML_CUDA_Q8K_DOT4_KQ_PAR_TILE_K];
+    __shared__ float probs[GGML_CUDA_Q8K_DOT4_KQ_PAR_TILE_K];
+    __shared__ float row_max_shared;
+    __shared__ float denom_shared;
+    __shared__ float old_scale_shared;
+    if (q_row >= nq || hq >= n_heads_q || b >= batch) {
+        return;
+    }
+
+    const int hk = hq / gqa_ratio;
+    const size_t q_base = ((size_t(b) * n_heads_q + hq) * (size_t)nq + q_row);
+    const int * q_row_payload = q_payload + q_base * (GGML_CUDA_Q8K_DOT4_KQ_D / 4);
+    const float * q_row_scales = q_scales + q_base * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS;
+    const char * v_head = V + int64_t(b) * nb23 + int64_t(hk) * nb22;
+
+    if (tid == 0) {
+        row_max_shared = -FLT_MAX;
+        denom_shared = 0.0f;
+    }
+    __syncthreads();
+
+    float out = 0.0f;
+    for (int k0 = 0; k0 < nk; k0 += GGML_CUDA_Q8K_DOT4_KQ_PAR_TILE_K) {
+        const int tile_n = min(GGML_CUDA_Q8K_DOT4_KQ_PAR_TILE_K, nk - k0);
+        const int k = k0 + tile_lane;
+        const size_t k_base = ((size_t(b) * n_heads_k + hk) * (size_t)nk + k0);
+        const int * k_tile_payload = k_payload + k_base * (GGML_CUDA_Q8K_DOT4_KQ_D / 4);
+        const half * k_tile_scales = k_scales + k_base * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS;
+        const float kq = ggml_cuda_q8k_dot4_kq_dot_tile8_parallel(
+            q_row_payload, q_row_scales, k_tile_payload, k_tile_scales, logits, tile_n, tile_lane);
+        if (tile_lane < tile_n && (tid & 31) == 0) {
+            logits[tile_lane] = kq * scale + ggml_cuda_q8k_dot4_mask_value(mask, nb30, nb31, nb33, ne33, q_row, k, b);
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            float tile_max = -FLT_MAX;
+#pragma unroll
+            for (int kk = 0; kk < GGML_CUDA_Q8K_DOT4_KQ_PAR_TILE_K; ++kk) {
+                tile_max = fmaxf(tile_max, kk < tile_n ? logits[kk] : -INFINITY);
+            }
+            const float next_max = fmaxf(row_max_shared, tile_max);
+            old_scale_shared = denom_shared > 0.0f ? expf(row_max_shared - next_max) : 0.0f;
+            float tile_sum = 0.0f;
+#pragma unroll
+            for (int kk = 0; kk < GGML_CUDA_Q8K_DOT4_KQ_PAR_TILE_K; ++kk) {
+                const float p = kk < tile_n ? expf(logits[kk] - next_max) : 0.0f;
+                probs[kk] = p;
+                tile_sum += p;
+            }
+            denom_shared = denom_shared * old_scale_shared + tile_sum;
+            row_max_shared = next_max;
+        }
+        __syncthreads();
+
+        out *= old_scale_shared;
+#pragma unroll
+        for (int kk = 0; kk < GGML_CUDA_Q8K_DOT4_KQ_PAR_TILE_K; ++kk) {
+            if (kk < tile_n) {
+                out += probs[kk] * ggml_cuda_q8k_dot4_dequant_q4_0(v_head + int64_t(k0 + kk) * nb21, nb20, tid);
+            }
+        }
+        __syncthreads();
+    }
+    dst[((size_t(b) * nq + q_row) * (size_t)n_heads_q + hq) * GGML_CUDA_Q8K_DOT4_KQ_D + tid] = out / denom_shared;
+    GGML_UNUSED(n_heads_k);
+}
+
 static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_kq_reference_kernel(
         const float * __restrict__ Q,
         const char  * __restrict__ K,
@@ -508,10 +640,12 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
     const char * variant_env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_KQ_VARIANT");
     const bool q8block_variant = variant_env && strcmp(variant_env, "q8block") == 0;
     const bool fused_online = variant_env && strcmp(variant_env, "fused_online") == 0;
+    const bool fused_tile8_parallel = variant_env && strcmp(variant_env, "fused_tile8_parallel") == 0;
+    const bool fused_variant = fused_online || fused_tile8_parallel;
     const bool full_fa = ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_KQ_FULL_FA");
 
-    if (fused_online && !full_fa) {
-        GGML_ABORT("q8k_dot4_kq fused_online variant requires GGML_CUDA_ROCM_Q8K_DOT4_KQ_FULL_FA=1");
+    if (fused_variant && !full_fa) {
+        GGML_ABORT("q8k_dot4_kq fused variants require GGML_CUDA_ROCM_Q8K_DOT4_KQ_FULL_FA=1");
     }
 
     if (full_fa) {
@@ -522,8 +656,8 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
         if (sinks != nullptr || max_bias != 0.0f || logit_softcap != 0.0f) {
             GGML_ABORT("q8k_dot4_kq full FA probe does not support sinks, max_bias, or logit_softcap");
         }
-        if (fused_online && q8block_variant) {
-            GGML_ABORT("q8k_dot4_kq fused_online variant requires packed16 K");
+        if (fused_variant && q8block_variant) {
+            GGML_ABORT("q8k_dot4_kq fused variants require packed16 K");
         }
         if (mask && (mask->type != GGML_TYPE_F16 || mask->ne[0] != K->ne[1] || mask->ne[1] != Q->ne[1] ||
                 mask->ne[2] != 1 || mask->ne[3] != Q->ne[3])) {
@@ -532,16 +666,22 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
     }
 
     const bool timing_requested = ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_KQ_TIMING");
+    bool stream_is_capturing = false;
+#ifdef USE_CUDA_GRAPH
+    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+    CUDA_CHECK(hipStreamIsCapturing(ctx.stream(), &capture_status));
+    stream_is_capturing = capture_status != hipStreamCaptureStatusNone;
+#endif // USE_CUDA_GRAPH
     const int timing_every = max(1, ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_KQ_TIMING_EVERY", 1));
     static unsigned long long timing_counter = 0;
     const unsigned long long timing_call = timing_requested ? ++timing_counter : 0;
-    const bool timing = timing_requested && (timing_call % (unsigned long long) timing_every) == 0;
+    const bool timing = timing_requested && !stream_is_capturing && (timing_call % (unsigned long long) timing_every) == 0;
 
     q_payload.alloc(q_rows * (GGML_CUDA_Q8K_DOT4_KQ_D / 4));
     q_scales.alloc(q_rows * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS);
     k_payload.alloc(k_rows * (GGML_CUDA_Q8K_DOT4_KQ_D / 4));
     k_scales.alloc(k_rows * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS);
-    if (!fused_online) {
+    if (!fused_variant) {
         logits.alloc(logits_ne);
     }
 
@@ -574,7 +714,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
         CUDA_CHECK(hipEventRecord(ev_q_quant, stream));
     }
 
-    if (!q8block_variant || fused_online) {
+    if (!q8block_variant || fused_variant) {
         dim3 pack_grid((k_rows * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS + 255) / 256);
         ggml_cuda_q8k_dot4_pack_k_packed16_kernel<<<pack_grid, block, 0, stream>>>(
             (const char *) K->data, k_payload.ptr, k_scales.ptr,
@@ -590,7 +730,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
     dim3 kq_grid((nk + GGML_CUDA_Q8K_DOT4_KQ_TILE_N - 1) / GGML_CUDA_Q8K_DOT4_KQ_TILE_N,
                  (nq + GGML_CUDA_Q8K_DOT4_KQ_TILE_M - 1) / GGML_CUDA_Q8K_DOT4_KQ_TILE_M,
                  n_heads_q * batch);
-    if (!fused_online) {
+    if (!fused_variant) {
         if (q8block_variant) {
             ggml_cuda_q8k_dot4_kq_q8block_kernel<<<kq_grid, block, 0, stream>>>(
                 q_payload.ptr, q_scales.ptr, (const char *) K->data, logits.ptr, scale,
@@ -606,7 +746,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
         CUDA_CHECK(hipEventRecord(ev_kq, stream));
     }
 
-    if (check && !fused_online) {
+    if (check && !fused_variant) {
         ref_logits.alloc(logits_ne);
         metrics.alloc(3);
         CUDA_CHECK(cudaMemsetAsync(metrics.ptr, 0, 3 * sizeof(float), stream));
@@ -635,7 +775,14 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
 
     if (full_fa) {
         dim3 fa_grid(nq, n_heads_q, batch);
-        if (fused_online) {
+        if (fused_tile8_parallel) {
+            ggml_cuda_q8k_dot4_fused_tile8_parallel_fattn_q4_0_kernel<<<fa_grid, block, 0, stream>>>(
+                q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr,
+                (const char *) V->data, mask ? (const char *) mask->data : nullptr, (float *) dst->data, scale,
+                V->nb[0], V->nb[1], V->nb[2], V->nb[3],
+                mask ? mask->nb[0] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[3] : 0, mask ? mask->ne[3] : 1,
+                nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch);
+        } else if (fused_online) {
             ggml_cuda_q8k_dot4_fused_online_fattn_q4_0_kernel<<<fa_grid, block, 0, stream>>>(
                 q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr,
                 (const char *) V->data, mask ? (const char *) mask->data : nullptr, (float *) dst->data, scale,
@@ -662,14 +809,14 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
         const float q_quant_ms = ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_start, ev_q_quant);
         const float k_pack_ms  = ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_q_quant, ev_k_pack);
         const float kq_ms      = ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_k_pack, ev_kq);
-        const float ref_ms     = check && !fused_online ? ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_kq, ev_ref) : 0.0f;
-        const float err_ms     = check && !fused_online ? ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_ref, ev_err) : 0.0f;
-        const float output_ms  = ggml_cuda_q8k_dot4_kq_event_elapsed_ms(check && !fused_online ? ev_err : ev_kq, ev_zero);
+        const float ref_ms     = check && !fused_variant ? ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_kq, ev_ref) : 0.0f;
+        const float err_ms     = check && !fused_variant ? ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_ref, ev_err) : 0.0f;
+        const float output_ms  = ggml_cuda_q8k_dot4_kq_event_elapsed_ms(check && !fused_variant ? ev_err : ev_kq, ev_zero);
         const float zero_ms    = full_fa ? 0.0f : output_ms;
         const float fa_ms      = full_fa ? output_ms : 0.0f;
         const float total_ms   = ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_start, ev_zero);
         GGML_LOG_INFO("%s: q8k_dot4_kq_timing call=%llu variant=%s nq=%d nk=%d heads_q=%d heads_k=%d batch=%d check=%d q_quant_ms=%.6f k_pack_ms=%.6f kq_ms=%.6f ref_ms=%.6f err_ms=%.6f zero_ms=%.6f total_ms=%.6f fa_ms=%.6f full_fa=%d\n",
-            __func__, timing_call, fused_online ? "fused_online" : (q8block_variant ? "q8block" : "packed16"), nq, nk, n_heads_q, n_heads_k, batch, check && !fused_online ? 1 : 0,
+            __func__, timing_call, fused_tile8_parallel ? "fused_tile8_parallel" : (fused_online ? "fused_online" : (q8block_variant ? "q8block" : "packed16")), nq, nk, n_heads_q, n_heads_k, batch, check && !fused_variant ? 1 : 0,
             q_quant_ms, k_pack_ms, kq_ms, ref_ms, err_ms, zero_ms, total_ms, fa_ms, full_fa ? 1 : 0);
         ggml_cuda_q8k_dot4_kq_event_destroy(ev_start);
         ggml_cuda_q8k_dot4_kq_event_destroy(ev_q_quant);
@@ -684,10 +831,10 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
     if (log_env && atoi(log_env) != 0) {
         const double q_mib = double(q_rows * GGML_CUDA_Q8K_DOT4_KQ_D) / (1024.0 * 1024.0);
         const double k_mib = double(k_rows * GGML_CUDA_Q8K_DOT4_KQ_D) / (1024.0 * 1024.0);
-        const double logits_mib = fused_online ? 0.0 : double(logits_ne * sizeof(float)) / (1024.0 * 1024.0);
+        const double logits_mib = fused_variant ? 0.0 : double(logits_ne * sizeof(float)) / (1024.0 * 1024.0);
         GGML_LOG_INFO("%s: route=rocm_q8k_dot4_kq variant=%s full_fa=%d nq=%d nk=%d heads_q=%d heads_k=%d batch=%d q_payload=%.3fMiB k_payload=%.3fMiB logits=%.3fMiB note=%s\n",
-            __func__, fused_online ? "fused_online" : (q8block_variant ? "q8block" : "packed16"), full_fa ? 1 : 0, nq, nk, n_heads_q, n_heads_k, batch, q_mib, k_mib, logits_mib,
-            fused_online ? "fused_online_probe" : (full_fa ? "full_fa_from_logits_probe" : "kq_only_zero_output"));
+            __func__, fused_tile8_parallel ? "fused_tile8_parallel" : (fused_online ? "fused_online" : (q8block_variant ? "q8block" : "packed16")), full_fa ? 1 : 0, nq, nk, n_heads_q, n_heads_k, batch, q_mib, k_mib, logits_mib,
+            fused_tile8_parallel ? "fused_tile8_parallel_probe" : (fused_online ? "fused_online_probe" : (full_fa ? "full_fa_from_logits_probe" : "kq_only_zero_output")));
     }
 
     GGML_UNUSED(sinks);
