@@ -481,25 +481,58 @@ static bool ggml_cuda_fattn_route_contract_applicable(
         const char * required,
         const ggml_tensor * dst,
         const ggml_cuda_rocm_quant_prefill_f16_policy * f16_policy) {
-    if (!ggml_cuda_fattn_route_contract_is_f16_temp(required)) {
-        return true;
-    }
-    if (!f16_policy) {
-        return false;
-    }
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
-    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_Q8_0 || Q->ne[1] <= 2) {
+
+    if (ggml_cuda_fattn_route_contract_is_f16_temp(required)) {
+        if (!f16_policy) {
+            return false;
+        }
+        if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_Q8_0 || Q->ne[1] <= 2) {
+            return false;
+        }
+        if (strcmp(required, "rocm_q8_tbq4_f16_temp") == 0) {
+            return V->type == GGML_TYPE_TBQ4_0;
+        }
+        if (strcmp(required, "rocm_q8q4_f16_temp") == 0) {
+            return V->type == GGML_TYPE_Q4_0;
+        }
+        return V->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_TBQ4_0 || V->type == GGML_TYPE_Q8_0;
+    }
+
+    if (!ggml_cuda_fattn_route_contract_is_i8(required)) {
+        return true;
+    }
+
+    // I8/dot4 route contracts are prefill-only. During graph reservation and
+    // decode the same context also probes one-token attention graphs; those
+    // should log as not-applicable instead of aborting a prefill contract.
+    if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || Q->ne[1] <= 2 ||
+            Q->ne[0] != 256 || K->ne[0] != 256 || V->ne[0] != 256 || dst->ne[0] != 256) {
         return false;
     }
-    if (strcmp(required, "rocm_q8_tbq4_f16_temp") == 0) {
-        return V->type == GGML_TYPE_TBQ4_0;
+
+    if (strcmp(required, "rocm_q8k_dot4_kq") == 0 ||
+            strcmp(required, "q8q4_dot4_prefill") == 0 ||
+            strcmp(required, "rocm_q8q4_dot4") == 0 ||
+            strcmp(required, "q8q4_dot4") == 0 ||
+            strcmp(required, "q8q4_wmma_i8") == 0 ||
+            strcmp(required, "rocm_q8q4_wmma_i8") == 0) {
+        return K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0;
     }
-    if (strcmp(required, "rocm_q8q4_f16_temp") == 0) {
-        return V->type == GGML_TYPE_Q4_0;
+    if (strcmp(required, "q8tbq4_dot4_prefill") == 0 ||
+            strcmp(required, "rocm_q8_tbq4_dot4") == 0 ||
+            strcmp(required, "q8tbq4_dot4") == 0) {
+        return K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TBQ4_0;
     }
-    return V->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_TBQ4_0 || V->type == GGML_TYPE_Q8_0;
+    if (strcmp(required, "tbq4_dot4_prefill") == 0 ||
+            strcmp(required, "rocm_tbq4_dot4") == 0 ||
+            strcmp(required, "tbq4_dot4") == 0) {
+        return K->type == GGML_TYPE_TBQ4_0 && V->type == GGML_TYPE_TBQ4_0;
+    }
+
+    return false;
 }
 
 static best_fattn_kernel ggml_cuda_fattn_select_rocm_quant_prefill_f16_backend(
