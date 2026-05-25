@@ -10,6 +10,32 @@ static constexpr int GGML_CUDA_Q8K_DOT4_KQ_PACKED16_PER_ROW = GGML_CUDA_Q8K_DOT4
 static constexpr int GGML_CUDA_Q8K_DOT4_KQ_TILE_M = 8;
 static constexpr int GGML_CUDA_Q8K_DOT4_KQ_TILE_N = 16;
 
+static inline bool ggml_cuda_q8k_dot4_kq_env_enabled(const char * name) {
+    const char * env = getenv(name);
+    return env && atoi(env) != 0;
+}
+
+static inline int ggml_cuda_q8k_dot4_kq_env_int(const char * name, int fallback) {
+    const char * env = getenv(name);
+    return env ? atoi(env) : fallback;
+}
+
+static inline void ggml_cuda_q8k_dot4_kq_event_create(hipEvent_t * event) {
+    CUDA_CHECK(hipEventCreate(event));
+}
+
+static inline void ggml_cuda_q8k_dot4_kq_event_destroy(hipEvent_t event) {
+    if (event != nullptr) {
+        CUDA_CHECK(hipEventDestroy(event));
+    }
+}
+
+static inline float ggml_cuda_q8k_dot4_kq_event_elapsed_ms(hipEvent_t start, hipEvent_t stop) {
+    float ms = 0.0f;
+    CUDA_CHECK(hipEventElapsedTime(&ms, start, stop));
+    return ms;
+}
+
 static __device__ __forceinline__ int ggml_cuda_q8k_dot4_i8_i8(const int a, const int b, const int c) {
 #if defined(RDNA3) || defined(RDNA4)
     return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
@@ -242,6 +268,15 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
     const size_t q_rows = (size_t) batch * n_heads_q * nq;
     const size_t k_rows = (size_t) batch * n_heads_k * nk;
     const size_t logits_ne = (size_t) batch * n_heads_q * nq * nk;
+    const char * check_env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_KQ_CHECK");
+    const bool check = check_env && atoi(check_env) != 0;
+
+    const bool timing_requested = ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_KQ_TIMING");
+    const int timing_every = max(1, ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_KQ_TIMING_EVERY", 1));
+    static unsigned long long timing_counter = 0;
+    const unsigned long long timing_call = timing_requested ? ++timing_counter : 0;
+    const bool timing = timing_requested && (timing_call % (unsigned long long) timing_every) == 0;
+
     q_payload.alloc(q_rows * (GGML_CUDA_Q8K_DOT4_KQ_D / 4));
     q_scales.alloc(q_rows * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS);
     k_payload.alloc(k_rows * (GGML_CUDA_Q8K_DOT4_KQ_D / 4));
@@ -249,18 +284,42 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
     logits.alloc(logits_ne);
 
     cudaStream_t stream = ctx.stream();
+    hipEvent_t ev_start = nullptr;
+    hipEvent_t ev_q_quant = nullptr;
+    hipEvent_t ev_k_pack = nullptr;
+    hipEvent_t ev_kq = nullptr;
+    hipEvent_t ev_ref = nullptr;
+    hipEvent_t ev_err = nullptr;
+    hipEvent_t ev_zero = nullptr;
+    if (timing) {
+        ggml_cuda_q8k_dot4_kq_event_create(&ev_start);
+        ggml_cuda_q8k_dot4_kq_event_create(&ev_q_quant);
+        ggml_cuda_q8k_dot4_kq_event_create(&ev_k_pack);
+        ggml_cuda_q8k_dot4_kq_event_create(&ev_kq);
+        ggml_cuda_q8k_dot4_kq_event_create(&ev_ref);
+        ggml_cuda_q8k_dot4_kq_event_create(&ev_err);
+        ggml_cuda_q8k_dot4_kq_event_create(&ev_zero);
+        CUDA_CHECK(hipEventRecord(ev_start, stream));
+    }
+
     dim3 q_grid(nq, n_heads_q, batch);
     dim3 block(256);
     ggml_cuda_q8k_dot4_quant_q_packed16_kernel<<<q_grid, block, 0, stream>>>(
         (const float *) Q->data, q_payload.ptr, q_scales.ptr,
         Q->nb[1], Q->nb[2], Q->nb[3], nq, n_heads_q, batch);
     CUDA_CHECK(cudaGetLastError());
+    if (timing) {
+        CUDA_CHECK(hipEventRecord(ev_q_quant, stream));
+    }
 
     dim3 pack_grid((k_rows * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS + 255) / 256);
     ggml_cuda_q8k_dot4_pack_k_packed16_kernel<<<pack_grid, block, 0, stream>>>(
         (const char *) K->data, k_payload.ptr, k_scales.ptr,
         K->nb[0], K->nb[1], K->nb[2], K->nb[3], nk, n_heads_k, batch);
     CUDA_CHECK(cudaGetLastError());
+    if (timing) {
+        CUDA_CHECK(hipEventRecord(ev_k_pack, stream));
+    }
 
     float scale = 1.0f;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
@@ -271,9 +330,10 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
         q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, logits.ptr, scale,
         nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch);
     CUDA_CHECK(cudaGetLastError());
+    if (timing) {
+        CUDA_CHECK(hipEventRecord(ev_kq, stream));
+    }
 
-    const char * check_env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_KQ_CHECK");
-    const bool check = check_env && atoi(check_env) != 0;
     if (check) {
         ref_logits.alloc(logits_ne);
         metrics.alloc(3);
@@ -283,9 +343,15 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
             Q->nb[1], Q->nb[2], Q->nb[3], K->nb[0], K->nb[1], K->nb[2], K->nb[3],
             nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch);
         CUDA_CHECK(cudaGetLastError());
+        if (timing) {
+            CUDA_CHECK(hipEventRecord(ev_ref, stream));
+        }
         ggml_cuda_q8k_dot4_kq_error_kernel<<<(logits_ne + 255) / 256, 256, 0, stream>>>(
             logits.ptr, ref_logits.ptr, metrics.ptr, logits_ne);
         CUDA_CHECK(cudaGetLastError());
+        if (timing) {
+            CUDA_CHECK(hipEventRecord(ev_err, stream));
+        }
         float h_metrics[3] = {0.0f, 0.0f, 0.0f};
         CUDA_CHECK(cudaMemcpyAsync(h_metrics, metrics.ptr, 3 * sizeof(float), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -299,6 +365,27 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
     // cannot masquerade as production attention. It exists to validate runtime
     // packed-DOT4 KQ layout, route contracts, and ISA only.
     CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
+    if (timing) {
+        CUDA_CHECK(hipEventRecord(ev_zero, stream));
+        CUDA_CHECK(hipEventSynchronize(ev_zero));
+        const float q_quant_ms = ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_start, ev_q_quant);
+        const float k_pack_ms  = ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_q_quant, ev_k_pack);
+        const float kq_ms      = ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_k_pack, ev_kq);
+        const float ref_ms     = check ? ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_kq, ev_ref) : 0.0f;
+        const float err_ms     = check ? ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_ref, ev_err) : 0.0f;
+        const float zero_ms    = ggml_cuda_q8k_dot4_kq_event_elapsed_ms(check ? ev_err : ev_kq, ev_zero);
+        const float total_ms   = ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_start, ev_zero);
+        GGML_LOG_INFO("%s: q8k_dot4_kq_timing call=%llu nq=%d nk=%d heads_q=%d heads_k=%d batch=%d check=%d q_quant_ms=%.6f k_pack_ms=%.6f kq_ms=%.6f ref_ms=%.6f err_ms=%.6f zero_ms=%.6f total_ms=%.6f\n",
+            __func__, timing_call, nq, nk, n_heads_q, n_heads_k, batch, check ? 1 : 0,
+            q_quant_ms, k_pack_ms, kq_ms, ref_ms, err_ms, zero_ms, total_ms);
+        ggml_cuda_q8k_dot4_kq_event_destroy(ev_start);
+        ggml_cuda_q8k_dot4_kq_event_destroy(ev_q_quant);
+        ggml_cuda_q8k_dot4_kq_event_destroy(ev_k_pack);
+        ggml_cuda_q8k_dot4_kq_event_destroy(ev_kq);
+        ggml_cuda_q8k_dot4_kq_event_destroy(ev_ref);
+        ggml_cuda_q8k_dot4_kq_event_destroy(ev_err);
+        ggml_cuda_q8k_dot4_kq_event_destroy(ev_zero);
+    }
 
     const char * log_env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_KQ_LOG");
     if (log_env && atoi(log_env) != 0) {
