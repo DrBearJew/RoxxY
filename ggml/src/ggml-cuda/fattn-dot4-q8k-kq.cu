@@ -68,6 +68,38 @@ static __device__ __forceinline__ int ggml_cuda_q8k_dot4_4chain(
     return acc;
 }
 
+static __device__ __forceinline__ float ggml_cuda_q8k_dot4_kq_dot_block(
+        const int   * __restrict__ q_payload,
+        const float * __restrict__ q_scales,
+        const int   * __restrict__ k_payload,
+        const half  * __restrict__ k_scales,
+        float       * __restrict__ kq_sums,
+        int buf) {
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    float partial = 0.0f;
+
+    if (tid < 32) {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int idx = lane + i * 32;
+            const int qb = idx / (QK8_0 / 4);
+            const int acc = ggml_cuda_q8k_dot4_i8_i8(q_payload[idx], k_payload[idx], 0);
+            partial += float(acc) * q_scales[qb] * __half2float(k_scales[qb]);
+        }
+
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            partial += __shfl_down(partial, offset, 32);
+        }
+        if (lane == 0) {
+            kq_sums[buf] = partial;
+        }
+    }
+    __syncthreads();
+    return kq_sums[buf];
+}
+
 static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_quant_q_packed16_kernel(
         const float * __restrict__ Q,
         int         * __restrict__ q_payload,
@@ -341,8 +373,11 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_fused_online
     const int q_row = blockIdx.x;
     const int hq = blockIdx.y;
     const int b = blockIdx.z;
-    const int lane = tid & 31;
-    __shared__ float kq_shared;
+    __shared__ float kq_sums[2];
+    __shared__ float row_max_shared;
+    __shared__ float denom_shared;
+    __shared__ float old_scale_shared;
+    __shared__ float p_shared;
     if (q_row >= nq || hq >= n_heads_q || b >= batch) {
         return;
     }
@@ -353,42 +388,32 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_fused_online
     const float * q_row_scales = q_scales + q_base * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS;
     const char * v_head = V + int64_t(b) * nb23 + int64_t(hk) * nb22;
 
-    float row_max = -FLT_MAX;
-    float denom = 0.0f;
+    if (tid == 0) {
+        row_max_shared = -FLT_MAX;
+        denom_shared = 0.0f;
+    }
+    __syncthreads();
+
     float out = 0.0f;
     for (int k = 0; k < nk; ++k) {
         const size_t k_base = ((size_t(b) * n_heads_k + hk) * (size_t)nk + k);
         const int * k_row_payload = k_payload + k_base * (GGML_CUDA_Q8K_DOT4_KQ_D / 4);
         const half * k_row_scales = k_scales + k_base * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS;
 
-        float sum = 0.0f;
-        if (tid < QK8_0 / 4) {
-#pragma unroll
-            for (int qb = 0; qb < GGML_CUDA_Q8K_DOT4_KQ_BLOCKS; ++qb) {
-                const int idx = qb * (QK8_0 / 4) + lane;
-                const int acc = ggml_cuda_q8k_dot4_i8_i8(q_row_payload[idx], k_row_payload[idx], 0);
-                sum += float(acc) * q_row_scales[qb] * __half2float(k_row_scales[qb]);
-            }
-        }
-#pragma unroll
-        for (int offset = 4; offset > 0; offset >>= 1) {
-            sum += __shfl_xor(sum, offset, 32);
-        }
+        const float kq = ggml_cuda_q8k_dot4_kq_dot_block(
+            q_row_payload, q_row_scales, k_row_payload, k_row_scales, kq_sums, k & 1);
         if (tid == 0) {
-            kq_shared = sum * scale + ggml_cuda_q8k_dot4_mask_value(mask, nb30, nb31, nb33, ne33, q_row, k, b);
+            const float s = kq * scale + ggml_cuda_q8k_dot4_mask_value(mask, nb30, nb31, nb33, ne33, q_row, k, b);
+            const float next_max = fmaxf(row_max_shared, s);
+            old_scale_shared = denom_shared > 0.0f ? expf(row_max_shared - next_max) : 0.0f;
+            p_shared = expf(s - next_max);
+            denom_shared = denom_shared * old_scale_shared + p_shared;
+            row_max_shared = next_max;
         }
         __syncthreads();
-
-        const float s = kq_shared;
-        const float next_max = fmaxf(row_max, s);
-        const float old_scale = denom > 0.0f ? expf(row_max - next_max) : 0.0f;
-        const float p = expf(s - next_max);
-        out = out * old_scale + p * ggml_cuda_q8k_dot4_dequant_q4_0(v_head + int64_t(k) * nb21, nb20, tid);
-        denom = denom * old_scale + p;
-        row_max = next_max;
-        __syncthreads();
+        out = out * old_scale_shared + p_shared * ggml_cuda_q8k_dot4_dequant_q4_0(v_head + int64_t(k) * nb21, nb20, tid);
     }
-    dst[((size_t(b) * nq + q_row) * (size_t)n_heads_q + hq) * GGML_CUDA_Q8K_DOT4_KQ_D + tid] = out / denom;
+    dst[((size_t(b) * nq + q_row) * (size_t)n_heads_q + hq) * GGML_CUDA_Q8K_DOT4_KQ_D + tid] = out / denom_shared;
     GGML_UNUSED(n_heads_k);
 }
 
