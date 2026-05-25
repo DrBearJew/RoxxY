@@ -7,6 +7,7 @@
 #include "fattn-wmma-f16.cuh"
 #include "fattn-wmma-q8q4-i8.cuh"
 #include "fattn-dot4-q8q4.cuh"
+#include "fattn-dot4-q8k-kq.cuh"
 void ggml_cuda_flash_attn_ext_wmma_tbq4(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_flash_attn_ext_wmma_compressed_kv(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 #include "cpy-planar-iso.cuh"
@@ -363,6 +364,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_Q8Q4_DOT4_PREFILL = 580, // experimental ROCm packed-dot4 i8 QK inside FA
     BEST_FATTN_KERNEL_Q8TBQ4_DOT4_PREFILL = 581, // experimental ROCm packed-dot4 i8 QK + TBQ4 V
     BEST_FATTN_KERNEL_TBQ4_DOT4_PREFILL = 582, // experimental ROCm TBQ4 packed-dot4 QK inside FA
+    BEST_FATTN_KERNEL_Q8K_DOT4_KQ = 583, // experimental ROCm KQ-only packed16 DOT4 probe
 };
 
 static const char * ggml_cuda_fattn_kernel_name(const best_fattn_kernel kernel) {
@@ -379,6 +381,7 @@ static const char * ggml_cuda_fattn_kernel_name(const best_fattn_kernel kernel) 
         case BEST_FATTN_KERNEL_Q8Q4_DOT4_PREFILL:  return "q8q4_dot4_prefill";
         case BEST_FATTN_KERNEL_Q8TBQ4_DOT4_PREFILL:return "q8tbq4_dot4_prefill";
         case BEST_FATTN_KERNEL_TBQ4_DOT4_PREFILL:  return "tbq4_dot4_prefill";
+        case BEST_FATTN_KERNEL_Q8K_DOT4_KQ:        return "rocm_q8k_dot4_kq";
     }
     return "unknown";
 }
@@ -402,9 +405,11 @@ static bool ggml_cuda_fattn_route_contract_matches(const char * required, const 
             kernel == BEST_FATTN_KERNEL_Q8Q4_WMMA_I8) {
         return true;
     }
-    if ((strcmp(required, "rocm_q8k_dot4_kq") == 0 || strcmp(required, "q8q4_dot4_prefill") == 0 ||
-         strcmp(required, "rocm_q8q4_dot4") == 0 || strcmp(required, "q8q4_dot4") == 0) &&
-            kernel == BEST_FATTN_KERNEL_Q8Q4_DOT4_PREFILL) {
+    if (strcmp(required, "rocm_q8k_dot4_kq") == 0 && kernel == BEST_FATTN_KERNEL_Q8K_DOT4_KQ) {
+        return true;
+    }
+    if ((strcmp(required, "q8q4_dot4_prefill") == 0 || strcmp(required, "rocm_q8q4_dot4") == 0 ||
+         strcmp(required, "q8q4_dot4") == 0) && kernel == BEST_FATTN_KERNEL_Q8Q4_DOT4_PREFILL) {
         return true;
     }
     if ((strcmp(required, "q8tbq4_dot4_prefill") == 0 || strcmp(required, "rocm_q8_tbq4_dot4") == 0 ||
@@ -513,8 +518,10 @@ static bool ggml_cuda_fattn_route_contract_applicable(
         return false;
     }
 
-    if (strcmp(required, "rocm_q8k_dot4_kq") == 0 ||
-            strcmp(required, "q8q4_dot4_prefill") == 0 ||
+    if (strcmp(required, "rocm_q8k_dot4_kq") == 0) {
+        return K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0 && ggml_cuda_q8k_dot4_kq_enabled();
+    }
+    if (strcmp(required, "q8q4_dot4_prefill") == 0 ||
             strcmp(required, "rocm_q8q4_dot4") == 0 ||
             strcmp(required, "q8q4_dot4") == 0 ||
             strcmp(required, "q8q4_wmma_i8") == 0 ||
@@ -1116,6 +1123,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                     (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3]);
         }
 
+        if (!require_f16_route && ggml_cuda_q8k_dot4_kq_supported(cc, dst)) {
+            return return_quantized_route(BEST_FATTN_KERNEL_Q8K_DOT4_KQ);
+        }
+
         if (!require_f16_route && ggml_cuda_q8q4_dot4_prefill_supported(cc, dst)) {
             return return_quantized_route(BEST_FATTN_KERNEL_Q8Q4_DOT4_PREFILL);
         }
@@ -1393,6 +1404,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_TBQ4_DOT4_PREFILL:
             ggml_cuda_flash_attn_ext_tbq4_dot4_prefill(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_Q8K_DOT4_KQ:
+            ggml_cuda_flash_attn_ext_q8k_dot4_kq(ctx, dst);
             break;
     }
 }

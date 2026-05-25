@@ -1,0 +1,315 @@
+#include "fattn-dot4-q8k-kq.cuh"
+
+#include <cstdlib>
+
+#ifdef GGML_USE_HIP
+
+static constexpr int GGML_CUDA_Q8K_DOT4_KQ_D = 256;
+static constexpr int GGML_CUDA_Q8K_DOT4_KQ_BLOCKS = GGML_CUDA_Q8K_DOT4_KQ_D / QK8_0;
+static constexpr int GGML_CUDA_Q8K_DOT4_KQ_PACKED16_PER_ROW = GGML_CUDA_Q8K_DOT4_KQ_D / 16;
+static constexpr int GGML_CUDA_Q8K_DOT4_KQ_TILE_M = 8;
+static constexpr int GGML_CUDA_Q8K_DOT4_KQ_TILE_N = 16;
+
+static __device__ __forceinline__ int ggml_cuda_q8k_dot4_i8_i8(const int a, const int b, const int c) {
+#if defined(RDNA3) || defined(RDNA4)
+    return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
+#else
+    return ggml_cuda_dp4a(a, b, c);
+#endif
+}
+
+static __device__ __forceinline__ int ggml_cuda_q8k_dot4_load_i32_unaligned(const char * p) {
+    int v;
+    memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+static __device__ __forceinline__ half ggml_cuda_q8k_dot4_load_half_unaligned(const char * p) {
+    half v;
+    memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+static __device__ __forceinline__ int ggml_cuda_q8k_dot4_4chain(
+        const int * __restrict__ q_payload,
+        const int * __restrict__ k_payload,
+        int idx) {
+    int acc = 0;
+    acc = ggml_cuda_q8k_dot4_i8_i8(q_payload[idx + 0], k_payload[idx + 0], acc);
+    acc = ggml_cuda_q8k_dot4_i8_i8(q_payload[idx + 1], k_payload[idx + 1], acc);
+    acc = ggml_cuda_q8k_dot4_i8_i8(q_payload[idx + 2], k_payload[idx + 2], acc);
+    acc = ggml_cuda_q8k_dot4_i8_i8(q_payload[idx + 3], k_payload[idx + 3], acc);
+    return acc;
+}
+
+static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_quant_q_packed16_kernel(
+        const float * __restrict__ Q,
+        int         * __restrict__ q_payload,
+        float       * __restrict__ q_scales,
+        int64_t nb01,
+        int64_t nb02,
+        int64_t nb03,
+        int nq,
+        int n_heads_q,
+        int batch) {
+    const int tid = threadIdx.x;
+    const int q = blockIdx.x;
+    const int hq = blockIdx.y;
+    const int b = blockIdx.z;
+    const int q_block = tid >> 5;
+    const int lane = tid & 31;
+    if (q >= nq || hq >= n_heads_q || b >= batch || q_block >= GGML_CUDA_Q8K_DOT4_KQ_BLOCKS) {
+        return;
+    }
+
+    const float * q_ptr = (const float *) ((const char *) Q + int64_t(b) * nb03 + int64_t(hq) * nb02 + int64_t(q) * nb01);
+    const int d = q_block * QK8_0 + lane;
+    const float x = q_ptr[d];
+    float amax = fabsf(x);
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        amax = fmaxf(amax, __shfl_xor(amax, mask, 32));
+    }
+    const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+    const int qi = max(-128, min(127, int(lrintf(x / scale))));
+
+    const size_t row = ((size_t(b) * n_heads_q + hq) * (size_t)nq + q);
+    ((int8_t *)(q_payload + row * (GGML_CUDA_Q8K_DOT4_KQ_D / 4)))[d] = (int8_t) qi;
+    if (lane == 0) {
+        q_scales[row * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS + q_block] = scale;
+    }
+}
+
+static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_pack_k_packed16_kernel(
+        const char * __restrict__ K,
+        int        * __restrict__ k_payload,
+        half       * __restrict__ k_scales,
+        int64_t nb10,
+        int64_t nb11,
+        int64_t nb12,
+        int64_t nb13,
+        int nk,
+        int n_heads_k,
+        int batch) {
+    const int linear = int(blockIdx.x) * int(blockDim.x) + int(threadIdx.x);
+    const int total = batch * n_heads_k * nk * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS;
+    if (linear >= total) {
+        return;
+    }
+
+    const int qblk = linear % GGML_CUDA_Q8K_DOT4_KQ_BLOCKS;
+    const int t = linear / GGML_CUDA_Q8K_DOT4_KQ_BLOCKS;
+    const int k = t % nk;
+    const int hk_b = t / nk;
+    const int hk = hk_b % n_heads_k;
+    const int b = hk_b / n_heads_k;
+    const char * src = K + int64_t(b) * nb13 + int64_t(hk) * nb12 + int64_t(k) * nb11 + int64_t(qblk) * nb10;
+    int * dst = k_payload + (size_t(t) * (GGML_CUDA_Q8K_DOT4_KQ_D / 4) + qblk * (QK8_0 / 4));
+
+    k_scales[size_t(t) * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS + qblk] = ggml_cuda_q8k_dot4_load_half_unaligned(src);
+#pragma unroll
+    for (int i = 0; i < QK8_0 / 4; ++i) {
+        dst[i] = ggml_cuda_q8k_dot4_load_i32_unaligned(src + sizeof(half) + 4 * i);
+    }
+}
+
+static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_kq_kernel(
+        const int   * __restrict__ q_payload,
+        const float * __restrict__ q_scales,
+        const int   * __restrict__ k_payload,
+        const half  * __restrict__ k_scales,
+        float       * __restrict__ logits,
+        float scale,
+        int nq,
+        int nk,
+        int n_heads_q,
+        int n_heads_k,
+        int gqa_ratio,
+        int batch) {
+    const int tid = threadIdx.x;
+    const int q_row = blockIdx.y * GGML_CUDA_Q8K_DOT4_KQ_TILE_M + (tid >> 5);
+    const int k_row = blockIdx.x * GGML_CUDA_Q8K_DOT4_KQ_TILE_N + (tid & 15);
+    const int half_tile = (tid >> 4) & 1;
+    const int hq = blockIdx.z % n_heads_q;
+    const int b = blockIdx.z / n_heads_q;
+    if (q_row >= nq || k_row >= nk || b >= batch) {
+        return;
+    }
+    const int hk = hq / gqa_ratio;
+
+    const size_t q_base = ((size_t(b) * n_heads_q + hq) * (size_t)nq + q_row);
+    const size_t k_base = ((size_t(b) * n_heads_k + hk) * (size_t)nk + k_row);
+    const int * q_row_payload = q_payload + q_base * (GGML_CUDA_Q8K_DOT4_KQ_D / 4);
+    const int * k_row_payload = k_payload + k_base * (GGML_CUDA_Q8K_DOT4_KQ_D / 4);
+    const float * q_row_scales = q_scales + q_base * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS;
+    const half * k_row_scales = k_scales + k_base * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS;
+
+    float sum = 0.0f;
+#pragma unroll
+    for (int qb = 0; qb < GGML_CUDA_Q8K_DOT4_KQ_BLOCKS; ++qb) {
+        const int idx = qb * (QK8_0 / 4) + half_tile * 4;
+        const int acc = ggml_cuda_q8k_dot4_4chain(q_row_payload, k_row_payload, idx);
+        sum += float(acc) * q_row_scales[qb] * __half2float(k_row_scales[qb]);
+    }
+    sum += __shfl_xor(sum, 16, 32);
+    if (half_tile == 0) {
+        logits[((size_t(b) * n_heads_q + hq) * (size_t)nq + q_row) * (size_t)nk + k_row] = sum * scale;
+    }
+    GGML_UNUSED(n_heads_k);
+}
+
+static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_kq_reference_kernel(
+        const float * __restrict__ Q,
+        const char  * __restrict__ K,
+        float       * __restrict__ logits,
+        float scale,
+        int64_t nb01,
+        int64_t nb02,
+        int64_t nb03,
+        int64_t nb10,
+        int64_t nb11,
+        int64_t nb12,
+        int64_t nb13,
+        int nq,
+        int nk,
+        int n_heads_q,
+        int n_heads_k,
+        int gqa_ratio,
+        int batch) {
+    const int tid = threadIdx.x;
+    const int q_row = blockIdx.y * GGML_CUDA_Q8K_DOT4_KQ_TILE_M + (tid >> 5);
+    const int k_row = blockIdx.x * GGML_CUDA_Q8K_DOT4_KQ_TILE_N + (tid & 15);
+    const int hq = blockIdx.z % n_heads_q;
+    const int b = blockIdx.z / n_heads_q;
+    if (q_row >= nq || k_row >= nk || b >= batch) {
+        return;
+    }
+    const int hk = hq / gqa_ratio;
+    const float * q_ptr = (const float *) ((const char *) Q + int64_t(b) * nb03 + int64_t(hq) * nb02 + int64_t(q_row) * nb01);
+
+    float sum = 0.0f;
+#pragma unroll
+    for (int qb = 0; qb < GGML_CUDA_Q8K_DOT4_KQ_BLOCKS; ++qb) {
+        const char * k_blk = K + int64_t(b) * nb13 + int64_t(hk) * nb12 + int64_t(k_row) * nb11 + int64_t(qb) * nb10;
+        const half ks_h = ggml_cuda_q8k_dot4_load_half_unaligned(k_blk);
+        const float ks = __half2float(ks_h);
+#pragma unroll
+        for (int lane = 0; lane < QK8_0; ++lane) {
+            const int8_t kval = *(const int8_t *) (k_blk + sizeof(half) + lane);
+            sum += q_ptr[qb * QK8_0 + lane] * float(kval) * ks;
+        }
+    }
+    logits[((size_t(b) * n_heads_q + hq) * (size_t)nq + q_row) * (size_t)nk + k_row] = sum * scale;
+    GGML_UNUSED(n_heads_k);
+}
+
+static __global__ void ggml_cuda_q8k_dot4_kq_error_kernel(
+        const float * __restrict__ candidate,
+        const float * __restrict__ reference,
+        float       * __restrict__ metrics,
+        size_t n) {
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const float diff = fabsf(candidate[i] - reference[i]);
+    atomicAdd(metrics + 0, diff * diff);
+    atomicAdd(metrics + 1, diff);
+    atomicAdd(metrics + 2, diff > 0.5f ? 1.0f : 0.0f);
+}
+
+void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_tensor * Q = dst->src[0];
+    ggml_tensor * K = dst->src[1];
+    ggml_tensor * V = dst->src[2];
+
+    const int nq = (int) Q->ne[1];
+    const int nk = (int) K->ne[1];
+    const int n_heads_q = (int) Q->ne[2];
+    const int n_heads_k = (int) K->ne[2];
+    const int batch = (int) Q->ne[3];
+    const int gqa_ratio = n_heads_q / n_heads_k;
+
+    ggml_cuda_pool & pool = ctx.pool();
+    ggml_cuda_pool_alloc<int>   q_payload(pool);
+    ggml_cuda_pool_alloc<float> q_scales(pool);
+    ggml_cuda_pool_alloc<int>   k_payload(pool);
+    ggml_cuda_pool_alloc<half>  k_scales(pool);
+    ggml_cuda_pool_alloc<float> logits(pool);
+    ggml_cuda_pool_alloc<float> ref_logits(pool);
+    ggml_cuda_pool_alloc<float> metrics(pool);
+
+    const size_t q_rows = (size_t) batch * n_heads_q * nq;
+    const size_t k_rows = (size_t) batch * n_heads_k * nk;
+    const size_t logits_ne = (size_t) batch * n_heads_q * nq * nk;
+    q_payload.alloc(q_rows * (GGML_CUDA_Q8K_DOT4_KQ_D / 4));
+    q_scales.alloc(q_rows * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS);
+    k_payload.alloc(k_rows * (GGML_CUDA_Q8K_DOT4_KQ_D / 4));
+    k_scales.alloc(k_rows * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS);
+    logits.alloc(logits_ne);
+
+    cudaStream_t stream = ctx.stream();
+    dim3 q_grid(nq, n_heads_q, batch);
+    dim3 block(256);
+    ggml_cuda_q8k_dot4_quant_q_packed16_kernel<<<q_grid, block, 0, stream>>>(
+        (const float *) Q->data, q_payload.ptr, q_scales.ptr,
+        Q->nb[1], Q->nb[2], Q->nb[3], nq, n_heads_q, batch);
+    CUDA_CHECK(cudaGetLastError());
+
+    dim3 pack_grid((k_rows * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS + 255) / 256);
+    ggml_cuda_q8k_dot4_pack_k_packed16_kernel<<<pack_grid, block, 0, stream>>>(
+        (const char *) K->data, k_payload.ptr, k_scales.ptr,
+        K->nb[0], K->nb[1], K->nb[2], K->nb[3], nk, n_heads_k, batch);
+    CUDA_CHECK(cudaGetLastError());
+
+    float scale = 1.0f;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+    dim3 kq_grid((nk + GGML_CUDA_Q8K_DOT4_KQ_TILE_N - 1) / GGML_CUDA_Q8K_DOT4_KQ_TILE_N,
+                 (nq + GGML_CUDA_Q8K_DOT4_KQ_TILE_M - 1) / GGML_CUDA_Q8K_DOT4_KQ_TILE_M,
+                 n_heads_q * batch);
+    ggml_cuda_q8k_dot4_kq_kernel<<<kq_grid, block, 0, stream>>>(
+        q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, logits.ptr, scale,
+        nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch);
+    CUDA_CHECK(cudaGetLastError());
+
+    const char * check_env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_KQ_CHECK");
+    const bool check = check_env && atoi(check_env) != 0;
+    if (check) {
+        ref_logits.alloc(logits_ne);
+        metrics.alloc(3);
+        CUDA_CHECK(cudaMemsetAsync(metrics.ptr, 0, 3 * sizeof(float), stream));
+        ggml_cuda_q8k_dot4_kq_reference_kernel<<<kq_grid, block, 0, stream>>>(
+            (const float *) Q->data, (const char *) K->data, ref_logits.ptr, scale,
+            Q->nb[1], Q->nb[2], Q->nb[3], K->nb[0], K->nb[1], K->nb[2], K->nb[3],
+            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch);
+        CUDA_CHECK(cudaGetLastError());
+        ggml_cuda_q8k_dot4_kq_error_kernel<<<(logits_ne + 255) / 256, 256, 0, stream>>>(
+            logits.ptr, ref_logits.ptr, metrics.ptr, logits_ne);
+        CUDA_CHECK(cudaGetLastError());
+        float h_metrics[3] = {0.0f, 0.0f, 0.0f};
+        CUDA_CHECK(cudaMemcpyAsync(h_metrics, metrics.ptr, 3 * sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        const double rms = sqrt(double(h_metrics[0]) / double(logits_ne));
+        const double mean_abs = double(h_metrics[1]) / double(logits_ne);
+        GGML_LOG_INFO("%s: q8k_dot4_kq_check logits=%zu rms=%.6g mean_abs=%.6g gt0.5=%.0f\n",
+            __func__, logits_ne, rms, mean_abs, double(h_metrics[2]));
+    }
+
+    // KQ-only probe: deliberately leave FA output unchanged/zeroed so this route
+    // cannot masquerade as production attention. It exists to validate runtime
+    // packed-DOT4 KQ layout, route contracts, and ISA only.
+    CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
+
+    const char * log_env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_KQ_LOG");
+    if (log_env && atoi(log_env) != 0) {
+        const double q_mib = double(q_rows * GGML_CUDA_Q8K_DOT4_KQ_D) / (1024.0 * 1024.0);
+        const double k_mib = double(k_rows * GGML_CUDA_Q8K_DOT4_KQ_D) / (1024.0 * 1024.0);
+        const double logits_mib = double(logits_ne * sizeof(float)) / (1024.0 * 1024.0);
+        GGML_LOG_INFO("%s: route=rocm_q8k_dot4_kq nq=%d nk=%d heads_q=%d heads_k=%d batch=%d q_payload=%.3fMiB k_payload=%.3fMiB logits=%.3fMiB note=kq_only_zero_output\n",
+            __func__, nq, nk, n_heads_q, n_heads_k, batch, q_mib, k_mib, logits_mib);
+    }
+
+    GGML_UNUSED(V);
+}
+
+#endif // GGML_USE_HIP
