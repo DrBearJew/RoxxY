@@ -369,6 +369,38 @@ static __device__ __forceinline__ float ggml_cuda_q8q4_dot4_kq_dot(
     return sum;
 }
 
+static __device__ __forceinline__ float ggml_cuda_q8q4_dot4_kq_dot_block(
+        const int   * __restrict__ q_row_i32,
+        const float * __restrict__ q_row_scales,
+        const int   * __restrict__ k_row_i32,
+        const half  * __restrict__ k_row_scales,
+        float       * __restrict__ kq_sums,
+        int buf) {
+    const int tid  = threadIdx.x;
+    const int lane = tid & 31;
+    float partial = 0.0f;
+
+    if (tid < 32) {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int idx = lane + i * 32;
+            const int qb = idx / GGML_CUDA_Q8Q4_DOT4_DOT4_PER_BLOCK;
+            const int acc = ggml_cuda_q8q4_dot4_i8_i8(q_row_i32[idx], k_row_i32[idx], 0);
+            partial += float(acc) * q_row_scales[qb] * __half2float(k_row_scales[qb]);
+        }
+
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            partial += __shfl_down(partial, offset, 32);
+        }
+        if (lane == 0) {
+            kq_sums[buf] = partial;
+        }
+    }
+    __syncthreads();
+    return kq_sums[buf];
+}
+
 static __device__ __forceinline__ float ggml_cuda_q8q4_dot4_dequant_q4_0(
         const char * __restrict__ V,
         int64_t nb20,
@@ -544,6 +576,7 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8q4_dot4_fattn_kerne
     const int * q_row_i32 = q_i32 + q_base * (GGML_CUDA_Q8Q4_DOT4_D / 4);
     const float * q_row_scales = q_scales + q_base * GGML_CUDA_Q8Q4_DOT4_BLOCKS;
     const char * v_head = V + int64_t(b) * nb23 + int64_t(hk) * nb22;
+    __shared__ float kq_sums[2];
 
     float row_max = -FLT_MAX;
     float denom = 0.0f;
@@ -552,7 +585,7 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8q4_dot4_fattn_kerne
         const size_t k_base = ((size_t(b) * n_heads_k + hk) * (size_t)nk + k);
         const int * k_row_i32 = k_i32 + k_base * (GGML_CUDA_Q8Q4_DOT4_D / 4);
         const half * k_row_scales = k_scales + k_base * GGML_CUDA_Q8Q4_DOT4_BLOCKS;
-        const float s = ggml_cuda_q8q4_dot4_kq_dot(q_row_i32, q_row_scales, k_row_i32, k_row_scales) * scale +
+        const float s = ggml_cuda_q8q4_dot4_kq_dot_block(q_row_i32, q_row_scales, k_row_i32, k_row_scales, kq_sums, k & 1) * scale +
             ggml_cuda_q8q4_dot4_mask_value(mask, nb30, nb31, nb33, ne33, q_row, k, b);
         const float next_max = fmaxf(row_max, s);
         const float old_scale = denom > 0.0f ? expf(row_max - next_max) : 0.0f;
@@ -678,6 +711,7 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8tbq4_dot4_fattn_ker
     const int * q_row_i32 = q_i32 + q_base * (GGML_CUDA_Q8Q4_DOT4_D / 4);
     const float * q_row_scales = q_scales + q_base * GGML_CUDA_Q8Q4_DOT4_BLOCKS;
     const char * v_head = V + int64_t(b) * nb23 + int64_t(hk) * nb22;
+    __shared__ float kq_sums[2];
 
     float row_max = -FLT_MAX;
     float denom = 0.0f;
@@ -686,7 +720,7 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8tbq4_dot4_fattn_ker
         const size_t k_base = ((size_t(b) * n_heads_k + hk) * (size_t)nk + k);
         const int * k_row_i32 = k_i32 + k_base * (GGML_CUDA_Q8Q4_DOT4_D / 4);
         const half * k_row_scales = k_scales + k_base * GGML_CUDA_Q8Q4_DOT4_BLOCKS;
-        const float s = ggml_cuda_q8q4_dot4_kq_dot(q_row_i32, q_row_scales, k_row_i32, k_row_scales) * scale +
+        const float s = ggml_cuda_q8q4_dot4_kq_dot_block(q_row_i32, q_row_scales, k_row_i32, k_row_scales, kq_sums, k & 1) * scale +
             ggml_cuda_q8q4_dot4_mask_value(mask, nb30, nb31, nb33, ne33, q_row, k, b);
         const float next_max = fmaxf(row_max, s);
         const float old_scale = denom > 0.0f ? expf(row_max - next_max) : 0.0f;
