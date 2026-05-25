@@ -70,6 +70,8 @@ static bool has_content_or_tool_calls(const common_chat_msg & msg) {
     return !msg.content.empty() || !msg.tool_calls.empty();
 }
 
+static std::string common_chat_templates_generation_prompt(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
+
 std::string common_chat_msg::render_content(const std::string & delimiter) const {
     if (!content.empty() && !content_parts.empty()) {
         throw std::runtime_error("Cannot specify both content and content_parts");
@@ -1022,7 +1024,7 @@ static common_chat_params common_chat_params_init_gpt_oss(const common_chat_temp
     }
 
     data.prompt            = prompt;
-    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs, /* messages_override= */ adjusted_messages);
+    data.generation_prompt = common_chat_templates_generation_prompt(tmpl, inputs);
     data.message_spans = common_chat_split_by_role(prompt, {
         { "assistant", "<|start|>assistant" },
         { "user",      "<|start|>user"      },
