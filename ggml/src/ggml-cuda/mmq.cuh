@@ -133,14 +133,35 @@ static bool ggml_cuda_mmq_x_max_auto_env() {
     return env_auto;
 }
 
-static int get_mmq_x_max_host(const int cc) {
-    const int native_max = (turing_mma_available(cc) || amd_wmma_available(cc)) ? 128 :
+static bool ggml_cuda_mmq_route_log_env() {
+    static const bool log = []() {
+        const char * env = getenv("GGML_CUDA_MMQ_ROUTE_LOG");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return log;
+}
+
+static int get_mmq_x_native_max_host(const int cc) {
+    return (turing_mma_available(cc) || amd_wmma_available(cc)) ? 128 :
         GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA ?
 #ifdef GGML_CUDA_FORCE_MMQ
             128                     : 64;
 #else
             MMQ_DP4A_MAX_BATCH_SIZE : 64;
 #endif // GGML_CUDA_FORCE_MMQ
+}
+
+static int get_mmq_x_max_capped_host(const int native_max, const int cap) {
+    if (cap == 0 || cap >= native_max) {
+        return native_max;
+    }
+
+    const int capped = 8 * (cap / 8) < 8 ? 8 : 8 * (cap / 8);
+    return capped < native_max ? capped : native_max;
+}
+
+static int get_mmq_x_max_host(const int cc) {
+    const int native_max = get_mmq_x_native_max_host(cc);
 
     int env_cap = ggml_cuda_mmq_x_max_env();
     if (env_cap == 0 && ggml_cuda_mmq_x_max_auto_env() && GGML_CUDA_CC_IS_RDNA3_0(cc)) {
@@ -149,12 +170,8 @@ static int get_mmq_x_max_host(const int cc) {
         // GGML_CUDA_MMQ_MAX_X always takes precedence over this opt-in helper.
         env_cap = 48;
     }
-    if (env_cap == 0 || env_cap >= native_max) {
-        return native_max;
-    }
 
-    const int capped = 8 * (env_cap / 8) < 8 ? 8 : 8 * (env_cap / 8);
-    return capped < native_max ? capped : native_max;
+    return get_mmq_x_max_capped_host(native_max, env_cap);
 }
 
 static constexpr __device__ int get_mmq_x_max_device() {
@@ -3722,7 +3739,8 @@ static __global__ void mul_mat_q(
                     break;
                 }
 
-                ids_dst_shared[j] = ids_dst[col_low + jt*mmq_x + j];
+                const int col = jt*mmq_x + j;
+                ids_dst_shared[j] = col < col_diff ? ids_dst[col_low + col] : 0;
             }
             __syncthreads();
         }
@@ -3802,7 +3820,8 @@ static __global__ void mul_mat_q(
                     break;
                 }
 
-                ids_dst_shared[j] = ids_dst[col_low + jt*mmq_x + j];
+                const int col = jt*mmq_x + j;
+                ids_dst_shared[j] = col < col_diff ? ids_dst[col_low + col] : 0;
             }
             __syncthreads();
         }
@@ -4004,7 +4023,8 @@ static __global__ void mul_mat_q_stream_k_fixup(
     const int col_diff = col_high - col_low;
 
     for (int j = threadIdx.y*warp_size + threadIdx.x; j < mmq_x; j += nwarps*warp_size) {
-        ids_dst_shared[j] = ids_dst[col_low + jt*mmq_x + j];
+        const int col = jt*mmq_x + j;
+        ids_dst_shared[j] = col < col_diff ? ids_dst[col_low + col] : 0;
     }
     __syncthreads();
 
@@ -4036,6 +4056,64 @@ struct mmq_args {
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     bool use_stream_k; int64_t ncols_max;
 };
+
+static int get_mmq_x_max_host(const int cc, const ggml_type type, const mmq_args & args) {
+    const int native_max = get_mmq_x_native_max_host(cc);
+    int cap = 0;
+    const char * reason = "native";
+
+    const int env_cap = ggml_cuda_mmq_x_max_env();
+    if (env_cap != 0) {
+        cap = env_cap;
+        reason = "manual";
+    } else if (ggml_cuda_mmq_x_max_auto_env() && GGML_CUDA_CC_IS_RDNA3_0(cc)) {
+        const bool is_moe = args.ids_dst != nullptr;
+        if (is_moe) {
+            // gfx1100 MoE MUL_MAT_ID sweeps show q4_0/q8_0 decode-ish n<128 cases
+            // prefer native x128, while prefill-sized n>=128 cases prefer a lower cap.
+            if (args.ncols_max < 128 && (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0)) {
+                reason = "auto_moe_small_native";
+            } else {
+                switch (type) {
+                    case GGML_TYPE_Q4_K:
+                    case GGML_TYPE_Q6_K:
+                    case GGML_TYPE_IQ2_XS:
+                    case GGML_TYPE_IQ2_S:
+                        // K-quants and IQ2 were best with x32 around n=128/256 in the
+                        // corrected MUL_MAT_ID cap sweep. For larger batches x48 remains
+                        // the safer general cap until more shapes are covered.
+                        cap = args.ncols_max <= 256 ? 32 : 48;
+                        reason = args.ncols_max <= 256 ? "auto_moe_kquant_iq2_x32" : "auto_moe_kquant_iq2_x48";
+                        break;
+                    default:
+                        cap = 48;
+                        reason = "auto_moe_default_x48";
+                        break;
+                }
+            }
+        } else {
+            // Dense/non-MoE measurements on gfx1100 favored the native/default cap;
+            // keep the shape-aware auto policy scoped to MoE MUL_MAT_ID paths.
+            reason = "auto_nonmoe_native";
+        }
+    }
+
+    const int selected = get_mmq_x_max_capped_host(native_max, cap);
+    if (ggml_cuda_mmq_route_log_env()) {
+        static bool logged[GGML_TYPE_COUNT][2][3] = {};
+        const int type_i = type >= 0 && type < GGML_TYPE_COUNT ? type : GGML_TYPE_COUNT - 1;
+        const int moe_i = args.ids_dst != nullptr ? 1 : 0;
+        const int ncols_i = args.ncols_max < 128 ? 0 : (args.ncols_max <= 256 ? 1 : 2);
+        bool & did_log = logged[type_i][moe_i][ncols_i];
+        if (!did_log) {
+            did_log = true;
+            GGML_LOG_INFO("%s: type=%s cc=%d moe=%d ncols_max=%lld native=%d cap=%d selected=%d auto=%d reason=%s\n",
+                    __func__, ggml_type_name(type), cc, moe_i, (long long) args.ncols_max,
+                    native_max, cap, selected, ggml_cuda_mmq_x_max_auto_env() ? 1 : 0, reason);
+        }
+    }
+    return selected;
+}
 
 static bool mmq_use_rdna2_matmul_opt(const int cc) {
 #ifdef RDNA2_MATMUL_OPT_V1
@@ -4195,7 +4273,7 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
     const int nwarps    = mmq_get_nwarps_host(cc, warp_size);
 
-    const int mmq_x_max = get_mmq_x_max_host(cc);
+    const int mmq_x_max = get_mmq_x_max_host(cc, type, args);
     const int mmq_y = get_mmq_y_host(cc);
     // Keep the RDNA2/RDNA3 experimental fast path scoped to MoE compact/expert prefill-sized matmuls.
     // Dense MTP/base and decode/small-batch MoE still use MMQ when selected, but not the LDS double-buffer variant.

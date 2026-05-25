@@ -1,0 +1,14 @@
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 24560 MiB):
+  Device 0: Radeon RX 7900 XTX, gfx1100 (0x1100), VMM: no, Wave Size: 32, VRAM: 24560 MiB
+get_mmq_x_max_host: type=q4_0 cc=16781568 moe=1 ncols_max=64 native=128 cap=0 selected=128 auto=1 reason=auto_moe_small_native
+get_mmq_x_max_host: type=q8_0 cc=16781568 moe=1 ncols_max=64 native=128 cap=0 selected=128 auto=1 reason=auto_moe_small_native
+get_mmq_x_max_host: type=q4_K cc=16781568 moe=1 ncols_max=64 native=128 cap=32 selected=32 auto=1 reason=auto_moe_kquant_iq2_x32
+get_mmq_x_max_host: type=q6_K cc=16781568 moe=1 ncols_max=64 native=128 cap=32 selected=32 auto=1 reason=auto_moe_kquant_iq2_x32
+get_mmq_x_max_host: type=iq2_xs cc=16781568 moe=1 ncols_max=64 native=128 cap=32 selected=32 auto=1 reason=auto_moe_kquant_iq2_x32
+get_mmq_x_max_host: type=q4_0 cc=16781568 moe=1 ncols_max=128 native=128 cap=48 selected=48 auto=1 reason=auto_moe_default_x48
+get_mmq_x_max_host: type=q8_0 cc=16781568 moe=1 ncols_max=128 native=128 cap=48 selected=48 auto=1 reason=auto_moe_default_x48
+get_mmq_x_max_host: type=q4_K cc=16781568 moe=1 ncols_max=128 native=128 cap=32 selected=32 auto=1 reason=auto_moe_kquant_iq2_x32
+get_mmq_x_max_host: type=q6_K cc=16781568 moe=1 ncols_max=128 native=128 cap=32 selected=32 auto=1 reason=auto_moe_kquant_iq2_x32
+get_mmq_x_max_host: type=iq2_xs cc=16781568 moe=1 ncols_max=128 native=128 cap=32 selected=32 auto=1 reason=auto_moe_kquant_iq2_x32
+get_mmq_x_max_host: type=q6_K cc=16781568 moe=0 ncols_max=25 native=128 cap=0 selected=128 auto=1 reason=auto_nonmoe_native
+get_mmq_x_max_host: type=iq2_xs cc=16781568 moe=0 ncols_max=23 native=128 cap=0 selected=128 auto=1 reason=auto_nonmoe_native

@@ -31,7 +31,7 @@ stack.
 | ROCm no-TBQ KV | stable public path | `q8_0` K + `q4_0` V, no experimental env knobs |
 | 27B ROCm MTP | promoted local path | `q8_0` K + `tbq4_0` V, MTP n3, f16-temp prefill on |
 | 35B ROCm no-MTP | stable prompt path | `q8_0` K + `tbq4_0` V, MMQ selector on, no speculative MTP |
-| 35B ROCm MTP | experimental but usable | MTP n2 plus explicit f16-temp prefill |
+| 35B ROCm MTP | experimental but usable | MTP n3 plus explicit f16-temp prefill, no force-MMQ by default |
 | Vulkan | baseline / comparison | q8/q4 is restored; TBQ4 Vulkan parity is not claimed |
 
 Q4_K_M works for both 27B and 35B. Context length, MTP depth, KV format, and

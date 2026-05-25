@@ -1,0 +1,8 @@
+{
+  "prompt_tokens_approx": 5120,
+  "n_predict": 1,
+  "temperature": 0.0,
+  "top_k": 1,
+  "cache_prompt": true,
+  "seed": 2
+}
