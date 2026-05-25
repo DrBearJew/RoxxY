@@ -81,6 +81,56 @@ static inline bool ggml_cuda_tbq4_lds_route_d_k_enabled() {
 #endif
 }
 
+static inline bool ggml_cuda_q8k_dot4_packed16_vec_route_required() {
+#ifdef GGML_USE_HIP
+    const char * required = getenv("GGML_CUDA_FA_ROUTE_REQUIRE");
+    return required && strcmp(required, "rocm_q8k_dot4_packed16_vec") == 0;
+#else
+    return false;
+#endif
+}
+
+static inline bool ggml_cuda_q8k_dot4_packed16_vec_enabled() {
+#ifdef GGML_USE_HIP
+    const char * unsafe = getenv("GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE");
+    if (!unsafe) {
+        unsafe = getenv("GGML_CUDA_ROCM_UNSAFE_EXPERIMENTS");
+    }
+    const char * env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_VEC");
+    return unsafe && atoi(unsafe) != 0 && env && atoi(env) != 0 && ggml_cuda_q8k_dot4_packed16_vec_route_required();
+#else
+    return false;
+#endif
+}
+
+static inline bool ggml_cuda_q8k_dot4_packed16_vec_supported(const int cc, const ggml_tensor * dst) {
+#ifdef GGML_USE_HIP
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    if (!ggml_cuda_q8k_dot4_packed16_vec_enabled()) {
+        return false;
+    }
+    if (!GGML_CUDA_CC_IS_RDNA3(cc) || Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_Q8_0 ||
+            V->type != GGML_TYPE_Q4_0 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (Q->ne[0] != 256 || K->ne[0] != 256 || V->ne[0] != 256 || dst->ne[0] != 256 || Q->ne[1] <= 2) {
+        return false;
+    }
+    if (K->ne[1] < Q->ne[1] || Q->ne[2] % K->ne[2] != 0 || Q->ne[3] != K->ne[3]) {
+        return false;
+    }
+    if (V->ne[1] < K->ne[1] || V->ne[2] != K->ne[2] || V->ne[3] != Q->ne[3]) {
+        return false;
+    }
+    return true;
+#else
+    GGML_UNUSED(cc); GGML_UNUSED(dst);
+    return false;
+#endif
+}
+
 static constexpr int GGML_CUDA_TBQ4_LDS_D_K_PACKED_STAGES = 2;
 
 template <int D>
@@ -362,6 +412,41 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
         const float Q_d = Q_ds[k_KQ_0/nthreads].x;
 
         sum += vec_dot_q8_0_q8_1_impl<float, 1>(&v, &Q_q8[k_KQ_0/nthreads], K_q8_0[ib].d, Q_d);
+    }
+
+    return sum;
+}
+
+// q8_0 K dot product for the lab-only packed16 K shadow layout used by
+// rocm_q8k_dot4_packed16_vec. Each K row is laid out as 256 payload bytes
+// followed by D/QK8_0 half scales. This preserves the stable VEC FA scaffolding
+// while replacing ggml's 34B q8_0 block reads with contiguous payload + scales.
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0_packed16(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    static_assert(D == 256, "q8_0 packed16 K shadow is currently D256-only");
+    static_assert(D % QK8_0 == 0, "bad q8_0 packed16 D");
+    GGML_UNUSED(Q_v);
+
+    const int  * K_qs = (const int  *) K_c;
+    const half * K_ds = (const half *) (K_c + D);
+    const float2 * Q_ds = (const float2 *) Q_ds_v;
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        const int ib  = k_KQ / QI8_0;
+        const int iqs = k_KQ % QI8_0;
+
+        const int v = K_qs[ib*QI8_0 + iqs];
+        const float Q_d = Q_ds[k_KQ_0/nthreads].x;
+        const float K_d = __half2float(K_ds[ib]);
+
+        sum += vec_dot_q8_0_q8_1_impl<float, 1>(&v, &Q_q8[k_KQ_0/nthreads], K_d, Q_d);
     }
 
     return sum;
@@ -1437,7 +1522,8 @@ static ggml_cuda_rocm_quant_prefill_f16_policy ggml_cuda_fattn_rocm_quant_prefil
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE,
+    const char * K_data_override = nullptr, const size_t nb11_override = 0, const size_t nb12_override = 0, const size_t nb13_override = 0
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1478,12 +1564,20 @@ void launch_fattn(
     size_t nb12 = K->nb[2];
     size_t nb13 = K->nb[3];
 
+    if (K_data_override) {
+        GGML_ASSERT(!need_f16_K);
+        K_data = K_data_override;
+        nb11 = nb11_override;
+        nb12 = nb12_override;
+        nb13 = nb13_override;
+    }
+
     const char * V_data = (const char *) V->data;
     size_t nb21 = V->nb[1];
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
 
-    if (need_f16_K && K->type != GGML_TYPE_F16) {
+    if (!K_data_override && need_f16_K && K->type != GGML_TYPE_F16) {
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
 

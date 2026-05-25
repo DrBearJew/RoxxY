@@ -128,3 +128,38 @@ launch_fattn
 The packed-K shadow should be treated as a separate measured variable. q8_0's
 34B block layout is the known tax; the packed16 microbench shows why a persistent
 or cheap shadow layout is likely necessary.
+
+## First FA-scaffold splice
+
+Implemented after the standalone tile16 harness: `rocm_q8k_dot4_packed16_vec`.
+
+This route intentionally does **not** add another standalone full-FA kernel. It
+keeps the stable VEC `launch_fattn` path for softmax, PV, GQA reuse, parallel KV
+blocks, combine, KV_max, mask, sinks, and output layout. The only experimental
+change is a per-call q8_0-K shadow pack:
+
+```text
+q8_0 K 34B blocks -> [256 int8 payload bytes][8 half scales] per K row
+```
+
+The KQ dot function then reads this packed16 shadow while still using the normal
+q8_1 Q quantization used by the existing q8_0 VEC route.
+
+Required runtime gates:
+
+```bash
+GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE=1
+GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_VEC=1
+GGML_CUDA_FA_ROUTE_REQUIRE=rocm_q8k_dot4_packed16_vec
+```
+
+Initial validation:
+
+- build: `cmake --build build-rocm-rdna2-fa --target ggml-hip test-backend-ops -j4`
+- correctness/route: `test-backend-ops -b ROCm0 -o FLASH_ATTN_EXT` with D256
+  q8_0-K/q4_0-V prefill filters selected `rocm_q8k_dot4_packed16_vec` and passed
+  tested mask/sink/causal-tail/prompt-local variants.
+- ISA: gfx1100 saved assembly contains native `v_dot4_i32_iu8 ... neg_lo:[1,1,0]`.
+
+This remains lab-only. The per-call pack is a bridge toward a persistent packed-K
+shadow, not a production promotion by itself.

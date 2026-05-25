@@ -16,7 +16,7 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
-template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool tbq4_vec_norm_hoist = false, bool sparse_v_dequant = false, int sparse_v_tau_level = 0, bool tbq4_lds_d_k = false> // D == head size
+template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool tbq4_vec_norm_hoist = false, bool sparse_v_dequant = false, int sparse_v_tau_level = 0, bool tbq4_lds_d_k = false, bool q8k_dot4_packed16_vec = false> // D == head size
 __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
 static __global__ void flash_attn_ext_vec(
         const char * __restrict__ Q,
@@ -109,7 +109,12 @@ static __global__ void flash_attn_ext_vec(
     constexpr int V_rows_per_thread = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 2*cpy_ne : 4;
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
 
-    constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ, tbq4_vec_norm_hoist>();
+    vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ, tbq4_vec_norm_hoist>();
+    if constexpr (type_K == GGML_TYPE_Q8_0 && D == 256) {
+        if (q8k_dot4_packed16_vec) {
+            vec_dot_KQ = vec_dot_fattn_vec_KQ_q8_0_packed16<D, nthreads_KQ>;
+        }
+    }
     constexpr bool Q_q8_1 = !KQ_uses_Q_reg;
 #ifdef V_DOT2_F32_F16_AVAILABLE
     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread>();
@@ -620,18 +625,95 @@ static __global__ void flash_attn_ext_vec(
 #pragma clang diagnostic pop
 #endif // __clang__
 
+template <int D>
+static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_pack_k_packed16_vec_kernel(
+        const char * __restrict__ K,
+        char       * __restrict__ K_packed,
+        const int64_t nb10,
+        const int64_t nb11,
+        const int64_t nb12,
+        const int64_t nb13,
+        const int64_t ne11,
+        const int64_t ne12,
+        const int64_t ne13) {
+    static_assert(D == 256, "q8K packed16 VEC shadow is currently D256-only");
+    constexpr int nblocks = D / QK8_0;
+    constexpr int row_bytes = D + nblocks * int(sizeof(half));
+    const int64_t total = ne13 * ne12 * ne11 * nblocks;
+    const int64_t linear = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (linear >= total) {
+        return;
+    }
+
+    const int qblk = int(linear % nblocks);
+    const int64_t t = linear / nblocks;
+    const int64_t k = t % ne11;
+    const int64_t h_b = t / ne11;
+    const int64_t h = h_b % ne12;
+    const int64_t b = h_b / ne12;
+
+    const char * src = K + b*nb13 + h*nb12 + k*nb11 + int64_t(qblk)*nb10;
+    char * dst_row = K_packed + ((b*ne12 + h)*ne11 + k) * row_bytes;
+
+    half d;
+    memcpy(&d, src, sizeof(d));
+    ((half *) (dst_row + D))[qblk] = d;
+
+    int * dst_q = (int *) dst_row;
+#pragma unroll
+    for (int i = 0; i < QK8_0 / int(sizeof(int)); ++i) {
+        int v;
+        memcpy(&v, src + sizeof(half) + i*int(sizeof(int)), sizeof(v));
+        dst_q[qblk * (QK8_0 / int(sizeof(int))) + i] = v;
+    }
+}
+
 template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool tbq4_vec_norm_hoist = false, bool sparse_v_dequant = false, int sparse_v_tau_level = 0, bool tbq4_lds_d_k = false>
 void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const ggml_tensor * K = dst->src[1];
 
     const int nthreads = ggml_cuda_fattn_vec_get_nthreads_host(cc);
     const int nwarps   = nthreads / WARP_SIZE;
-    fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, tbq4_vec_norm_hoist, sparse_v_dequant, sparse_v_tau_level, tbq4_lds_d_k>;
+    const bool q8k_dot4_packed16_vec = type_K == GGML_TYPE_Q8_0 && D == 256 && ggml_cuda_q8k_dot4_packed16_vec_enabled();
+    fattn_kernel_t fattn_kernel = nullptr;
+    if constexpr (type_K == GGML_TYPE_Q8_0 && D == 256) {
+        fattn_kernel = q8k_dot4_packed16_vec ?
+            flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, tbq4_vec_norm_hoist, sparse_v_dequant, sparse_v_tau_level, tbq4_lds_d_k, true> :
+            flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, tbq4_vec_norm_hoist, sparse_v_dequant, sparse_v_tau_level, tbq4_lds_d_k, false>;
+    } else {
+        fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, tbq4_vec_norm_hoist, sparse_v_dequant, sparse_v_tau_level, tbq4_lds_d_k, false>;
+    }
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = tbq4_lds_d_k ? ggml_cuda_tbq4_lds_d_k_shared_bytes<D>() : 0;
     constexpr int nbatch_fa = tbq4_lds_d_k ? ggml_cuda_tbq4_lds_d_k_tile_rows<D>() : D;
-    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, need_f16_K, need_f16_V, false);
+
+    ggml_cuda_pool_alloc<char> K_packed(ctx.pool());
+    const char * K_data_override = nullptr;
+    size_t nb11_override = 0;
+    size_t nb12_override = 0;
+    size_t nb13_override = 0;
+    if constexpr (type_K == GGML_TYPE_Q8_0 && D == 256) {
+        if (q8k_dot4_packed16_vec) {
+            constexpr size_t row_bytes = D + (D / QK8_0) * sizeof(half);
+            const size_t nrows = size_t(K->ne[1]) * size_t(K->ne[2]) * size_t(K->ne[3]);
+            K_packed.alloc(nrows * row_bytes);
+            const dim3 pack_grid((nrows * (D / QK8_0) + 255) / 256);
+            ggml_cuda_q8k_pack_k_packed16_vec_kernel<D><<<pack_grid, 256, 0, ctx.stream()>>>(
+                (const char *) K->data, K_packed.ptr,
+                K->nb[0], K->nb[1], K->nb[2], K->nb[3],
+                K->ne[1], K->ne[2], K->ne[3]);
+            CUDA_CHECK(cudaGetLastError());
+            K_data_override = K_packed.ptr;
+            nb11_override = row_bytes;
+            nb12_override = size_t(K->ne[1]) * row_bytes;
+            nb13_override = size_t(K->ne[2]) * nb12_override;
+        }
+    }
+
+    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, need_f16_K, need_f16_V, false,
+        WARP_SIZE, K_data_override, nb11_override, nb12_override, nb13_override);
 }
 
 template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool tbq4_vec_norm_hoist, bool tbq4_lds_d_k = false>

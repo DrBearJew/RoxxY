@@ -233,6 +233,20 @@ Current DOT4 outcome and next-plan guardrails are in
 promote the standalone tile8/split-KV probes; any next prototype should reuse
 the stable `launch_fattn` tiled/GQA/combine scaffolding before adding DOT4.
 
+A newer q8_0-K packed16 shadow splice keeps the stable VEC `launch_fattn`
+softmax/PV/combine path but repacks K rows to contiguous payload bytes plus
+separate scales before KQ. It is also lab-only and requires all gates:
+
+```bash
+GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE=1
+GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_VEC=1
+GGML_CUDA_FA_ROUTE_REQUIRE=rocm_q8k_dot4_packed16_vec
+```
+
+This route exists to validate the packed16 DOT4 KQ producer inside production
+FA scaffolding; it is not a default route and should not be enabled in daily
+wrappers without end-to-end benchmark evidence.
+
 A separate q8_0-K/q4_0-V VEC scaffold A/B knob keeps the stable VEC kernel and
 only changes Q columns per block. It is also unsafe/opt-in; tested values are
 `4`, `8`, and `16`, with default behavior still equivalent to `2`:
