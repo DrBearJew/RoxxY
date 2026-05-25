@@ -38,6 +38,9 @@ static inline bool ggml_cuda_q8k_dot4_kq_supported(const int cc, const ggml_tens
     if (K->ne[1] < Q->ne[1] || Q->ne[2] % K->ne[2] != 0 || Q->ne[3] != K->ne[3]) {
         return false;
     }
+    if (V->ne[1] < K->ne[1] || V->ne[2] != K->ne[2] || V->ne[3] != Q->ne[3]) {
+        return false;
+    }
     return true;
 }
 
