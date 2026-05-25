@@ -332,6 +332,9 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,       GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0,      GGML_TYPE_Q4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,      GGML_TYPE_Q8_0)
+    // Stable no-TBQ public path: q8_0 K + q4_0 V should run without
+    // GGML_CUDA_FA_ALL_QUANTS or lab/unsafe ROCm route knobs.
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,      GGML_TYPE_Q4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16,      GGML_TYPE_BF16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_PLANAR3_0, GGML_TYPE_PLANAR3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_ISO3_0,    GGML_TYPE_ISO3_0)
@@ -386,14 +389,6 @@ static bool ggml_cuda_fattn_route_contract_matches(const char * required, const 
          strcmp(required, "rocm_quant_prefill_f16") == 0 ||
          strcmp(required, "f16_temp") == 0) &&
             (kernel == BEST_FATTN_KERNEL_MMA_F16 || kernel == BEST_FATTN_KERNEL_WMMA_F16)) {
-        return true;
-    }
-    if ((strcmp(required, "rocm_q8q4_dot4") == 0 || strcmp(required, "q8q4_dot4") == 0) &&
-            kernel == BEST_FATTN_KERNEL_Q8Q4_DOT4_PREFILL) {
-        return true;
-    }
-    if ((strcmp(required, "rocm_q8_tbq4_dot4") == 0 || strcmp(required, "q8tbq4_dot4") == 0) &&
-            kernel == BEST_FATTN_KERNEL_Q8TBQ4_DOT4_PREFILL) {
         return true;
     }
     if ((strcmp(required, "rocm_q8q4_wmma_i8") == 0 || strcmp(required, "q8q4_wmma_i8") == 0) &&
@@ -594,6 +589,7 @@ static void ggml_cuda_fattn_log_selection(const best_fattn_kernel kernel, const 
     const bool tbq4_vec_norm_hoist = kernel == BEST_FATTN_KERNEL_VEC && K->type == GGML_TYPE_TBQ4_0 && ggml_cuda_tbq4_vec_norm_hoist_enabled();
     const bool sparse_v_dequant = kernel == BEST_FATTN_KERNEL_VEC && V->type == GGML_TYPE_TBQ4_0 && Q->ne[1] == 1 && ggml_cuda_sparse_v_dequant_enabled();
     const bool q8k_tbq4v_vec = kernel == BEST_FATTN_KERNEL_VEC && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TBQ4_0;
+    const bool q8k_q4v_vec   = kernel == BEST_FATTN_KERNEL_VEC && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0;
     const int sparse_v_tau_level = sparse_v_dequant ? ggml_cuda_sparse_v_tau_level() : 0;
     const bool tbq4_lds_d_k = kernel == BEST_FATTN_KERNEL_VEC && K->type == GGML_TYPE_TBQ4_0 && (Q->ne[0] == 128 || Q->ne[0] == 256) && Q->ne[1] == 1 &&
         ggml_cuda_tbq4_lds_route_d_k_enabled() && (!sparse_v_dequant || sparse_v_tau_level == 0);
@@ -606,6 +602,8 @@ static void ggml_cuda_fattn_log_selection(const best_fattn_kernel kernel, const 
         }
     } else if (q8k_tbq4v_vec) {
         route = sparse_v_dequant ? "q8k_tbq4v_sparsev" : "q8k_tbq4v_vec";
+    } else if (q8k_q4v_vec) {
+        route = "q8k_q4v_vec";
     } else if (tbq4_vec_norm_hoist) {
         route = sparse_v_dequant ? "tbq4_vec_norm_hoist_sparsev" : "tbq4_vec_norm_hoist";
     } else if (kernel == BEST_FATTN_KERNEL_VEC && K->type == GGML_TYPE_TBQ4_0) {
@@ -666,6 +664,163 @@ static void ggml_cuda_fattn_log_rocm_quant_prefill_f16_once(
 #else
     GGML_UNUSED(Q); GGML_UNUSED(K); GGML_UNUSED(V); GGML_UNUSED(policy);
 #endif // GGML_USE_HIP
+}
+
+static bool ggml_cuda_rocm_experimental_unsafe_enabled() {
+#ifdef GGML_USE_HIP
+    const char * env = getenv("GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE");
+    if (!env) {
+        env = getenv("GGML_CUDA_ROCM_UNSAFE_EXPERIMENTS");
+    }
+    return env && atoi(env) != 0;
+#else
+    return false;
+#endif // GGML_USE_HIP
+}
+
+static bool ggml_cuda_fattn_route_log_enabled() {
+#ifdef GGML_USE_HIP
+    const char * env = getenv("COMPRESSED_KV_FATTN_LOG");
+    return env && atoi(env) != 0;
+#else
+    return false;
+#endif // GGML_USE_HIP
+}
+
+static int64_t ggml_cuda_q8q4_wmma_i8_prefill_max_nq() {
+#ifdef GGML_USE_HIP
+    const char * env = getenv("GGML_CUDA_ROCM_Q8Q4_WMMA_I8_PREFILL_MAX_NQ");
+    // If the existing ROCm quant-prefill F16 policy is enabled, keep long
+    // prompt processing on that path and reserve Q8Q4 WMMA-I8 for smaller
+    // decode/speculative batches. Set to 0 to force all prefill to F16, or set
+    // higher to let larger prompt chunks use the experimental I8 path.
+    return env ? atoll(env) : 256;
+#else
+    return 0;
+#endif // GGML_USE_HIP
+}
+
+static bool ggml_cuda_tbq4_wmma_fattn_enabled() {
+#ifdef GGML_USE_HIP
+    if (!ggml_cuda_rocm_experimental_unsafe_enabled()) {
+        return false;
+    }
+    const char * env = getenv("GGML_CUDA_ROCM_TBQ4_WMMA_FATTN");
+    if (!env) {
+        env = getenv("TBQ4_WMMA_FATTN"); // backward-compatible prototype knob
+    }
+    return env && atoi(env) != 0;
+#else
+    return false;
+#endif // GGML_USE_HIP
+}
+
+static void ggml_cuda_tbq4_wmma_fattn_log_reject(const char * reason, const ggml_tensor * dst) {
+    if (!ggml_cuda_fattn_route_log_enabled()) {
+        return;
+    }
+
+    const ggml_tensor * Q     = dst->src[0];
+    const ggml_tensor * K     = dst->src[1];
+    const ggml_tensor * V     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    GGML_LOG_INFO("%s: route=wmma_tbq4 reject=%s Q=%s K=%s V=%s mask=%s sinks=%d nq=%lld nkv=%lld d_q=%lld d_v=%lld\n",
+        __func__, reason,
+        ggml_type_name(Q->type), ggml_type_name(K->type), ggml_type_name(V->type),
+        mask ? ggml_type_name(mask->type) : "none", sinks ? 1 : 0,
+        (long long) Q->ne[1], (long long) K->ne[1],
+        (long long) Q->ne[0], (long long) V->ne[0]);
+}
+
+static bool ggml_cuda_tbq4_wmma_fattn_supported(
+        const int cc, const ggml_tensor * dst,
+        const float max_bias, const float logit_softcap) {
+#ifdef GGML_USE_HIP
+    if (!ggml_cuda_tbq4_wmma_fattn_enabled()) {
+        return false;
+    }
+
+    const ggml_tensor * Q     = dst->src[0];
+    const ggml_tensor * K     = dst->src[1];
+    const ggml_tensor * V     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    const auto reject = [&](const char * reason) {
+        ggml_cuda_tbq4_wmma_fattn_log_reject(reason, dst);
+        return false;
+    };
+
+    if (!ggml_cuda_should_use_wmma_fattn(cc)) {
+        return reject("wmma_unavailable_or_not_compiled");
+    }
+    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_TBQ4_0 || V->type != GGML_TYPE_TBQ4_0 || dst->type != GGML_TYPE_F32) {
+        return reject("type");
+    }
+    if ((Q->ne[0] != 128 && Q->ne[0] != 256) || K->ne[0] != Q->ne[0] || V->ne[0] != Q->ne[0] || dst->ne[0] != Q->ne[0]) {
+        return reject("shape_d");
+    }
+    if (Q->ne[1] <= 2 || K->ne[1] < Q->ne[1] || V->ne[1] != K->ne[1]) {
+        return reject("shape_tokens");
+    }
+    if (Q->ne[2] % K->ne[2] != 0 || V->ne[2] != K->ne[2] || Q->ne[3] != K->ne[3] || V->ne[3] != K->ne[3]) {
+        return reject("shape_heads_sequences");
+    }
+    if (dst->ne[1] != Q->ne[2] || dst->ne[2] != Q->ne[1] || dst->ne[3] != Q->ne[3]) {
+        return reject("shape_dst");
+    }
+    if (K->ne[1] % FATTN_KQ_STRIDE != 0) {
+        return reject("nkv_not_full_tile");
+    }
+    if (Q->nb[0] != ggml_element_size(Q) || K->nb[0] != ggml_element_size(K) || V->nb[0] != ggml_element_size(V)) {
+        return reject("stride_nb0");
+    }
+    if (sinks != nullptr) {
+        return reject("sinks");
+    }
+    if (max_bias != 0.0f) {
+        return reject("alibi");
+    }
+    if (logit_softcap != 0.0f) {
+        return reject("logit_softcap");
+    }
+    if (mask && (mask->type != GGML_TYPE_F16 || mask->ne[0] != K->ne[1] || mask->ne[1] != Q->ne[1] || mask->ne[2] != 1 || mask->ne[3] != Q->ne[3])) {
+        return reject("mask_layout");
+    }
+
+    return true;
+#else
+    GGML_UNUSED(cc); GGML_UNUSED(dst); GGML_UNUSED(max_bias); GGML_UNUSED(logit_softcap);
+    return false;
+#endif // GGML_USE_HIP
+}
+
+static bool ggml_cuda_fattn_mixed_kv_supported(const ggml_tensor * Q, const ggml_tensor * K, const ggml_tensor * V) {
+    if (K->type == V->type) {
+        return true;
+    }
+#ifdef GGML_CUDA_FA_ALL_QUANTS
+    GGML_UNUSED(Q);
+    return true;
+#else
+    GGML_UNUSED(Q);
+    const bool tbq4_q8_mix = (K->type == GGML_TYPE_TBQ4_0 && V->type == GGML_TYPE_Q8_0) ||
+                             (K->type == GGML_TYPE_Q8_0   && V->type == GGML_TYPE_TBQ4_0);
+    const bool q8_q4_mix = K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0;
+    return tbq4_q8_mix || q8_q4_mix;
+#endif // GGML_CUDA_FA_ALL_QUANTS
+}
+
+static void ggml_cuda_fattn_log_mixed_kv_reject(const ggml_tensor * Q, const ggml_tensor * K, const ggml_tensor * V) {
+    if (!ggml_cuda_fattn_route_log_enabled()) {
+        return;
+    }
+    GGML_LOG_INFO("%s: route=none reject=unsupported_mixed_kv Q=%s K=%s V=%s nq=%lld nkv=%lld d_q=%lld d_v=%lld\n",
+        __func__, ggml_type_name(Q->type), ggml_type_name(K->type), ggml_type_name(V->type),
+        (long long) Q->ne[1], (long long) K->ne[1],
+        (long long) Q->ne[0], (long long) V->ne[0]);
 }
 
 enum ggml_cuda_rocm_quant_prefill_f16_mode {
@@ -810,11 +965,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 return BEST_FATTN_KERNEL_NONE;
             }
 #ifdef GGML_USE_HIP
-            // Experimental prefill paths. Keep default decode/quantized-KV route
-            // on VEC; enable only with explicit env vars and pure TBQ4 V.
-            if (v_is_tbq4 && ggml_cuda_tbq4_dot4_prefill_supported(cc, dst)) {
-                return BEST_FATTN_KERNEL_TBQ4_DOT4_PREFILL;
-            }
+            // Experimental rocWMMA prefill path. Default decode/quantized-KV
+            // route remains VEC unless the unsafe lab gate is explicitly set.
             if (v_is_tbq4 && ggml_cuda_tbq4_wmma_fattn_supported(cc, dst, max_bias, logit_softcap)) {
                 return BEST_FATTN_KERNEL_WMMA_TBQ4;
             }
@@ -840,7 +992,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             if (Q->ne[0] == 128 || Q->ne[0] == 256) {
 #ifdef GGML_USE_HIP
                 const char * compressed_wmma_fattn_env = getenv("COMPRESSED_KV_WMMA_FATTN");
-                if (K->type == V->type && Q->ne[1] > 2 && compressed_wmma_fattn_env && atoi(compressed_wmma_fattn_env) != 0 && amd_wmma_available(cc)) {
+                if (ggml_cuda_rocm_experimental_unsafe_enabled() && K->type == V->type && Q->ne[1] > 2 &&
+                        compressed_wmma_fattn_env && atoi(compressed_wmma_fattn_env) != 0 && amd_wmma_available(cc)) {
                     return BEST_FATTN_KERNEL_WMMA_COMPRESSED_KV;
                 }
 #endif // GGML_USE_HIP
@@ -872,10 +1025,17 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         const bool require_i8_route  = ggml_cuda_fattn_route_contract_is_i8(required_route);
         const bool require_f16_route = ggml_cuda_fattn_route_contract_is_f16_temp(required_route);
         const bool f16_prefill_applicable = ggml_cuda_fattn_route_contract_applicable("f16_temp", dst, &f16_policy);
-        if ((require_f16_route || f16_mode == GGML_CUDA_ROCM_QUANT_PREFILL_F16_REQUIRE ||
+        const bool stable_q8q4_f16_prefill =
+            f16_mode == GGML_CUDA_ROCM_QUANT_PREFILL_F16_ALLOW &&
+            !require_i8_route && f16_prefill_applicable &&
+            Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0 &&
+            Q->ne[1] > 2;
+        if ((stable_q8q4_f16_prefill || require_f16_route ||
+             f16_mode == GGML_CUDA_ROCM_QUANT_PREFILL_F16_REQUIRE ||
              f16_mode == GGML_CUDA_ROCM_QUANT_PREFILL_F16_PREFER) && f16_prefill_applicable) {
             f16_policy.forced = require_f16_route || f16_mode == GGML_CUDA_ROCM_QUANT_PREFILL_F16_REQUIRE;
-            f16_policy.automatic = !f16_policy.forced && f16_mode == GGML_CUDA_ROCM_QUANT_PREFILL_F16_PREFER;
+            f16_policy.automatic = !f16_policy.forced &&
+                (f16_mode == GGML_CUDA_ROCM_QUANT_PREFILL_F16_PREFER || stable_q8q4_f16_prefill);
             f16_policy.allowed = f16_policy.contiguous_ok && f16_policy.under_budget;
         }
         const bool allow_quant_prefill_f16 = f16_mode != GGML_CUDA_ROCM_QUANT_PREFILL_F16_OFF && f16_policy.allowed;
@@ -915,13 +1075,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return return_quantized_route(f16_backend);
         }
 
-        if (ggml_cuda_q8q4_dot4_prefill_supported(cc, dst)) {
-            return return_quantized_route(BEST_FATTN_KERNEL_Q8Q4_DOT4_PREFILL);
-        }
-        if (ggml_cuda_q8tbq4_dot4_prefill_supported(cc, dst)) {
-            return return_quantized_route(BEST_FATTN_KERNEL_Q8TBQ4_DOT4_PREFILL);
-        }
-
         const int64_t q8q4_wmma_prefill_max_nq = ggml_cuda_q8q4_wmma_i8_prefill_max_nq();
         const bool prefer_f16_prefill = allow_quant_prefill_f16 && Q->ne[1] > q8q4_wmma_prefill_max_nq;
         if (!prefer_f16_prefill && ggml_cuda_q8q4_wmma_i8_supported(cc, dst, max_bias, logit_softcap)) {
@@ -929,15 +1082,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
 
         if (!allow_quant_prefill_f16) {
-#ifndef GGML_CUDA_FA_ALL_QUANTS
-            // q8K/q4V mixed VEC is not compiled in the default build; if the
-            // bounded f16-temp route is disabled or over budget, report no FA
-            // support so the caller can use the non-FA fallback instead of
-            // dispatching an uninstantiated VEC case.
-            if (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0) {
-                return return_quantized_route(BEST_FATTN_KERNEL_NONE);
-            }
-#endif // GGML_CUDA_FA_ALL_QUANTS
             return return_quantized_route(BEST_FATTN_KERNEL_VEC);
         }
 

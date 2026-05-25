@@ -28,6 +28,7 @@ stack.
 
 | Target | Status | Use |
 |---|---|---|
+| ROCm no-TBQ KV | stable public path | `q8_0` K + `q4_0` V, no experimental env knobs |
 | 27B ROCm MTP | promoted local path | `q8_0` K + `tbq4_0` V, MTP n3, f16-temp prefill on |
 | 35B ROCm no-MTP | stable prompt path | `q8_0` K + `tbq4_0` V, MMQ selector on, no speculative MTP |
 | 35B ROCm MTP | experimental but usable | MTP n2 plus explicit f16-temp prefill |
@@ -95,6 +96,20 @@ If symmetric `tbq4_0` K+V is requested on high-GQA models, K is promoted to
 policy without importing TheTom's Turbo/TQ enum architecture.
 
 ## Run recipes
+
+### Stable ROCm q8/q4 without TBQ
+
+Use this when sharing a simple no-TBQ test recipe. Do not set any ROCm lab-route
+environment variables for this path. Long prefill uses the bounded f16-temp path
+when applicable; decode and unsupported shapes fall back to the normal VEC path.
+
+```bash
+./build-rocm-vulkan/bin/llama-server \
+  --device ROCm0 \
+  --model /path/to/model.gguf \
+  --flash-attn on \
+  --cache-type-k q8_0 --cache-type-v q4_0
+```
 
 ### 27B ROCm MTP
 
@@ -182,14 +197,16 @@ Backend selection is runtime-only:
 
 ## Deprecated / not default
 
-Do not enable these in user-facing wrappers:
+Do not enable these in user-facing wrappers. Experimental compressed-KV WMMA
+routes require both the route flag and the generic unsafe gate:
 
 ```bash
-TBQ4_WMMA_FATTN
-COMPRESSED_KV_WMMA_FATTN
+GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE=1
+TBQ4_WMMA_FATTN=1                  # or GGML_CUDA_ROCM_TBQ4_WMMA_FATTN=1
+COMPRESSED_KV_WMMA_FATTN=1
 ```
 
-rocWMMA compressed-KV work remains research/lab material.
+The stable no-TBQ q8/q4 path does not use these flags.
 
 ## Credits
 
