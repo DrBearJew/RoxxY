@@ -733,6 +733,28 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
         }
         const char * cols_env = getenv("GGML_CUDA_ROCM_Q8K_Q4V_VEC_COLS");
         const int cols_override = (unsafe && atoi(unsafe) != 0 && cols_env) ? atoi(cols_env) : 0;
+        if (cols_override == 16) {
+            constexpr int cols_per_block = 16;
+            if (logit_softcap == 0.0f) {
+                constexpr bool use_logit_softcap = false;
+                ggml_cuda_flash_attn_ext_vec_case_dispatch<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+            } else {
+                constexpr bool use_logit_softcap = true;
+                ggml_cuda_flash_attn_ext_vec_case_dispatch<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+            }
+            return;
+        }
+        if (cols_override == 8) {
+            constexpr int cols_per_block = 8;
+            if (logit_softcap == 0.0f) {
+                constexpr bool use_logit_softcap = false;
+                ggml_cuda_flash_attn_ext_vec_case_dispatch<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+            } else {
+                constexpr bool use_logit_softcap = true;
+                ggml_cuda_flash_attn_ext_vec_case_dispatch<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+            }
+            return;
+        }
         if (cols_override == 4) {
             constexpr int cols_per_block = 4;
             if (logit_softcap == 0.0f) {

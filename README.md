@@ -234,7 +234,8 @@ promote the standalone tile8/split-KV probes; any next prototype should reuse
 the stable `launch_fattn` tiled/GQA/combine scaffolding before adding DOT4.
 
 A separate q8_0-K/q4_0-V VEC scaffold A/B knob keeps the stable VEC kernel and
-only changes Q columns per block. It is also unsafe/opt-in:
+only changes Q columns per block. It is also unsafe/opt-in; tested values are
+`4`, `8`, and `16`, with default behavior still equivalent to `2`:
 
 ```bash
 GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE=1
