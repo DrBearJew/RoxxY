@@ -220,8 +220,17 @@ private:
         ggml_tensor * k;
         ggml_tensor * v;
 
+        // Packed16 DOT4 K cache (optional — allocated when GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE=1)
+        // Stores quantized K in INT8-packed I32 payload + F16 scales, ready for DOT4 FA kernel.
+        ggml_tensor * k_payload = nullptr;  // GGML_TYPE_I32, [D/4, n_tokens]
+        ggml_tensor * k_scales  = nullptr;  // GGML_TYPE_F16, [D/32, n_tokens]
+
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // Packed16 stream views (same view offset as k_stream/v_stream)
+        std::vector<ggml_tensor *> k_payload_stream;
+        std::vector<ggml_tensor *> k_scales_stream;
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -428,3 +437,15 @@ private:
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
 };
+
+// Packed16 K cache registry (shared between KV-cache ctor and DOT4 FA dispatch).
+// Defined in ggml/src/ggml-cuda/fattn-dot4-q8k-kq.cu.
+#ifdef __cplusplus
+extern "C" {
+#endif
+struct ggml_tensor;
+void llama_kv_cache_register_packed16(const void * k_view_data, struct ggml_tensor * payload, struct ggml_tensor * scales);
+void llama_kv_cache_get_packed16_tensors(const void * k_view_data, struct ggml_tensor ** payload, struct ggml_tensor ** scales);
+#ifdef __cplusplus
+}
+#endif

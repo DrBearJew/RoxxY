@@ -1,6 +1,9 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 
+#include <mutex>
+#include <vector>
+
 static int ggml_cuda_fattn_vec_get_nthreads_host(const int cc) {
     return 128;
     GGML_UNUSED(cc);
@@ -635,11 +638,17 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_pack_k_packed16_v
         const int64_t nb13,
         const int64_t ne11,
         const int64_t ne12,
-        const int64_t ne13) {
+        const int64_t ne13,
+        const int64_t packed_ne11,
+        const int64_t k_start) {
     static_assert(D == 256, "q8K packed16 VEC shadow is currently D256-only");
     constexpr int nblocks = D / QK8_0;
     constexpr int row_bytes = D + nblocks * int(sizeof(half));
-    const int64_t total = ne13 * ne12 * ne11 * nblocks;
+    const int64_t n_k = ne11 - k_start;
+    if (n_k <= 0) {
+        return;
+    }
+    const int64_t total = ne13 * ne12 * n_k * nblocks;
     const int64_t linear = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (linear >= total) {
         return;
@@ -647,13 +656,13 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_pack_k_packed16_v
 
     const int qblk = int(linear % nblocks);
     const int64_t t = linear / nblocks;
-    const int64_t k = t % ne11;
-    const int64_t h_b = t / ne11;
+    const int64_t k = k_start + t % n_k;
+    const int64_t h_b = t / n_k;
     const int64_t h = h_b % ne12;
     const int64_t b = h_b / ne12;
 
     const char * src = K + b*nb13 + h*nb12 + k*nb11 + int64_t(qblk)*nb10;
-    char * dst_row = K_packed + ((b*ne12 + h)*ne11 + k) * row_bytes;
+    char * dst_row = K_packed + ((b*ne12 + h)*packed_ne11 + k) * row_bytes;
 
     half d;
     memcpy(&d, src, sizeof(d));
@@ -667,6 +676,120 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_pack_k_packed16_v
         dst_q[qblk * (QK8_0 / int(sizeof(int))) + i] = v;
     }
 }
+
+#ifdef GGML_USE_HIP
+struct ggml_cuda_q8k_packed16_vec_cache_entry {
+    int device = -1;
+    const void * owner = nullptr;
+    int stream_no = -1;
+    const void * k_data = nullptr;
+    int64_t nb10 = 0;
+    int64_t nb11 = 0;
+    int64_t nb12 = 0;
+    int64_t nb13 = 0;
+    int64_t ne12 = 0;
+    int64_t ne13 = 0;
+    int64_t packed_ne11 = 0;
+    int64_t packed_upto = 0;
+    char * data = nullptr;
+    size_t bytes = 0;
+};
+
+static inline bool ggml_cuda_q8k_dot4_packed16_vec_cache_enabled() {
+    const char * env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_CACHE");
+    if (!env || atoi(env) == 0) {
+        return false;
+    }
+#ifdef USE_CUDA_GRAPH
+    // This unsafe lab cache updates host-side append state between graph launches.
+    // Keep it out of CUDA/HIP graph capture unless graphs are explicitly disabled.
+    return getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr;
+#else
+    return true;
+#endif
+}
+
+static std::mutex & ggml_cuda_q8k_packed16_vec_cache_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+static std::vector<ggml_cuda_q8k_packed16_vec_cache_entry> & ggml_cuda_q8k_packed16_vec_cache_entries() {
+    static std::vector<ggml_cuda_q8k_packed16_vec_cache_entry> entries;
+    return entries;
+}
+
+static inline int64_t ggml_cuda_q8k_packed16_vec_cache_stride_ne11(const ggml_tensor * K) {
+    int64_t packed_ne11 = K->ne[1];
+    if (K->nb[2] > 0 && K->nb[3] > 0) {
+        const int64_t capacity = int64_t(K->nb[3] / K->nb[2]);
+        if (capacity >= K->ne[1]) {
+            packed_ne11 = capacity;
+        }
+    }
+    return packed_ne11;
+}
+
+template <int D>
+static const char * ggml_cuda_q8k_packed16_vec_cache_get(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * K,
+        size_t & nb11_override,
+        size_t & nb12_override,
+        size_t & nb13_override) {
+    static_assert(D == 256, "q8K packed16 VEC cache is currently D256-only");
+    constexpr size_t row_bytes = D + (D / QK8_0) * sizeof(half);
+    const int64_t packed_ne11 = ggml_cuda_q8k_packed16_vec_cache_stride_ne11(K);
+    const void * owner = (const void *) &ctx;
+    const size_t bytes = size_t(K->ne[3]) * size_t(K->ne[2]) * size_t(packed_ne11) * row_bytes;
+    if (bytes == 0 || K->ne[1] > packed_ne11) {
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(ggml_cuda_q8k_packed16_vec_cache_mutex());
+    auto & entries = ggml_cuda_q8k_packed16_vec_cache_entries();
+    ggml_cuda_q8k_packed16_vec_cache_entry * entry = nullptr;
+    for (auto & e : entries) {
+        if (e.device == ctx.device && e.owner == owner && e.stream_no == ctx.curr_stream_no && e.k_data == K->data &&
+                e.nb10 == int64_t(K->nb[0]) && e.nb11 == int64_t(K->nb[1]) && e.nb12 == int64_t(K->nb[2]) && e.nb13 == int64_t(K->nb[3]) &&
+                e.ne12 == K->ne[2] && e.ne13 == K->ne[3] && e.packed_ne11 == packed_ne11) {
+            entry = &e;
+            break;
+        }
+    }
+
+    if (!entry) {
+        ggml_cuda_set_device(ctx.device);
+        char * ptr = nullptr;
+        CUDA_CHECK(cudaMalloc((void **) &ptr, bytes));
+        entries.push_back({ctx.device, owner, ctx.curr_stream_no, K->data,
+            int64_t(K->nb[0]), int64_t(K->nb[1]), int64_t(K->nb[2]), int64_t(K->nb[3]),
+            K->ne[2], K->ne[3], packed_ne11, 0, ptr, bytes});
+        entry = &entries.back();
+    }
+
+    if (K->ne[1] < entry->packed_upto) {
+        entry->packed_upto = 0;
+    }
+
+    if (K->ne[1] > entry->packed_upto) {
+        const int64_t k_start = entry->packed_upto;
+        const int64_t n_k = K->ne[1] - k_start;
+        const dim3 pack_grid((size_t(n_k) * size_t(K->ne[2]) * size_t(K->ne[3]) * (D / QK8_0) + 255) / 256);
+        ggml_cuda_q8k_pack_k_packed16_vec_kernel<D><<<pack_grid, 256, 0, ctx.stream()>>>(
+            (const char *) K->data, entry->data,
+            K->nb[0], K->nb[1], K->nb[2], K->nb[3],
+            K->ne[1], K->ne[2], K->ne[3], packed_ne11, k_start);
+        CUDA_CHECK(cudaGetLastError());
+        entry->packed_upto = K->ne[1];
+    }
+
+    nb11_override = row_bytes;
+    nb12_override = size_t(packed_ne11) * row_bytes;
+    nb13_override = size_t(K->ne[2]) * nb12_override;
+    return entry->data;
+}
+#endif // GGML_USE_HIP
 
 template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool tbq4_vec_norm_hoist = false, bool sparse_v_dequant = false, int sparse_v_tau_level = 0, bool tbq4_lds_d_k = false>
 void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -696,19 +819,26 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     size_t nb13_override = 0;
     if constexpr (type_K == GGML_TYPE_Q8_0 && D == 256) {
         if (q8k_dot4_packed16_vec) {
-            constexpr size_t row_bytes = D + (D / QK8_0) * sizeof(half);
-            const size_t nrows = size_t(K->ne[1]) * size_t(K->ne[2]) * size_t(K->ne[3]);
-            K_packed.alloc(nrows * row_bytes);
-            const dim3 pack_grid((nrows * (D / QK8_0) + 255) / 256);
-            ggml_cuda_q8k_pack_k_packed16_vec_kernel<D><<<pack_grid, 256, 0, ctx.stream()>>>(
-                (const char *) K->data, K_packed.ptr,
-                K->nb[0], K->nb[1], K->nb[2], K->nb[3],
-                K->ne[1], K->ne[2], K->ne[3]);
-            CUDA_CHECK(cudaGetLastError());
-            K_data_override = K_packed.ptr;
-            nb11_override = row_bytes;
-            nb12_override = size_t(K->ne[1]) * row_bytes;
-            nb13_override = size_t(K->ne[2]) * nb12_override;
+#ifdef GGML_USE_HIP
+            if (ggml_cuda_q8k_dot4_packed16_vec_cache_enabled()) {
+                K_data_override = ggml_cuda_q8k_packed16_vec_cache_get<D>(ctx, K, nb11_override, nb12_override, nb13_override);
+            }
+#endif // GGML_USE_HIP
+            if (!K_data_override) {
+                constexpr size_t row_bytes = D + (D / QK8_0) * sizeof(half);
+                const size_t nrows = size_t(K->ne[1]) * size_t(K->ne[2]) * size_t(K->ne[3]);
+                K_packed.alloc(nrows * row_bytes);
+                const dim3 pack_grid((nrows * (D / QK8_0) + 255) / 256);
+                ggml_cuda_q8k_pack_k_packed16_vec_kernel<D><<<pack_grid, 256, 0, ctx.stream()>>>(
+                    (const char *) K->data, K_packed.ptr,
+                    K->nb[0], K->nb[1], K->nb[2], K->nb[3],
+                    K->ne[1], K->ne[2], K->ne[3], K->ne[1], 0);
+                CUDA_CHECK(cudaGetLastError());
+                K_data_override = K_packed.ptr;
+                nb11_override = row_bytes;
+                nb12_override = size_t(K->ne[1]) * row_bytes;
+                nb13_override = size_t(K->ne[2]) * nb12_override;
+            }
         }
     }
 

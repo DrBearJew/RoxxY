@@ -23,6 +23,7 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "ggml-cuda/fattn-dot4-q8k-kq.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
@@ -2385,6 +2386,12 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
+    const int32_t hint = ggml_get_op_params_i32(dst, 1);
+    if (hint == GGML_HINT_SRC0_IS_HADAMARD) {
+        GGML_ASSERT(!split);
+        return;
+    }
+
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
     // Therefore, in such cases use cuBLAS.
@@ -2647,6 +2654,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_SET_ROWS:
             ggml_cuda_op_set_rows(ctx, dst);
+            break;
+        case GGML_OP_PACK_K_PACKED16:
+            ggml_cuda_op_pack_k_packed16(ctx, dst);
             break;
         case GGML_OP_SET:
             ggml_cuda_op_set(ctx, dst);
@@ -5007,6 +5017,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                        op->type == GGML_TYPE_PLANAR4_0 || op->type == GGML_TYPE_ISO4_0) &&
                        op->src[0]->type == GGML_TYPE_F32 &&
                        (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
+            } break;
+        case GGML_OP_PACK_K_PACKED16:
+            {
+                return op->type == GGML_TYPE_I32 &&
+                       (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32) &&
+                       op->src[1]->type == GGML_TYPE_F16;
             } break;
         case GGML_OP_SET:
             {

@@ -1134,9 +1134,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+    "PACK_K_PACKED16",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 96");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1246,7 +1247,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 96");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3978,6 +3979,28 @@ struct ggml_tensor * ggml_set_rows(
     result->src[0] = b;
     result->src[1] = c;
     result->src[2] = a; // note: order is weird due to legacy reasons (https://github.com/ggml-org/llama.cpp/pull/16063#discussion_r2385795931)
+
+    return result;
+}
+
+// ggml_pack_k_packed16
+
+struct ggml_tensor * ggml_pack_k_packed16(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k_cur,
+        struct ggml_tensor  * payload,
+        struct ggml_tensor  * scales) {
+    GGML_ASSERT(ggml_is_contiguous(k_cur));
+    GGML_ASSERT(payload->type == GGML_TYPE_I32);
+    GGML_ASSERT(scales->type  == GGML_TYPE_F16);
+    GGML_ASSERT(k_cur->ne[0] == payload->ne[0] * 4);
+    GGML_ASSERT(k_cur->ne[0] == scales->ne[0]  * 32);
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, payload);
+
+    result->op     = GGML_OP_PACK_K_PACKED16;
+    result->src[0] = k_cur;   // source f16 K
+    result->src[1] = scales;  // secondary output (scales tensor)
 
     return result;
 }

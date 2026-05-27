@@ -3,6 +3,7 @@
 #include "tbq4-cuda.cuh"
 #include "set-rows-planar-iso.cuh"
 #include "tbq3-cuda.cuh"
+#include "fattn-dot4-q8k-kq.cuh"
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 

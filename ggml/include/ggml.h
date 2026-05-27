@@ -592,6 +592,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_PACK_K_PACKED16,
+
         GGML_OP_COUNT,
     };
 
@@ -1693,6 +1695,14 @@ extern "C" {
             struct ggml_tensor  * a,  // destination
             struct ggml_tensor  * b,  // source
             struct ggml_tensor  * c); // row indices
+
+    // Pack f16 K tensor into packed16 DOT4 format (I32 payload + F16 scales).
+    // Quantizes f16→int8 per-block, outputs two tensors: payload (I32) and scales (F16).
+    GGML_API struct ggml_tensor * ggml_pack_k_packed16(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k_cur,    // source (F32 or F16)
+            struct ggml_tensor  * payload,  // destination payload (I32)
+            struct ggml_tensor  * scales);  // destination scales (F16)
 
     GGML_API struct ggml_tensor * ggml_diag(
         struct ggml_context     * ctx,

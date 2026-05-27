@@ -139,7 +139,7 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer_kv*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(4u*(1 + n_stream)*n_layer_kv*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -260,6 +260,20 @@ llama_kv_cache::llama_kv_cache(
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v_layer, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
+        ggml_tensor * k_payload = nullptr;
+        ggml_tensor * k_scales  = nullptr;
+        {
+            const char * env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE");
+            if (has_k && env && atoi(env) != 0) {
+                k_payload = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_embd_k_gqa / 4, kv_size, n_stream);
+                k_scales  = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_embd_k_gqa / 32, kv_size, n_stream);
+                ggml_format_name(k_payload, "cache_k_payload_l%d", il);
+                ggml_format_name(k_scales,  "cache_k_scales_l%d", il);
+            }
+        }
+        std::vector<ggml_tensor *> k_payload_stream;
+        std::vector<ggml_tensor *> k_scales_stream;
+
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
 
@@ -273,7 +287,7 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, });
+        layers.push_back({ il, k, v, k_payload, k_scales, k_stream, v_stream, k_payload_stream, k_scales_stream, });
     }
 
     if (reuse) {

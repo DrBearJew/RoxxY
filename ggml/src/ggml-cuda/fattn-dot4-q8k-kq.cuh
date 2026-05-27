@@ -5,6 +5,9 @@
 #include <cstdlib>
 #include <cstring>
 
+struct ggml_backend_cuda_context;
+void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst);
+
 #ifdef GGML_USE_HIP
 
 // Lab-only ROCm q8K DOT4 KQ/FA route. Keep this behind both the generic unsafe
@@ -47,6 +50,11 @@ static inline bool ggml_cuda_q8k_dot4_kq_supported(const int cc, const ggml_tens
         return false;
     }
     return true;
+}
+
+static inline bool ggml_cuda_q8k_dot4_packed16_k_cache_enabled() {
+    const char * env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE");
+    return env && atoi(env) != 0;
 }
 
 void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
