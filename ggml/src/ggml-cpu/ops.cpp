@@ -8309,7 +8309,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     GGML_ASSERT(nbk0 == ggml_type_size(k->type));
     GGML_ASSERT(nbv0 == ggml_type_size(v->type));
 
-    GGML_ASSERT(neq0 == DK);
+    // I32 packed16 K: skip Q/K dim assert for non-I32 K
+    if (k->type != GGML_TYPE_I32) { GGML_ASSERT(neq0 == DK); }
     GGML_ASSERT(nek0 == DK);
     GGML_ASSERT(nev0 == DV);
 
@@ -8543,7 +8544,8 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     GGML_ASSERT(nbk0 == ggml_type_size(k->type));
     GGML_ASSERT(nbv0 == ggml_type_size(v->type));
 
-    GGML_ASSERT(neq0 == DK);
+    // I32 packed16 K: skip Q/K dim assert for non-I32 K
+    if (k->type != GGML_TYPE_I32) { GGML_ASSERT(neq0 == DK); }
     GGML_ASSERT(nek0 == DK);
     GGML_ASSERT(nev0 == DV);
 
@@ -8902,7 +8904,10 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     GGML_ASSERT(nbk0 == ggml_type_size(k->type));
     GGML_ASSERT(nbv0 == ggml_type_size(v->type));
 
-    GGML_ASSERT(neq0 == DK);
+    // I32 packed16 K has per-head dimension D/4 vs Q's D; only check for non-I32 K
+    if (k->type != GGML_TYPE_I32) {
+        GGML_ASSERT(neq0 == DK);
+    }
     GGML_ASSERT(nek0 == DK);
     GGML_ASSERT(nev0 == DV);
 

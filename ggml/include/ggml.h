@@ -1698,11 +1698,13 @@ extern "C" {
 
     // Pack f16 K tensor into packed16 DOT4 format (I32 payload + F16 scales).
     // Quantizes f16→int8 per-block, outputs two tensors: payload (I32) and scales (F16).
+    // k_idxs keeps the scheduler buffer alive for the row indices tensor.
     GGML_API struct ggml_tensor * ggml_pack_k_packed16(
             struct ggml_context * ctx,
             struct ggml_tensor  * k_cur,    // source (F32 or F16)
             struct ggml_tensor  * payload,  // destination payload (I32)
-            struct ggml_tensor  * scales);  // destination scales (F16)
+            struct ggml_tensor  * scales,   // destination scales (F16)
+            struct ggml_tensor  * k_idxs);  // row indices (I64/I32) — scheduler dependency
 
     GGML_API struct ggml_tensor * ggml_diag(
         struct ggml_context     * ctx,

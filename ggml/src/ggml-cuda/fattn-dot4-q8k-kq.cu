@@ -165,6 +165,75 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_quant_k_pack
     }
 }
 
+// Indexed variant: writes to absolute KV cache slots using k_idxs.
+// Uses fixed kv_size head stride so persistent cache survives chunk growth.
+template <typename idx_t>
+static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_quant_k_packed16_indexed_kernel(
+        const half  * __restrict__ K,
+        int         * __restrict__ k_payload,
+        half        * __restrict__ k_scales,
+        const idx_t * __restrict__ k_idxs,
+        int64_t nb01,
+        int64_t nb02,
+        int64_t nb03,
+        int64_t src_head_stride_bytes,
+        int nk_cur,
+        int n_heads_k,
+        int batch,
+        int kv_size) {
+    const int tid = threadIdx.x;
+    const int k_local = blockIdx.x;
+    const int hk = blockIdx.y;
+    const int b = blockIdx.z;
+    const int q_block = tid >> 5;
+    const int lane = tid & 31;
+    if (k_local >= nk_cur || hk >= n_heads_k || b >= batch || q_block >= GGML_CUDA_Q8K_DOT4_KQ_BLOCKS) {
+        return;
+    }
+
+    const int64_t cell = (int64_t) k_idxs[k_local];
+    if (cell < 0 || cell >= kv_size) {
+        return;
+    }
+
+    // Read K source as float — k_cur may be f32 (model output) or f16.
+    // Always use 4-byte float stride for head offset.
+    const float * k_ptr = (const float *) ((const char *) K
+            + int64_t(b)       * nb03
+            + int64_t(k_local) * nb01
+            + int64_t(hk)      * src_head_stride_bytes);
+    const int d = q_block * QK8_0 + lane;
+    const float x = k_ptr[d];
+
+    // Pass 1: block-wise amax for initial scale.
+    float amax = fabsf(x);
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        amax = fmaxf(amax, __shfl_xor(amax, mask, 32));
+    }
+    const float scale0 = amax > 0.0f ? amax / 127.0f : 1.0f;
+    const int qi0 = max(-128, min(127, int(lrintf(x / scale0))));
+
+    // Pass 2: MSE-optimal scale = sum(x * qi) / sum(qi^2)
+    const float xi = (float) qi0;
+    float num = x * xi;
+    float den = xi * xi;
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        num += __shfl_xor(num, mask, 32);
+        den += __shfl_xor(den, mask, 32);
+    }
+    const float scale = (den > 0.0f) ? (num / den) : scale0;
+    const int qi = max(-128, min(127, int(lrintf(x / scale))));
+
+    // Fixed kv_size head stride — row = head * kv_size + cell
+    const size_t row = (size_t(b) * size_t(n_heads_k) + size_t(hk)) * size_t(kv_size) + size_t(cell);
+    ((int8_t *)(k_payload + row * (GGML_CUDA_Q8K_DOT4_KQ_D / 4)))[d] = (int8_t) qi;
+    if (lane == 0) {
+        k_scales[row * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS + q_block] = __float2half(scale);
+    }
+}
+
 static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_quant_q_packed16_kernel(
         const float * __restrict__ Q,
         int         * __restrict__ q_payload,
@@ -1964,7 +2033,9 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_blockfa_rect
         int n_heads_k,
         int gqa_ratio,
         int batch,
-        int q_offset) {
+        int q_offset,
+        int k_head_stride_rows,
+        int k_batch_stride_rows) {
     static constexpr int BM_VAL = BM;
     static constexpr bool F16_V = USE_F16_V;
     static constexpr int I32_PER_ROW = GGML_CUDA_Q8K_DOT4_KQ_D / 4;
@@ -1988,7 +2059,8 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_blockfa_rect
     if (b >= batch || hq >= n_heads_q || hk >= n_heads_k) return;
 
     const size_t q_head_base = ((size_t(b) * n_heads_q + hq) * size_t(nq));
-    const size_t k_head_base = ((size_t(b) * n_heads_k + hk) * size_t(nk));
+    const size_t k_head_base = size_t(b) * size_t(k_batch_stride_rows)
+                             + size_t(hk) * size_t(k_head_stride_rows);
     const char * v_head = V + int64_t(b) * nb23 + int64_t(hk) * nb22;
 
     for (int off = tid; off < BM_VAL * I32_PER_ROW; off += blockDim.x) {
@@ -2999,6 +3071,23 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
     ggml_tensor * mask = dst->src[3];
     ggml_tensor * sinks = dst->src[4];
 
+    // I32 packed16 K contract: DOT4-dispatch path only.
+    const bool k_is_i32_packed16 = K->type == GGML_TYPE_I32;
+
+    if (k_is_i32_packed16) {
+        GGML_ASSERT(Q->type == GGML_TYPE_F32);
+        GGML_ASSERT(V->type == GGML_TYPE_F16);
+        GGML_ASSERT(dst->type == GGML_TYPE_F32);
+        GGML_ASSERT(K->ne[0] * 4 == Q->ne[0]);  // D/4 * 4 == D
+        GGML_ASSERT(V->ne[0] == Q->ne[0]);
+        GGML_ASSERT(K->ne[1] > 0);
+        GGML_ASSERT(K->ne[2] > 0);
+        GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
+        GGML_ASSERT(K->data != nullptr);
+        GGML_ASSERT(V->data != nullptr);
+        GGML_ASSERT(dst->data != nullptr);
+    }
+
     const int nq = (int) Q->ne[1];
     const int nk = (int) K->ne[1];
     const int n_heads_q = (int) Q->ne[2];
@@ -3155,6 +3244,10 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
         ggml_tensor * payload_tensor = nullptr;
         ggml_tensor * scales_tensor  = nullptr;
         llama_kv_cache_get_packed16_tensors(K->data, &payload_tensor, &scales_tensor);
+        // Packed16 I32 K MUST have registry entries (pre-quantized in cache).
+        if (K->type == GGML_TYPE_I32) {
+            GGML_ASSERT(payload_tensor && scales_tensor && "I32 K requires packed16 registry (populated in kv_cache init)");
+        }
         if (payload_tensor && scales_tensor) {
             // Use GGML tensors directly — no hipMalloc needed.
             k_payload.ptr = (int *) payload_tensor->data;
@@ -3282,7 +3375,11 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
 
     if (!q8block_variant || fused_variant) {
         if (!skip_k_repack) {
-            if (K->type == GGML_TYPE_F16) {
+            // Packed16 I32 K is pre-quantized; skip repack and use registry data.
+            const bool k_is_already_packed16 = (K->type == GGML_TYPE_I32);
+            if (k_is_already_packed16) {
+                skip_k_repack = true; // already in k_payload.ptr from registry above
+            } else if (K->type == GGML_TYPE_F16) {
                 // Direct f16→packed16 quantization (one kernel, no intermediate)
                 dim3 k_quant_grid(nk, n_heads_k, batch);
                 ggml_cuda_q8k_dot4_quant_k_packed16_kernel<<<k_quant_grid, block, 0, stream>>>(
@@ -3375,25 +3472,52 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                 if (!use_causal) {
                     GGML_ABORT("q8k_dot4_kq blockfa_recthist_v4_single requires causal-tail mask and GGML_CUDA_ROCM_Q8K_DOT4_BLOCKFA_ASSUME_CAUSAL=1");
                 }
+                // Debug instrumentation for I32 packed16 contracts.
+                static bool debug_i32_contract_printed = false;
+                if (k_is_i32_packed16 && !debug_i32_contract_printed &&
+                        ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_KQ_DEBUG_I32")) {
+                    debug_i32_contract_printed = true;
+                    fprintf(stderr,
+                        "q8k_dot4_i32: Q type=%d ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] data=%p\n"
+                        "q8k_dot4_i32: K type=%d ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] data=%p\n"
+                        "q8k_dot4_i32: V type=%d ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] data=%p\n"
+                        "q8k_dot4_i32: payload=%p scales=%p nq=%d nk=%d hq=%d hk=%d batch=%d gqa=%d\n",
+                        Q->type, Q->ne[0], Q->ne[1], Q->ne[2], Q->ne[3],
+                        Q->nb[0], Q->nb[1], Q->nb[2], Q->nb[3], Q->data,
+                        K->type, K->ne[0], K->ne[1], K->ne[2], K->ne[3],
+                        K->nb[0], K->nb[1], K->nb[2], K->nb[3], K->data,
+                        V->type, V->ne[0], V->ne[1], V->ne[2], V->ne[3],
+                        V->nb[0], V->nb[1], V->nb[2], V->nb[3], V->data,
+                        k_payload.ptr, k_scales.ptr, nq, nk, n_heads_q, n_heads_k, batch, gqa_ratio);
+                }
+                // Ensure all prior GPU work (pack_k on any stream) finished before FA reads registry data.
+                const bool force_sync = ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_KQ_FORCE_SYNC");
+                if (force_sync) {
+                    CUDA_CHECK(cudaDeviceSynchronize());
+                }
                 const int q_offset = blockfa_q_offset;
                 const int v4_bn = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_BLOCKFA_BN", 8);
                 const int v4_bm = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_BLOCKFA_BM", 8);
                 const size_t smem_v4 = (size_t(v4_bm * v4_bn + 3 * v4_bm + 2 * v4_bn * GGML_CUDA_Q8K_DOT4_KQ_D) + size_t(v4_bm * (GGML_CUDA_Q8K_DOT4_KQ_D / 4)) + size_t(v4_bm * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS)) * sizeof(float);
                 const dim3 recthist_grid((nq + v4_bm - 1) / v4_bm, n_heads_q, batch);
                 const bool use_f16_v = (V->type == GGML_TYPE_F16);
+                // Fixed KV cache head strides for persistent packed16 K.
+                GGML_ASSERT(K->nb[1] % sizeof(int) == 0);
+                const int k_head_stride_rows  = (int)(K->nb[2] / K->nb[1]);
+                const int k_batch_stride_rows = (int)(K->nb[3] / K->nb[1]);
                 if (v4_bm == 16 && v4_bn == 8) {
                     if (use_f16_v) {
                         ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_single_kernel<true, 8, 16><<<recthist_grid, block, smem_v4, stream>>>(
                             q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
                             (float *) dst->data, scale,
                             V->nb[0], V->nb[1], V->nb[2], V->nb[3],
-                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset);
+                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows);
                     } else {
                         ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_single_kernel<false, 8, 16><<<recthist_grid, block, smem_v4, stream>>>(
                             q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
                             (float *) dst->data, scale,
                             V->nb[0], V->nb[1], V->nb[2], V->nb[3],
-                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset);
+                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows);
                     }
                 } else if (v4_bm == 8 && v4_bn == 16) {
                     if (use_f16_v) {
@@ -3401,13 +3525,13 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                             q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
                             (float *) dst->data, scale,
                             V->nb[0], V->nb[1], V->nb[2], V->nb[3],
-                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset);
+                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows);
                     } else {
                         ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_single_kernel<false, 16, 8><<<recthist_grid, block, smem_v4, stream>>>(
                             q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
                             (float *) dst->data, scale,
                             V->nb[0], V->nb[1], V->nb[2], V->nb[3],
-                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset);
+                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows);
                     }
                 } else {
                     if (use_f16_v) {
@@ -3415,13 +3539,13 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                             q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
                             (float *) dst->data, scale,
                             V->nb[0], V->nb[1], V->nb[2], V->nb[3],
-                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset);
+                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows);
                     } else {
                         ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_single_kernel<false, 8, 8><<<recthist_grid, block, smem_v4, stream>>>(
                             q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
                             (float *) dst->data, scale,
                             V->nb[0], V->nb[1], V->nb[2], V->nb[3],
-                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset);
+                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows);
                     }
                 }
                 if (timing) {
@@ -3763,22 +3887,87 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
 void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_tensor * k_cur   = dst->src[0];  // f16 source
     ggml_tensor * scales  = dst->src[1];  // F16 scales output
+    ggml_tensor * k_idxs  = dst->src[2];  // row indices (absolute cache slots)
     ggml_tensor * payload = dst;          // I32 payload (dst is view of payload)
 
-    const int nq = (int) k_cur->ne[1];
-    const int n_heads = (int) k_cur->ne[2];
-    const int batch   = (int) k_cur->ne[3];
+    GGML_ASSERT(k_idxs != nullptr);
+    GGML_ASSERT(payload->type == GGML_TYPE_I32);
+    GGML_ASSERT(scales->type == GGML_TYPE_F16);
+    GGML_ASSERT(payload->ne[0] == GGML_CUDA_Q8K_DOT4_KQ_D / 4);
+    GGML_ASSERT(scales->ne[0]  == GGML_CUDA_Q8K_DOT4_KQ_BLOCKS);
 
-    dim3 grid(nq, n_heads, batch);
+    const int D = GGML_CUDA_Q8K_DOT4_KQ_D;
+    const int batch    = (int) k_cur->ne[3];
+
+    // Infer KV head count from source K shape.  k_cur may be split-head [D, n_heads, nk, B]
+    // or combined-GQA [D*nh, nk, 1, B].  The DOT4 kernel needs per-head packed16 rows.
+    int n_heads = 0;
+    int nk_cur  = 0;
+    int64_t src_head_stride_bytes = 0;
+
+    if (k_cur->ne[0] == D) {
+        // Split-head source: [D, n_heads, nk_cur, batch]
+        n_heads = (int) k_cur->ne[1];
+        nk_cur  = (int) k_cur->ne[2];
+        src_head_stride_bytes = k_cur->nb[1];
+    } else {
+        // Combined GQA source: [D * n_heads, nk_cur, 1, batch]
+        GGML_ASSERT(k_cur->ne[0] % D == 0);
+        n_heads = (int) (k_cur->ne[0] / D);
+        nk_cur  = (int) k_cur->ne[1];
+        src_head_stride_bytes = (int64_t) D * (int64_t) ggml_type_size(k_cur->type);
+    }
+
+    GGML_ASSERT(n_heads > 0);
+    GGML_ASSERT(payload->ne[1] % n_heads == 0);
+
+    const int kv_size = (int) (payload->ne[1] / n_heads);
+
+    GGML_ASSERT(kv_size >= nk_cur);
+
+    // Token stride for source K: nb[2] for split-head, nb[1] for combined-GQA.
+    const int64_t src_token_stride_bytes = (k_cur->ne[0] == D)
+        ? k_cur->nb[2]   // nb[2] advances across tokens in [D, nh, nk, B]
+        : k_cur->nb[1];  // nb[1] advances across tokens in [D*nh, nk, 1, B]
+
+    static bool pack_debug_printed = false;
+    if (!pack_debug_printed && ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_KQ_DEBUG_I32")) {
+        pack_debug_printed = true;
+        fprintf(stderr,
+            "pack_k_i32: k_cur type=%d ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] "
+            "payload ne=[%lld,%lld,%lld,%lld] scales ne=[%lld,%lld,%lld,%lld] "
+            "n_heads=%d nk_cur=%d kv_size=%d src_head_stride=%lld\n",
+            k_cur->type, k_cur->ne[0], k_cur->ne[1], k_cur->ne[2], k_cur->ne[3],
+            k_cur->nb[0], k_cur->nb[1], k_cur->nb[2], k_cur->nb[3],
+            payload->ne[0], payload->ne[1], payload->ne[2], payload->ne[3],
+            scales->ne[0], scales->ne[1], scales->ne[2], scales->ne[3],
+            n_heads, nk_cur, kv_size, (long long) src_head_stride_bytes);
+    }
+
+    dim3 grid(nk_cur, n_heads, batch);
     dim3 block(256);
     cudaStream_t stream = ctx.stream();
 
-    ggml_cuda_q8k_dot4_quant_k_packed16_kernel<<<grid, block, 0, stream>>>(
-        (const half *) k_cur->data,
-        (int *) payload->data,
-        (half *) scales->data,
-        k_cur->nb[1], k_cur->nb[2], k_cur->nb[3],
-        nq, n_heads, batch);
+    if (k_idxs->type == GGML_TYPE_I64) {
+        ggml_cuda_q8k_dot4_quant_k_packed16_indexed_kernel<int64_t><<<grid, block, 0, stream>>>(
+            (const half *) k_cur->data,
+            (int *) payload->data,
+            (half *) scales->data,
+            (const int64_t *) k_idxs->data,
+            src_token_stride_bytes, k_cur->nb[2], k_cur->nb[3],
+            src_head_stride_bytes,
+            nk_cur, n_heads, batch, kv_size);
+    } else {
+        GGML_ASSERT(k_idxs->type == GGML_TYPE_I32);
+        ggml_cuda_q8k_dot4_quant_k_packed16_indexed_kernel<int32_t><<<grid, block, 0, stream>>>(
+            (const half *) k_cur->data,
+            (int *) payload->data,
+            (half *) scales->data,
+            (const int32_t *) k_idxs->data,
+            src_token_stride_bytes, k_cur->nb[2], k_cur->nb[3],
+            src_head_stride_bytes,
+            nk_cur, n_heads, batch, kv_size);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

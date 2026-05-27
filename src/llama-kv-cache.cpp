@@ -257,16 +257,23 @@ llama_kv_cache::llama_kv_cache(
             }
         }
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+        const bool packed16_active = has_k && (bool)(getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE") && atoi(getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE")) != 0);
+
+        ggml_tensor * k = (has_k && !packed16_active) ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v_layer, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
         ggml_tensor * k_payload = nullptr;
         ggml_tensor * k_scales  = nullptr;
         {
-            const char * env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE");
-            if (has_k && env && atoi(env) != 0) {
-                k_payload = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_embd_k_gqa / 4, kv_size, n_stream);
-                k_scales  = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_embd_k_gqa / 32, kv_size, n_stream);
+            if (has_k && packed16_active) {
+                GGML_ASSERT(n_embd_k_gqa % 32 == 0);
+                const int64_t n_head_kv = (int64_t) hparams.n_head_kv(il);
+                const int64_t n_embd_head_k = hparams.n_embd_head_k(il);
+                const int64_t k_payload_d4  = n_embd_head_k / 4;
+                const int64_t k_scales_d32  = n_embd_head_k / 32;
+                GGML_ASSERT(n_embd_head_k % 32 == 0);
+                k_payload = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, k_payload_d4, kv_size * n_head_kv, n_stream);
+                k_scales  = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, k_scales_d32, kv_size * n_head_kv, n_stream);
                 ggml_format_name(k_payload, "cache_k_payload_l%d", il);
                 ggml_format_name(k_scales,  "cache_k_scales_l%d", il);
             }
@@ -274,15 +281,20 @@ llama_kv_cache::llama_kv_cache(
         std::vector<ggml_tensor *> k_payload_stream;
         std::vector<ggml_tensor *> k_scales_stream;
 
-        has_k && ggml_format_name(k, "cache_k_l%d", il);
+        has_k && k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
-            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
+            k_stream.push_back((has_k && k) ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
             v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
+            if (k_payload) {
+                const int64_t n_head_kv2 = (int64_t) hparams.n_head_kv(il);
+                k_payload_stream.push_back(ggml_view_2d(ctx, k_payload, k_payload->ne[0], kv_size * n_head_kv2, k_payload->nb[1], s*k_payload->nb[2]));
+                k_scales_stream.push_back(ggml_view_2d(ctx, k_scales, k_scales->ne[0], kv_size * n_head_kv2, k_scales->nb[1], s*k_scales->nb[2]));
+            }
         }
 
         map_layer_ids[il] = layers.size();
@@ -333,6 +345,16 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_clear(buf, 0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    // Register packed16 K tensors for DOT4 FA dispatch lookup.
+    for (auto & layer : layers) {
+        if (layer.k_payload && layer.k_scales) {
+            llama_kv_cache_register_packed16(layer.k_payload->data, layer.k_payload, layer.k_scales);
+            if (layer.k) {
+                llama_kv_cache_register_packed16(layer.k->data, layer.k_payload, layer.k_scales);
+            }
+        }
     }
 
     {
@@ -1204,6 +1226,7 @@ bool llama_kv_cache::get_has_shift() const {
 }
 
 ggml_type llama_kv_cache::type_k() const {
+    if (!layers[0].k && layers[0].k_payload) return layers[0].k_payload->type; // I32
     return layers[0].k->type;
 }
 
@@ -1231,6 +1254,30 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * k = layers[ikv].k;
+    auto * kp = layers[ikv].k_payload;
+
+    // Packed16-only mode: return I32 payload as 4D view.
+    if (!k && kp) {
+        const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+        const int64_t n_head_kv = hparams.n_head_kv(il);
+        const int64_t n_embd_head_k = hparams.n_embd_head_k(il);
+        const int64_t d4_per_head = n_embd_head_k / 4;
+        const uint32_t kv_size_total = get_size();
+
+        GGML_ASSERT(kp->type == GGML_TYPE_I32);
+        GGML_ASSERT(kp->ne[0] == d4_per_head);
+        GGML_ASSERT(kp->ne[1] == (int64_t) kv_size_total * n_head_kv);
+
+        const size_t row_bytes = kp->nb[1];
+
+        // [D/4 per head, n_kv, n_head_kv, ns] — fixed kv_size head stride
+        return ggml_view_4d(ctx, kp,
+                d4_per_head, n_kv, n_head_kv, ns,
+                row_bytes,
+                row_bytes * (size_t) kv_size_total,
+                row_bytes * (size_t) kv_size_total * (size_t) n_head_kv,
+                row_bytes * (size_t) kv_size_total * (size_t) n_head_kv * (size_t) sinfo.s0);
+    }
 
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_k_gqa = k->ne[0];
@@ -1300,33 +1347,43 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
 
     const int32_t ikv = map_layer_ids.at(il);
 
-    ggml_tensor * k = layers[ikv].k;
+    ggml_tensor * k         = layers[ikv].k;
+    ggml_tensor * k_payload = layers[ikv].k_payload;
+    ggml_tensor * k_scales  = layers[ikv].k_scales;
 
+    // Packed16 path: quantize directly.  Pack handler handles combined-GQA layout.
+    if (k_payload && k_scales) {
+        ggml_tensor * pack = ggml_pack_k_packed16(ctx, k_cur, k_payload, k_scales, k_idxs);
+        if (k) {
+            // Shadow mode: also write f16 K for graph compatibility.
+            const int64_t n_embd_head = k_cur->ne[0];
+            const int64_t n_head      = k_cur->ne[1];
+            const int64_t n_embd_gqa  = n_embd_head * n_head;
+            ggml_tensor * k_cur_2d = ggml_view_2d(ctx, k_cur, n_embd_gqa, k_cur->ne[2], k_cur->nb[2], 0);
+            ggml_set_rows(ctx, k, k_cur_2d, k_idxs);
+            return pack;
+        }
+        return pack;
+    }
+
+    // Standard f16 K cache path (no packed16).
     const int64_t n_embd_head = k_cur->ne[0];
     const int64_t n_head      = k_cur->ne[1];
     const int64_t n_tokens    = k_cur->ne[2];
+    const int64_t n_embd_gqa  = n_embd_head * n_head;
 
-    const int64_t n_embd_gqa = n_embd_head*n_head;
-
-    // we can merge dims 0 and 1
-    // TODO: add ggml helper function for this?
     GGML_ASSERT(ggml_row_size(k_cur->type, n_embd_head) == k_cur->nb[1]);
 
     k_cur = ggml_view_2d(ctx, k_cur, n_embd_gqa, n_tokens, k_cur->nb[2], 0);
 
     const int64_t n_stream = k->ne[2];
-
     if (n_stream > 1) {
         const int64_t kv_size = get_size();
-
         assert(n_embd_gqa == k->ne[0]);
         assert(kv_size    == k->ne[1]);
-
-        // merge the buffer across all streams because the idxs are global
-        k = ggml_reshape_2d(ctx, k, n_embd_gqa, kv_size*n_stream);
+        k = ggml_reshape_2d(ctx, k, n_embd_gqa, kv_size * n_stream);
     }
 
-    // store the current K values into the cache
     return ggml_set_rows(ctx, k, k_cur, k_idxs);
 }
 
@@ -1809,7 +1866,9 @@ size_t llama_kv_cache::size_k_bytes() const {
     size_t size_k_bytes = 0;
 
     for (const auto & layer : layers) {
-        size_k_bytes += ggml_nbytes(layer.k);
+        if (layer.k) size_k_bytes += ggml_nbytes(layer.k);
+        if (layer.k_payload) size_k_bytes += ggml_nbytes(layer.k_payload);
+        if (layer.k_scales)  size_k_bytes += ggml_nbytes(layer.k_scales);
     }
 
     return size_k_bytes;
@@ -1920,28 +1979,28 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
     for (const auto & layer : layers) {
         const uint32_t il = layer.il;
 
-        const int64_t n_head_kv    = hparams.n_head_kv(il);
-        const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+        // Packed16-only K cache: skip f16 K shift (absolute k_idxs handle positioning).
+        // V shift still applies normally.
+        if (layer.k) {
+            const int64_t n_head_kv    = hparams.n_head_kv(il);
+            const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+            const auto n_rot         = hparams.n_rot(il);
+            const auto n_embd_head_k = hparams.n_embd_head_k(il);
+            const auto n_embd_nope   = hparams.n_lora_kv > 0 ? n_embd_head_k - n_rot : 0;
+            const float freq_base_l  = model.get_rope_freq_base (cparams, il);
+            const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
+            ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
 
-        const auto n_rot         = hparams.n_rot(il);
-        const auto n_embd_head_k = hparams.n_embd_head_k(il);
-        const auto n_embd_nope   = hparams.n_lora_kv > 0 ? n_embd_head_k - n_rot : 0;
+            ggml_tensor * k =
+                ggml_view_3d(ctx, layer.k,
+                    n_rot, n_head_kv, get_size()*n_stream,
+                    ggml_row_size(layer.k->type, n_embd_head_k),
+                    ggml_row_size(layer.k->type, n_embd_k_gqa),
+                    ggml_row_size(layer.k->type, n_embd_nope));
 
-        const float freq_base_l  = model.get_rope_freq_base (cparams, il);
-        const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
-
-        ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
-
-        ggml_tensor * k =
-            ggml_view_3d(ctx, layer.k,
-                n_rot, n_head_kv, get_size()*n_stream,
-                ggml_row_size(layer.k->type, n_embd_head_k),
-                ggml_row_size(layer.k->type, n_embd_k_gqa),
-                ggml_row_size(layer.k->type, n_embd_nope));
-
-        ggml_tensor * cur = build_rope_shift(cparams, ctx, k, inp->k_shift, inp->k_rot, rope_factors, freq_base_l, freq_scale_l, il);
-
-        ggml_build_forward_expand(gf, cur);
+            ggml_tensor * cur = build_rope_shift(cparams, ctx, k, inp->k_shift, inp->k_rot, rope_factors, freq_base_l, freq_scale_l, il);
+            ggml_build_forward_expand(gf, cur);
+        }
     }
 
     res->add_input(std::move(inp));

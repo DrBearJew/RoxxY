@@ -519,13 +519,23 @@ static bool ggml_cuda_fattn_route_contract_applicable(
     // I8/dot4 route contracts are prefill-only. During graph reservation and
     // decode the same context also probes one-token attention graphs; those
     // should log as not-applicable instead of aborting a prefill contract.
-    if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || Q->ne[1] <= 2 ||
-            Q->ne[0] != 256 || K->ne[0] != 256 || V->ne[0] != 256 || dst->ne[0] != 256) {
+    if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || Q->ne[1] <= 2) {
+        return false;
+    }
+
+    // Shape check: Q must be 256, V must be 256. K can be 256 (q8_0) or D/4 (I32 packed16)
+    const bool k_shape_ok = (K->type == GGML_TYPE_I32)
+        ? (K->ne[0] * 4 == Q->ne[0])
+        : (K->ne[0] == 256);
+    if (Q->ne[0] != 256 || !k_shape_ok || V->ne[0] != 256 || dst->ne[0] != 256) {
         return false;
     }
 
     if (strcmp(required, "rocm_q8k_dot4_kq") == 0) {
-        return K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0 && ggml_cuda_q8k_dot4_kq_enabled();
+        // Accept q8_0 K (original) or I32 packed16 K (packed16-only mode)
+        return ((K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0) ||
+                (K->type == GGML_TYPE_I32 && V->type == GGML_TYPE_F16)) &&
+               ggml_cuda_q8k_dot4_kq_enabled();
     }
     if (strcmp(required, "rocm_q8k_dot4_packed16_vec") == 0) {
         return K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0 && ggml_cuda_q8k_dot4_packed16_vec_enabled();
@@ -968,6 +978,36 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     const int cc = ggml_cuda_info().devices[device].cc;
+
+    // I32 packed16 K: DOT4-only format.  Bypass generic shape switch that
+    // would reject K->ne[0]=64 vs V->ne[0]=128/256 mismatch.
+    if (K->type == GGML_TYPE_I32) {
+        const bool k_shape_ok = K->ne[0] * 4 == Q->ne[0];  // D/4 * 4 == D
+        const bool v_shape_ok = V->ne[0] == Q->ne[0];
+        const bool head_ok    = Q->ne[2] > 0 && K->ne[2] > 0 && Q->ne[2] % K->ne[2] == 0;
+
+        if (!(Q->type == GGML_TYPE_F32 && V->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32 &&
+              k_shape_ok && v_shape_ok && K->ne[1] > 0 && head_ok)) {
+            // Log why I32 K was rejected so we can debug shape mismatches.
+            static bool i32_reject_printed = false;
+            if (!i32_reject_printed) {
+                i32_reject_printed = true;
+                fprintf(stderr,
+                    "fattn.cu: I32 K rejected — Q type=%d ne=[%lld,%lld,%lld,%lld] "
+                    "K ne=[%lld,%lld,%lld,%lld] V ne=[%lld,%lld,%lld,%lld]\n",
+                    Q->type, Q->ne[0], Q->ne[1], Q->ne[2], Q->ne[3],
+                    K->ne[0], K->ne[1], K->ne[2], K->ne[3],
+                    V->ne[0], V->ne[1], V->ne[2], V->ne[3]);
+            }
+            return BEST_FATTN_KERNEL_NONE;
+        }
+
+        if (!ggml_cuda_q8k_dot4_kq_enabled()) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+
+        return BEST_FATTN_KERNEL_Q8K_DOT4_KQ;
+    }
 
     switch (K->ne[0]) {
         case  40:

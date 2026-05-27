@@ -36,11 +36,26 @@ static inline bool ggml_cuda_q8k_dot4_kq_supported(const int cc, const ggml_tens
     if (!ggml_cuda_q8k_dot4_kq_enabled()) {
         return false;
     }
-    if (!GGML_CUDA_CC_IS_RDNA3(cc) || Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_Q8_0 ||
-            V->type != GGML_TYPE_Q4_0 || dst->type != GGML_TYPE_F32) {
+    const bool k_is_packed16_i32 = (K->type == GGML_TYPE_I32);
+    if (!GGML_CUDA_CC_IS_RDNA3(cc) || Q->type != GGML_TYPE_F32 ||
+            dst->type != GGML_TYPE_F32) {
         return false;
     }
-    if (Q->ne[0] != 256 || K->ne[0] != 256 || V->ne[0] != 256 || dst->ne[0] != 256 || Q->ne[1] <= 2) {
+    // Accept: q8_0 K (original path) or I32 packed16 K (packed16-only path)
+    if (!k_is_packed16_i32 && (K->type != GGML_TYPE_Q8_0 || V->type != GGML_TYPE_Q4_0)) {
+        return false;
+    }
+    if (k_is_packed16_i32 && V->type != GGML_TYPE_F16) {
+        return false;  // packed16 path requires f16 V
+    }
+    // Packed16 I32 K has ne[0] = D_per_head/4 vs Q's ne[0] = D_per_head
+    const bool k_shape_ok = k_is_packed16_i32
+        ? (K->ne[0] * 4 == Q->ne[0])
+        : (K->ne[0] == Q->ne[0] && K->ne[0] == 256);
+    if (!k_shape_ok) return false;
+    if (!k_is_packed16_i32 && (V->ne[0] != 256 || dst->ne[0] != 256)) return false;
+    if (k_is_packed16_i32 && (dst->ne[0] != Q->ne[0])) return false;
+    if (Q->ne[1] <= 2) {
         return false;
     }
     if (K->ne[1] < Q->ne[1] || Q->ne[2] % K->ne[2] != 0 || Q->ne[3] != K->ne[3]) {

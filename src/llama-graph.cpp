@@ -180,6 +180,12 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_tokens = ubatch->n_tokens;
 
+    // If scheduler didn't allocate out_ids (unused by graph), skip.
+    // Safe when n_outputs == n_tokens (no output compaction needed).
+    if (!out_ids->buffer) {
+        return;  // scheduler didn't allocate; benign when output identity (n_outputs==n_tokens) or no compaction needed
+    }
+
     GGML_ASSERT(ggml_backend_buffer_is_host(out_ids->buffer));
     int32_t * data = (int32_t *) out_ids->data;
 
@@ -1982,7 +1988,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     const bool v_trans = v->nb[1] > v->nb[2];
     const bool k_is_tbq = k->type == GGML_TYPE_TBQ3_0 || k->type == GGML_TYPE_TBQ4_0;
     const bool v_is_tbq = v->type == GGML_TYPE_TBQ3_0 || v->type == GGML_TYPE_TBQ4_0;
-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+    // packed16 I32 K cannot use non-flash ggml_mul_mat path; force FA
+    const bool k_is_packed16_i32 = k->type == GGML_TYPE_I32;
+    const bool use_flash_attn = (cparams.flash_attn || k_is_packed16_i32) && kq_b == nullptr;
     // split the batch into streams if needed
     const auto n_stream = k_is_tbq ? k->ne[2] : (v_is_tbq ? v->ne[2] : k->ne[3]);
 
@@ -2036,7 +2044,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     // types avoid TILE/WMMA full-f16 temporary buffers at long context.
 
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
-    k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+    // Packed16 I32 K is already in [D/4, n_kv, n_head_kv, ns] layout
+    // that DOT4 dispatch expects; skip permute to avoid stride corruption
+    if (!k_is_packed16_i32) {
+        k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+    }
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
 
     ggml_tensor * cur;
@@ -2055,6 +2067,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         if (v->type == GGML_TYPE_F32) {
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+        }
+
+        // When FA is forced for packed16 I32 K but cparams.flash_attn was false,
+        // the mask may still be F32. FA requires F16 mask.
+        if (kq_mask && kq_mask->type != GGML_TYPE_F16) {
+            kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
         }
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,

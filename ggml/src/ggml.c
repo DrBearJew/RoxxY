@@ -3989,18 +3989,31 @@ struct ggml_tensor * ggml_pack_k_packed16(
         struct ggml_context * ctx,
         struct ggml_tensor  * k_cur,
         struct ggml_tensor  * payload,
-        struct ggml_tensor  * scales) {
+        struct ggml_tensor  * scales,
+        struct ggml_tensor  * k_idxs) {
     GGML_ASSERT(ggml_is_contiguous(k_cur));
     GGML_ASSERT(payload->type == GGML_TYPE_I32);
     GGML_ASSERT(scales->type  == GGML_TYPE_F16);
-    GGML_ASSERT(k_cur->ne[0] == payload->ne[0] * 4);
-    GGML_ASSERT(k_cur->ne[0] == scales->ne[0]  * 32);
+    GGML_ASSERT(k_idxs);
+    GGML_ASSERT(k_idxs->type == GGML_TYPE_I64 || k_idxs->type == GGML_TYPE_I32);
+    // k_cur has GQA combined dimension; payload has per-head D/4.
+    const int64_t k_cur_dim = k_cur->ne[0];
+    const int64_t k_pld_dim = payload->ne[0] * 4;
+    GGML_ASSERT(k_pld_dim > 0);
+    GGML_ASSERT(k_cur_dim % k_pld_dim == 0 && "k_cur width must be multiple of per-head packed16 width");
+    const int64_t inferred_heads = k_cur_dim / k_pld_dim;
+    GGML_ASSERT(inferred_heads > 0);
+    GGML_ASSERT(scales->ne[0] * 32 == k_pld_dim);
+    GGML_ASSERT(k_cur->ne[0] == scales->ne[0] * 32 * inferred_heads);
+    GGML_ASSERT(payload->ne[1] % inferred_heads == 0);
+    GGML_ASSERT(scales->ne[1] == payload->ne[1]);
 
     struct ggml_tensor * result = ggml_view_tensor(ctx, payload);
 
     result->op     = GGML_OP_PACK_K_PACKED16;
     result->src[0] = k_cur;   // source f16 K
     result->src[1] = scales;  // secondary output (scales tensor)
+    result->src[2] = k_idxs;  // row indices (scheduler dependency, keeps buffer allocated)
 
     return result;
 }
@@ -5405,6 +5418,23 @@ struct ggml_tensor * ggml_arange(
     return result;
 }
 
+// Flash-attn-specific K/Q compatibility helper.
+// Does NOT modify ggml_can_mul_mat(); packed16 I32 K is only valid for FA, not generic matmul.
+static inline bool ggml_can_flash_attn_ext_kq(
+        const struct ggml_tensor * k,
+        const struct ggml_tensor * q) {
+    static_assert(GGML_MAX_DIMS == 4, "GGML_MAX_DIMS is not 4 - update this function");
+
+    const bool normal_kq = k->ne[0] == q->ne[0];
+    const bool packed16_kq =
+        k->type == GGML_TYPE_I32 &&
+        k->ne[0] * 4 == q->ne[0];
+
+    return (normal_kq || packed16_kq) &&
+           (q->ne[2] % k->ne[2] == 0) &&
+           (q->ne[3] % k->ne[3] == 0);
+}
+
 // ggml_flash_attn_ext
 
 struct ggml_tensor * ggml_flash_attn_ext(
@@ -5416,7 +5446,7 @@ struct ggml_tensor * ggml_flash_attn_ext(
         float                 scale,
         float                 max_bias,
         float                 logit_softcap) {
-    GGML_ASSERT(ggml_can_mul_mat(k, q));
+    GGML_ASSERT(ggml_can_flash_attn_ext_kq(k, q));
     // TODO: check if vT can be multiplied by (k*qT)
 
     GGML_ASSERT(q->ne[3] == k->ne[3]);
