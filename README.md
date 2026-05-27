@@ -26,13 +26,39 @@ stack.
 
 ## Current recommendation
 
-| Target | Status | Use |
+| Target | Status | ctx | q8_0/tbq4_0 K/V | MTP | gen tok/s |
+|---|---:|---|---:|---:|
+| 27B ROCm MTP | daily driver | 128K | q8_0/tbq4_0 target, q8_0/q4_0 draft | n3, force-MMQ | ~54 |
+| 35B ROCm MTP | daily driver | 256K | q8_0/tbq4_0 target, q8_0/q4_0 draft | n3, no force-MMQ | ~112 |
+| Vulkan | fallback | 64K | q8_0/q4_0 target+draft | n2 | — |
+
+### Context sizing
+
+Set `--ctx-size` per model; VRAM headroom at 24 GB:
+
+| Model | Safe ceiling | Notes |
 |---|---|---|
-| ROCm no-TBQ KV | stable public path | `q8_0` K + `q4_0` V, no experimental env knobs |
-| 27B ROCm MTP | promoted local path | `q8_0` K + `tbq4_0` V, MTP n3, f16-temp prefill on |
-| 35B ROCm no-MTP | stable prompt path | `q8_0` K + `tbq4_0` V, MMQ selector on, no speculative MTP |
-| 35B ROCm MTP | experimental but usable | MTP n3 plus explicit f16-temp prefill, no force-MMQ by default |
-| Vulkan | baseline / comparison | q8/q4 is restored; TBQ4 Vulkan parity is not claimed |
+| 27B | 128K | 180K static estimate fits but inference compute buffers overflow |
+| 35B | 256K | Fits with ~1.8 GB VRAM headroom |
+
+### VRAM-constrained flags
+
+Avoid these in daily wrappers — each costs generation throughput or VRAM:
+
+- `--spec-default` — enables ngram-mod, wastes VRAM on dense 27B
+- `--mlock --no-mmap` — memory locking overhead
+- `--cache-ram <N>` — unnecessary at these context sizes on 24 GB
+- `--no-context-shift` — changes KV behavior, slows generation
+- `--spec-ngram-mod-*` — ngram pool overhead, regression on general text
+
+### MTP draft acceptance
+
+llama.cpp defaults `--spec-draft-n-max` to 16, which severely degrades
+aggregate acceptance (~36%). Always set `--spec-draft-n-max 3` when MTP is
+enabled (70-87% acceptance on gfx1100).
+
+Draft KV: `q8_0` K + `q4_0` V saves VRAM vs symmetric `tbq4_0` and is faster
+for draft verification on dense 27B.
 
 Q4_K_M works for both 27B and 35B. Context length, MTP depth, KV format, and
 batch/ubatch sizing determine the practical VRAM budget.
@@ -54,7 +80,7 @@ MTP has separate draft-context KV flags. Use these when draft KV should match
 the target q8/tbq4 KV format:
 
 ```bash
---cache-type-k-draft q8_0 --cache-type-v-draft tbq4_0
+--cache-type-k-draft q8_0 --cache-type-v-draft q4_0
 ```
 
 ### ROCm quantized-KV f16 prefill
@@ -124,12 +150,12 @@ GGML_CUDA_ROCM_QUANT_PREFILL_F16=1 \
   --model /path/to/Qwen3.6-27B-Q4_K_M-mtp.gguf \
   --flash-attn on \
   --cache-type-k q8_0 --cache-type-v tbq4_0 \
-  --cache-type-k-draft q8_0 --cache-type-v-draft tbq4_0 \
-  --batch-size 1024 --ubatch-size 1024 \
-  --spec-type draft-mtp --spec-default \
+  --cache-type-k-draft q8_0 --cache-type-v-draft q4_0 \
+  --batch-size 2048 --ubatch-size 1024 \
+  --spec-type draft-mtp \
   --spec-draft-n-max 3 --spec-draft-p-min 0 \
   --spec-draft-prio 2 --spec-draft-prio-batch 2 \
-  --parallel 1
+  --parallel 1 --ctx-size 131072 --no-warmup
 ```
 
 ### 35B ROCm, no MTP
@@ -149,12 +175,7 @@ GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_NKV=40960 \
   --parallel 1
 ```
 
-### 35B ROCm MTP recommended
-
-Local gfx1100 temp-0.6 validation favored draft depth 3 without force-MMQ:
-`mtp_n3` reached 2677 prompt tok/s and 98.8 generation tok/s with 3192/4044
-draft acceptance and ~21.23 GiB peak VRAM. `LLAMA_MTP_PREFILL_FORCE_MMQ=1` was
-worse as a force-control (75.9 generation tok/s), so leave it unset by default.
+### 35B ROCm MTP
 
 ```bash
 RDNA2_MATMUL_OPT_V1=1 \
@@ -165,16 +186,15 @@ GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_NKV=40960 \
 ./build-rocm-vulkan/bin/llama-server \
   --device ROCm0 \
   --model /path/to/Qwen3.6-35B-A3B-IQ4_XS-00001-of-00002.gguf \
-  --ctx-size 40960 \
   --flash-attn on \
-  --cache-type-k q8_0 --cache-type-v tbq4_0 \
-  --cache-type-k-draft q8_0 --cache-type-v-draft tbq4_0 \
-  --batch-size 1024 --ubatch-size 1024 \
   --temp 0.6 --top-p 0.95 \
-  --spec-type draft-mtp --spec-default \
+  --cache-type-k q8_0 --cache-type-v tbq4_0 \
+  --cache-type-k-draft q8_0 --cache-type-v-draft q4_0 \
+  --batch-size 2048 --ubatch-size 1024 \
+  --spec-type draft-mtp \
   --spec-draft-n-max 3 --spec-draft-p-min 0 \
   --spec-draft-prio 2 --spec-draft-prio-batch 2 \
-  --parallel 1
+  --parallel 1 --ctx-size 262144 --no-warmup
 ```
 
 ## Build
