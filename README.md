@@ -26,11 +26,11 @@ stack.
 
 ## Current recommendation
 
-| Target | Status | ctx | q8_0/tbq4_0 K/V | MTP | gen tok/s |
-|---|---:|---|---:|---:|
-| 27B ROCm MTP | daily driver | 128K | q8_0/tbq4_0 target, q8_0/q4_0 draft | n3, force-MMQ | ~54 |
-| 35B ROCm MTP | daily driver | 256K | q8_0/tbq4_0 target, q8_0/q4_0 draft | n3, no force-MMQ | ~112 |
-| Vulkan | fallback | 64K | q8_0/q4_0 target+draft | n2 | — |
+| Target | Status | ctx | K/V (target) | K/V (draft) | MTP | gen tok/s |
+| --- | --- | --- | --- | --- | --- | --- |
+| 27B ROCm MTP | daily | 128K | q8_0 / tbq4_0 | q8_0 / q4_0 | n3, force-MMQ | ~54 |
+| 35B ROCm MTP | daily | 256K | q8_0 / tbq4_0 | q8_0 / q4_0 | n3, no force-MMQ | ~112 |
+| Vulkan | fallback | 64K | q8_0 / q4_0 | q8_0 / q4_0 | n2 | — |
 
 ### Context sizing
 
