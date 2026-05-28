@@ -945,14 +945,113 @@ static ggml_cuda_rocm_quant_prefill_f16_mode ggml_cuda_rocm_quant_prefill_f16_mo
     return GGML_CUDA_ROCM_QUANT_PREFILL_F16_ALLOW;
 }
 
+// ── DOT4 archetype roles ─────────────────────────────────────────
+// The DOT4 archetype defines workload roles:
+//
+//   Prefill      nq > 1  → v4 recthist
+//   MTP verify   nq > 1  → v4 recthist
+//   Small decode nq == 1 → BN64 decode
+//   Long decode  nq == 1 → split-K
+//
+// MTP verify is a named DOT4 workload. The role is derived from the
+// FA instruction, not from K/V type. K/V type is a legality gate.
+
+enum ggml_cuda_dot4_role {
+    GGML_CUDA_DOT4_ROLE_NONE = 0,
+    GGML_CUDA_DOT4_ROLE_PREFILL_RECTHIST_V4,
+    GGML_CUDA_DOT4_ROLE_MTP_VERIFY_RECTHIST_V4,
+    GGML_CUDA_DOT4_ROLE_DECODE_BN64,
+    GGML_CUDA_DOT4_ROLE_DECODE_SPLITK,
+};
+
+static const char * ggml_cuda_dot4_role_name(enum ggml_cuda_dot4_role role) {
+    switch (role) {
+        case GGML_CUDA_DOT4_ROLE_MTP_VERIFY_RECTHIST_V4: return "recthist_v4_mtp_verify";
+        case GGML_CUDA_DOT4_ROLE_PREFILL_RECTHIST_V4:    return "recthist_v4_prefill";
+        case GGML_CUDA_DOT4_ROLE_DECODE_BN64:            return "decode_bn64";
+        case GGML_CUDA_DOT4_ROLE_DECODE_SPLITK:          return "decode_splitk";
+        default:                                          return "-";
+    }
+}
+
+static enum ggml_cuda_dot4_role ggml_cuda_dot4_role_from_instruction(
+        int32_t inst,
+        const ggml_tensor * Q) {
+    if (inst == GGML_FATTN_INST_MTP_VERIFY_QK && Q->ne[1] > 1) {
+        return GGML_CUDA_DOT4_ROLE_MTP_VERIFY_RECTHIST_V4;
+    }
+    return GGML_CUDA_DOT4_ROLE_NONE;
+}
+
 // ── MTP instruction selector ────────────────────────────────────────
-// MTP_VERIFY_QK: run FA as the QK/V backend for MTP verification.
-// MTP_DRAFT: run FA for draft token generation (no DOT4 preference).
 //
-// Instruction-first: MTP declares the instrument, then DOT4/WMMA/VEC
-// are selected as implementations of that instruction.
+// MTP_VERIFY_QK is a semantic FlashAttention instruction.
+// It maps to the DOT4 recthist-v4 archetype when a legal K representation
+// exists. nq and K/V type are legality gates only; they must not classify
+// the operation.
 //
-// KV format and nq are legality gates, not semantic classifiers.
+// MTP_DRAFT intentionally does not prefer DOT4 and must not use packed16 K.
+
+static bool ggml_cuda_mtp_verify_dot4_nq2_enabled() {
+#ifdef GGML_USE_HIP
+    const char * env = getenv("GGML_CUDA_ROCM_MTP_VERIFY_DOT4_NQ2");
+    return env && atoi(env) != 0;
+#else
+    return false;
+#endif
+}
+
+static bool ggml_cuda_mtp_verify_dot4_recthist_supported(
+        const int cc,
+        const ggml_tensor * dst) {
+#ifdef GGML_USE_HIP
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    if (!ggml_cuda_q8k_dot4_kq_enabled()) {
+        return false;
+    }
+
+    if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    // Archetype: MTP verify nq > 1 → v4 recthist.
+    // Current implementation gate: nq > 2 (DOT4 helpers reject nq <= 2).
+    // nq == 2 behind explicit env.
+    if (Q->ne[1] <= 1) {
+        return false;
+    }
+    if (Q->ne[1] == 2 && !ggml_cuda_mtp_verify_dot4_nq2_enabled()) {
+        return false;
+    }
+
+    // Legal K representations:
+    //   A. K = I32 packed16, V = f16/q8_0/q4_0
+    //   B. K = q8_0,       V = q4_0
+    const bool packed16_k =
+        K->type == GGML_TYPE_I32 &&
+        K->ne[0] * 4 == Q->ne[0] &&
+        (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0);
+
+    const bool q8q4_kv =
+        K->type == GGML_TYPE_Q8_0 &&
+        V->type == GGML_TYPE_Q4_0 &&
+        K->ne[0] == Q->ne[0] &&
+        V->ne[0] == Q->ne[0];
+
+    if (!packed16_k && !q8q4_kv) {
+        return false;
+    }
+
+    return ggml_cuda_q8k_dot4_kq_supported(cc, dst);
+#else
+    GGML_UNUSED(cc);
+    GGML_UNUSED(dst);
+    return false;
+#endif
+}
 
 static const char * ggml_cuda_mtp_inst_name(int32_t inst) {
     switch (inst) {
@@ -970,68 +1069,64 @@ static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
+    const auto dot4_role = ggml_cuda_dot4_role_from_instruction(
+            GGML_FATTN_INST_MTP_VERIFY_QK, Q);
+
     const auto log_mtp = [&](const char * impl_status, best_fattn_kernel selected) {
         if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
             if (log_env && atoi(log_env) != 0) {
-                GGML_LOG_INFO("%s: fa_instruction=mtp_verify_qk nq=%lld K=%s V=%s impl_status=%s impl_candidates=%s\n",
+                GGML_LOG_INFO("%s: fa_instruction=mtp_verify_qk nq=%lld K=%s V=%s "
+                        "dot4_role=%s impl_status=%s selected=%s\n",
                         __func__, (long long) Q->ne[1],
                         ggml_type_name(K->type), ggml_type_name(V->type),
+                        ggml_cuda_dot4_role_name(dot4_role),
                         impl_status,
-                        selected == BEST_FATTN_KERNEL_Q8K_DOT4_KQ ? "dot4" :
-                        selected == BEST_FATTN_KERNEL_Q8K_DOT4_PACKED16_VEC ? "dot4_packed16_vec" :
-                        selected == BEST_FATTN_KERNEL_Q8Q4_DOT4_PREFILL ? "q8q4_dot4" :
-                        selected == BEST_FATTN_KERNEL_Q8TBQ4_DOT4_PREFILL ? "q8tbq4_dot4" :
+                        selected == BEST_FATTN_KERNEL_Q8K_DOT4_KQ ? "rocm_q8k_dot4_kq" :
+                        selected == BEST_FATTN_KERNEL_Q8K_DOT4_PACKED16_VEC ? "q8k_dot4_packed16_vec" :
+                        selected == BEST_FATTN_KERNEL_Q8Q4_DOT4_PREFILL ? "q8q4_dot4_prefill" :
+                        selected == BEST_FATTN_KERNEL_Q8TBQ4_DOT4_PREFILL ? "q8tbq4_dot4_prefill" :
                         selected == BEST_FATTN_KERNEL_WMMA_F16 ? "wmma_f16" :
                         selected == BEST_FATTN_KERNEL_MMA_F16 ? "mma_f16" :
-                        "vec,tile");
+                        selected == BEST_FATTN_KERNEL_VEC ? "vec" :
+                        selected == BEST_FATTN_KERNEL_Q8Q4_WMMA_I8 ? "q8q4_wmma_i8" :
+                        "<existing_policy>");
             }
         }
     };
 
-    // nq <= 2: no DOT4; fall through to existing policy.
-    if (Q->ne[1] <= 2) {
-        log_mtp("nq_le_2_dot4_ineligible", BEST_FATTN_KERNEL_VEC);
-        return BEST_FATTN_KERNEL_NONE; // signal: use existing policy
+    // Archetype: MTP verify nq > 1 -> v4 recthist.
+    // Current implementation gate: nq > 2 (DOT4 helpers reject nq <= 2).
+    // nq == 2 behind explicit env.
+    if (Q->ne[1] <= 1) {
+        log_mtp("nq_eq_1_decode_not_recthist", BEST_FATTN_KERNEL_NONE);
+        return BEST_FATTN_KERNEL_NONE;
+    }
+    if (Q->ne[1] == 2 && !ggml_cuda_mtp_verify_dot4_nq2_enabled()) {
+        log_mtp("nq_eq_2_disabled", BEST_FATTN_KERNEL_NONE);
+        return BEST_FATTN_KERNEL_NONE;
     }
 
-    // DOT4 backends (quantized KV compatible)
-    if (ggml_cuda_q8k_dot4_kq_supported(cc, dst)) {
+    // Try DOT4 recthist as implementation.
+    if (ggml_cuda_mtp_verify_dot4_recthist_supported(cc, dst)) {
         const auto selected = ggml_cuda_fattn_apply_route_contract(
                 dst, BEST_FATTN_KERNEL_Q8K_DOT4_KQ, f16_policy);
         log_mtp("dot4_selected", selected);
         return selected;
     }
-    if (ggml_cuda_q8k_dot4_packed16_vec_supported(cc, dst)) {
-        const auto selected = ggml_cuda_fattn_apply_route_contract(
-                dst, BEST_FATTN_KERNEL_Q8K_DOT4_PACKED16_VEC, f16_policy);
-        log_mtp("dot4_selected", selected);
-        return selected;
-    }
-    if (ggml_cuda_q8q4_dot4_prefill_supported(cc, dst)) {
-        const auto selected = ggml_cuda_fattn_apply_route_contract(
-                dst, BEST_FATTN_KERNEL_Q8Q4_DOT4_PREFILL, f16_policy);
-        log_mtp("dot4_selected", selected);
-        return selected;
-    }
-    if (ggml_cuda_q8tbq4_dot4_prefill_supported(cc, dst)) {
-        const auto selected = ggml_cuda_fattn_apply_route_contract(
-                dst, BEST_FATTN_KERNEL_Q8TBQ4_DOT4_PREFILL, f16_policy);
-        log_mtp("dot4_selected", selected);
-        return selected;
-    }
 
-    // DOT4 not applicable — log why.
+    // DOT4 not legal — determine why.
     {
-        const bool dot4_env = ggml_cuda_q8k_dot4_kq_enabled() ||
-                              ggml_cuda_q8k_dot4_packed16_vec_enabled() ||
-                              ggml_cuda_q8q4_dot4_prefill_enabled() ||
-                              ggml_cuda_q8tbq4_dot4_prefill_enabled();
-        const bool kv_ok = (K->type == GGML_TYPE_I32) ||
-                           (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0);
-        const char * status = !dot4_env ? "dot4_env_disabled"
-                            : !kv_ok   ? "kv_format_incompatible"
-                            :            "dot4_shape_or_type";
-        log_mtp(status, BEST_FATTN_KERNEL_VEC);
+        const bool dot4_env = ggml_cuda_q8k_dot4_kq_enabled();
+        const bool packed16_k =
+            K->type == GGML_TYPE_I32 &&
+            (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0);
+        const bool q8q4_kv =
+            K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0;
+
+        const char * status = !dot4_env    ? "dot4_env_disabled"
+                            : !packed16_k && !q8q4_kv ? "missing_legal_k_representation"
+                            :              "dot4_shape_or_type";
+        log_mtp(status, BEST_FATTN_KERNEL_NONE);
     }
 
     return BEST_FATTN_KERNEL_NONE; // signal: use existing policy
