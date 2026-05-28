@@ -163,9 +163,25 @@ for (k_tile = 0; k_tile < nk; k_tile += BN) {
 // Final: out[q][d] /= row_l[q]
 ```
 
+## Why Flash Attention Matters
+
+The speed comparison (820 vs 902 t/s, ±6%) misses the point. FlashAttention isn't primarily about throughput — it's about **memory**. Without tiling, attention computes the full `nq × nk` logit matrix in HBM:
+
+| Context length | Attention matrix (f32) | Feasible without FA? |
+|---------------:|-----------------------:|---------------------:|
+| 512 | 1 MB | Yes |
+| 4k | 64 MB | Marginal |
+| 16k | 1 GB | No (dominates VRAM) |
+| 64k | 16 GB | No (exceeds GPU memory) |
+| 128k | 64 GB | No |
+
+With tiled online-softmax FlashAttention, the working set is one BM×BN logit tile plus row state — constant memory regardless of context length. The DOT4 FA kernel enables long-context inference on consumer GPUs where materializing the full attention matrix would OOM.
+
+Every existing llama.cpp ROCm attention route (VEC, tile, MMA) already uses FlashAttention tiling. Our kernel adds INT8 math to that family. The comparison isn't "DOT4 FA vs no FA" — the comparison is "DOT4 FA vs other FA routes," and the advantage is PPL fidelity on default f16 KV cache without the FP16-temp memory cost.
+
 ## Key Performance Numbers
 
-### PPL Correctness (Qwen3.6-27B Q4_K_M, gfx1100, 48 layers)
+### PPL Correctness (Qwen3.6-27B Q4_K_M, gfx1100, 48 layers, pp512)
 
 | Metric | Value |
 |--------|-------|
@@ -179,6 +195,8 @@ Run 2: 817 t/s, PPL 1.0128
 ```
 
 The PPL test measures token prediction accuracy end-to-end through the full model — not a tile-level NRMSE. If cache corruption or X-input staleness existed, PPL would drift. It doesn't.
+
+**Open question: q8_0 K cache PPL at long context.** Quantized K caches (q8_0, q4_0, TBQ4) lose precision per key row, and softmax amplifies those errors non-linearly as context grows. A proper PPL comparison between f16 K and q8_0 K at 64k–128k context would measure the real quality cost of quantized KV caches. We have not run this measurement. Our kernel supports both f16 K (lossless PPL) and q8_0 K (for VRAM-constrained use), but the quality gap between them at scale is unknown.
 
 ### Throughput (pp1536, gfx1100)
 
