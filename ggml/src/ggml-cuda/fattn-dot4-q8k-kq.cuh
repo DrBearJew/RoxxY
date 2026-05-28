@@ -42,15 +42,15 @@ static inline bool ggml_cuda_q8k_dot4_kq_supported(const int cc, const ggml_tens
     // The primary gate is in llama_kv_cache (is_mtp_draft), but if an MTP
     // FA op somehow sees I32 K, reject here with a log.
     {
-        const int32_t fa_hint = ((const int32_t *)dst->op_params)[4];
-        const bool is_mtp = (fa_hint == GGML_FATTN_HINT_MTP_DRAFT ||
-                             fa_hint == GGML_FATTN_HINT_MTP_VERIFY);
+        const int32_t fa_inst = ((const int32_t *)dst->op_params)[4];
+        const bool is_mtp = (fa_inst == GGML_FATTN_INST_MTP_DRAFT ||
+                             fa_inst == GGML_FATTN_INST_MTP_VERIFY_QK);
         if (is_mtp && k_is_packed16_i32) {
             if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
                 if (log_env && atoi(log_env) != 0) {
-                    GGML_LOG_INFO("%s: q8k_dot4_kq reject=mtp_packed16_k hint=%s Q=[%lld,%lld,%lld,%lld]\n",
+                    GGML_LOG_INFO("%s: q8k_dot4_kq reject=mtp_packed16_k inst=%s Q=[%lld,%lld,%lld,%lld]\n",
                             __func__,
-                            fa_hint == GGML_FATTN_HINT_MTP_DRAFT ? "mtp_draft" : "mtp_verify",
+                            fa_inst == GGML_FATTN_INST_MTP_DRAFT ? "mtp_draft" : "mtp_verify_qk",
                             (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3]);
                 }
             }

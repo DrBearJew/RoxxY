@@ -2085,14 +2085,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         if (gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
             // MTP verify: target feeds h_pre_norm via ubatch.embd.
+            //   Instruction: run FA as QK/V backend for MTP verification.
             // MTP draft: autoregressive continuation (token-only).
-            // Both currently route the same, but the distinction is
-            // preserved for logging, safety gates, and future policy.
+            //   Instruction: run FA for draft token generation.
             const bool is_mtp_verify = (ubatch.embd != nullptr);
-            const auto hint = is_mtp_verify
-                ? GGML_FATTN_HINT_MTP_VERIFY
-                : GGML_FATTN_HINT_MTP_DRAFT;
-            ggml_flash_attn_ext_set_route_hint(cur, hint);
+            const auto inst = is_mtp_verify
+                ? GGML_FATTN_INST_MTP_VERIFY_QK
+                : GGML_FATTN_INST_MTP_DRAFT;
+            ggml_flash_attn_ext_set_instruction(cur, inst);
         }
 
         if (v_mla) {

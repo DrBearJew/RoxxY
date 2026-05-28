@@ -668,9 +668,9 @@ static void ggml_cuda_fattn_log_selection(const best_fattn_kernel kernel, const 
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    const int32_t fa_hint_i32 = ((const int32_t *)dst->op_params)[4];
-    const char * fattn_hint = fa_hint_i32 == GGML_FATTN_HINT_MTP_DRAFT ? "mtp_draft"
-        : fa_hint_i32 == GGML_FATTN_HINT_MTP_VERIFY ? "mtp_verify" : "none";
+    const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
+    const char * fa_inst_name = fa_inst_i32 == GGML_FATTN_INST_MTP_DRAFT ? "mtp_draft"
+        : fa_inst_i32 == GGML_FATTN_INST_MTP_VERIFY_QK ? "mtp_verify_qk" : "none";
 
     const bool tbq4_vec_norm_hoist = kernel == BEST_FATTN_KERNEL_VEC && K->type == GGML_TYPE_TBQ4_0 && ggml_cuda_tbq4_vec_norm_hoist_enabled();
     const bool sparse_v_dequant = kernel == BEST_FATTN_KERNEL_VEC && V->type == GGML_TYPE_TBQ4_0 && Q->ne[1] == 1 && ggml_cuda_sparse_v_dequant_enabled();
@@ -702,8 +702,8 @@ static void ggml_cuda_fattn_log_selection(const best_fattn_kernel kernel, const 
         const int lds_tile_rows = Q->ne[0] == 256 ? ggml_cuda_tbq4_lds_d_k_tile_rows<256>() : ggml_cuda_tbq4_lds_d_k_tile_rows<128>();
         const int lds_f16_stride = Q->ne[0] == 256 ? ggml_cuda_tbq4_lds_d_k_f16_stride_half2<256>() : ggml_cuda_tbq4_lds_d_k_f16_stride_half2<128>();
         const int lds_packed_stride = Q->ne[0] == 256 ? ggml_cuda_tbq4_lds_d_k_packed_stride<256>() : ggml_cuda_tbq4_lds_d_k_packed_stride<128>();
-        GGML_LOG_INFO("%s: kernel=%s route=%s fattn_hint=%s d=%lld tile_rows=%d f16_stride=%d packed_stride=%d sparse_v_tau=%d fallback=tbq4_vec Q=%s K=%s V=%s nq=%lld nkv=%lld d_q=%lld d_v=%lld\n",
-            __func__, ggml_cuda_fattn_kernel_name(kernel), route, fattn_hint,
+        GGML_LOG_INFO("%s: kernel=%s route=%s fa_inst=%s d=%lld tile_rows=%d f16_stride=%d packed_stride=%d sparse_v_tau=%d fallback=tbq4_vec Q=%s K=%s V=%s nq=%lld nkv=%lld d_q=%lld d_v=%lld\n",
+            __func__, ggml_cuda_fattn_kernel_name(kernel), route, fa_inst_name,
             (long long) Q->ne[0], lds_tile_rows, lds_f16_stride, lds_packed_stride,
             sparse_v_tau_level,
             ggml_type_name(Q->type), ggml_type_name(K->type), ggml_type_name(V->type),
@@ -712,8 +712,8 @@ static void ggml_cuda_fattn_log_selection(const best_fattn_kernel kernel, const 
         return;
     }
 
-    GGML_LOG_INFO("%s: kernel=%s route=%s fattn_hint=%s Q=%s K=%s V=%s nq=%lld nkv=%lld d_q=%lld d_v=%lld sparse_v_tau_level=%d\n",
-        __func__, ggml_cuda_fattn_kernel_name(kernel), route, fattn_hint,
+    GGML_LOG_INFO("%s: kernel=%s route=%s fa_inst=%s Q=%s K=%s V=%s nq=%lld nkv=%lld d_q=%lld d_v=%lld sparse_v_tau_level=%d\n",
+        __func__, ggml_cuda_fattn_kernel_name(kernel), route, fa_inst_name,
         ggml_type_name(Q->type), ggml_type_name(K->type), ggml_type_name(V->type),
         (long long) Q->ne[1], (long long) K->ne[1],
         (long long) Q->ne[0], (long long) V->ne[0], sparse_v_tau_level);
@@ -945,6 +945,98 @@ static ggml_cuda_rocm_quant_prefill_f16_mode ggml_cuda_rocm_quant_prefill_f16_mo
     return GGML_CUDA_ROCM_QUANT_PREFILL_F16_ALLOW;
 }
 
+// ── MTP instruction selector ────────────────────────────────────────
+// MTP_VERIFY_QK: run FA as the QK/V backend for MTP verification.
+// MTP_DRAFT: run FA for draft token generation (no DOT4 preference).
+//
+// Instruction-first: MTP declares the instrument, then DOT4/WMMA/VEC
+// are selected as implementations of that instruction.
+//
+// KV format and nq are legality gates, not semantic classifiers.
+
+static const char * ggml_cuda_mtp_inst_name(int32_t inst) {
+    switch (inst) {
+        case GGML_FATTN_INST_MTP_DRAFT:     return "mtp_draft";
+        case GGML_FATTN_INST_MTP_VERIFY_QK: return "mtp_verify_qk";
+        default:                              return "none";
+    }
+}
+
+static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
+        const int cc,
+        const ggml_tensor * dst,
+        const ggml_cuda_rocm_quant_prefill_f16_policy * f16_policy) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    const auto log_mtp = [&](const char * impl_status, best_fattn_kernel selected) {
+        if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
+            if (log_env && atoi(log_env) != 0) {
+                GGML_LOG_INFO("%s: fa_instruction=mtp_verify_qk nq=%lld K=%s V=%s impl_status=%s impl_candidates=%s\n",
+                        __func__, (long long) Q->ne[1],
+                        ggml_type_name(K->type), ggml_type_name(V->type),
+                        impl_status,
+                        selected == BEST_FATTN_KERNEL_Q8K_DOT4_KQ ? "dot4" :
+                        selected == BEST_FATTN_KERNEL_Q8K_DOT4_PACKED16_VEC ? "dot4_packed16_vec" :
+                        selected == BEST_FATTN_KERNEL_Q8Q4_DOT4_PREFILL ? "q8q4_dot4" :
+                        selected == BEST_FATTN_KERNEL_Q8TBQ4_DOT4_PREFILL ? "q8tbq4_dot4" :
+                        selected == BEST_FATTN_KERNEL_WMMA_F16 ? "wmma_f16" :
+                        selected == BEST_FATTN_KERNEL_MMA_F16 ? "mma_f16" :
+                        "vec,tile");
+            }
+        }
+    };
+
+    // nq <= 2: no DOT4; fall through to existing policy.
+    if (Q->ne[1] <= 2) {
+        log_mtp("nq_le_2_dot4_ineligible", BEST_FATTN_KERNEL_VEC);
+        return BEST_FATTN_KERNEL_NONE; // signal: use existing policy
+    }
+
+    // DOT4 backends (quantized KV compatible)
+    if (ggml_cuda_q8k_dot4_kq_supported(cc, dst)) {
+        const auto selected = ggml_cuda_fattn_apply_route_contract(
+                dst, BEST_FATTN_KERNEL_Q8K_DOT4_KQ, f16_policy);
+        log_mtp("dot4_selected", selected);
+        return selected;
+    }
+    if (ggml_cuda_q8k_dot4_packed16_vec_supported(cc, dst)) {
+        const auto selected = ggml_cuda_fattn_apply_route_contract(
+                dst, BEST_FATTN_KERNEL_Q8K_DOT4_PACKED16_VEC, f16_policy);
+        log_mtp("dot4_selected", selected);
+        return selected;
+    }
+    if (ggml_cuda_q8q4_dot4_prefill_supported(cc, dst)) {
+        const auto selected = ggml_cuda_fattn_apply_route_contract(
+                dst, BEST_FATTN_KERNEL_Q8Q4_DOT4_PREFILL, f16_policy);
+        log_mtp("dot4_selected", selected);
+        return selected;
+    }
+    if (ggml_cuda_q8tbq4_dot4_prefill_supported(cc, dst)) {
+        const auto selected = ggml_cuda_fattn_apply_route_contract(
+                dst, BEST_FATTN_KERNEL_Q8TBQ4_DOT4_PREFILL, f16_policy);
+        log_mtp("dot4_selected", selected);
+        return selected;
+    }
+
+    // DOT4 not applicable — log why.
+    {
+        const bool dot4_env = ggml_cuda_q8k_dot4_kq_enabled() ||
+                              ggml_cuda_q8k_dot4_packed16_vec_enabled() ||
+                              ggml_cuda_q8q4_dot4_prefill_enabled() ||
+                              ggml_cuda_q8tbq4_dot4_prefill_enabled();
+        const bool kv_ok = (K->type == GGML_TYPE_I32) ||
+                           (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0);
+        const char * status = !dot4_env ? "dot4_env_disabled"
+                            : !kv_ok   ? "kv_format_incompatible"
+                            :            "dot4_shape_or_type";
+        log_mtp(status, BEST_FATTN_KERNEL_VEC);
+    }
+
+    return BEST_FATTN_KERNEL_NONE; // signal: use existing policy
+}
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
@@ -970,19 +1062,19 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // Fires for every MTP hint, regardless of KV type. Logs whether DOT4
     // is eligible for MTP_VERIFY based on KV format compatibility.
     {
-        const int32_t fa_hint_i32 = ((const int32_t *)KQV->op_params)[4];
-        const bool is_mtp = (fa_hint_i32 == GGML_FATTN_HINT_MTP_DRAFT ||
-                             fa_hint_i32 == GGML_FATTN_HINT_MTP_VERIFY);
+        const int32_t fa_inst_i32 = ((const int32_t *)KQV->op_params)[4];
+        const bool is_mtp = (fa_inst_i32 == GGML_FATTN_INST_MTP_DRAFT ||
+                             fa_inst_i32 == GGML_FATTN_INST_MTP_VERIFY_QK);
         if (is_mtp) {
-            const char * hint_name = fa_hint_i32 == GGML_FATTN_HINT_MTP_DRAFT
+            const char * inst_name = fa_inst_i32 == GGML_FATTN_INST_MTP_DRAFT
                 ? "mtp_draft" : "mtp_verify";
             const bool quantized_kv = ggml_is_quantized(K->type) || ggml_is_quantized(V->type);
             const bool dot4_kv_ok = (K->type == GGML_TYPE_I32) ||
                 (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0);
-            if (!dot4_kv_ok && fa_hint_i32 == GGML_FATTN_HINT_MTP_VERIFY) {
+            if (!dot4_kv_ok && fa_inst_i32 == GGML_FATTN_INST_MTP_VERIFY_QK) {
                 if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
                     if (log_env && atoi(log_env) != 0) {
-                        GGML_LOG_INFO("%s: fa_route fattn_hint=mtp_verify nq=%lld dot4_candidate=0 dot4_reject_reason=kv_type_incompatible K=%s V=%s\n",
+                        GGML_LOG_INFO("%s: fa_route fa_inst=mtp_verify nq=%lld dot4_candidate=0 dot4_reject_reason=kv_type_incompatible K=%s V=%s\n",
                                 __func__, (long long) Q->ne[1],
                                 ggml_type_name(K->type), ggml_type_name(V->type));
                     }
@@ -1195,80 +1287,28 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return ggml_cuda_fattn_apply_route_contract(dst, selected, &f16_policy);
         };
 
-        // ── MTP semantic FA routing ───────────────────────────────────
-        // MTP-verify (h_pre_norm from target, nq > 2): prefer DOT4 prefill.
-        // MTP-draft (token-only continuation): fall through to existing policy.
-        // Conservative gate: nq must be >= 3 (DOT4 support gate is nq > 2).
+        // ── MTP instruction dispatch ──────────────────────────────
+        // MTP_VERIFY_QK: run FA as QK/V backend for MTP verification.
+        // MTP_DRAFT: run FA for draft generation (no DOT4 preference).
         //
-        // Log canary (COMPRESSED_KV_FATTN_LOG=1):
-        //   fa_route fattn_hint=<mtp_draft|mtp_verify|none> nq=<n>
-        //     dot4_candidate=<0|1> dot4_reject_reason=<reason|->
-        //   log_selection: kernel=<name> route=<route> fattn_hint=<hint>
-        //     (fires after route contract enforcement; true final state)
-        const int32_t fa_hint_i32 = ((const int32_t *)dst->op_params)[4];
-        const bool is_mtp_fa =
-            fa_hint_i32 == GGML_FATTN_HINT_MTP_DRAFT ||
-            fa_hint_i32 == GGML_FATTN_HINT_MTP_VERIFY;
-        // Only MTP-verify gets DOT4 prefill; draft falls through.
-        const bool mtp_verify_prefill_like =
-            fa_hint_i32 == GGML_FATTN_HINT_MTP_VERIFY && Q->ne[1] > 2;
-
-        if (is_mtp_fa) {
-            const char * hint_name = fa_hint_i32 == GGML_FATTN_HINT_MTP_DRAFT
-                ? "mtp_draft" : "mtp_verify";
-
-            if (Q->ne[1] <= 2) {
-                // nq <= 2: no DOT4 for any MTP role.
-                if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
-                    if (log_env && atoi(log_env) != 0) {
-                        GGML_LOG_INFO("%s: fa_route fattn_hint=%s nq=%lld dot4_candidate=0 dot4_reject_reason=mtp_nq_le_2\n",
-                                __func__, hint_name, (long long) Q->ne[1]);
-                    }
+        // Instruction-first: MTP declares the instrument, then
+        // DOT4/WMMA/VEC are selected as implementations.
+        {
+            const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
+            if (fa_inst_i32 == GGML_FATTN_INST_MTP_VERIFY_QK) {
+                const auto selected = ggml_cuda_select_mtp_verify_fattn(cc, dst, &f16_policy);
+                if (selected != BEST_FATTN_KERNEL_NONE) {
+                    return selected;
                 }
-            } else if (fa_hint_i32 == GGML_FATTN_HINT_MTP_DRAFT) {
-                // nq > 2 but draft: DOT4 not enabled for draft.
+                // BEST_FATTN_KERNEL_NONE: fall through to existing policy.
+            } else if (fa_inst_i32 == GGML_FATTN_INST_MTP_DRAFT) {
                 if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
                     if (log_env && atoi(log_env) != 0) {
-                        GGML_LOG_INFO("%s: fa_route fattn_hint=mtp_draft nq=%lld dot4_candidate=0 dot4_reject_reason=mtp_draft_dot4_not_enabled\n",
+                        GGML_LOG_INFO("%s: fa_instruction=mtp_draft nq=%lld impl_status=existing_policy\n",
                                 __func__, (long long) Q->ne[1]);
                     }
                 }
-            }
-        }
-
-        // MTP-verify: prefer DOT4 prefill routes at nq > 2.
-        // Final route is logged by ggml_cuda_fattn_log_selection() after
-        // route contract enforcement, including fattn_hint=.
-        if (mtp_verify_prefill_like) {
-            if (ggml_cuda_q8k_dot4_kq_supported(cc, dst)) {
-                return return_quantized_route(BEST_FATTN_KERNEL_Q8K_DOT4_KQ);
-            }
-
-            if (ggml_cuda_q8k_dot4_packed16_vec_supported(cc, dst)) {
-                return return_quantized_route(BEST_FATTN_KERNEL_Q8K_DOT4_PACKED16_VEC);
-            }
-
-            if (ggml_cuda_q8q4_dot4_prefill_supported(cc, dst)) {
-                return return_quantized_route(BEST_FATTN_KERNEL_Q8Q4_DOT4_PREFILL);
-            }
-
-            if (ggml_cuda_q8tbq4_dot4_prefill_supported(cc, dst)) {
-                return return_quantized_route(BEST_FATTN_KERNEL_Q8TBQ4_DOT4_PREFILL);
-            }
-
-            // DOT4 candidate but none matched — log reason.
-            if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
-                if (log_env && atoi(log_env) != 0) {
-                    const bool dot4_kq_env      = ggml_cuda_q8k_dot4_kq_enabled();
-                    const bool dot4_p16vec_env  = ggml_cuda_q8k_dot4_packed16_vec_enabled();
-                    const bool dot4_q8q4_env    = ggml_cuda_q8q4_dot4_prefill_enabled();
-                    const bool dot4_q8tbq4_env  = ggml_cuda_q8tbq4_dot4_prefill_enabled();
-                    const bool any_dot4_env     = dot4_kq_env || dot4_p16vec_env || dot4_q8q4_env || dot4_q8tbq4_env;
-                    const char * reject_reason = !any_dot4_env ? "dot4_env_disabled"
-                        : "dot4_shape_or_type";
-                    GGML_LOG_INFO("%s: fa_route fattn_hint=mtp_verify nq=%lld dot4_candidate=1 dot4_reject_reason=%s\n",
-                            __func__, (long long) Q->ne[1], reject_reason);
-                }
+                // Fall through to existing policy.
             }
         }
 

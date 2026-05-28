@@ -25,12 +25,17 @@
 //    - MTP draft context must NOT use packed16 K (is_mtp_draft KV-cache gate).
 //      The FA selector also rejects I32 K for MTP draft via fa_hint check.
 //
-//  MTP semantic routing:
-//    MTP_VERIFY is a semantic FA/QK role. nq is only a kernel legality gate.
-//    DOT4 is eligible for MTP_VERIFY only when nq > 2.
+//  MTP instruction layer:
+//    MTP_VERIFY_QK is a semantic FA instruction. nq is only a kernel legality gate.
+//    DOT4 is eligible for MTP_VERIFY_QK only when nq > 2.
 //    MTP_DRAFT never enables DOT4 preference — it falls through to existing policy.
 //    MTP chunk size (LLAMA_MTP_PREFILL_CHUNK) does not control route selection;
-//    the hint does. Chunk size only controls whether the chosen kernel is legal.
+//    the instruction does. Chunk size only controls whether the chosen kernel is legal.
+//
+//  Instruction → implementation:
+//    MTP_VERIFY_QK + q8_0/q4_0  → DOT4 (if env enabled)
+//    MTP_VERIFY_QK + f16/f16    → WMMA/F16/VEC (DOT4 kv_format_incompatible)
+//    MTP_DRAFT                  → existing policy (no DOT4 preference)
 //
 //  Env flags:
 //    GGML_CUDA_ROCM_Q8K_DOT4_DECODE_BN=64
