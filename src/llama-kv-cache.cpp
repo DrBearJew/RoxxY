@@ -876,7 +876,13 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
             for (uint32_t il = 0; il < layers.size(); ++il) {
                 const auto & layer = layers[il];
 
-                ggml_backend_tensor_copy(layer.k_stream[ssrc], layer.k_stream[sdst]);
+                if (layer.k_stream[ssrc]) {
+                    ggml_backend_tensor_copy(layer.k_stream[ssrc], layer.k_stream[sdst]);
+                }
+                if (layer.k_payload_stream[ssrc]) {
+                    ggml_backend_tensor_copy(layer.k_payload_stream[ssrc], layer.k_payload_stream[sdst]);
+                    ggml_backend_tensor_copy(layer.k_scales_stream [ssrc], layer.k_scales_stream [sdst]);
+                }
 
                 if (layer.v_stream[ssrc]) {
                     ggml_backend_tensor_copy(layer.v_stream[ssrc], layer.v_stream[sdst]);
@@ -2156,21 +2162,23 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 
         const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
 
-        auto * k = layer.k_stream[cr.strm];
+        if (layer.k) {
+            auto * k = layer.k_stream[cr.strm];
 
-        // Write key type
-        const int32_t k_type_i = (int32_t) k->type;
-        io.write(&k_type_i, sizeof(k_type_i));
+            // Write key type
+            const int32_t k_type_i = (int32_t) k->type;
+            io.write(&k_type_i, sizeof(k_type_i));
 
-        // Write row size of key
-        const uint64_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
-        io.write(&k_size_row, sizeof(k_size_row));
+            // Write row size of key
+            const uint64_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
+            io.write(&k_size_row, sizeof(k_size_row));
 
         // Read each range of cells of k_size length and write out
         for (const auto & range : cr.data) {
             const size_t range_size = range.second - range.first;
             const size_t buf_size = range_size * k_size_row;
             io.write_tensor(k, range.first * k_size_row, buf_size);
+        }
         }
     }
 
@@ -2388,16 +2396,17 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 
         const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
 
-        auto * k = layer.k_stream[strm];
+        if (layer.k) {
+            auto * k = layer.k_stream[strm];
 
-        // Read type of key
-        int32_t k_type_i_ref;
-        io.read(&k_type_i_ref, sizeof(k_type_i_ref));
-        const int32_t k_type_i = (int32_t) k->type;
-        if (k_type_i != k_type_i_ref) {
-            LLAMA_LOG_ERROR("%s: mismatched key type (%d != %d, layer %d)\n", __func__, k_type_i, k_type_i_ref, il);
-            return false;
-        }
+            // Read type of key
+            int32_t k_type_i_ref;
+            io.read(&k_type_i_ref, sizeof(k_type_i_ref));
+            const int32_t k_type_i = (int32_t) k->type;
+            if (k_type_i != k_type_i_ref) {
+                LLAMA_LOG_ERROR("%s: mismatched key type (%d != %d, layer %d)\n", __func__, k_type_i, k_type_i_ref, il);
+                return false;
+            }
 
         // Read row size of key
         uint64_t k_size_row_ref;
@@ -2419,6 +2428,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                     io.read_tensor(k, dst_offset, k_size_row);
                 }
             }
+        }
         }
     }
 
