@@ -39,9 +39,9 @@
 //    rotation = OFF        GQA ratio integer
 //
 //  Expected performance (7900 XTX, 27B Q4_K_M, q4_0 V, packed16 K):
-//    ctx=512:  BN64 32 t/s,  splitK 32 t/s
-//    ctx=8k:   BN64 28 t/s,  splitK 32 t/s
-//    ctx=16k:  BN64 24 t/s,  splitK 32 t/s
+//    Prefill (v4):  pp512=401  pp2k=689  pp8k=746  pp15k=709 t/s
+//    Decode BN64:   ctx=512: 32 t/s,  ctx=8k: 28 t/s,  ctx=16k: 24 t/s
+//    Decode splitK: ctx=512: 32 t/s,  ctx=8k: 32 t/s,  ctx=16k: 32 t/s
 //
 //  See: .harness/research/packed16-only-k-implementation-plan.md
 //       docs/rocm-tbq4-paths/packed16-benchmark-report-20260528.md
