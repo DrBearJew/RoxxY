@@ -413,6 +413,16 @@ static bool ggml_cuda_mtp_verify_f16k_dot4_adapter_enabled() {
 // Separate support check for f16-source materialization.
 // Does NOT call q8k_dot4_kq_supported() — that rejects source K=f16.
 // The DOT4 launch path already has f16→packed16 quantization.
+
+static bool ggml_cuda_mtp_verify_dot4_nq2_enabled() {
+#ifdef GGML_USE_HIP
+    const char * env = getenv("GGML_CUDA_ROCM_MTP_VERIFY_DOT4_NQ2");
+    return env && atoi(env) != 0;
+#else
+    return false;
+#endif
+}
+
 static bool ggml_cuda_mtp_verify_f16k_dot4_adapter_supported(
         const int cc,
         const ggml_tensor * dst) {
@@ -427,6 +437,8 @@ static bool ggml_cuda_mtp_verify_f16k_dot4_adapter_supported(
     if (!ggml_cuda_q8k_dot4_kq_enabled()) {
         return false;
     }
+    // nq==1 is decode (not recthist). nq==2 behind explicit env.
+    const int nq_min = ggml_cuda_mtp_verify_dot4_nq2_enabled() ? 2 : 3;
     return GGML_CUDA_CC_IS_RDNA3(cc) &&
            Q->type == GGML_TYPE_F32 &&
            K->type == GGML_TYPE_F16 &&
@@ -435,7 +447,7 @@ static bool ggml_cuda_mtp_verify_f16k_dot4_adapter_supported(
            Q->ne[0] == 256 &&
            K->ne[0] == Q->ne[0] &&
            V->ne[0] == Q->ne[0] &&
-           Q->ne[1] > 2 &&
+           Q->ne[1] >= nq_min &&
            K->ne[1] >= Q->ne[1] &&
            Q->ne[2] % K->ne[2] == 0 &&
            V->ne[2] == K->ne[2] &&
@@ -1064,15 +1076,6 @@ static enum ggml_cuda_dot4_role ggml_cuda_dot4_role_from_instruction(
 // nq==2 is currently disabled pending explicit validation.
 //
 // Frozen: MTP_FA_INSTRUCTION_PR3_FROZEN
-
-static bool ggml_cuda_mtp_verify_dot4_nq2_enabled() {
-#ifdef GGML_USE_HIP
-    const char * env = getenv("GGML_CUDA_ROCM_MTP_VERIFY_DOT4_NQ2");
-    return env && atoi(env) != 0;
-#else
-    return false;
-#endif
-}
 
 static bool ggml_cuda_mtp_verify_dot4_recthist_supported(
         const int cc,
