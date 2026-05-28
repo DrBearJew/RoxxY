@@ -1353,16 +1353,20 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
 
     // Packed16 path: quantize directly.  Pack handler handles combined-GQA layout.
     if (k_payload && k_scales) {
-        ggml_tensor * pack = ggml_pack_k_packed16(ctx, k_cur, k_payload, k_scales, k_idxs);
         if (k) {
-            // Shadow mode: also write f16 K for graph compatibility.
+            // Shadow mode: first copy f32→q8_0 via set_rows, then indexed-pack
+            // from calibrated q8_0 K cache (preserves ggml quantizer quality).
             const int64_t n_embd_head = k_cur->ne[0];
             const int64_t n_head      = k_cur->ne[1];
             const int64_t n_embd_gqa  = n_embd_head * n_head;
             ggml_tensor * k_cur_2d = ggml_view_2d(ctx, k_cur, n_embd_gqa, k_cur->ne[2], k_cur->nb[2], 0);
             ggml_set_rows(ctx, k, k_cur_2d, k_idxs);
+            // Pack from q8_0 shadow K — uses calibrated q8_0 block quantizer.
+            ggml_tensor * pack = ggml_pack_k_packed16(ctx, k, k_payload, k_scales, k_idxs);
             return pack;
         }
+        // Packed16-only mode (no shadow K): indexed pack is the primary K write.
+        ggml_tensor * pack = ggml_pack_k_packed16(ctx, k_cur, k_payload, k_scales, k_idxs);
         return pack;
     }
 

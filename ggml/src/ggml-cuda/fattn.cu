@@ -534,7 +534,7 @@ static bool ggml_cuda_fattn_route_contract_applicable(
     if (strcmp(required, "rocm_q8k_dot4_kq") == 0) {
         // Accept q8_0 K (original) or I32 packed16 K (packed16-only mode)
         return ((K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0) ||
-                (K->type == GGML_TYPE_I32 && V->type == GGML_TYPE_F16)) &&
+                (K->type == GGML_TYPE_I32 && (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0))) &&
                ggml_cuda_q8k_dot4_kq_enabled();
     }
     if (strcmp(required, "rocm_q8k_dot4_packed16_vec") == 0) {
@@ -986,7 +986,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         const bool v_shape_ok = V->ne[0] == Q->ne[0];
         const bool head_ok    = Q->ne[2] > 0 && K->ne[2] > 0 && Q->ne[2] % K->ne[2] == 0;
 
-        if (!(Q->type == GGML_TYPE_F32 && V->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32 &&
+        if (!(Q->type == GGML_TYPE_F32 && (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0) && dst->type == GGML_TYPE_F32 &&
               k_shape_ok && v_shape_ok && K->ne[1] > 0 && head_ok)) {
             // Log why I32 K was rejected so we can debug shape mismatches.
             static bool i32_reject_printed = false;

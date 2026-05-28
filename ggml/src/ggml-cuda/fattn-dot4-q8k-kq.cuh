@@ -45,7 +45,7 @@ static inline bool ggml_cuda_q8k_dot4_kq_supported(const int cc, const ggml_tens
     if (!k_is_packed16_i32 && (K->type != GGML_TYPE_Q8_0 || V->type != GGML_TYPE_Q4_0)) {
         return false;
     }
-    if (k_is_packed16_i32 && V->type != GGML_TYPE_F16) {
+    if (k_is_packed16_i32 && V->type != GGML_TYPE_F16 && V->type != GGML_TYPE_Q8_0 && V->type != GGML_TYPE_Q4_0) {
         return false;  // packed16 path requires f16 V
     }
     // Packed16 I32 K has ne[0] = D_per_head/4 vs Q's ne[0] = D_per_head

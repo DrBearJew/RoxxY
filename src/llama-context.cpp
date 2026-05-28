@@ -440,7 +440,11 @@ llama_context::llama_context(
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
-                throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
+                // Packed16 K cache with DOT4 FA supports quantized V without cparams.flash_attn.
+                const bool packed16_active = (bool)(getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE") && atoi(getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE")) != 0);
+                if (!packed16_active) {
+                    throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
+                }
             }
         }
     }
