@@ -1,3 +1,52 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  Packed16 Decode Kernel System — canonical route table
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//  Four kernel roles, dispatched by (nq, nk, K type):
+//
+//  ┌──────────────┬───────────────┬────────────────────┬────────────────────┐
+//  │ Workload     │ Condition     │ Kernel             │ Notes              │
+//  ├──────────────┼───────────────┼────────────────────┼────────────────────┤
+//  │ Prefill      │ nq > 1        │ v4 (recthist)      │ Existing path      │
+//  │ MTP verify   │ nq > 1        │ v4 (recthist)      │ Existing path      │
+//  │ Small decode │ nq == 1,      │ BN64 decode         │ No split overhead  │
+//  │              │ nk < 2048     │                    │                    │
+//  │ Long decode  │ nq == 1,      │ split-K stage1+2    │ Parallel over K    │
+//  │              │ nk >= 2048    │                    │                    │
+//  └──────────────┴───────────────┴────────────────────┴────────────────────┘
+//
+//  Hard rules:
+//    - nq == 1  → decode kernels (BN64 or split-K). Never v4.
+//    - nq > 1   → v4 kernel. Never BN64 or split-K.
+//    - split-K  → stage1 writes UNNORMALIZED partial_o. Stage2 merges.
+//    - Q4PAIR   → experimental, disabled by default. No speed gain.
+//    - MTP draft context must NOT use packed16 K (is_mtp_draft gate).
+//
+//  Env flags:
+//    GGML_CUDA_ROCM_Q8K_DOT4_DECODE_BN=64
+//    GGML_CUDA_ROCM_Q8K_DOT4_DECODE_SPLITK=1          (force-enable)
+//    GGML_CUDA_ROCM_Q8K_DOT4_DECODE_SPLITK_THRESHOLD=2048
+//    GGML_CUDA_ROCM_Q8K_DOT4_DECODE_SPLITK_SIZE=512
+//    GGML_CUDA_ROCM_Q8K_DOT4_DECODE_Q4PAIR=1          (experimental)
+//    GGML_CUDA_ROCM_Q8K_DOT4_DECODE_INLINE_Q4=1       (experimental)
+//    GGML_CUDA_ROCM_Q8K_DOT4_DISABLE_SPLITK=1         (debug override)
+//    GGML_CUDA_ROCM_Q8K_DOT4_DISABLE_BN64=1           (debug override)
+//    GGML_CUDA_ROCM_Q8K_DOT4_FORCE_V4=1               (debug override)
+//
+//  Contract (all packed16 decode paths):
+//    Q = F32, D=256        K = I32 packed16, D/4*4==D
+//    dst = F32, D=256      V = q4_0/q8_0/f16
+//    rotation = OFF        GQA ratio integer
+//
+//  Expected performance (7900 XTX, 27B Q4_K_M, q4_0 V, packed16 K):
+//    ctx=512:  BN64 32 t/s,  splitK 32 t/s
+//    ctx=8k:   BN64 28 t/s,  splitK 32 t/s
+//    ctx=16k:  BN64 24 t/s,  splitK 32 t/s
+//
+//  See: .harness/research/packed16-only-k-implementation-plan.md
+//       docs/rocm-tbq4-paths/packed16-benchmark-report-20260528.md
+// ═══════════════════════════════════════════════════════════════════════════
+
 // ── Packed16 decode kernel — BN outer QK + BN_VSUB V accumulation ────────
 // Env: GGML_CUDA_ROCM_Q8K_DOT4_DECODE_BN (default 64), DECODE_VSUB (default 8)
 //      GGML_CUDA_ROCM_Q8K_DOT4_DECODE_Q4PAIR=1, DECODE_Q4PAIR=1
