@@ -959,6 +959,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     hparams          (params.hparams),
     cparams          (params.cparams),
     ubatch           (params.ubatch),
+    gtype            (params.gtype),
     n_embd           (hparams.n_embd),
     n_layer          (hparams.n_layer),
     n_rot            (hparams.n_rot()),
@@ -2081,6 +2082,18 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+
+        if (gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+            // MTP verify: target feeds h_pre_norm via ubatch.embd.
+            // MTP draft: autoregressive continuation (token-only).
+            // Both currently route the same, but the distinction is
+            // preserved for logging, safety gates, and future policy.
+            const bool is_mtp_verify = (ubatch.embd != nullptr);
+            const auto hint = is_mtp_verify
+                ? GGML_FATTN_HINT_MTP_VERIFY
+                : GGML_FATTN_HINT_MTP_DRAFT;
+            ggml_flash_attn_ext_set_route_hint(cur, hint);
+        }
 
         if (v_mla) {
 #if 0

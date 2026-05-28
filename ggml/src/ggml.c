@@ -5516,6 +5516,14 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
+void ggml_flash_attn_ext_set_route_hint(
+        struct ggml_tensor * a,
+        enum ggml_fattn_route_hint hint) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    ggml_set_op_params_i32(a, 4, (int32_t) hint);
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(

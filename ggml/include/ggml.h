@@ -2437,6 +2437,16 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    enum ggml_fattn_route_hint {
+        GGML_FATTN_HINT_NONE       = 0,
+        GGML_FATTN_HINT_MTP_DRAFT  = 1,
+        GGML_FATTN_HINT_MTP_VERIFY = 2,
+    };
+
+    GGML_API void ggml_flash_attn_ext_set_route_hint(
+            struct ggml_tensor * a,
+            enum ggml_fattn_route_hint hint);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,

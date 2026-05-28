@@ -8,7 +8,7 @@
 //  │ Workload     │ Condition     │ Kernel             │ Notes              │
 //  ├──────────────┼───────────────┼────────────────────┼────────────────────┤
 //  │ Prefill      │ nq > 1        │ v4 (recthist)      │ Existing path      │
-//  │ MTP verify   │ nq > 1        │ v4 (recthist)      │ Existing path      │
+//  │ MTP verify   │ nq > 1        │ v4 (recthist)      │ DOT4 routes: nq>2  │
 //  │ Small decode │ nq == 1,      │ BN64 decode         │ No split overhead  │
 //  │              │ nk < 2048     │                    │                    │
 //  │ Long decode  │ nq == 1,      │ split-K stage1+2    │ Parallel over K    │
@@ -18,9 +18,19 @@
 //  Hard rules:
 //    - nq == 1  → decode kernels (BN64 or split-K). Never v4.
 //    - nq > 1   → v4 kernel. Never BN64 or split-K.
+//    - nq > 2   → DOT4/I8 prefill routes become eligible (via MTP hint or
+//                 standard prefill policy).
 //    - split-K  → stage1 writes UNNORMALIZED partial_o. Stage2 merges.
 //    - Q4PAIR   → experimental, disabled by default. No speed gain.
-//    - MTP draft context must NOT use packed16 K (is_mtp_draft gate).
+//    - MTP draft context must NOT use packed16 K (is_mtp_draft KV-cache gate).
+//      The FA selector also rejects I32 K for MTP draft via fa_hint check.
+//
+//  MTP semantic routing:
+//    MTP_VERIFY is a semantic FA/QK role. nq is only a kernel legality gate.
+//    DOT4 is eligible for MTP_VERIFY only when nq > 2.
+//    MTP_DRAFT never enables DOT4 preference — it falls through to existing policy.
+//    MTP chunk size (LLAMA_MTP_PREFILL_CHUNK) does not control route selection;
+//    the hint does. Chunk size only controls whether the chosen kernel is legal.
 //
 //  Env flags:
 //    GGML_CUDA_ROCM_Q8K_DOT4_DECODE_BN=64
