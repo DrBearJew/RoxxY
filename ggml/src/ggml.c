@@ -5521,6 +5521,9 @@ void ggml_flash_attn_ext_set_instruction(
         enum ggml_fattn_instruction inst) {
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
 
+    // op_params[4] carries ggml_fattn_instruction for FLASH_ATTN_EXT.
+    // Default zero means GGML_FATTN_INST_NONE, preserving non-MTP behavior.
+    // Do not overload this slot without updating the CUDA selector.
     ggml_set_op_params_i32(a, 4, (int32_t) inst);
 }
 

@@ -2437,6 +2437,10 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // FlashAttention instruction — not a backend preference.
+    // NONE preserves existing behavior for non-MTP graphs.
+    // MTP_VERIFY_QK maps to DOT4 recthist-v4 when legality gates pass.
+    // MTP_DRAFT intentionally does not prefer DOT4.
     enum ggml_fattn_instruction {
         GGML_FATTN_INST_NONE           = 0,
         GGML_FATTN_INST_MTP_DRAFT      = 1,

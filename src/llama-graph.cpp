@@ -2084,10 +2084,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
 
         if (gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
-            // MTP verify: target feeds h_pre_norm via ubatch.embd.
-            //   Instruction: run FA as QK/V backend for MTP verification.
-            // MTP draft: autoregressive continuation (token-only).
-            //   Instruction: run FA for draft token generation.
+            // MTP verify is hidden-state / h_pre_norm driven and maps to the FA QK instruction.
+            // MTP draft is token-only continuation and must not receive DOT4 preference.
             const bool is_mtp_verify = (ubatch.embd != nullptr);
             const auto inst = is_mtp_verify
                 ? GGML_FATTN_INST_MTP_VERIFY_QK
