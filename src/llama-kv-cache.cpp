@@ -258,6 +258,9 @@ llama_kv_cache::llama_kv_cache(
             }
         }
 
+        // MTP draft contexts must not create persistent packed16 K.
+        // MTP_VERIFY may materialize packed16 op-locally inside FA,
+        // but the MTP draft KV cache remains non-packed16.
         const bool packed16_active = has_k && !is_mtp_draft
             && (bool)(getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE")
               && atoi(getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE")) != 0);

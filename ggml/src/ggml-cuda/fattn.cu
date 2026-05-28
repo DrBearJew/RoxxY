@@ -1069,13 +1069,14 @@ static enum ggml_cuda_dot4_role ggml_cuda_dot4_role_from_instruction(
 // ── MTP instruction selector ────────────────────────────────────────
 //
 // MTP_VERIFY_QK is a semantic FlashAttention instruction.
-// It maps to DOT4 recthist-v4 when a legal K representation exists:
+// It maps to the DOT4 recthist-v4 archetype when legal.
+// Legal K representations:
 //   1. persistent packed16 I32,
 //   2. q8_0/q4_0,
 //   3. source f16 materialized op-locally into packed16.
-// MTP_DRAFT intentionally does not prefer DOT4.
-// nq==1 is decode, not recthist.
-// nq==2 is currently disabled pending explicit validation.
+// nq==1 is decode territory, not recthist.
+// nq==2 is recthist archetype but env-gated pending validation/default decision.
+// MTP_DRAFT intentionally does not prefer DOT4 and must not use packed16 K.
 //
 // Frozen: MTP_FA_INSTRUCTION_PR3_FROZEN
 

@@ -2091,6 +2091,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 ? GGML_FATTN_INST_MTP_VERIFY_QK
                 : GGML_FATTN_INST_MTP_DRAFT;
             ggml_flash_attn_ext_set_instruction(cur, inst);
+
+            // Debug assert: instruction must match graph type.
+            GGML_ASSERT(inst != GGML_FATTN_INST_MTP_VERIFY_QK || gtype == LLM_GRAPH_TYPE_DECODER_MTP);
+            GGML_ASSERT(inst != GGML_FATTN_INST_MTP_DRAFT || gtype == LLM_GRAPH_TYPE_DECODER_MTP);
         }
 
         if (v_mla) {
