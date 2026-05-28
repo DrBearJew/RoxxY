@@ -3566,11 +3566,16 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                     GGML_ASSERT(K->nb[1] % sizeof(int) == 0);
                     const int k_head_stride_rows  = (int)(K->nb[2] / K->nb[1]);
                     const int k_batch_stride_rows = (int)(K->nb[3] / K->nb[1]);
-                    if      (decode_bn == 8)  { LAUNCH_DECODE_BN(8)  }
-                    else if (decode_bn == 16) { LAUNCH_DECODE_BN(16) }
-                    else if (decode_bn == 32) { LAUNCH_DECODE_BN(32) }
-                    else if (decode_bn == 64) { LAUNCH_DECODE_BN(64) }
-                    else GGML_ABORT("q8k_dot4_kq decode_bn must be 8/16/32/64, got %d", decode_bn);
+                    const int decode_vsub = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_VSUB", 8);
+                    const bool inline_q4 = ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_INLINE_Q4");
+                    const bool q4pair = false; // Q4PAIR disabled — needs output-dim mapping fix
+                    if (decode_bn == 64 && decode_vsub == 8) {
+                        if (q4pair)      LAUNCH_DECODE_Q4PAIR(64, 8)
+                        else if (inline_q4) LAUNCH_DECODE_INLINE_Q4(64, 8)
+                        else             LAUNCH_DECODE_VSUB(64, 8)
+                    } else {
+                        GGML_ABORT("q8k_dot4_kq decode: expected BN=64 VSUB=8, got BN=%d VSUB=%d", decode_bn, decode_vsub);
+                    }
                     return;
                 }
                 // Fixed KV cache head strides for persistent packed16 K.
