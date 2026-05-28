@@ -3117,6 +3117,8 @@ static __global__ void ggml_cuda_q8k_dot4_kq_error_kernel(
     atomicAdd(metrics + 2, diff > 0.5f ? 1.0f : 0.0f);
 }
 
+#include "fattn-dot4-q8k-decode.cuh"
+
 void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_tensor * Q = dst->src[0];
     ggml_tensor * K = dst->src[1];
@@ -3558,6 +3560,19 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                 const dim3 recthist_grid((nq + v4_bm - 1) / v4_bm, n_heads_q, batch);
                 const bool use_f16_v = (V->type == GGML_TYPE_F16);
                 const bool use_q8_v  = (V->type == GGML_TYPE_Q8_0);
+                // ---- Packed16 decode fast-path (nq=1) ----
+                const int decode_bn = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_BN", 0);
+                if (decode_bn > 0 && nq == 1 && K->type == GGML_TYPE_I32) {
+                    GGML_ASSERT(K->nb[1] % sizeof(int) == 0);
+                    const int k_head_stride_rows  = (int)(K->nb[2] / K->nb[1]);
+                    const int k_batch_stride_rows = (int)(K->nb[3] / K->nb[1]);
+                    if      (decode_bn == 8)  { LAUNCH_DECODE_BN(8)  }
+                    else if (decode_bn == 16) { LAUNCH_DECODE_BN(16) }
+                    else if (decode_bn == 32) { LAUNCH_DECODE_BN(32) }
+                    else if (decode_bn == 64) { LAUNCH_DECODE_BN(64) }
+                    else GGML_ABORT("q8k_dot4_kq decode_bn must be 8/16/32/64, got %d", decode_bn);
+                    return;
+                }
                 // Fixed KV cache head strides for persistent packed16 K.
                 GGML_ASSERT(K->nb[1] % sizeof(int) == 0);
                 const int k_head_stride_rows  = (int)(K->nb[2] / K->nb[1]);
