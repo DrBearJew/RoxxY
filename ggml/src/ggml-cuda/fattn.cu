@@ -966,6 +966,32 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     memcpy(&max_bias,      (const float *) KQV->op_params + 1, sizeof(float));
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
+    // ── MTP early diagnostic ────────────────────────────────────────
+    // Fires for every MTP hint, regardless of KV type. Logs whether DOT4
+    // is eligible for MTP_VERIFY based on KV format compatibility.
+    {
+        const int32_t fa_hint_i32 = ((const int32_t *)KQV->op_params)[4];
+        const bool is_mtp = (fa_hint_i32 == GGML_FATTN_HINT_MTP_DRAFT ||
+                             fa_hint_i32 == GGML_FATTN_HINT_MTP_VERIFY);
+        if (is_mtp) {
+            const char * hint_name = fa_hint_i32 == GGML_FATTN_HINT_MTP_DRAFT
+                ? "mtp_draft" : "mtp_verify";
+            const bool quantized_kv = ggml_is_quantized(K->type) || ggml_is_quantized(V->type);
+            const bool dot4_kv_ok = (K->type == GGML_TYPE_I32) ||
+                (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0);
+            if (!dot4_kv_ok && fa_hint_i32 == GGML_FATTN_HINT_MTP_VERIFY) {
+                if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
+                    if (log_env && atoi(log_env) != 0) {
+                        GGML_LOG_INFO("%s: fa_route fattn_hint=mtp_verify nq=%lld dot4_candidate=0 dot4_reject_reason=kv_type_incompatible K=%s V=%s\n",
+                                __func__, (long long) Q->ne[1],
+                                ggml_type_name(K->type), ggml_type_name(V->type));
+                    }
+                }
+            }
+            GGML_UNUSED(quantized_kv);
+        }
+    }
+
     // The effective batch size for the kernel can be increased by gqa_ratio.
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
     bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
