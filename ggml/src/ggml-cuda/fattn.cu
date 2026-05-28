@@ -1414,6 +1414,31 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
 #ifdef GGML_USE_HIP
+    // ── MTP instruction dispatch (all KV types) ─────────────────
+    // MTP_VERIFY_QK: run FA as QK/V backend for MTP verification.
+    // MTP_DRAFT: run FA for draft generation (no DOT4 preference).
+    //
+    // Instruction-first: MTP declares the instrument, then
+    // DOT4/WMMA/VEC are selected as implementations.
+    {
+        const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
+        if (fa_inst_i32 == GGML_FATTN_INST_MTP_VERIFY_QK) {
+            // Default f16 policy for non-quantized path.
+            ggml_cuda_rocm_quant_prefill_f16_policy mtp_f16_policy = {};
+            const auto selected = ggml_cuda_select_mtp_verify_fattn(cc, dst, &mtp_f16_policy);
+            if (selected != BEST_FATTN_KERNEL_NONE) {
+                return selected;
+            }
+        } else if (fa_inst_i32 == GGML_FATTN_INST_MTP_DRAFT) {
+            if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
+                if (log_env && atoi(log_env) != 0) {
+                    GGML_LOG_INFO("%s: fa_instruction=mtp_draft nq=%lld impl_status=existing_policy\n",
+                            __func__, (long long) Q->ne[1]);
+                }
+            }
+        }
+    }
+
     // HIP/ROCm: keep quantized KV one/two-token decode on VEC. The f16-temp
     // TILE/MMA selector is opt-in only: GGML_CUDA_ROCM_QUANT_PREFILL_F16=1
     // for promoted paths such as 27B MTP, or GGML_CUDA_ROCM_QUANT_PREFILL_F16_AUTO=1
@@ -1449,31 +1474,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         const auto return_quantized_route = [&](best_fattn_kernel selected) {
             return ggml_cuda_fattn_apply_route_contract(dst, selected, &f16_policy);
         };
-
-        // ── MTP instruction dispatch ──────────────────────────────
-        // MTP_VERIFY_QK: run FA as QK/V backend for MTP verification.
-        // MTP_DRAFT: run FA for draft generation (no DOT4 preference).
-        //
-        // Instruction-first: MTP declares the instrument, then
-        // DOT4/WMMA/VEC are selected as implementations.
-        {
-            const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
-            if (fa_inst_i32 == GGML_FATTN_INST_MTP_VERIFY_QK) {
-                const auto selected = ggml_cuda_select_mtp_verify_fattn(cc, dst, &f16_policy);
-                if (selected != BEST_FATTN_KERNEL_NONE) {
-                    return selected;
-                }
-                // BEST_FATTN_KERNEL_NONE: fall through to existing policy.
-            } else if (fa_inst_i32 == GGML_FATTN_INST_MTP_DRAFT) {
-                if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
-                    if (log_env && atoi(log_env) != 0) {
-                        GGML_LOG_INFO("%s: fa_instruction=mtp_draft nq=%lld impl_status=existing_policy\n",
-                                __func__, (long long) Q->ne[1]);
-                    }
-                }
-                // Fall through to existing policy.
-            }
-        }
 
         if (ggml_cuda_q8q4_wmma_i8_require_selected_applies(dst)) {
             if (ggml_cuda_q8q4_wmma_i8_supported(cc, dst, max_bias, logit_softcap)) {
