@@ -141,8 +141,8 @@ void ggml_cuda_q8k_dot4_decode_p16_kernel(
             const int pt = tid;
             const int pb = pt >> 4, pi = pt & 15;
             size_t base = ((size_t(b) * nq + 0) * size_t(n_heads_q) + hq) * 256;
-            dst[base + pb * 32 + pi * 2]      = out0 * norm;
-            dst[base + pb * 32 + pi * 2 + 1]  = out1 * norm;
+            dst[base + pb * 32 + pi]      = out0 * norm;
+            dst[base + pb * 32 + pi + 16] = out1 * norm;
         }
     } else if (tid < 256) {
         dst[((size_t(b) * nq + 0) * size_t(n_heads_q) + hq) * 256 + tid] = out0 / sm[1];

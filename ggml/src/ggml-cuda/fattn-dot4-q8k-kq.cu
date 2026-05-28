@@ -3568,7 +3568,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                     const int k_batch_stride_rows = (int)(K->nb[3] / K->nb[1]);
                     const int decode_vsub = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_VSUB", 8);
                     const bool inline_q4 = ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_INLINE_Q4");
-                    const bool q4pair = false; // Q4PAIR disabled — needs output-dim mapping fix
+                    const bool q4pair = V->type == GGML_TYPE_Q4_0 && ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_Q4PAIR");
                     if (decode_bn == 64 && decode_vsub == 8) {
                         if (q4pair)      LAUNCH_DECODE_Q4PAIR(64, 8)
                         else if (inline_q4) LAUNCH_DECODE_INLINE_Q4(64, 8)
