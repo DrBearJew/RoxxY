@@ -388,6 +388,62 @@ static const char * ggml_cuda_fattn_kernel_name(const best_fattn_kernel kernel) 
     return "unknown";
 }
 
+static int32_t ggml_cuda_fattn_get_instruction(const ggml_tensor * dst) {
+    return ((const int32_t *)dst->op_params)[4];
+}
+
+// PR3: f16 K op-local adapter.
+// When enabled, MTP_VERIFY_QK + K=f16 will quantize K into a temporary
+// packed16 representation inside the DOT4 launch path, without altering
+// the persistent MTP KV cache.
+static bool ggml_cuda_mtp_verify_f16k_dot4_adapter_enabled() {
+#ifdef GGML_USE_HIP
+    const char * env = getenv("GGML_CUDA_ROCM_MTP_VERIFY_F16K_DOT4_ADAPTER");
+    return env && atoi(env) != 0;
+#else
+    return false;
+#endif
+}
+
+// Separate support check for the f16 adapter path.
+// Does NOT call q8k_dot4_kq_supported() — that rejects f16 K.
+// The DOT4 launch path already has f16→packed16 quantization.
+static bool ggml_cuda_mtp_verify_f16k_dot4_adapter_supported(
+        const int cc,
+        const ggml_tensor * dst) {
+#ifdef GGML_USE_HIP
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    if (!ggml_cuda_mtp_verify_f16k_dot4_adapter_enabled()) {
+        return false;
+    }
+    if (!ggml_cuda_q8k_dot4_kq_enabled()) {
+        return false;
+    }
+    return GGML_CUDA_CC_IS_RDNA3(cc) &&
+           Q->type == GGML_TYPE_F32 &&
+           K->type == GGML_TYPE_F16 &&
+           V->type == GGML_TYPE_F16 &&
+           dst->type == GGML_TYPE_F32 &&
+           Q->ne[0] == 256 &&
+           K->ne[0] == Q->ne[0] &&
+           V->ne[0] == Q->ne[0] &&
+           Q->ne[1] > 2 &&
+           K->ne[1] >= Q->ne[1] &&
+           Q->ne[2] % K->ne[2] == 0 &&
+           V->ne[2] == K->ne[2] &&
+           Q->ne[3] == K->ne[3] &&
+           V->ne[3] == K->ne[3];
+#else
+    GGML_UNUSED(cc);
+    GGML_UNUSED(dst);
+    return false;
+#endif
+}
+
+
 static bool ggml_cuda_fattn_route_contract_matches(const char * required, const best_fattn_kernel kernel) {
     if (!required || required[0] == '\0' || strcmp(required, "any") == 0) {
         return true;
@@ -533,9 +589,15 @@ static bool ggml_cuda_fattn_route_contract_applicable(
 
     if (strcmp(required, "rocm_q8k_dot4_kq") == 0) {
         // Accept q8_0 K (original) or I32 packed16 K (packed16-only mode)
-        return ((K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0) ||
-                (K->type == GGML_TYPE_I32 && (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0))) &&
-               ggml_cuda_q8k_dot4_kq_enabled();
+        // or f16 K with MTP_VERIFY adapter.
+        const bool original_kv =
+            (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0) ||
+            (K->type == GGML_TYPE_I32 && (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0));
+        const bool f16_adapter =
+            K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
+            ggml_cuda_mtp_verify_f16k_dot4_adapter_enabled() &&
+            ggml_cuda_fattn_get_instruction(dst) == GGML_FATTN_INST_MTP_VERIFY_QK;
+        return (original_kv || f16_adapter) && ggml_cuda_q8k_dot4_kq_enabled();
     }
     if (strcmp(required, "rocm_q8k_dot4_packed16_vec") == 0) {
         return K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0 && ggml_cuda_q8k_dot4_packed16_vec_enabled();
@@ -1001,19 +1063,6 @@ static bool ggml_cuda_mtp_verify_dot4_nq2_enabled() {
 #endif
 }
 
-// PR3: f16 K op-local adapter.
-// When enabled, MTP_VERIFY_QK + K=f16 will quantize K into a temporary
-// packed16 representation inside the DOT4 launch path, without altering
-// the persistent MTP KV cache.
-static bool ggml_cuda_mtp_verify_f16k_dot4_adapter_enabled() {
-#ifdef GGML_USE_HIP
-    const char * env = getenv("GGML_CUDA_ROCM_MTP_VERIFY_F16K_DOT4_ADAPTER");
-    return env && atoi(env) != 0;
-#else
-    return false;
-#endif
-}
-
 static bool ggml_cuda_mtp_verify_dot4_recthist_supported(
         const int cc,
         const ggml_tensor * dst) {
@@ -1056,18 +1105,17 @@ static bool ggml_cuda_mtp_verify_dot4_recthist_supported(
         V->ne[0] == Q->ne[0];
 
     // PR3: f16 K op-local adapter.
-    // K=f16, V=f16 with adapter enabled: quantize K to packed16 on-the-fly.
-    const bool f16_adapter =
-        ggml_cuda_mtp_verify_f16k_dot4_adapter_enabled() &&
-        K->type == GGML_TYPE_F16 &&
-        V->type == GGML_TYPE_F16 &&
-        K->ne[0] == Q->ne[0];
-
-    if (!packed16_k && !q8q4_kv && !f16_adapter) {
-        return false;
+    // K=f16, V=f16 with adapter enabled: the DOT4 launch path already
+    // has f16→packed16 quantization. Use separate support helper.
+    if (packed16_k || q8q4_kv) {
+        return ggml_cuda_q8k_dot4_kq_supported(cc, dst);
     }
 
-    return ggml_cuda_q8k_dot4_kq_supported(cc, dst);
+    if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) {
+        return ggml_cuda_mtp_verify_f16k_dot4_adapter_supported(cc, dst);
+    }
+
+    return false;
 #else
     GGML_UNUSED(cc);
     GGML_UNUSED(dst);
@@ -1139,19 +1187,13 @@ static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
     // DOT4 not legal — determine why.
     {
         const bool dot4_env = ggml_cuda_q8k_dot4_kq_enabled();
-        const bool packed16_k =
-            K->type == GGML_TYPE_I32 &&
-            (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0);
-        const bool q8q4_kv =
-            K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0;
-        const bool f16_adapter =
-            ggml_cuda_mtp_verify_f16k_dot4_adapter_enabled() &&
-            K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
+        const bool f16_k = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
+        const bool adapter_on = ggml_cuda_mtp_verify_f16k_dot4_adapter_enabled();
 
-        const char * status = !dot4_env    ? "dot4_env_disabled"
-                            : f16_adapter  ? "adapter_not_yet_implemented"
-                            : !packed16_k && !q8q4_kv ? "missing_legal_k_representation"
-                            :              "dot4_shape_or_type";
+        const char * status = !dot4_env                ? "dot4_env_disabled"
+                            : f16_k && !adapter_on     ? "f16_adapter_disabled"
+                            : f16_k && adapter_on      ? "adapter_shape_or_rdna3"
+                            :                            "missing_legal_k_representation";
         log_mtp(status, BEST_FATTN_KERNEL_NONE);
     }
 
