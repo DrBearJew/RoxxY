@@ -454,6 +454,16 @@ static __device__ __forceinline__ float ggml_cuda_q8k_dot4_dequant_q4_0(
     return (float(q) - 8.0f) * __half2float(v->d);
 }
 
+static __device__ __forceinline__ float ggml_cuda_q8k_dot4_dequant_q8_0(
+        const char * __restrict__ V,
+        int64_t nb20,
+        int i) {
+    const int ib = i / QK8_0;
+    const int iq = i % QK8_0;
+    const block_q8_0 * v = (const block_q8_0 *) (V + int64_t(ib) * nb20);
+    return float(v->qs[iq]) * __half2float(v->d);
+}
+
 static __device__ __forceinline__ float ggml_cuda_q8k_dot4_mask_value(
         const char * __restrict__ mask,
         int64_t nb30,
@@ -2050,7 +2060,7 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_blockfa_rect
     }
 }
 
-template <bool USE_F16_V, int BN, int BM>
+template <bool USE_F16_V, bool USE_Q8_V, int BN, int BM>
 static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_single_kernel(
         const int   * __restrict__ q_payload,
         const float * __restrict__ q_scales,
@@ -2074,6 +2084,7 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_blockfa_rect
         int k_batch_stride_rows) {
     static constexpr int BM_VAL = BM;
     static constexpr bool F16_V = USE_F16_V;
+    static constexpr bool Q8_V  = USE_Q8_V;
     static constexpr int I32_PER_ROW = GGML_CUDA_Q8K_DOT4_KQ_D / 4;
     static constexpr int N_BLOCKS   = GGML_CUDA_Q8K_DOT4_KQ_BLOCKS;
     static constexpr int V_TILE_SIZE = BN * GGML_CUDA_Q8K_DOT4_KQ_D;
@@ -2123,7 +2134,9 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_blockfa_rect
             v_tile[off] = (kk < tile_n && k < nk)
                 ? (F16_V
                     ? __half2float(((const half *)(v_head + int64_t(k) * nb21))[off - kk * GGML_CUDA_Q8K_DOT4_KQ_D])
-                    : ggml_cuda_q8k_dot4_dequant_q4_0(v_head + int64_t(k) * nb21, nb20, off - kk * GGML_CUDA_Q8K_DOT4_KQ_D)) : 0.0f;
+                    : (Q8_V
+                        ? ggml_cuda_q8k_dot4_dequant_q8_0(v_head + int64_t(k) * nb21, nb20, off - kk * GGML_CUDA_Q8K_DOT4_KQ_D)
+                        : ggml_cuda_q8k_dot4_dequant_q4_0(v_head + int64_t(k) * nb21, nb20, off - kk * GGML_CUDA_Q8K_DOT4_KQ_D))) : 0.0f;
         }
     }
     __syncthreads();
@@ -2155,7 +2168,9 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_blockfa_rect
                     v_tile_next[off] = (kk < next_tile_n && k < nk)
                         ? (F16_V
                             ? __half2float(((const half *)(v_head + int64_t(k) * nb21))[off - kk * GGML_CUDA_Q8K_DOT4_KQ_D])
-                            : ggml_cuda_q8k_dot4_dequant_q4_0(v_head + int64_t(k) * nb21, nb20, off - kk * GGML_CUDA_Q8K_DOT4_KQ_D)) : 0.0f;
+                            : (Q8_V
+                                ? ggml_cuda_q8k_dot4_dequant_q8_0(v_head + int64_t(k) * nb21, nb20, off - kk * GGML_CUDA_Q8K_DOT4_KQ_D)
+                                : ggml_cuda_q8k_dot4_dequant_q4_0(v_head + int64_t(k) * nb21, nb20, off - kk * GGML_CUDA_Q8K_DOT4_KQ_D))) : 0.0f;
                 }
             }
             __syncthreads();
@@ -2211,7 +2226,9 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_blockfa_rect
                 v_tile_next[off] = (kk < next_tile_n && k < nk)
                     ? (F16_V
                         ? __half2float(((const half *)(v_head + int64_t(k) * nb21))[off - kk * GGML_CUDA_Q8K_DOT4_KQ_D])
-                        : ggml_cuda_q8k_dot4_dequant_q4_0(v_head + int64_t(k) * nb21, nb20, off - kk * GGML_CUDA_Q8K_DOT4_KQ_D)) : 0.0f;
+                        : (Q8_V
+                            ? ggml_cuda_q8k_dot4_dequant_q8_0(v_head + int64_t(k) * nb21, nb20, off - kk * GGML_CUDA_Q8K_DOT4_KQ_D)
+                            : ggml_cuda_q8k_dot4_dequant_q4_0(v_head + int64_t(k) * nb21, nb20, off - kk * GGML_CUDA_Q8K_DOT4_KQ_D))) : 0.0f;
             }
         }
         __syncthreads();
@@ -3540,19 +3557,26 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                 const size_t smem_v4 = (size_t(v4_bm * v4_bn + 3 * v4_bm + 2 * v4_bn * GGML_CUDA_Q8K_DOT4_KQ_D) + size_t(v4_bm * (GGML_CUDA_Q8K_DOT4_KQ_D / 4)) + size_t(v4_bm * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS)) * sizeof(float);
                 const dim3 recthist_grid((nq + v4_bm - 1) / v4_bm, n_heads_q, batch);
                 const bool use_f16_v = (V->type == GGML_TYPE_F16);
+                const bool use_q8_v  = (V->type == GGML_TYPE_Q8_0);
                 // Fixed KV cache head strides for persistent packed16 K.
                 GGML_ASSERT(K->nb[1] % sizeof(int) == 0);
                 const int k_head_stride_rows  = (int)(K->nb[2] / K->nb[1]);
                 const int k_batch_stride_rows = (int)(K->nb[3] / K->nb[1]);
                 if (v4_bm == 16 && v4_bn == 8) {
                     if (use_f16_v) {
-                        ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_single_kernel<true, 8, 16><<<recthist_grid, block, smem_v4, stream>>>(
+                        ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_single_kernel<true, false, 8, 16><<<recthist_grid, block, smem_v4, stream>>>(
+                            q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
+                            (float *) dst->data, scale,
+                            V->nb[0], V->nb[1], V->nb[2], V->nb[3],
+                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows);
+                    } else if (use_q8_v) {
+                        ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_single_kernel<false, true, 8, 16><<<recthist_grid, block, smem_v4, stream>>>(
                             q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
                             (float *) dst->data, scale,
                             V->nb[0], V->nb[1], V->nb[2], V->nb[3],
                             nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows);
                     } else {
-                        ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_single_kernel<false, 8, 16><<<recthist_grid, block, smem_v4, stream>>>(
+                        ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_single_kernel<false, false, 8, 16><<<recthist_grid, block, smem_v4, stream>>>(
                             q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
                             (float *) dst->data, scale,
                             V->nb[0], V->nb[1], V->nb[2], V->nb[3],
@@ -3560,13 +3584,19 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                     }
                 } else if (v4_bm == 8 && v4_bn == 16) {
                     if (use_f16_v) {
-                        ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_single_kernel<true, 16, 8><<<recthist_grid, block, smem_v4, stream>>>(
+                        ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_single_kernel<true, false, 16, 8><<<recthist_grid, block, smem_v4, stream>>>(
+                            q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
+                            (float *) dst->data, scale,
+                            V->nb[0], V->nb[1], V->nb[2], V->nb[3],
+                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows);
+                    } else if (use_q8_v) {
+                        ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_single_kernel<false, true, 16, 8><<<recthist_grid, block, smem_v4, stream>>>(
                             q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
                             (float *) dst->data, scale,
                             V->nb[0], V->nb[1], V->nb[2], V->nb[3],
                             nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows);
                     } else {
-                        ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_single_kernel<false, 16, 8><<<recthist_grid, block, smem_v4, stream>>>(
+                        ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_single_kernel<false, false, 16, 8><<<recthist_grid, block, smem_v4, stream>>>(
                             q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
                             (float *) dst->data, scale,
                             V->nb[0], V->nb[1], V->nb[2], V->nb[3],
@@ -3574,13 +3604,19 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                     }
                 } else {
                     if (use_f16_v) {
-                        ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_single_kernel<true, 8, 8><<<recthist_grid, block, smem_v4, stream>>>(
+                        ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_single_kernel<true, false, 8, 8><<<recthist_grid, block, smem_v4, stream>>>(
+                            q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
+                            (float *) dst->data, scale,
+                            V->nb[0], V->nb[1], V->nb[2], V->nb[3],
+                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows);
+                    } else if (use_q8_v) {
+                        ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_single_kernel<false, true, 8, 8><<<recthist_grid, block, smem_v4, stream>>>(
                             q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
                             (float *) dst->data, scale,
                             V->nb[0], V->nb[1], V->nb[2], V->nb[3],
                             nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows);
                     } else {
-                        ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_single_kernel<false, 8, 8><<<recthist_grid, block, smem_v4, stream>>>(
+                        ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_single_kernel<false, false, 8, 8><<<recthist_grid, block, smem_v4, stream>>>(
                             q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
                             (float *) dst->data, scale,
                             V->nb[0], V->nb[1], V->nb[2], V->nb[3],
