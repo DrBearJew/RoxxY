@@ -1001,6 +1001,19 @@ static bool ggml_cuda_mtp_verify_dot4_nq2_enabled() {
 #endif
 }
 
+// PR3: f16 K op-local adapter.
+// When enabled, MTP_VERIFY_QK + K=f16 will quantize K into a temporary
+// packed16 representation inside the DOT4 launch path, without altering
+// the persistent MTP KV cache.
+static bool ggml_cuda_mtp_verify_f16k_dot4_adapter_enabled() {
+#ifdef GGML_USE_HIP
+    const char * env = getenv("GGML_CUDA_ROCM_MTP_VERIFY_F16K_DOT4_ADAPTER");
+    return env && atoi(env) != 0;
+#else
+    return false;
+#endif
+}
+
 static bool ggml_cuda_mtp_verify_dot4_recthist_supported(
         const int cc,
         const ggml_tensor * dst) {
@@ -1030,6 +1043,7 @@ static bool ggml_cuda_mtp_verify_dot4_recthist_supported(
     // Legal K representations:
     //   A. K = I32 packed16, V = f16/q8_0/q4_0
     //   B. K = q8_0,       V = q4_0
+    //   C. K = f16,         V = f16  (op-local adapter, env-gated)
     const bool packed16_k =
         K->type == GGML_TYPE_I32 &&
         K->ne[0] * 4 == Q->ne[0] &&
@@ -1041,7 +1055,15 @@ static bool ggml_cuda_mtp_verify_dot4_recthist_supported(
         K->ne[0] == Q->ne[0] &&
         V->ne[0] == Q->ne[0];
 
-    if (!packed16_k && !q8q4_kv) {
+    // PR3: f16 K op-local adapter.
+    // K=f16, V=f16 with adapter enabled: quantize K to packed16 on-the-fly.
+    const bool f16_adapter =
+        ggml_cuda_mtp_verify_f16k_dot4_adapter_enabled() &&
+        K->type == GGML_TYPE_F16 &&
+        V->type == GGML_TYPE_F16 &&
+        K->ne[0] == Q->ne[0];
+
+    if (!packed16_k && !q8q4_kv && !f16_adapter) {
         return false;
     }
 
@@ -1122,8 +1144,12 @@ static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
             (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0);
         const bool q8q4_kv =
             K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0;
+        const bool f16_adapter =
+            ggml_cuda_mtp_verify_f16k_dot4_adapter_enabled() &&
+            K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
 
         const char * status = !dot4_env    ? "dot4_env_disabled"
+                            : f16_adapter  ? "adapter_not_yet_implemented"
                             : !packed16_k && !q8q4_kv ? "missing_legal_k_representation"
                             :              "dot4_shape_or_type";
         log_mtp(status, BEST_FATTN_KERNEL_NONE);
