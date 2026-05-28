@@ -592,7 +592,9 @@ static bool ggml_cuda_fattn_route_contract_applicable(
     // I8/dot4 route contracts are prefill-only. During graph reservation and
     // decode the same context also probes one-token attention graphs; those
     // should log as not-applicable instead of aborting a prefill contract.
-    if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || Q->ne[1] <= 2) {
+    // nq==2 is allowed when GGML_CUDA_ROCM_MTP_VERIFY_DOT4_NQ2=1.
+    const int nq_min = ggml_cuda_mtp_verify_dot4_nq2_enabled() ? 2 : 3;
+    if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || Q->ne[1] < nq_min) {
         return false;
     }
 
@@ -1159,10 +1161,15 @@ static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
     const auto log_mtp = [&](const char * impl_status, best_fattn_kernel selected) {
         if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
             if (log_env && atoi(log_env) != 0) {
+                const char * k_repr = K->type == GGML_TYPE_I32 ? "packed16_i32"
+                    : (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0) ? "q8q4"
+                    : (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) ? "source_f16_op_local_packed16"
+                    : "-";
                 GGML_LOG_INFO("%s: fa_instruction=mtp_verify_qk nq=%lld K=%s V=%s "
-                        "dot4_role=%s impl_status=%s selected=%s\n",
+                        "k_repr=%s dot4_role=%s impl_status=%s selected=%s\n",
                         __func__, (long long) Q->ne[1],
                         ggml_type_name(K->type), ggml_type_name(V->type),
+                        k_repr,
                         ggml_cuda_dot4_role_name(dot4_role),
                         impl_status,
                         selected == BEST_FATTN_KERNEL_Q8K_DOT4_KQ ? "rocm_q8k_dot4_kq" :
@@ -1204,9 +1211,9 @@ static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
         const bool f16_k = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
         const bool adapter_on = ggml_cuda_mtp_verify_f16k_dot4_adapter_enabled();
 
-        const char * status = !dot4_env                ? "dot4_env_disabled"
-                            : f16_k && !adapter_on     ? "f16_adapter_disabled"
-                            : f16_k && adapter_on      ? "adapter_shape_or_rdna3"
+        const char * status = !dot4_env                ? "env_disabled"
+                            : f16_k && !adapter_on     ? "source_f16_materialization_disabled"
+                            : f16_k && adapter_on      ? "shape_or_device_reject"
                             :                            "missing_legal_k_representation";
         log_mtp(status, BEST_FATTN_KERNEL_NONE);
     }
