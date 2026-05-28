@@ -90,7 +90,8 @@ llama_kv_cache::llama_kv_cache(
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
     const layer_filter_cb & filter,
-    const  layer_reuse_cb & reuse) :
+    const  layer_reuse_cb & reuse,
+                         bool   is_mtp_draft) :
     model(model), hparams(model.hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
 
@@ -257,7 +258,9 @@ llama_kv_cache::llama_kv_cache(
             }
         }
 
-        const bool packed16_active = has_k && (bool)(getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE") && atoi(getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE")) != 0);
+        const bool packed16_active = has_k && !is_mtp_draft
+            && (bool)(getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE")
+              && atoi(getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE")) != 0);
 
         ggml_tensor * k = (has_k && !packed16_active) ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v_layer, n_embd_v_gqa, kv_size, n_stream) : nullptr;
