@@ -392,10 +392,15 @@ static int32_t ggml_cuda_fattn_get_instruction(const ggml_tensor * dst) {
     return ((const int32_t *)dst->op_params)[4];
 }
 
-// PR3: f16 K op-local adapter.
-// When enabled, MTP_VERIFY_QK + K=f16 will quantize K into a temporary
-// packed16 representation inside the DOT4 launch path, without altering
-// the persistent MTP KV cache.
+// PR3: f16-source K op-local materialization.
+// When enabled, MTP_VERIFY_QK + source K=f16 will quantize K into a
+// temporary packed16 representation inside the DOT4 launch path, without
+// altering the persistent MTP KV cache.
+//
+// Legal K representations for DOT4 recthist:
+//   - persistent packed16 I32
+//   - q8_0/q4_0
+//   - source f16 materialized op-locally into packed16
 static bool ggml_cuda_mtp_verify_f16k_dot4_adapter_enabled() {
 #ifdef GGML_USE_HIP
     const char * env = getenv("GGML_CUDA_ROCM_MTP_VERIFY_F16K_DOT4_ADAPTER");
@@ -405,8 +410,8 @@ static bool ggml_cuda_mtp_verify_f16k_dot4_adapter_enabled() {
 #endif
 }
 
-// Separate support check for the f16 adapter path.
-// Does NOT call q8k_dot4_kq_supported() — that rejects f16 K.
+// Separate support check for f16-source materialization.
+// Does NOT call q8k_dot4_kq_supported() — that rejects source K=f16.
 // The DOT4 launch path already has f16→packed16 quantization.
 static bool ggml_cuda_mtp_verify_f16k_dot4_adapter_supported(
         const int cc,
@@ -588,8 +593,10 @@ static bool ggml_cuda_fattn_route_contract_applicable(
     }
 
     if (strcmp(required, "rocm_q8k_dot4_kq") == 0) {
-        // Accept q8_0 K (original) or I32 packed16 K (packed16-only mode)
-        // or f16 K with MTP_VERIFY adapter.
+        // Legal K representations:
+        //   - q8_0 K (original)
+        //   - I32 packed16 K (packed16-only mode)
+        //   - source f16 K materialized op-locally (MTP_VERIFY adapter)
         const bool original_kv =
             (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0) ||
             (K->type == GGML_TYPE_I32 && (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0));
@@ -1089,10 +1096,10 @@ static bool ggml_cuda_mtp_verify_dot4_recthist_supported(
         return false;
     }
 
-    // Legal K representations:
-    //   A. K = I32 packed16, V = f16/q8_0/q4_0
-    //   B. K = q8_0,       V = q4_0
-    //   C. K = f16,         V = f16  (op-local adapter, env-gated)
+    // Legal K representations for DOT4 recthist:
+    //   A. Persistent packed16 I32, V = f16/q8_0/q4_0
+    //   B. q8_0/q4_0
+    //   C. Source f16 materialized op-locally into packed16 (env-gated)
     const bool packed16_k =
         K->type == GGML_TYPE_I32 &&
         K->ne[0] * 4 == Q->ne[0] &&
@@ -1104,7 +1111,7 @@ static bool ggml_cuda_mtp_verify_dot4_recthist_supported(
         K->ne[0] == Q->ne[0] &&
         V->ne[0] == Q->ne[0];
 
-    // PR3: f16 K op-local adapter.
+    // PR3: Source f16 materialization.
     // K=f16, V=f16 with adapter enabled: the DOT4 launch path already
     // has f16→packed16 quantization. Use separate support helper.
     if (packed16_k || q8q4_kv) {
