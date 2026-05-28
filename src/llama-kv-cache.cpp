@@ -403,6 +403,7 @@ llama_kv_cache::llama_kv_cache(
         n_embd_head_v_all > 0 &&
         ggml_is_quantized(type_v) &&
         type_v != GGML_TYPE_TBQ4_0 &&
+        attn_rot_k &&  // V rotation only when K is also rotated (symmetric domain)
         hparams.n_embd_head_v() % 64 == 0;
 
     LLAMA_LOG_INFO("%s: attn_rot_k = %d, n_embd_head_k_all = %d, k_domain = %s, k_rot_order = %d\n", __func__, attn_rot_k, n_embd_head_k_all,
