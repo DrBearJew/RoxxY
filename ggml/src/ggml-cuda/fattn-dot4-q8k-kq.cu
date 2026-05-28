@@ -3544,22 +3544,6 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                 GGML_ASSERT(K->nb[1] % sizeof(int) == 0);
                 const int k_head_stride_rows  = (int)(K->nb[2] / K->nb[1]);
                 const int k_batch_stride_rows = (int)(K->nb[3] / K->nb[1]);
-                // Byte-level row dump: first 2 heads, row k=0
-                fprintf(stderr, "q8k_i32_rowdump: kv_hs=%d bs=%d nk=%d nhk=%d pld=%p scl=%p\n",
-                        k_head_stride_rows, k_batch_stride_rows, nk, n_heads_k,
-                        (void*)k_payload.ptr, (void*)k_scales.ptr);
-                for (int dbg_hk = 0; dbg_hk < 2 && dbg_hk < n_heads_k; ++dbg_hk) {
-                    const size_t roff = (size_t)dbg_hk * (size_t)k_head_stride_rows;
-                    const int I32_PR = GGML_CUDA_Q8K_DOT4_KQ_D / 4;
-                    const int NBLK   = GGML_CUDA_Q8K_DOT4_KQ_BLOCKS;
-                    int pld[4]; half scl[4];
-                    CUDA_CHECK(cudaMemcpyAsync(pld, k_payload.ptr + roff * I32_PR, 16, cudaMemcpyDeviceToHost, stream));
-                    CUDA_CHECK(cudaMemcpyAsync(scl, k_scales.ptr  + roff * NBLK,   8,  cudaMemcpyDeviceToHost, stream));
-                    CUDA_CHECK(cudaStreamSynchronize(stream));
-                    fprintf(stderr, "q8k_i32_rowdump: hk=%d row=%zu pld=%08x %08x %08x %08x scl=%.4f %.4f %.4f %.4f\n",
-                            dbg_hk, roff, pld[0],pld[1],pld[2],pld[3],
-                            __half2float(scl[0]),__half2float(scl[1]),__half2float(scl[2]),__half2float(scl[3]));
-                }
                 if (v4_bm == 16 && v4_bn == 8) {
                     if (use_f16_v) {
                         ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_single_kernel<true, 8, 16><<<recthist_grid, block, smem_v4, stream>>>(
