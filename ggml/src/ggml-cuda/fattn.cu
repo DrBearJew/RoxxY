@@ -1127,13 +1127,14 @@ static bool ggml_cuda_mtp_verify_dot4_recthist_supported(
         V->ne[0] == Q->ne[0];
 
     // PR3: Source f16 materialization.
-    // K=f16, V=f16 with adapter enabled: the DOT4 launch path already
-    // has f16→packed16 quantization. Use separate support helper.
+    // K=f16, V=f16/q8_0/q4_0 with adapter enabled: the DOT4 launch
+    // path already has f16→packed16 quantization. Use separate support
+    // helper.
     if (packed16_k || q8q4_kv) {
         return ggml_cuda_q8k_dot4_kq_supported(cc, dst);
     }
 
-    if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) {
+    if (K->type == GGML_TYPE_F16 && (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0)) {
         return ggml_cuda_mtp_verify_f16k_dot4_adapter_supported(cc, dst);
     }
 
@@ -1175,11 +1176,13 @@ static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
                     : V->type == GGML_TYPE_Q4_0 ? "q4_0"
                     : V->type == GGML_TYPE_Q8_0 ? "q8_0"
                     : "-";
+                const bool dot4_active = (selected == BEST_FATTN_KERNEL_Q8K_DOT4_KQ);
+
                 GGML_LOG_INFO("%s: fa_instruction=mtp_verify_qk nq=%lld K=%s V=%s "
-                        "k_repr=%s v_repr=%s dot4_role=%s impl_status=%s selected=%s\n",
+                        "%s=%s v_repr=%s dot4_role=%s impl_status=%s selected=%s\n",
                         __func__, (long long) Q->ne[1],
                         ggml_type_name(K->type), ggml_type_name(V->type),
-                        k_repr, v_repr,
+                        dot4_active ? "k_repr" : "k_repr_candidate", k_repr, v_repr,
                         ggml_cuda_dot4_role_name(dot4_role),
                         impl_status,
                         selected == BEST_FATTN_KERNEL_Q8K_DOT4_KQ ? "rocm_q8k_dot4_kq" :
