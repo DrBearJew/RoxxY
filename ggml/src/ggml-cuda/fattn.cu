@@ -410,6 +410,141 @@ static bool ggml_cuda_mtp_verify_f16k_dot4_adapter_enabled() {
 #endif
 }
 
+// ── MTP_VERIFY_QK WMMA/MMA fallback env gates ──────────────────────
+// Default off. Part 3: instruction-aware fallback when DOT4 is disabled
+// or illegal. WMMA/MMA are f16/f32 only — no q8/q4 dequant fallback.
+
+static bool ggml_cuda_mtp_verify_wmma_f16_enabled() {
+#ifdef GGML_USE_HIP
+    const char * env = getenv("GGML_CUDA_ROCM_MTP_VERIFY_WMMA_F16");
+    return env && atoi(env) != 0;
+#else
+    return false;
+#endif
+}
+
+static bool ggml_cuda_mtp_verify_mma_f16_enabled() {
+#ifdef GGML_USE_HIP
+    const char * env = getenv("GGML_CUDA_ROCM_MTP_VERIFY_MMA_F16");
+    return env && atoi(env) != 0;
+#else
+    return false;
+#endif
+}
+
+static bool ggml_cuda_mtp_verify_wmma_f16_supported(
+        const int cc,
+        const ggml_tensor * dst) {
+#ifdef GGML_USE_HIP
+    if (!ggml_cuda_mtp_verify_wmma_f16_enabled()) {
+        return false;
+    }
+
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    if (!Q || !K || !V) {
+        return false;
+    }
+
+    if (!ggml_cuda_should_use_wmma_fattn(cc)) {
+        return false;
+    }
+
+    if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const bool k_ok =
+        K->type == GGML_TYPE_F16 ||
+        K->type == GGML_TYPE_F32;
+
+    const bool v_ok =
+        V->type == GGML_TYPE_F16 ||
+        V->type == GGML_TYPE_F32;
+
+    if (!k_ok || !v_ok) {
+        return false;
+    }
+
+    if (K->ne[1] % FATTN_KQ_STRIDE != 0) {
+        return false;
+    }
+
+    // Existing WMMA f16 path excludes these dimensions.
+    if (Q->ne[0] == 40 || Q->ne[0] == 72 ||
+        Q->ne[0] == 512 || Q->ne[0] == 576) {
+        return false;
+    }
+
+    if (mask && mask->ne[2] != 1) {
+        return false;
+    }
+
+    return true;
+#else
+    GGML_UNUSED(cc);
+    GGML_UNUSED(dst);
+    return false;
+#endif
+}
+
+static bool ggml_cuda_mtp_verify_mma_f16_supported(
+        const int cc,
+        const ggml_tensor * dst) {
+#ifdef GGML_USE_HIP
+    if (!ggml_cuda_mtp_verify_mma_f16_enabled()) {
+        return false;
+    }
+
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    if (!Q || !K || !V) {
+        return false;
+    }
+
+    if (!amd_mfma_available(cc)) {
+        return false;
+    }
+
+    if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const bool k_ok =
+        K->type == GGML_TYPE_F16 ||
+        K->type == GGML_TYPE_F32;
+
+    const bool v_ok =
+        V->type == GGML_TYPE_F16 ||
+        V->type == GGML_TYPE_F32;
+
+    if (!k_ok || !v_ok) {
+        return false;
+    }
+
+    if (Q->ne[0] == 40 || Q->ne[0] == 72 ||
+        Q->ne[0] == 512 || Q->ne[0] == 576) {
+        return false;
+    }
+
+    if (mask && mask->ne[2] != 1) {
+        return false;
+    }
+
+    return true;
+#else
+    GGML_UNUSED(cc);
+    GGML_UNUSED(dst);
+    return false;
+#endif
+}
+
 // Separate support check for f16-source materialization.
 // Does NOT call q8k_dot4_kq_supported() — that rejects source K=f16.
 // The DOT4 launch path already has f16→packed16 quantization.
@@ -1736,6 +1871,40 @@ static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
             k_repr,
             status,
             BEST_FATTN_KERNEL_NONE);
+    }
+
+    // ── Instruction-aware fallback: WMMA_F16 / MMA_F16 ───────────────
+    // Only after DOT4 is rejected. f16/f32 K/V only — no q8/q4 dequant.
+    // Default off; env-gated per backend.
+
+    if (ggml_cuda_mtp_verify_wmma_f16_supported(cc, dst)) {
+        const best_fattn_kernel selected = BEST_FATTN_KERNEL_WMMA_F16;
+
+        ggml_cuda_fattn_log_instruction_route(
+            dst,
+            "mtp_verify_qk",
+            ggml_cuda_dot4_role_name(dot4_role),
+            GGML_CUDA_FATTN_BACKEND_WMMA_F16,
+            GGML_CUDA_DOT4_K_REPR_NONE,
+            "dot4_rejected_wmma_f16_selected",
+            selected);
+
+        return selected;
+    }
+
+    if (ggml_cuda_mtp_verify_mma_f16_supported(cc, dst)) {
+        const best_fattn_kernel selected = BEST_FATTN_KERNEL_MMA_F16;
+
+        ggml_cuda_fattn_log_instruction_route(
+            dst,
+            "mtp_verify_qk",
+            ggml_cuda_dot4_role_name(dot4_role),
+            GGML_CUDA_FATTN_BACKEND_MMA_F16,
+            GGML_CUDA_DOT4_K_REPR_NONE,
+            "dot4_rejected_mma_f16_selected",
+            selected);
+
+        return selected;
     }
 
     return BEST_FATTN_KERNEL_NONE; // signal: use existing policy
