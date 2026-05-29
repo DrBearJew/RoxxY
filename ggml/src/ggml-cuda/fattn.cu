@@ -1715,6 +1715,19 @@ struct ggml_cuda_fa_inst_tracker {
 
 static ggml_cuda_fa_inst_tracker g_fa_inst_tracker;
 
+// Forward declarations: called from ggml_cuda_try_instruction_fastpath
+// (defined later in this file).
+static best_fattn_kernel ggml_cuda_select_mtp_draft_decode_fattn(
+        const int cc,
+        const ggml_tensor * dst,
+        const ggml_cuda_rocm_quant_prefill_f16_policy * f16_policy);
+
+static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
+        const int cc,
+        const ggml_tensor * dst,
+        const ggml_cuda_rocm_quant_prefill_f16_policy * f16_policy,
+        const ggml_fattn_instruction inst);
+
 static ggml_cuda_fa_fastpath_result ggml_cuda_try_instruction_fastpath(
         const int cc,
         const ggml_tensor * dst,
@@ -1723,11 +1736,81 @@ static ggml_cuda_fa_fastpath_result ggml_cuda_try_instruction_fastpath(
     const enum ggml_cuda_fattn_fast_route wanted = route_for_instruction(inst, Q);
 
     switch (wanted) {
-        case GGML_CUDA_FAST_ROUTE_DOT4_RECTHIST:
-            return ggml_cuda_try_dot4_recthist(cc, dst, inst);
+        case GGML_CUDA_FAST_ROUTE_DOT4_RECTHIST: {
+            // Delegate to the old selector for full gate coverage, then
+            // wrap in fastpath_result with a proper reject reason.
+            ggml_cuda_rocm_quant_prefill_f16_policy mtp_f16_policy = {};
+            const best_fattn_kernel selected =
+                ggml_cuda_select_mtp_verify_fattn(cc, dst, &mtp_f16_policy, inst);
+            if (selected != BEST_FATTN_KERNEL_NONE) {
+                return { selected, "dot4_recthist", FA_REJECT_NONE };
+            }
+            // Rejected: determine the reason from the old selector's logic.
+            // The old selector logs the reason internally; we synthesize one from
+            // the same gates it checks.
+            if (!ggml_cuda_q8k_dot4_kq_enabled()) {
+                return { BEST_FATTN_KERNEL_NONE, "dot4_recthist", FA_REJECT_ENV_DISABLED };
+            }
+            if (!GGML_CUDA_CC_IS_RDNA3(cc)) {
+                return { BEST_FATTN_KERNEL_NONE, "dot4_recthist", FA_REJECT_NOT_RDNA3 };
+            }
+            if (Q->ne[1] <= 1) {
+                return { BEST_FATTN_KERNEL_NONE, "dot4_recthist", FA_REJECT_NQ_WRONG_FOR_ROUTE };
+            }
+            if (Q->ne[0] != 256) {
+                return { BEST_FATTN_KERNEL_NONE, "dot4_recthist", FA_REJECT_D_NOT_256 };
+            }
+            // For nq==2 on MTP_VERIFY_QK, the old selector requires
+            // GGML_CUDA_ROCM_MTP_VERIFY_DOT4_NQ2=1; PREFILL_QK bypasses.
+            if (Q->ne[1] == 2 && inst == GGML_FATTN_INST_MTP_VERIFY_QK) {
+                const char * nq2_env = getenv("GGML_CUDA_ROCM_MTP_VERIFY_DOT4_NQ2");
+                if (!nq2_env || atoi(nq2_env) == 0) {
+                    return { BEST_FATTN_KERNEL_NONE, "dot4_recthist", FA_REJECT_NQ_WRONG_FOR_ROUTE };
+                }
+            }
+            // K/V legality: the old selector has full K/V checks.
+            // Synthesize a reason from type checks.
+            const ggml_tensor * K = dst->src[1];
+            const ggml_tensor * V = dst->src[2];
+            const bool k_ok = K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q8_0 ||
+                              K->type == GGML_TYPE_I32;
+            const bool v_ok = V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 ||
+                              V->type == GGML_TYPE_Q4_0;
+            if (!k_ok) {
+                return { BEST_FATTN_KERNEL_NONE, "dot4_recthist", FA_REJECT_MISSING_K_REPR };
+            }
+            if (!v_ok) {
+                return { BEST_FATTN_KERNEL_NONE, "dot4_recthist", FA_REJECT_UNSUPPORTED_V };
+            }
+            return { BEST_FATTN_KERNEL_NONE, "dot4_recthist", FA_REJECT_ROUTE_CONTRACT };
+        }
 
-        case GGML_CUDA_FAST_ROUTE_DOT4_DECODE:
-            return ggml_cuda_try_dot4_decode(cc, dst, inst);
+        case GGML_CUDA_FAST_ROUTE_DOT4_DECODE: {
+            ggml_cuda_rocm_quant_prefill_f16_policy mtp_f16_policy = {};
+            const best_fattn_kernel selected =
+                ggml_cuda_select_mtp_draft_decode_fattn(cc, dst, &mtp_f16_policy);
+            if (selected != BEST_FATTN_KERNEL_NONE) {
+                return { selected, "dot4_decode", FA_REJECT_NONE };
+            }
+            if (!ggml_cuda_q8k_dot4_kq_enabled()) {
+                return { BEST_FATTN_KERNEL_NONE, "dot4_decode", FA_REJECT_ENV_DISABLED };
+            }
+            if (!GGML_CUDA_CC_IS_RDNA3(cc)) {
+                return { BEST_FATTN_KERNEL_NONE, "dot4_decode", FA_REJECT_NOT_RDNA3 };
+            }
+            if (Q->ne[1] != 1) {
+                return { BEST_FATTN_KERNEL_NONE, "dot4_decode", FA_REJECT_NQ_WRONG_FOR_ROUTE };
+            }
+            const ggml_tensor * K = dst->src[1];
+            const ggml_tensor * V = dst->src[2];
+            if (K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_Q8_0) {
+                return { BEST_FATTN_KERNEL_NONE, "dot4_decode", FA_REJECT_MISSING_K_REPR };
+            }
+            if (V->type != GGML_TYPE_F16 && V->type != GGML_TYPE_Q8_0 && V->type != GGML_TYPE_Q4_0) {
+                return { BEST_FATTN_KERNEL_NONE, "dot4_decode", FA_REJECT_UNSUPPORTED_V };
+            }
+            return { BEST_FATTN_KERNEL_NONE, "dot4_decode", FA_REJECT_ROUTE_CONTRACT };
+        }
 
         default:
             return { BEST_FATTN_KERNEL_NONE, "none", FA_REJECT_NONE };
@@ -2345,7 +2428,7 @@ static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
             ggml_cuda_dot4_role_name(dot4_role),
             GGML_CUDA_FATTN_BACKEND_DOT4_RECTHIST_V4,
             k_repr,
-            "dot4_selected",
+            "dot4_candidate",
             selected);
 
         return selected;
@@ -2623,12 +2706,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
 #ifdef GGML_USE_HIP
-    // ── MTP instruction dispatch (all KV types) ─────────────────
-    // MTP_VERIFY_QK: run FA as QK/V backend for MTP verification.
-    // MTP_DRAFT: run FA for draft generation (no DOT4 preference).
+    // ── Instruction-driven FA dispatch ──────────────────────────
+    // For instruction paths (PREFILL_QK, DECODE_QK, etc.),
+    // ggml_cuda_try_instruction_fastpath IS the authoritative selector.
+    // It internally delegates to the legacy selectors for gate coverage
+    // but wraps results in fastpath_result with proper reject reasons.
     //
-    // Instruction-first: workload declares the instrument, then
-    // DOT4/WMMA/VEC are selected as implementations.
+    // MTP_DRAFT stays on existing policy (no DOT4 preference).
     {
         const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
         const ggml_fattn_instruction inst = (ggml_fattn_instruction)fa_inst_i32;
@@ -2643,49 +2727,38 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         const bool is_instruction_path =
             is_recthist_inst || is_decode_inst;
 
-        if (is_recthist_inst) {
-            ggml_cuda_rocm_quant_prefill_f16_policy mtp_f16_policy = {};
-            const auto selected = ggml_cuda_select_mtp_verify_fattn(
-                cc, dst, &mtp_f16_policy, inst);
-            if (selected != BEST_FATTN_KERNEL_NONE) {
-                return selected;
+        if (is_instruction_path) {
+            // Authoritative: this IS the selector for instruction paths.
+            ggml_cuda_fa_fastpath_result fast =
+                ggml_cuda_try_instruction_fastpath(cc, dst, inst);
+
+            if (fast.selected != BEST_FATTN_KERNEL_NONE) {
+                return fast.selected;
             }
-        } else if (is_decode_inst) {
-            ggml_cuda_rocm_quant_prefill_f16_policy mtp_f16_policy = {};
-            const auto selected = ggml_cuda_select_mtp_draft_decode_fattn(
-                cc, dst, &mtp_f16_policy);
-            if (selected != BEST_FATTN_KERNEL_NONE) {
-                return selected;
+
+            // Fast path rejected. Save context for hunter hooks.
+            g_fa_inst_tracker.active = true;
+            g_fa_inst_tracker.inst = inst;
+            g_fa_inst_tracker.fast = fast;
+
+            if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
+                if (log_env && atoi(log_env) != 0) {
+                    GGML_LOG_INFO("%s: fa_instruction=%s route=legacy_fallback "
+                        "attempted_route=%s reject=%s "
+                        "nq=%lld K=%s V=%s\n",
+                        __func__,
+                        ggml_cuda_fattn_instruction_name(inst),
+                        fast.route ? fast.route : "-",
+                        ggml_cuda_fa_reject_reason_name(fast.reject),
+                        (long long) Q->ne[1],
+                        ggml_type_name(K->type), ggml_type_name(V->type));
+                }
             }
         } else if (fa_inst_i32 == GGML_FATTN_INST_MTP_DRAFT) {
             if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
                 if (log_env && atoi(log_env) != 0) {
                     GGML_LOG_INFO("%s: fa_instruction=mtp_draft nq=%lld impl_status=legacy_fallback\n",
                             __func__, (long long) Q->ne[1]);
-                }
-            }
-        }
-
-        // ── VEC/TILE fallback severity ──────────────────────────
-        // When an instruction path falls through to VEC/TILE, save
-        // context so the caller (ggml_cuda_flash_attn_ext) can run
-        // hunter hooks after the final kernel is selected.
-        if (is_instruction_path) {
-            g_fa_inst_tracker.active = true;
-            g_fa_inst_tracker.inst = inst;
-            g_fa_inst_tracker.fast = ggml_cuda_try_instruction_fastpath(cc, dst, inst);
-
-            if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
-                if (log_env && atoi(log_env) != 0) {
-                    GGML_LOG_INFO("%s: fa_instruction=%s route=legacy_fallback "
-                        "attempted_route=%s reject=%s "
-                        "nq=%lld K=%s V=%s fallback_severity=pending\n",
-                        __func__,
-                        ggml_cuda_fattn_instruction_name(inst),
-                        g_fa_inst_tracker.fast.route ? g_fa_inst_tracker.fast.route : "-",
-                        ggml_cuda_fa_reject_reason_name(g_fa_inst_tracker.fast.reject),
-                        (long long) Q->ne[1],
-                        ggml_type_name(K->type), ggml_type_name(V->type));
                 }
             }
         }
