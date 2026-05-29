@@ -3562,10 +3562,15 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                 const bool use_q8_v  = (V->type == GGML_TYPE_Q8_0);
                 // ---- Packed16 decode fast-path (nq=1) ----
                 const int decode_bn = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_BN", 0);
-                if (decode_bn > 0 && nq == 1 && K->type == GGML_TYPE_I32) {
-                    GGML_ASSERT(K->nb[1] % sizeof(int) == 0);
-                    const int k_head_stride_rows  = (int)(K->nb[2] / K->nb[1]);
-                    const int k_batch_stride_rows = (int)(K->nb[3] / K->nb[1]);
+                const int32_t fa_inst = ((const int32_t *)dst->op_params)[4];
+                const bool is_mtp_draft_decode = (fa_inst == GGML_FATTN_INST_MTP_DRAFT_DECODE_QK);
+
+                if (decode_bn > 0 && nq == 1 && (K->type == GGML_TYPE_I32 || is_mtp_draft_decode)) {
+                    // For f16-source K, packed16 is already materialized in k_payload/k_scales.
+                    // Strides are computed from packed16 layout, not from K tensor strides.
+                    const int packed16_per_row = 64; // D=256 / 4
+                    const int k_head_stride_rows  = nk * packed16_per_row;
+                    const int k_batch_stride_rows = n_heads_k * k_head_stride_rows;
                     const int decode_vsub = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_VSUB", 8);
                     const bool inline_q4 = ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_INLINE_Q4");
                     const bool q4pair = V->type == GGML_TYPE_Q4_0 && ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_Q4PAIR");
