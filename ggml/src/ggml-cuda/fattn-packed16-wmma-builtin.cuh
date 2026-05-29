@@ -22,7 +22,8 @@ static constexpr int PBWMMA_BN = 16;
 
 // ── RDNA3 WMMA intrinsic helpers ──────────────────────────────────
 
-#if defined(__HIPCC__)
+#if defined(__HIPCC__) && \
+    (defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(RDNA3))
 #define PBWMMA_RDNA3_BUILTIN 1
 
 using pbwmma_v16fp16 = _Float16 __attribute__((ext_vector_type(16)));
@@ -144,7 +145,7 @@ static bool pbwmma_qk_probe_pass(hipStream_t stream) {
 #else
 static bool pbwmma_qk_probe_pass(hipStream_t stream) {
     GGML_UNUSED(stream);
-    fprintf(stderr, "PBWMMA QK probe SKIPPED (not gfx1100)\n");
+    fprintf(stderr, "PBWMMA QK probe SKIPPED (not RDNA3/gfx11)\n");
     return false;
 }
-#endif // __HIPCC__
+#endif // RDNA3/gfx11 guard

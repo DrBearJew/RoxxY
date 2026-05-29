@@ -310,11 +310,19 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
     GGML_ASSERT(packed16_payload->nb[0] == (int64_t)sizeof(int) && packed16_scales->nb[0] == (int64_t)sizeof(half));
     GGML_ASSERT(packed16_payload->nb[1] == (PWMMA_D/4)*(int64_t)sizeof(int));
     GGML_ASSERT(packed16_scales->nb[1] == (PWMMA_D/QK8_0)*(int64_t)sizeof(half));
-    // Assert compact head/batch layout (required for k_head_base arithmetic)
+    // Assert compact head/batch layout
     GGML_ASSERT(packed16_payload->nb[2] == packed16_payload->ne[1] * packed16_payload->nb[1]);
     GGML_ASSERT(packed16_scales->nb[2]  == packed16_scales->ne[1]  * packed16_scales->nb[1]);
     GGML_ASSERT(packed16_payload->nb[3] == packed16_payload->ne[2] * packed16_payload->nb[2]);
     GGML_ASSERT(packed16_scales->nb[3]  == packed16_scales->ne[2]  * packed16_scales->nb[2]);
+    // v0.3: single-batch only. Packed16 rows are flat [head][kv].
+    GGML_ASSERT(batch == 1);
+    GGML_ASSERT(packed16_payload->ne[1] >= K->ne[1] * K->ne[2]);
+    GGML_ASSERT(packed16_scales->ne[1]  >= K->ne[1] * K->ne[2]);
+    GGML_ASSERT(packed16_payload->ne[2] == 1);
+    GGML_ASSERT(packed16_scales->ne[2]  == 1);
+    GGML_ASSERT(packed16_payload->ne[3] == 1);
+    GGML_ASSERT(packed16_scales->ne[3]  == 1);
     // Packed16 stores all heads flat in ne[1]: rows = kv_size * n_heads_k
     // ne[2] = n_stream (batch), not n_heads_k
     (void)0;
@@ -325,8 +333,7 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
     const int nq = (int)Q->ne[1], nk = (int)K->ne[1], n_heads_q = (int)Q->ne[2], n_heads_k = (int)K->ne[2];
     const int gqa_ratio = n_heads_q / n_heads_k, batch = (int)Q->ne[3];
     const float attention_scale = ((const float*)dst->op_params)[0];
-    const int packed_kv_size = (int)packed16_payload->ne[1]; // total flat rows (all heads)
-    const int packed_batch   = (int)packed16_payload->ne[3];
+    const int packed_kv_size = (int)packed16_payload->ne[1]; // unused in v0.3 single-batch, kept for future multi-batch
     const int64_t v_ne13 = V->ne[3] > 0 ? V->ne[3] : 1;
     const int64_t mask_nb30 = mask ? mask->nb[0] : 0, mask_nb31 = mask ? mask->nb[1] : 0;
     const int64_t mask_nb33 = mask ? mask->nb[3] : 0, mask_ne33 = mask ? mask->ne[3] : 1;
