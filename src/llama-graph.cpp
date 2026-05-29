@@ -2068,13 +2068,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
-        // v_trans get_v() returns V as [n_kv, n_head_kv, head_dim, batch].
-        // After the global permute (0,2,1,3) it becomes [n_kv, head_dim, n_head_kv, batch].
-        // FlashAttention needs [head_dim, n_kv, n_head_kv, batch] with nb[0]=type_size.
-        // Apply (1,0,2,3) to swap head_dim to dim 0, then cont to fix strides.
         if (v_trans) {
-            v = ggml_permute(ctx0, v, 1, 0, 2, 3);
-            v = ggml_cont(ctx0, v);
+            v = ggml_transpose(ctx0, v);
+        }
         } else {
             v = ggml_transpose(ctx0, v);
         }
