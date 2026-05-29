@@ -23,7 +23,7 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, struct ggml_t
 //   rocm_q8k_dot4_decode_splitk_mtp_draft     — split-K decode
 static inline bool ggml_cuda_q8k_dot4_kq_route_required() {
     const char * required = getenv("GGML_CUDA_FA_ROUTE_REQUIRE");
-    if (!required) return false;
+    if (!required) return true; // No route requirement → DOT4 allowed
     // Broad contract plus all precise family names.
     return strcmp(required, "rocm_q8k_dot4_kq") == 0
         || strcmp(required, "rocm_q8k_dot4_recthist_mtp_verify") == 0
