@@ -33,6 +33,12 @@ enum packed16_wmma_v_type {
 #if defined(GGML_USE_HIP) && defined(GGML_HIP_ROCWMMA_FATTN)
 #include <rocwmma/rocwmma.hpp>
 
+// ── Explicit packed-byte extraction (no pointer-pun on int) ────
+static __device__ __forceinline__ int8_t pwmma_i8_from_i32(const int packed, const int byte) {
+    const uint32_t u = static_cast<uint32_t>(packed);
+    return static_cast<int8_t>((u >> (8 * byte)) & 0xffu);
+}
+
 // ── Reference decode helpers (for debug checks) ──────────────────
 
 static __device__ __forceinline__ float pwmma_decode_k(
@@ -44,7 +50,7 @@ static __device__ __forceinline__ float pwmma_decode_k(
     const int qb = d / QK8_0, inner = d & 31;
     const int word = inner >> 2, byte = inner & 3;
     const int   packed = k_payload[row * I32_PER_ROW + qb * 8 + word];
-    const int8_t q     = ((const int8_t *) &packed)[byte];
+    const int8_t q     = pwmma_i8_from_i32(packed, byte);
     return float(q) * __half2float(k_scales[row * SCALES_PER_ROW + qb]);
 }
 
@@ -284,17 +290,49 @@ static __global__ void packed16_wmma_tile_kernel(
                 for (int i = 0; i < 16; ++i) {
                     const int d = d0 + i;
                     a_frag[i] = (_Float16) q_tile_f16[lane_lo][d];
+#ifdef GGML_CUDA_PWMMA_DEBUG
+                    if (!isfinite(float(a_frag[i]))) {
+                        printf("PWMMA AFRAG NaN hq=%d q_tile=%d lane=%d lane_lo=%d i=%d d=%d af=%f\n",
+                               hq, q_tile, lane, lane_lo, i, d, float(a_frag[i]));
+                        asm volatile("s_trap 33");
+                    }
+#endif
                     if (k_col_valid) {
                         const size_t row = k_head_base + size_t(k0) + size_t(lane_lo);
                         const int qb = d / QK8_0, inner = d & 31, word = inner >> 2, byte = inner & 3;
                         const int packed = k_payload[row * (PWMMA_D/4) + qb * 8 + word];
                         const float s = __half2float(k_scales[row * (PWMMA_D/QK8_0) + qb]);
-                        b_frag[i] = (_Float16)(float(((const int8_t*)&packed)[byte]) * s);
+                        b_frag[i] = (_Float16)(float(pwmma_i8_from_i32(packed, byte)) * s);
+#ifdef GGML_CUDA_PWMMA_DEBUG
+                        if (!isfinite(float(b_frag[i]))) {
+                            printf("PWMMA BFRAG NaN hq=%d hk=%d k0=%d lane=%d lane_lo=%d lane_hi=%d i=%d d=%d row=%llu val=%f\n",
+                                   hq, hk, k0, lane, lane_lo, lane_hi, i, d,
+                                   (unsigned long long)row, float(b_frag[i]));
+                            asm volatile("s_trap 32");
+                        }
+                        // K payload debug dump for odd lanes on affected heads
+                        if ((hq == 9 || hq == 11) && blockIdx.x == 0 && blockIdx.z == 0 && k0 == 0 && d0 == 0 && i == 0)
+                            printf("PWMMA KDBG hq=%d hk=%d lane_lo=%d row=%llu packed0=%08x scale0=%f packed=%08x byte=%d i8=%d\n",
+                                   hq, hk, lane_lo, (unsigned long long)row,
+                                   k_payload[row * (PWMMA_D / 4) + 0],
+                                   __half2float(k_scales[row * (PWMMA_D / QK8_0) + 0]),
+                                   packed, byte, (int)pwmma_i8_from_i32(packed, byte));
+#endif
                     } else {
                         b_frag[i] = (_Float16)0.0f;
                     }
                 }
                 acc = pbwmma_mma(a_frag, b_frag, acc);
+#ifdef GGML_CUDA_PWMMA_DEBUG
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    if (!isfinite(acc[i])) {
+                        printf("PWMMA ACC NaN hq=%d hk=%d k0=%d d0=%d lane=%d lane_lo=%d lane_hi=%d slot=%d cf=%f\n",
+                               hq, hk, k0, d0, lane, lane_lo, lane_hi, i, acc[i]);
+                        asm volatile("s_trap 34");
+                    }
+                }
+#endif
             }
             #pragma unroll
             for (int i = 0; i < 8; ++i) logits_f32[2*i + lane_hi][lane_lo] = acc[i];
@@ -302,8 +340,18 @@ static __global__ void packed16_wmma_tile_kernel(
         __syncthreads();
 
 #ifdef GGML_CUDA_PWMMA_DEBUG
-        // Diagnostic 1: real-kernel QK reference (first tile per block)
-        if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.z == 0) {
+        // PREMASK NaN trap: raw QK logits from WMMA, before scale/mask
+        for (int idx = threadIdx.x; idx < PWMMA_BM * PWMMA_BN; idx += blockDim.x) {
+            const int r = idx / PWMMA_BN, c = idx % PWMMA_BN;
+            if (!isfinite(logits_f32[r][c])) {
+                printf("PWMMA PREMASK QK NaN block=(%d,%d,%d) hq=%d hk=%d r=%d c=%d x=%f\n",
+                       blockIdx.x, blockIdx.y, blockIdx.z, hq, hk, r, c, logits_f32[r][c]);
+                asm volatile("s_trap 30");
+            }
+        }
+        // QK scalar reference on affected heads + per-column print
+        const bool debug_head = (hq == 9 || hq == 11);
+        if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.z == 0 && debug_head) {
             float max_abs_err = 0.0f, max_ref_abs = 0.0f;
             for (int r = 0; r < PWMMA_BM; ++r) {
                 const int qq = q_tile * PWMMA_BM + r;
@@ -316,6 +364,9 @@ static __global__ void packed16_wmma_tile_kernel(
                                pwmma_decode_k(k_payload, k_scales, row, d);
                     }
                     const float got = logits_f32[r][c];
+                    printf("PWMMA QK hq=%d hk=%d c=%d ref=%f got=%f err=%f row=%llu\n",
+                           hq, hk, c, ref, got, fabsf(ref - got),
+                           (unsigned long long)row);
                     max_abs_err = fmaxf(max_abs_err, fabsf(ref - got));
                     max_ref_abs = fmaxf(max_ref_abs, fabsf(ref));
                 }
@@ -335,7 +386,23 @@ static __global__ void packed16_wmma_tile_kernel(
             const int r = idx / PWMMA_BN, c = idx % PWMMA_BN, qq = q_tile * PWMMA_BM + r;
             float v = logits_f32[r][c];
             if (qq >= nq || c >= valid_k) v = -FLT_MAX/2.0f;
-            else { if (mask) v += pwmma_mask_val(mask, mask_nb30, mask_nb31, mask_nb33, mask_ne33, qq, k0+c, b); }
+            else {
+                if (mask) {
+                    float mv = pwmma_mask_val(mask, mask_nb30, mask_nb31, mask_nb33, mask_ne33, qq, k0+c, b);
+#ifdef GGML_CUDA_PWMMA_DEBUG
+                    if (!isfinite(mv)) {
+                        printf("PWMMA MASK NaN block=(%d,%d,%d) hq=%d hk=%d qq=%d k=%d r=%d c=%d mv=%f "
+                               "mnb30=%lld mnb31=%lld mnb33=%lld mne33=%lld\n",
+                               blockIdx.x, blockIdx.y, blockIdx.z,
+                               hq, hk, qq, k0+c, r, c, mv,
+                               (long long)mask_nb30, (long long)mask_nb31,
+                               (long long)mask_nb33, (long long)mask_ne33);
+                        asm volatile("s_trap 31");
+                    }
+#endif
+                    v += mv;
+                }
+            }
             logits_f32[r][c] = v;
         }
         __syncthreads();
@@ -445,7 +512,7 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
     llama_kv_cache_get_packed16_tensors(K->data, &packed16_payload, &packed16_scales);
     GGML_ASSERT(packed16_payload && packed16_scales);
     GGML_ASSERT(packed16_payload->ne[0] == PWMMA_D/4 && packed16_scales->ne[0] == PWMMA_D/QK8_0);
-    GGML_ASSERT(packed16_payload->ne[1] >= K->ne[1] && packed16_scales->ne[1] >= K->ne[1]);
+    GGML_ASSERT(packed16_payload->ne[1] >= K->ne[1] * K->ne[2] && packed16_scales->ne[1] >= K->ne[1] * K->ne[2]);
     GGML_ASSERT(packed16_payload->nb[0] == (int64_t)sizeof(int) && packed16_scales->nb[0] == (int64_t)sizeof(half));
     GGML_ASSERT(packed16_payload->nb[1] == (PWMMA_D/4)*(int64_t)sizeof(int));
     GGML_ASSERT(packed16_scales->nb[1] == (PWMMA_D/QK8_0)*(int64_t)sizeof(half));
@@ -475,8 +542,10 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
     hipStream_t stream = ctx.stream();
 
     { static bool once = false; if (!once) { once = true;
-        fprintf(stderr, "PWMMA v0.3 Q4fix=%d nq=%d nk=%d hq=%d hk=%d b=%d sc=%g\n",
-                PWMMA_Q4_LAYOUT_FIXED, nq, nk, n_heads_q, n_heads_k, batch, (double)attention_scale);
+        fprintf(stderr, "PWMMA v0.3 Q4fix=%d nq=%d nk=%d hq=%d hk=%d b=%d sc=%g "
+                "payload_ne1=%lld payload_ne2=%lld packed_kv_size=%d\n",
+                PWMMA_Q4_LAYOUT_FIXED, nq, nk, n_heads_q, n_heads_k, batch, (double)attention_scale,
+                (long long)packed16_payload->ne[1], (long long)packed16_payload->ne[2], packed_kv_size);
         if (!pbwmma_qk_probe_pass(stream)) GGML_ABORT("PBWMMA QK probe failed");
     }}
 
