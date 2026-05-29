@@ -372,24 +372,28 @@ static void print_mask(const float * data, int64_t n_tokens, int64_t n_kv, int64
     LLAMA_LOG_DEBUG("%s: n_swa : %d, n_kv: %d, swq_type: %s\n", __func__, (int)n_swa, (int)n_kv, swa_type_str);
     LLAMA_LOG_DEBUG("%s: '0' = can attend, '∞' = masked\n", __func__);
     LLAMA_LOG_DEBUG("%s: Rows = query tokens, Columns = key/value tokens\n\n", __func__);
+}
 
-    LLAMA_LOG_DEBUG("    ");
-    for (int j = 0; j < std::min((int64_t)20, n_kv); ++j) {
-        LLAMA_LOG_DEBUG("%2d", j);
-    }
-    LLAMA_LOG_DEBUG("\n");
-
-    for (int i = 0; i < std::min((int64_t)20, n_tokens); ++i) {
-        LLAMA_LOG_DEBUG(" %2d ", i);
-        for (int j = 0; j < std::min((int64_t)20, n_kv); ++j) {
-            float val = data[i * n_kv + j];
-            if (val == -INFINITY) {
-                LLAMA_LOG_DEBUG(" ∞");
-            } else {
-                LLAMA_LOG_DEBUG(" 0");
-            }
-        }
-        LLAMA_LOG_DEBUG("\n");
+static void assert_fa_v_layout(const ggml_tensor * v, const char * tag) {
+    const int64_t ts = ggml_type_size(v->type);
+    if (v->nb[0] != ts) {
+        fprintf(stderr,
+            "%s bad FA V layout: name=%s type=%s "
+            "ne=(%lld,%lld,%lld,%lld) nb=(%lld,%lld,%lld,%lld) type_size=%lld op=%s\n",
+            tag,
+            v->name ? v->name : "(null)",
+            ggml_type_name(v->type),
+            (long long) v->ne[0],
+            (long long) v->ne[1],
+            (long long) v->ne[2],
+            (long long) v->ne[3],
+            (long long) v->nb[0],
+            (long long) v->nb[1],
+            (long long) v->nb[2],
+            (long long) v->nb[3],
+            (long long) ts,
+            ggml_op_name(v->op));
+        /* GGML_ABORT("bad FA V layout"); */
     }
 }
 
@@ -2053,6 +2057,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     if (!k_is_packed16_i32) {
         k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     }
+    fprintf(stderr, "build_attn_mha: V pre-permute ne=(%lld,%lld,%lld,%lld) nb=(%lld,%lld,%lld,%lld) v_type=%s v_name=%s\n",
+        (long long)v->ne[0], (long long)v->ne[1], (long long)v->ne[2], (long long)v->ne[3],
+        (long long)v->nb[0], (long long)v->nb[1], (long long)v->nb[2], (long long)v->nb[3],
+        ggml_type_name(v->type), v->name ? v->name : "(null)");
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
 
     ggml_tensor * cur;
@@ -2060,12 +2068,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
-        // v_trans returns V as [n_kv, n_head_kv, head_dim, batch] but after
-        // the global permute (0,2,1,3) it becomes [n_kv, head_dim, n_head_kv, batch].
-        // FlashAttention needs [head_dim, n_kv, n_head_kv, batch].
-        // Apply (1,2,0,3) to fix the layout for FA.
+        // v_trans get_v() returns V as [n_kv, n_head_kv, head_dim, batch].
+        // After the global permute (0,2,1,3) it becomes [n_kv, head_dim, n_head_kv, batch].
+        // FlashAttention needs [head_dim, n_kv, n_head_kv, batch] with nb[0]=type_size.
+        // Apply (1,0,2,3) to swap head_dim to dim 0, then cont to fix strides.
         if (v_trans) {
-            v = ggml_permute(ctx0, v, 1, 2, 0, 3);
+            v = ggml_permute(ctx0, v, 1, 0, 2, 3);
+            v = ggml_cont(ctx0, v);
         } else {
             v = ggml_transpose(ctx0, v);
         }
@@ -2085,6 +2094,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
         }
 
+        assert_fa_v_layout(v, "build_attn_mha FA input V");
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         cb(cur, LLAMA_TENSOR_NAME_FATTN, il);
@@ -2458,6 +2468,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+    assert_fa_v_layout(v, "swa v-from-k view");
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);

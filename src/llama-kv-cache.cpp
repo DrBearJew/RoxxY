@@ -1329,30 +1329,57 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
     if (v->type == GGML_TYPE_TBQ3_0 || v->type == GGML_TYPE_TBQ4_0) {
-        return ggml_view_3d(ctx, v,
+        ggml_tensor * v_view = ggml_view_3d(ctx, v,
                 n_embd_v_gqa, n_kv, ns,
                 ggml_row_size(v->type, n_embd_v_gqa),
                 ggml_row_size(v->type, n_embd_v_gqa*kv_size),
                 ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
+        {
+            const int64_t ts = ggml_type_size(v_view->type);
+            if (v_view->nb[0] != ts) {
+                fprintf(stderr, "get_v TBQ BAD: name=%s type=%s ne=(%lld,%lld,%lld,%lld) nb=(%lld,%lld,%lld,%lld) ts=%lld\n",
+                    v_view->name ? v_view->name : "(null)", ggml_type_name(v_view->type),
+                    (long long)v_view->ne[0], (long long)v_view->ne[1], (long long)v_view->ne[2], (long long)v_view->ne[3],
+                    (long long)v_view->nb[0], (long long)v_view->nb[1], (long long)v_view->nb[2], (long long)v_view->nb[3],
+                    (long long)ts);
+                GGML_ABORT("get_v TBQ bad V layout");
+            }
+        }
+        return v_view;
     }
 
     if (!v_trans) {
         // note: v->nb[1] <= v->nb[2]
-        return ggml_view_4d(ctx, v,
+        ggml_tensor * v_view = ggml_view_4d(ctx, v,
                 hparams.n_embd_head_v(il), hparams.n_head_kv(il), n_kv, ns,
                 ggml_row_size(v->type, hparams.n_embd_head_v(il)),          // v->nb[1]
                 ggml_row_size(v->type, n_embd_v_gqa),                   // v->nb[2]
                 ggml_row_size(v->type, n_embd_v_gqa*kv_size),           // v->nb[3]
                 ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
+        {
+            const int64_t ts = ggml_type_size(v_view->type);
+            if (v_view->nb[0] != ts) {
+                fprintf(stderr, "get_v non-v_trans BAD: name=%s type=%s ne=(%lld,%lld,%lld,%lld) nb=(%lld,%lld,%lld,%lld) ts=%lld\n",
+                    v_view->name ? v_view->name : "(null)", ggml_type_name(v_view->type),
+                    (long long)v_view->ne[0], (long long)v_view->ne[1], (long long)v_view->ne[2], (long long)v_view->ne[3],
+                    (long long)v_view->nb[0], (long long)v_view->nb[1], (long long)v_view->nb[2], (long long)v_view->nb[3],
+                    (long long)ts);
+                GGML_ABORT("get_v non-v_trans bad V layout");
+            }
+        }
+        return v_view;
     }
 
     // note: v->nb[1] > v->nb[2]
-    return ggml_view_4d(ctx, v,
-            n_kv, hparams.n_head_kv(il), hparams.n_embd_head_v(il), ns,
-            ggml_row_size(v->type, kv_size*hparams.n_embd_head_v(il)),  // v->nb[1]
-            ggml_row_size(v->type, kv_size),                        // v->nb[2]
-            ggml_row_size(v->type, kv_size*n_embd_v_gqa),           // v->nb[3]
-            ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
+    {
+        ggml_tensor * v_view = ggml_view_4d(ctx, v,
+                n_kv, hparams.n_head_kv(il), hparams.n_embd_head_v(il), ns,
+                ggml_row_size(v->type, kv_size*hparams.n_embd_head_v(il)),  // v->nb[1]
+                ggml_row_size(v->type, kv_size),                        // v->nb[2]
+                ggml_row_size(v->type, kv_size*n_embd_v_gqa),           // v->nb[3]
+                ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
+        return v_view;
+    }
 }
 
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
