@@ -898,7 +898,25 @@ static best_fattn_kernel ggml_cuda_fattn_apply_route_contract(
 #endif // GGML_USE_HIP
 }
 
+// ── Selector call-site context ────────────────────────────────────
+// get_best_fattn_kernel() is called from TWO entry points:
+//   1. support probe  → ggml_cuda_flash_attn_ext_supported()
+//   2. actual dispatch → ggml_cuda_flash_attn_ext()
+// Logs must only fire in dispatch context to avoid false-positives.
+enum ggml_cuda_fattn_select_context {
+    GGML_CUDA_FATTN_SELECT_SUPPORT_PROBE = 0,
+    GGML_CUDA_FATTN_SELECT_DISPATCH      = 1,
+};
+
+// File-scope context tag. Set by the caller before invoking
+// get_best_fattn_kernel, read by internal log sites.
+static ggml_cuda_fattn_select_context g_fattn_select_ctx = GGML_CUDA_FATTN_SELECT_SUPPORT_PROBE;
+
 static void ggml_cuda_fattn_log_selection(const best_fattn_kernel kernel, const ggml_tensor * dst) {
+    if (g_fattn_select_ctx != GGML_CUDA_FATTN_SELECT_DISPATCH) {
+        return;
+    }
+
     const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG");
     if (!log_env || atoi(log_env) == 0) {
         return;
@@ -1830,6 +1848,11 @@ static void ggml_cuda_fattn_log_instruction_route(
         const char * impl_status,
         const best_fattn_kernel selected) {
 #ifdef GGML_USE_HIP
+    // Only log in dispatch context; suppress during support probe.
+    if (g_fattn_select_ctx != GGML_CUDA_FATTN_SELECT_DISPATCH) {
+        return;
+    }
+
     const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG");
     if (!log_env || atoi(log_env) == 0) {
         return;
@@ -2492,6 +2515,9 @@ static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
     return BEST_FATTN_KERNEL_NONE; // signal: use existing policy
 }
 
+// ── Instruction dispatch block (below) uses g_fattn_select_ctx
+// which is defined earlier in this file.
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
@@ -2741,24 +2767,28 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             g_fa_inst_tracker.inst = inst;
             g_fa_inst_tracker.fast = fast;
 
-            if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
-                if (log_env && atoi(log_env) != 0) {
-                    GGML_LOG_INFO("%s: fa_instruction=%s route=legacy_fallback "
-                        "attempted_route=%s reject=%s "
-                        "nq=%lld K=%s V=%s\n",
-                        __func__,
-                        ggml_cuda_fattn_instruction_name(inst),
-                        fast.route ? fast.route : "-",
-                        ggml_cuda_fa_reject_reason_name(fast.reject),
-                        (long long) Q->ne[1],
-                        ggml_type_name(K->type), ggml_type_name(V->type));
+            if (g_fattn_select_ctx == GGML_CUDA_FATTN_SELECT_DISPATCH) {
+                if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
+                    if (log_env && atoi(log_env) != 0) {
+                        GGML_LOG_INFO("%s: fa_instruction=%s route=legacy_fallback "
+                            "attempted_route=%s reject=%s "
+                            "nq=%lld K=%s V=%s\n",
+                            __func__,
+                            ggml_cuda_fattn_instruction_name(inst),
+                            fast.route ? fast.route : "-",
+                            ggml_cuda_fa_reject_reason_name(fast.reject),
+                            (long long) Q->ne[1],
+                            ggml_type_name(K->type), ggml_type_name(V->type));
+                    }
                 }
             }
         } else if (fa_inst_i32 == GGML_FATTN_INST_MTP_DRAFT) {
-            if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
-                if (log_env && atoi(log_env) != 0) {
-                    GGML_LOG_INFO("%s: fa_instruction=mtp_draft nq=%lld impl_status=legacy_fallback\n",
-                            __func__, (long long) Q->ne[1]);
+            if (g_fattn_select_ctx == GGML_CUDA_FATTN_SELECT_DISPATCH) {
+                if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
+                    if (log_env && atoi(log_env) != 0) {
+                        GGML_LOG_INFO("%s: fa_instruction=mtp_draft nq=%lld impl_status=legacy_fallback\n",
+                                __func__, (long long) Q->ne[1]);
+                    }
                 }
             }
         }
@@ -3057,6 +3087,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         }
     }
 
+    g_fattn_select_ctx = GGML_CUDA_FATTN_SELECT_DISPATCH;
     const best_fattn_kernel best_kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
     ggml_cuda_fattn_log_selection(best_kernel, dst);
 
@@ -3072,9 +3103,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 
     // ── Final select proof ─────────────────────────────────────
-    // Log the final kernel selection independent of the instruction
-    // path, so we can verify that DOT4 was actually the final choice.
-    {
+    // Only log in dispatch context (not during support probe).
+    if (g_fattn_select_ctx == GGML_CUDA_FATTN_SELECT_DISPATCH) {
         const ggml_tensor * Q = dst->src[0];
         const ggml_tensor * K = dst->src[1];
         const ggml_tensor * V = dst->src[2];
@@ -3155,6 +3185,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+    g_fattn_select_ctx = GGML_CUDA_FATTN_SELECT_SUPPORT_PROBE;
     const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
     const ggml_tensor * Q = dst->src[0];
     const best_fattn_kernel k = ggml_cuda_get_best_fattn_kernel(device, dst);
