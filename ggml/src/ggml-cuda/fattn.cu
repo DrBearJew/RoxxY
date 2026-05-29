@@ -3028,6 +3028,22 @@ static void ggml_cuda_flash_attn_ext_mma_tbq4(ggml_backend_cuda_context & ctx, g
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
 
+    // ── Entry proof: every FA op must pass through here ──────────
+    {
+        const ggml_tensor * Q = dst->src[0];
+        const ggml_tensor * K = dst->src[1];
+        const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
+        if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
+            if (log_env && atoi(log_env) != 0) {
+                GGML_LOG_INFO(
+                    "fa_entry: inst=%s nq=%lld nk=%lld\n",
+                    ggml_cuda_fattn_instruction_name((ggml_fattn_instruction)fa_inst_i32),
+                    (long long) Q->ne[1],
+                    (long long) K->ne[1]);
+            }
+        }
+    }
+
     // Initialize planar/iso rotation constants on first use.
     // Must happen before any planar/iso kernel (VEC, cpy, set-rows).
     {
@@ -3139,5 +3155,15 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
-    return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
+    const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
+    const ggml_tensor * Q = dst->src[0];
+    const best_fattn_kernel k = ggml_cuda_get_best_fattn_kernel(device, dst);
+    const bool result = k != BEST_FATTN_KERNEL_NONE;
+    if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
+        if (log_env && atoi(log_env) != 0) {
+            GGML_LOG_INFO("fa_supported: inst=%d nq=%lld kernel=%d result=%d\n",
+                fa_inst_i32, (long long) Q->ne[1], (int)k, (int)result);
+        }
+    }
+    return result;
 }
