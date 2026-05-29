@@ -316,7 +316,7 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
     GGML_ASSERT(packed16_payload->nb[3] == packed16_payload->ne[2] * packed16_payload->nb[2]);
     GGML_ASSERT(packed16_scales->nb[3]  == packed16_scales->ne[2]  * packed16_scales->nb[2]);
     // v0.3: single-batch only. Packed16 rows are flat [head][kv].
-    GGML_ASSERT(batch == 1);
+    GGML_ASSERT(Q->ne[3] == 1);
     GGML_ASSERT(packed16_payload->ne[1] >= K->ne[1] * K->ne[2]);
     GGML_ASSERT(packed16_scales->ne[1]  >= K->ne[1] * K->ne[2]);
     GGML_ASSERT(packed16_payload->ne[2] == 1);
