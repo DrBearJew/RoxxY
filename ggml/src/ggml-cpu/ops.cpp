@@ -8902,7 +8902,16 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     // input tensor rows must be contiguous
     GGML_ASSERT(nbq0 == ggml_type_size(q->type));
     GGML_ASSERT(nbk0 == ggml_type_size(k->type));
-    GGML_ASSERT(nbv0 == ggml_type_size(v->type));
+    if (nbv0 != ggml_type_size(v->type)) {
+        fprintf(stderr, "FLASH_ATTN BAD V: nq=%lld nk=%lld nv=%lld "
+                "v_type=%s v_ne=(%lld,%lld,%lld,%lld) v_nb=(%lld,%lld,%lld,%lld) nbv0=%lld type_size=%zu\n",
+                (long long)neq1, (long long)nek1, (long long)nev1,
+                ggml_type_name(v->type),
+                (long long)v->ne[0], (long long)v->ne[1], (long long)v->ne[2], (long long)v->ne[3],
+                (long long)v->nb[0], (long long)v->nb[1], (long long)v->nb[2], (long long)v->nb[3],
+                (long long)nbv0, ggml_type_size(v->type));
+        GGML_ABORT("V tensor nb[0] mismatch");
+    }
 
     // I32 packed16 K has per-head dimension D/4 vs Q's D; only check for non-I32 K
     if (k->type != GGML_TYPE_I32) {
