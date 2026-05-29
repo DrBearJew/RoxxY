@@ -2662,6 +2662,30 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     if (!ggml_cuda_fattn_mixed_kv_supported(Q, K, V)) {
+        // Instruction paths with legal DOT4 K-representation adapters
+        // can handle mixed KV (e.g., K=f16,V=q4_0 → source f16 → packed16).
+        // Check instruction dispatch BEFORE rejecting mixed KV.
+        const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
+        if (fa_inst_i32 != GGML_FATTN_INST_NONE) {
+            // Let instruction dispatch try. If it selects non-NONE,
+            // return it and skip the mixed KV rejection.
+#ifdef GGML_USE_HIP
+            const ggml_fattn_instruction inst = (ggml_fattn_instruction)fa_inst_i32;
+            ggml_cuda_fa_fastpath_result fast =
+                ggml_cuda_try_instruction_fastpath(cc, dst, inst);
+
+            if (fast.selected != BEST_FATTN_KERNEL_NONE) {
+                return fast.selected;
+            }
+
+            // Fast path rejected. Save context for hunter hooks.
+            g_fa_inst_tracker.active = true;
+            g_fa_inst_tracker.inst = inst;
+            g_fa_inst_tracker.fast = fast;
+#endif // GGML_USE_HIP
+        }
+
+        // Instruction path also couldn't handle it. Reject.
         ggml_cuda_fattn_log_mixed_kv_reject(Q, K, V);
         return BEST_FATTN_KERNEL_NONE;
     }
@@ -2740,57 +2764,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
 #ifdef GGML_USE_HIP
-    // ── Instruction-driven FA dispatch ──────────────────────────
-    // For instruction paths (PREFILL_QK, DECODE_QK, etc.),
-    // ggml_cuda_try_instruction_fastpath IS the authoritative selector.
-    // It internally delegates to the legacy selectors for gate coverage
-    // but wraps results in fastpath_result with proper reject reasons.
-    //
-    // MTP_DRAFT stays on existing policy (no DOT4 preference).
+    // ── Instruction-driven FA dispatch (HIP-only legacy block) ──
+    // For instruction paths: handled upstream at the mixed KV gate.
+    // For MTP_DRAFT: log and fall through to existing policy.
     {
         const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
-        const ggml_fattn_instruction inst = (ggml_fattn_instruction)fa_inst_i32;
-        const bool is_recthist_inst =
-            fa_inst_i32 == GGML_FATTN_INST_MTP_VERIFY_QK ||
-            fa_inst_i32 == GGML_FATTN_INST_PREFILL_QK ||
-            fa_inst_i32 == GGML_FATTN_INST_SPEC_VERIFY_QK ||
-            fa_inst_i32 == GGML_FATTN_INST_BATCH_VERIFY_QK;
-        const bool is_decode_inst =
-            fa_inst_i32 == GGML_FATTN_INST_MTP_DRAFT_DECODE_QK ||
-            fa_inst_i32 == GGML_FATTN_INST_DECODE_QK;
-        const bool is_instruction_path =
-            is_recthist_inst || is_decode_inst;
-
-        if (is_instruction_path) {
-            // Authoritative: this IS the selector for instruction paths.
-            ggml_cuda_fa_fastpath_result fast =
-                ggml_cuda_try_instruction_fastpath(cc, dst, inst);
-
-            if (fast.selected != BEST_FATTN_KERNEL_NONE) {
-                return fast.selected;
-            }
-
-            // Fast path rejected. Save context for hunter hooks.
-            g_fa_inst_tracker.active = true;
-            g_fa_inst_tracker.inst = inst;
-            g_fa_inst_tracker.fast = fast;
-
-            if (g_fattn_select_ctx == GGML_CUDA_FATTN_SELECT_DISPATCH) {
-                if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
-                    if (log_env && atoi(log_env) != 0) {
-                        GGML_LOG_INFO("%s: fa_instruction=%s route=legacy_fallback "
-                            "attempted_route=%s reject=%s "
-                            "nq=%lld K=%s V=%s\n",
-                            __func__,
-                            ggml_cuda_fattn_instruction_name(inst),
-                            fast.route ? fast.route : "-",
-                            ggml_cuda_fa_reject_reason_name(fast.reject),
-                            (long long) Q->ne[1],
-                            ggml_type_name(K->type), ggml_type_name(V->type));
-                    }
-                }
-            }
-        } else if (fa_inst_i32 == GGML_FATTN_INST_MTP_DRAFT) {
+        
+        // MTP_DRAFT only: log and continue (no DOT4 preference).
+        // Other instruction paths were handled before mixed KV rejection.
+        if (fa_inst_i32 == GGML_FATTN_INST_MTP_DRAFT) {
             if (g_fattn_select_ctx == GGML_CUDA_FATTN_SELECT_DISPATCH) {
                 if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
                     if (log_env && atoi(log_env) != 0) {
