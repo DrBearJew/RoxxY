@@ -1646,6 +1646,48 @@ static bool ggml_cuda_mtp_draft_dot4_decode_enabled() {
 #endif
 }
 
+// ── Draft decode kill switches ────────────────────────────────────
+
+static int64_t ggml_cuda_mtp_draft_dot4_decode_splitk_threshold() {
+    const char * env = getenv(
+        "GGML_CUDA_ROCM_MTP_DRAFT_DOT4_DECODE_SPLITK_THRESHOLD");
+    return env ? atoll(env) : 2048;
+}
+
+static bool ggml_cuda_mtp_draft_dot4_decode_bn64_disabled() {
+    const char * env = getenv(
+        "GGML_CUDA_ROCM_MTP_DRAFT_DOT4_DECODE_DISABLE_BN64");
+    return env && atoi(env) != 0;
+}
+
+static bool ggml_cuda_mtp_draft_dot4_decode_splitk_disabled() {
+    const char * env = getenv(
+        "GGML_CUDA_ROCM_MTP_DRAFT_DOT4_DECODE_DISABLE_SPLITK");
+    return env && atoi(env) != 0;
+}
+
+static ggml_cuda_dot4_role ggml_cuda_dot4_role_for_mtp_draft_decode(
+        const ggml_tensor * Q,
+        const ggml_tensor * K) {
+    if (!Q || !K) {
+        return GGML_CUDA_DOT4_ROLE_NONE;
+    }
+
+    // Decode instruction must be scalar.
+    if (Q->ne[1] != 1) {
+        return GGML_CUDA_DOT4_ROLE_NONE;
+    }
+
+    const int64_t threshold =
+        ggml_cuda_mtp_draft_dot4_decode_splitk_threshold();
+
+    if (K->ne[1] >= threshold) {
+        return GGML_CUDA_DOT4_ROLE_DECODE_SPLITK_MTP_DRAFT;
+    }
+
+    return GGML_CUDA_DOT4_ROLE_DECODE_BN64_MTP_DRAFT;
+}
+
 static bool ggml_cuda_mtp_draft_dot4_decode_supported(
         const int cc,
         const ggml_tensor * dst) {
@@ -1695,7 +1737,12 @@ static bool ggml_cuda_mtp_draft_dot4_decode_supported(
            Q->ne[2] % K->ne[2] == 0 &&
            V->ne[2] == K->ne[2] &&
            Q->ne[3] == K->ne[3] &&
-           V->ne[3] == K->ne[3];
+           V->ne[3] == K->ne[3] &&
+           // Kill switch checks: BN64 / splitK disabled.
+           (ggml_cuda_dot4_role_for_mtp_draft_decode(Q, K) ==
+                GGML_CUDA_DOT4_ROLE_DECODE_BN64_MTP_DRAFT
+                ? !ggml_cuda_mtp_draft_dot4_decode_bn64_disabled()
+                : !ggml_cuda_mtp_draft_dot4_decode_splitk_disabled());
 #else
     GGML_UNUSED(cc);
     GGML_UNUSED(dst);
