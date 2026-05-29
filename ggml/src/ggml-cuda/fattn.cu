@@ -574,8 +574,12 @@ static bool ggml_cuda_mtp_verify_f16k_dot4_adapter_supported(
     if (!ggml_cuda_q8k_dot4_kq_enabled()) {
         return false;
     }
-    // nq==1 is decode (not recthist). nq==2 behind explicit env.
-    const int nq_min = ggml_cuda_mtp_verify_dot4_nq2_enabled() ? 2 : 3;
+    // nq==1 is decode (not recthist).
+    // nq==2 behind explicit env for MTP_VERIFY_QK only.
+    // General PREFILL_QK / SPEC_VERIFY_QK / BATCH_VERIFY_QK bypass.
+    const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
+    const int nq_min = (fa_inst_i32 == GGML_FATTN_INST_MTP_VERIFY_QK &&
+                        !ggml_cuda_mtp_verify_dot4_nq2_enabled()) ? 3 : 2;
 
     // V must be f16, q8_0, or q4_0 for DOT4 with source-f16 K materialization.
     const bool v_ok = V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0;
@@ -2127,11 +2131,15 @@ static bool ggml_cuda_mtp_verify_dot4_recthist_supported(
 
     // Archetype: MTP verify nq > 1 → v4 recthist.
     // Current implementation gate: nq > 2 (DOT4 helpers reject nq <= 2).
-    // nq == 2 behind explicit env.
+    // nq == 2 behind explicit env for MTP_VERIFY_QK only.
+    // General PREFILL_QK / SPEC_VERIFY_QK / BATCH_VERIFY_QK bypass.
     if (Q->ne[1] <= 1) {
         return false;
     }
-    if (Q->ne[1] == 2 && !ggml_cuda_mtp_verify_dot4_nq2_enabled()) {
+    const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
+    if (Q->ne[1] == 2 &&
+        fa_inst_i32 == GGML_FATTN_INST_MTP_VERIFY_QK &&
+        !ggml_cuda_mtp_verify_dot4_nq2_enabled()) {
         return false;
     }
 
