@@ -1152,6 +1152,36 @@ static const char * ggml_cuda_fattn_backend_family_name(
     return "unknown";
 }
 
+// Maps selected kernel → backend family. Plumbing only, no behavior change.
+// Used for logging when existing policy picked WMMA/MMA/VEC/TILE as a
+// fallback for MTP instructions.
+
+static ggml_cuda_fattn_backend_family ggml_cuda_fattn_backend_family_from_kernel(
+        const best_fattn_kernel kernel) {
+    switch (kernel) {
+        case BEST_FATTN_KERNEL_Q8K_DOT4_KQ:
+        case BEST_FATTN_KERNEL_Q8Q4_DOT4_PREFILL:
+        case BEST_FATTN_KERNEL_Q8TBQ4_DOT4_PREFILL:
+        case BEST_FATTN_KERNEL_TBQ4_DOT4_PREFILL:
+            return GGML_CUDA_FATTN_BACKEND_DOT4_RECTHIST_V4;
+
+        case BEST_FATTN_KERNEL_WMMA_F16:
+            return GGML_CUDA_FATTN_BACKEND_WMMA_F16;
+
+        case BEST_FATTN_KERNEL_MMA_F16:
+            return GGML_CUDA_FATTN_BACKEND_MMA_F16;
+
+        case BEST_FATTN_KERNEL_VEC:
+            return GGML_CUDA_FATTN_BACKEND_VEC;
+
+        case BEST_FATTN_KERNEL_TILE:
+            return GGML_CUDA_FATTN_BACKEND_TILE;
+
+        default:
+            return GGML_CUDA_FATTN_BACKEND_EXISTING;
+    }
+}
+
 // ── Canonical log helper ──────────────────────────────────────────
 // Centralized instruction-route logging for all MTP selectors.
 // Single format: fa_instruction, dot4_role, backend_family, k_repr, v_repr.
