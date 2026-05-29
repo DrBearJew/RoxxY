@@ -82,6 +82,7 @@ run_server "canary_a" \
     env COMPRESSED_KV_FATTN_LOG=1 \
     GGML_CUDA_ROCM_Q8K_DOT4_KQ=1 \
     GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE=1 \
+    GGML_CUDA_FA_ROUTE_REQUIRE=rocm_q8k_dot4_kq \
     GGML_CUDA_ROCM_MTP_VERIFY_F16K_DOT4_ADAPTER=1 \
     "$SERVER_BIN" --model "$MODEL" --host 127.0.0.1 --port "$PORT" \
     -fa on --batch-size 2048 --ubatch-size 1024 \
@@ -97,6 +98,7 @@ run_server "canary_b" \
     env COMPRESSED_KV_FATTN_LOG=1 \
     GGML_CUDA_ROCM_Q8K_DOT4_KQ=1 \
     GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE=1 \
+    GGML_CUDA_FA_ROUTE_REQUIRE=rocm_q8k_dot4_kq \
     GGML_CUDA_ROCM_MTP_VERIFY_F16K_DOT4_ADAPTER=1 \
     "$SERVER_BIN" --model "$MODEL" --host 127.0.0.1 --port "$PORT" \
     -fa on --batch-size 2048 --ubatch-size 1024 \
@@ -112,6 +114,7 @@ run_server "canary_c" \
     env COMPRESSED_KV_FATTN_LOG=1 \
     GGML_CUDA_ROCM_Q8K_DOT4_KQ=1 \
     GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE=1 \
+    GGML_CUDA_FA_ROUTE_REQUIRE=rocm_q8k_dot4_kq \
     GGML_CUDA_ROCM_MTP_VERIFY_F16K_DOT4_ADAPTER=1 \
     "$SERVER_BIN" --model "$MODEL" --host 127.0.0.1 --port "$PORT" \
     -fa on --batch-size 2048 --ubatch-size 1024 \
@@ -127,6 +130,7 @@ run_server "canary_d" \
     env COMPRESSED_KV_FATTN_LOG=1 \
     GGML_CUDA_ROCM_Q8K_DOT4_KQ=1 \
     GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE=1 \
+    GGML_CUDA_FA_ROUTE_REQUIRE=rocm_q8k_dot4_kq \
     GGML_CUDA_ROCM_MTP_VERIFY_F16K_DOT4_ADAPTER=1 \
     "$SERVER_BIN" --model "$MODEL" --host 127.0.0.1 --port "$PORT" \
     -fa on --batch-size 2048 --ubatch-size 1024 \
@@ -142,6 +146,7 @@ run_server "canary_e" \
     env COMPRESSED_KV_FATTN_LOG=1 \
     GGML_CUDA_ROCM_Q8K_DOT4_KQ=1 \
     GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE=1 \
+    GGML_CUDA_FA_ROUTE_REQUIRE=rocm_q8k_dot4_kq \
     GGML_CUDA_ROCM_MTP_VERIFY_F16K_DOT4_ADAPTER=1 \
     GGML_CUDA_ROCM_MTP_VERIFY_DOT4_NQ2=1 \
     "$SERVER_BIN" --model "$MODEL" --host 127.0.0.1 --port "$PORT" \
@@ -158,6 +163,7 @@ run_server "canary_f" \
     env COMPRESSED_KV_FATTN_LOG=1 \
     GGML_CUDA_ROCM_Q8K_DOT4_KQ=1 \
     GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE=1 \
+    GGML_CUDA_FA_ROUTE_REQUIRE=rocm_q8k_dot4_kq \
     GGML_CUDA_ROCM_MTP_VERIFY_F16K_DOT4_ADAPTER=1 \
     "$SERVER_BIN" --model "$MODEL" --host 127.0.0.1 --port "$PORT" \
     -fa on --batch-size 2048 --ubatch-size 1024 \
