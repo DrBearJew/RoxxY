@@ -2084,17 +2084,23 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
 
         if (gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
-            // MTP verify is hidden-state / h_pre_norm driven and maps to the FA QK instruction.
-            // MTP draft is token-only continuation and must not receive DOT4 preference.
-            const bool is_mtp_verify = (ubatch.embd != nullptr);
-            const auto inst = is_mtp_verify
-                ? GGML_FATTN_INST_MTP_VERIFY_QK
-                : GGML_FATTN_INST_MTP_DRAFT;
+            // MTP verify is hidden-state / h_pre_norm driven and maps to recthist-v4.
+            // MTP draft decode (n_tokens==1) is scalar token generation → DOT4 BN64/split-K.
+            // MTP draft batch (n_tokens>1, token-only) → existing policy, no DOT4 preference.
+            ggml_fattn_instruction inst;
+            if (ubatch.embd != nullptr) {
+                inst = GGML_FATTN_INST_MTP_VERIFY_QK;
+            } else if (ubatch.n_tokens == 1) {
+                inst = GGML_FATTN_INST_MTP_DRAFT_DECODE_QK;
+            } else {
+                inst = GGML_FATTN_INST_MTP_DRAFT;
+            }
             ggml_flash_attn_ext_set_instruction(cur, inst);
 
             // Debug assert: instruction must match graph type.
             GGML_ASSERT(inst != GGML_FATTN_INST_MTP_VERIFY_QK || gtype == LLM_GRAPH_TYPE_DECODER_MTP);
             GGML_ASSERT(inst != GGML_FATTN_INST_MTP_DRAFT || gtype == LLM_GRAPH_TYPE_DECODER_MTP);
+            GGML_ASSERT(inst != GGML_FATTN_INST_MTP_DRAFT_DECODE_QK || gtype == LLM_GRAPH_TYPE_DECODER_MTP);
         }
 
         if (v_mla) {

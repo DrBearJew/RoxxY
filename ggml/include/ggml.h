@@ -2441,10 +2441,17 @@ extern "C" {
     // NONE preserves existing behavior for non-MTP graphs.
     // MTP_VERIFY_QK maps to DOT4 recthist-v4 when legality gates pass.
     // MTP_DRAFT intentionally does not prefer DOT4.
+    // FA instruction — MTP declares the instrument; DOT4/WMMA/VEC are implementations.
+    //
+    // NONE:                    non-MTP or unannotated FA ops.
+    // MTP_DRAFT:               token-only MTP draft batch (nq>1, no DOT4 preference).
+    // MTP_VERIFY_QK:           hidden-state MTP verify (nq>1, DOT4 recthist-v4).
+    // MTP_DRAFT_DECODE_QK:     scalar MTP draft decode (nq==1, DOT4 BN64/split-K).
     enum ggml_fattn_instruction {
-        GGML_FATTN_INST_NONE           = 0,
-        GGML_FATTN_INST_MTP_DRAFT      = 1,
-        GGML_FATTN_INST_MTP_VERIFY_QK  = 2,
+        GGML_FATTN_INST_NONE                = 0,
+        GGML_FATTN_INST_MTP_DRAFT           = 1,
+        GGML_FATTN_INST_MTP_VERIFY_QK       = 2,
+        GGML_FATTN_INST_MTP_DRAFT_DECODE_QK = 3,
     };
 
     GGML_API void ggml_flash_attn_ext_set_instruction(

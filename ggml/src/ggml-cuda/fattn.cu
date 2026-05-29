@@ -758,7 +758,8 @@ static void ggml_cuda_fattn_log_selection(const best_fattn_kernel kernel, const 
 
     const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
     const char * fa_inst_name = fa_inst_i32 == GGML_FATTN_INST_MTP_DRAFT ? "mtp_draft"
-        : fa_inst_i32 == GGML_FATTN_INST_MTP_VERIFY_QK ? "mtp_verify_qk" : "none";
+        : fa_inst_i32 == GGML_FATTN_INST_MTP_VERIFY_QK ? "mtp_verify_qk"
+        : fa_inst_i32 == GGML_FATTN_INST_MTP_DRAFT_DECODE_QK ? "mtp_draft_decode_qk" : "none";
 
     const bool tbq4_vec_norm_hoist = kernel == BEST_FATTN_KERNEL_VEC && K->type == GGML_TYPE_TBQ4_0 && ggml_cuda_tbq4_vec_norm_hoist_enabled();
     const bool sparse_v_dequant = kernel == BEST_FATTN_KERNEL_VEC && V->type == GGML_TYPE_TBQ4_0 && Q->ne[1] == 1 && ggml_cuda_sparse_v_dequant_enabled();
@@ -1033,6 +1034,164 @@ static ggml_cuda_rocm_quant_prefill_f16_mode ggml_cuda_rocm_quant_prefill_f16_mo
     return GGML_CUDA_ROCM_QUANT_PREFILL_F16_ALLOW;
 }
 
+// ── DOT4 guardrail: K-representation classification ───────────────
+// Source f16 "materialized op-locally into packed16" must be tracked
+// explicitly — not as loose string logic. Both verify and decode
+// selectors use the same K-repr concept, but with different roles.
+
+enum ggml_cuda_dot4_k_repr {
+    GGML_CUDA_DOT4_K_REPR_NONE                      = 0,
+    GGML_CUDA_DOT4_K_REPR_PERSISTENT_PACKED16_I32   = 1,
+    GGML_CUDA_DOT4_K_REPR_Q8_Q4                     = 2,
+    GGML_CUDA_DOT4_K_REPR_SOURCE_F16_OP_LOCAL_PACK  = 3,
+};
+
+static const char * ggml_cuda_dot4_k_repr_name(ggml_cuda_dot4_k_repr r) {
+    switch (r) {
+        case GGML_CUDA_DOT4_K_REPR_PERSISTENT_PACKED16_I32:  return "packed16_i32";
+        case GGML_CUDA_DOT4_K_REPR_Q8_Q4:                    return "q8q4";
+        case GGML_CUDA_DOT4_K_REPR_SOURCE_F16_OP_LOCAL_PACK: return "source_f16_op_local_packed16";
+        default:                                               return "-";
+    }
+}
+
+static const char * ggml_cuda_dot4_v_repr_name(enum ggml_type type) {
+    return type == GGML_TYPE_F16  ? "f16"
+         : type == GGML_TYPE_Q8_0 ? "q8_0"
+         : type == GGML_TYPE_Q4_0 ? "q4_0"
+         :                          "-";
+}
+
+static ggml_cuda_dot4_k_repr ggml_cuda_dot4_k_repr_from_tensors(
+        const ggml_tensor * K, const ggml_tensor * V) {
+    if (K->type == GGML_TYPE_I32)
+        return GGML_CUDA_DOT4_K_REPR_PERSISTENT_PACKED16_I32;
+    if (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0)
+        return GGML_CUDA_DOT4_K_REPR_Q8_Q4;
+    if (K->type == GGML_TYPE_F16 &&
+        (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0))
+        return GGML_CUDA_DOT4_K_REPR_SOURCE_F16_OP_LOCAL_PACK;
+    return GGML_CUDA_DOT4_K_REPR_NONE;
+}
+
+// ── DOT4 guardrail: backend family ─────────────────────────────────
+// Prevents recthist/decode confusion. 'rocm_q8k_dot4_kq' is too broad
+// — it can mean recthist, BN64 decode, or split-K decode.
+
+enum ggml_cuda_fattn_backend_family {
+    GGML_CUDA_FATTN_BACKEND_EXISTING             = 0,
+    GGML_CUDA_FATTN_BACKEND_DOT4_RECTHIST        = 1,
+    GGML_CUDA_FATTN_BACKEND_DOT4_DECODE_BN64     = 2,
+    GGML_CUDA_FATTN_BACKEND_DOT4_DECODE_SPLITK   = 3,
+};
+
+static const char * ggml_cuda_fattn_backend_family_name(enum ggml_cuda_fattn_backend_family f) {
+    switch (f) {
+        case GGML_CUDA_FATTN_BACKEND_DOT4_RECTHIST:        return "dot4_recthist";
+        case GGML_CUDA_FATTN_BACKEND_DOT4_DECODE_BN64:     return "dot4_decode_bn64";
+        case GGML_CUDA_FATTN_BACKEND_DOT4_DECODE_SPLITK:   return "dot4_decode_splitk";
+        default:                                             return "existing";
+    }
+}
+
+// ── DOT4 guardrail: decode policy object ───────────────────────────
+// Centralized BN vs split-K thresholds for MTP draft decode.
+// nq==1 → BN64 (nk < threshold) or split-K (nk >= threshold).
+
+struct ggml_cuda_dot4_decode_policy {
+    int bn;
+    int vsub;
+    int64_t splitk_threshold;
+    int splitk_size;
+    bool splitk_enabled;
+    bool bn64_enabled;
+};
+
+static ggml_cuda_dot4_decode_policy ggml_cuda_dot4_decode_policy_from_env() {
+    ggml_cuda_dot4_decode_policy p = {};
+    p.bn = 64;
+    p.vsub = 8;
+    p.splitk_threshold = 2048;
+    p.splitk_size = 512;
+    p.splitk_enabled = true;
+    p.bn64_enabled = true;
+
+    const char * bn_env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_BN");
+    const char * vsub_env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_VSUB");
+    const char * thresh_env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_SPLITK_THRESHOLD");
+    const char * size_env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_SPLITK_SIZE");
+
+    if (bn_env)    p.bn    = atoi(bn_env);
+    if (vsub_env)  p.vsub  = atoi(vsub_env);
+    if (thresh_env) p.splitk_threshold = atoll(thresh_env);
+    if (size_env)  p.splitk_size  = atoi(size_env);
+    if (getenv("GGML_CUDA_ROCM_Q8K_DOT4_DISABLE_SPLITK")) p.splitk_enabled = false;
+    if (getenv("GGML_CUDA_ROCM_Q8K_DOT4_DISABLE_BN64"))   p.bn64_enabled   = false;
+
+    return p;
+}
+
+// ── DOT4 guardrail: workspace plan ─────────────────────────────────
+// Recthist and split-K both need scratch/partials, but in different
+// ways. Without a planner, per-branch allocations make memory behavior
+// impossible to reason about.
+
+struct ggml_cuda_dot4_workspace_plan {
+    bool required;
+    size_t k_payload_bytes;
+    size_t k_scales_bytes;
+    size_t partial_o_bytes;
+    size_t partial_m_bytes;
+    size_t partial_l_bytes;
+    const char * reason;
+};
+
+// ── DOT4 guardrail: kill switches ──────────────────────────────────
+// Enable flags open gates; kill switches close them fast during
+// regression isolation. Keep separate from env gate chain.
+
+static bool ggml_cuda_dot4_mtp_verify_disabled() {
+    const char * env = getenv("GGML_CUDA_ROCM_MTP_VERIFY_DOT4_DISABLE");
+    return env && atoi(env) != 0;
+}
+
+static bool ggml_cuda_dot4_mtp_draft_decode_disabled() {
+    const char * env = getenv("GGML_CUDA_ROCM_MTP_DRAFT_DECODE_DOT4_DISABLE");
+    return env && atoi(env) != 0;
+}
+
+static bool ggml_cuda_dot4_source_f16_pack_disabled() {
+    const char * env = getenv("GGML_CUDA_ROCM_DOT4_SOURCE_F16_PACK16_DISABLE");
+    return env && atoi(env) != 0;
+}
+
+// ── DOT4 guardrail: fallback contract ──────────────────────────────
+// Single rule: if DOT4 instruction path is not legal, fall back to
+// existing policy UNLESS route contract explicitly requires DOT4.
+// No silent fallback without reason logged.
+//
+// Log format:
+//   impl_status=<reason> selected=<existing_policy|route_contract_rejected>
+//   rejected features: mask/ALiBi/sinks/logit_softcap/mask_layout
+
+// ── DOT4 guardrail: instruction legality table ─────────────────────
+//
+// Instruction legality:
+//
+// MTP_VERIFY_QK:
+//   nq == 1  -> decode territory, not recthist
+//   nq > 1   -> DOT4 recthist-v4 eligible
+//
+// MTP_DRAFT_DECODE_QK:
+//   nq == 1  -> DOT4 decode BN64 or split-K eligible
+//   nq > 1   -> not decode
+//
+// MTP_DRAFT:
+//   existing policy only; no DOT4 preference
+//
+// NONE:
+//   unchanged
+
 // ── DOT4 archetype roles ─────────────────────────────────────────
 // The DOT4 archetype defines workload roles:
 //
@@ -1047,28 +1206,58 @@ static ggml_cuda_rocm_quant_prefill_f16_mode ggml_cuda_rocm_quant_prefill_f16_mo
 enum ggml_cuda_dot4_role {
     GGML_CUDA_DOT4_ROLE_NONE = 0,
     GGML_CUDA_DOT4_ROLE_PREFILL_RECTHIST_V4,
-    GGML_CUDA_DOT4_ROLE_MTP_VERIFY_RECTHIST_V4,
-    GGML_CUDA_DOT4_ROLE_DECODE_BN64,
-    GGML_CUDA_DOT4_ROLE_DECODE_SPLITK,
+    GGML_CUDA_DOT4_ROLE_RECTHIST_V4_MTP_VERIFY,
+    GGML_CUDA_DOT4_ROLE_DECODE_BN64_MTP_DRAFT,
+    GGML_CUDA_DOT4_ROLE_DECODE_SPLITK_MTP_DRAFT,
 };
 
 static const char * ggml_cuda_dot4_role_name(enum ggml_cuda_dot4_role role) {
     switch (role) {
-        case GGML_CUDA_DOT4_ROLE_MTP_VERIFY_RECTHIST_V4: return "recthist_v4_mtp_verify";
-        case GGML_CUDA_DOT4_ROLE_PREFILL_RECTHIST_V4:    return "recthist_v4_prefill";
-        case GGML_CUDA_DOT4_ROLE_DECODE_BN64:            return "decode_bn64";
-        case GGML_CUDA_DOT4_ROLE_DECODE_SPLITK:          return "decode_splitk";
-        default:                                          return "-";
+        case GGML_CUDA_DOT4_ROLE_RECTHIST_V4_MTP_VERIFY:  return "recthist_v4_mtp_verify";
+        case GGML_CUDA_DOT4_ROLE_PREFILL_RECTHIST_V4:     return "recthist_v4_prefill";
+        case GGML_CUDA_DOT4_ROLE_DECODE_BN64_MTP_DRAFT:   return "decode_bn64_mtp_draft";
+        case GGML_CUDA_DOT4_ROLE_DECODE_SPLITK_MTP_DRAFT: return "decode_splitk_mtp_draft";
+        default:                                            return "-";
     }
 }
 
+// Forward decl — defined after ggml_cuda_dot4_decode_policy_from_env().
+static int64_t ggml_cuda_q8k_dot4_decode_splitk_threshold();
+
 static enum ggml_cuda_dot4_role ggml_cuda_dot4_role_from_instruction(
         int32_t inst,
-        const ggml_tensor * Q) {
+        const ggml_tensor * Q,
+        const ggml_tensor * K) {
+    // MTP verify: nq > 1 → recthist-v4.
     if (inst == GGML_FATTN_INST_MTP_VERIFY_QK && Q->ne[1] > 1) {
-        return GGML_CUDA_DOT4_ROLE_MTP_VERIFY_RECTHIST_V4;
+        return GGML_CUDA_DOT4_ROLE_RECTHIST_V4_MTP_VERIFY;
+    }
+    // MTP draft decode: nq == 1 → BN64 or split-K based on nk threshold.
+    if (inst == GGML_FATTN_INST_MTP_DRAFT_DECODE_QK) {
+        if (Q->ne[1] != 1) {
+            return GGML_CUDA_DOT4_ROLE_NONE;
+        }
+        const int64_t threshold = ggml_cuda_q8k_dot4_decode_splitk_threshold();
+        return K->ne[1] >= threshold
+            ? GGML_CUDA_DOT4_ROLE_DECODE_SPLITK_MTP_DRAFT
+            : GGML_CUDA_DOT4_ROLE_DECODE_BN64_MTP_DRAFT;
     }
     return GGML_CUDA_DOT4_ROLE_NONE;
+}
+
+static enum ggml_cuda_fattn_backend_family
+    ggml_cuda_fattn_backend_family_from_role(enum ggml_cuda_dot4_role role) {
+    switch (role) {
+        case GGML_CUDA_DOT4_ROLE_RECTHIST_V4_MTP_VERIFY:
+        case GGML_CUDA_DOT4_ROLE_PREFILL_RECTHIST_V4:
+            return GGML_CUDA_FATTN_BACKEND_DOT4_RECTHIST;
+        case GGML_CUDA_DOT4_ROLE_DECODE_BN64_MTP_DRAFT:
+            return GGML_CUDA_FATTN_BACKEND_DOT4_DECODE_BN64;
+        case GGML_CUDA_DOT4_ROLE_DECODE_SPLITK_MTP_DRAFT:
+            return GGML_CUDA_FATTN_BACKEND_DOT4_DECODE_SPLITK;
+        default:
+            return GGML_CUDA_FATTN_BACKEND_EXISTING;
+    }
 }
 
 // ── MTP instruction selector ────────────────────────────────────────
@@ -1148,10 +1337,170 @@ static bool ggml_cuda_mtp_verify_dot4_recthist_supported(
 
 static const char * ggml_cuda_mtp_inst_name(int32_t inst) {
     switch (inst) {
-        case GGML_FATTN_INST_MTP_DRAFT:     return "mtp_draft";
-        case GGML_FATTN_INST_MTP_VERIFY_QK: return "mtp_verify_qk";
-        default:                              return "none";
+        case GGML_FATTN_INST_MTP_DRAFT:           return "mtp_draft";
+        case GGML_FATTN_INST_MTP_VERIFY_QK:       return "mtp_verify_qk";
+        case GGML_FATTN_INST_MTP_DRAFT_DECODE_QK: return "mtp_draft_decode_qk";
+        default:                                    return "none";
     }
+}
+
+// ── MTP draft decode helpers ────────────────────────────────────────
+
+// BK threshold — delegates to centralized decode policy.
+static int64_t ggml_cuda_q8k_dot4_decode_splitk_threshold() {
+    return ggml_cuda_dot4_decode_policy_from_env().splitk_threshold;
+}
+
+static bool ggml_cuda_mtp_draft_dot4_decode_enabled() {
+#ifdef GGML_USE_HIP
+    const char * env = getenv("GGML_CUDA_ROCM_MTP_DRAFT_DOT4_DECODE");
+    return env && atoi(env) != 0;
+#else
+    return false;
+#endif
+}
+
+static bool ggml_cuda_mtp_draft_dot4_decode_supported(
+        const int cc,
+        const ggml_tensor * dst) {
+#ifdef GGML_USE_HIP
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    if (!ggml_cuda_mtp_draft_dot4_decode_enabled()) {
+        return false;
+    }
+    if (!ggml_cuda_q8k_dot4_kq_enabled()) {
+        return false;
+    }
+    if (!GGML_CUDA_CC_IS_RDNA3(cc)) {
+        return false;
+    }
+    if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (Q->ne[1] != 1) {
+        return false;
+    }
+
+    // V: f16 / q8_0 / q4_0 for source-f16 decode.
+    const bool v_ok =
+        V->type == GGML_TYPE_F16  ||
+        V->type == GGML_TYPE_Q8_0 ||
+        V->type == GGML_TYPE_Q4_0;
+
+    // K: source f16 (op-local packed16) or q8_0/q4_0 original.
+    // No persistent I32 packed16 for MTP draft (enforced by KV-cache gate).
+    const bool source_f16_k =
+        K->type == GGML_TYPE_F16 &&
+        K->ne[0] == Q->ne[0];
+
+    const bool q8q4_original =
+        K->type == GGML_TYPE_Q8_0 &&
+        V->type == GGML_TYPE_Q4_0 &&
+        K->ne[0] == Q->ne[0];
+
+    return Q->ne[0] == 256 &&
+           V->ne[0] == Q->ne[0] &&
+           v_ok &&
+           (source_f16_k || q8q4_original) &&
+           K->ne[1] > 0 &&
+           Q->ne[2] % K->ne[2] == 0 &&
+           V->ne[2] == K->ne[2] &&
+           Q->ne[3] == K->ne[3] &&
+           V->ne[3] == K->ne[3];
+#else
+    GGML_UNUSED(cc);
+    GGML_UNUSED(dst);
+    return false;
+#endif
+}
+
+// ── MTP draft decode selector (nq == 1 → DOT4 BN64/split-K) ─────────
+
+static best_fattn_kernel ggml_cuda_select_mtp_draft_decode_fattn(
+        const int cc,
+        const ggml_tensor * dst,
+        const ggml_cuda_rocm_quant_prefill_f16_policy * f16_policy) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    const auto dot4_role = ggml_cuda_dot4_role_from_instruction(
+            GGML_FATTN_INST_MTP_DRAFT_DECODE_QK, Q, K);
+
+    const auto log_decode = [&](const char * impl_status, best_fattn_kernel selected,
+                                 const char * decode_impl) {
+        if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
+            if (log_env && atoi(log_env) != 0) {
+                const char * k_repr = ggml_cuda_dot4_k_repr_name(
+                        ggml_cuda_dot4_k_repr_from_tensors(K, V));
+                const char * v_repr = ggml_cuda_dot4_v_repr_name(V->type);
+                const bool dot4_active = (selected == BEST_FATTN_KERNEL_Q8K_DOT4_KQ);
+                const char * family = ggml_cuda_fattn_backend_family_name(
+                        ggml_cuda_fattn_backend_family_from_role(dot4_role));
+                GGML_LOG_INFO("%s: fa_instruction=mtp_draft_decode_qk "
+                        "dot4_role=%s backend_family=%s nq=%lld nk=%lld K=%s V=%s "
+                        "%s=%s v_repr=%s decode_impl=%s "
+                        "impl_status=%s selected=%s\n",
+                        __func__,
+                        ggml_cuda_dot4_role_name(dot4_role),
+                        family,
+                        (long long) Q->ne[1], (long long) K->ne[1],
+                        ggml_type_name(K->type), ggml_type_name(V->type),
+                        dot4_active ? "k_repr" : "k_repr_candidate", k_repr, v_repr,
+                        decode_impl, impl_status,
+                        selected == BEST_FATTN_KERNEL_Q8K_DOT4_KQ ? "rocm_q8k_dot4_kq" :
+                        "<existing_policy>");
+            }
+        }
+    };
+
+    // nq must be 1 for decode.
+    if (Q->ne[1] != 1) {
+        log_decode("nq_not_1_decode_ineligible", BEST_FATTN_KERNEL_NONE, "none");
+        return BEST_FATTN_KERNEL_NONE;
+    }
+
+    // Disable switches.
+    if (getenv("GGML_CUDA_ROCM_Q8K_DOT4_DISABLE_BN64")) {
+        log_decode("bn64_disabled", BEST_FATTN_KERNEL_NONE, "bn64_disabled");
+        return BEST_FATTN_KERNEL_NONE;
+    }
+    if (getenv("GGML_CUDA_ROCM_Q8K_DOT4_DISABLE_SPLITK")) {
+        log_decode("splitk_disabled", BEST_FATTN_KERNEL_NONE, "splitk_disabled");
+        return BEST_FATTN_KERNEL_NONE;
+    }
+
+    if (ggml_cuda_mtp_draft_dot4_decode_supported(cc, dst)) {
+        const auto selected = ggml_cuda_fattn_apply_route_contract(
+                dst, BEST_FATTN_KERNEL_Q8K_DOT4_KQ, f16_policy);
+        const bool is_splitk = (dot4_role == GGML_CUDA_DOT4_ROLE_DECODE_SPLITK_MTP_DRAFT);
+        const char * decode_impl = is_splitk ? "splitk_stage1_stage2" : "bn64";
+        if (is_splitk) {
+            // split-K stage1 writes unnormalized partial_o; stage2 merges.
+            // Normalization must not happen in stage1.
+        }
+        log_decode("dot4_decode_selected", selected, decode_impl);
+        return selected;
+    }
+
+    // Not legal — determine why.
+    {
+        const bool dot4_env = ggml_cuda_q8k_dot4_kq_enabled();
+        const bool decode_env = ggml_cuda_mtp_draft_dot4_decode_enabled();
+        const bool shapes_ok = (Q->ne[0] == 256 && V->ne[0] == Q->ne[0] &&
+                                 K->ne[0] == Q->ne[0]);
+
+        const char * status = !dot4_env            ? "env_disabled"
+                            : !decode_env         ? "decode_env_disabled"
+                            : !shapes_ok          ? "shape_or_device_reject"
+                            :                        "missing_legal_k_representation";
+        log_decode(status, BEST_FATTN_KERNEL_NONE, "none");
+    }
+
+    return BEST_FATTN_KERNEL_NONE;
 }
 
 static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
@@ -1163,27 +1512,25 @@ static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
     const ggml_tensor * V = dst->src[2];
 
     const auto dot4_role = ggml_cuda_dot4_role_from_instruction(
-            GGML_FATTN_INST_MTP_VERIFY_QK, Q);
+            GGML_FATTN_INST_MTP_VERIFY_QK, Q, K);
 
     const auto log_mtp = [&](const char * impl_status, best_fattn_kernel selected) {
         if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
             if (log_env && atoi(log_env) != 0) {
-                const char * k_repr = K->type == GGML_TYPE_I32 ? "packed16_i32"
-                    : (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0) ? "q8q4"
-                    : (K->type == GGML_TYPE_F16 && (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0)) ? "source_f16_op_local_packed16"
-                    : "-";
-                const char * v_repr = V->type == GGML_TYPE_F16 ? "f16"
-                    : V->type == GGML_TYPE_Q4_0 ? "q4_0"
-                    : V->type == GGML_TYPE_Q8_0 ? "q8_0"
-                    : "-";
+                const char * k_repr = ggml_cuda_dot4_k_repr_name(
+                        ggml_cuda_dot4_k_repr_from_tensors(K, V));
+                const char * v_repr = ggml_cuda_dot4_v_repr_name(V->type);
                 const bool dot4_active = (selected == BEST_FATTN_KERNEL_Q8K_DOT4_KQ);
+                const char * family = ggml_cuda_fattn_backend_family_name(
+                        ggml_cuda_fattn_backend_family_from_role(dot4_role));
 
                 GGML_LOG_INFO("%s: fa_instruction=mtp_verify_qk nq=%lld K=%s V=%s "
-                        "%s=%s v_repr=%s dot4_role=%s impl_status=%s selected=%s\n",
+                        "%s=%s v_repr=%s dot4_role=%s backend_family=%s impl_status=%s selected=%s\n",
                         __func__, (long long) Q->ne[1],
                         ggml_type_name(K->type), ggml_type_name(V->type),
                         dot4_active ? "k_repr" : "k_repr_candidate", k_repr, v_repr,
                         ggml_cuda_dot4_role_name(dot4_role),
+                        family,
                         impl_status,
                         selected == BEST_FATTN_KERNEL_Q8K_DOT4_KQ ? "rocm_q8k_dot4_kq" :
                         selected == BEST_FATTN_KERNEL_Q8K_DOT4_PACKED16_VEC ? "q8k_dot4_packed16_vec" :
@@ -1460,6 +1807,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             // Default f16 policy for non-quantized path.
             ggml_cuda_rocm_quant_prefill_f16_policy mtp_f16_policy = {};
             const auto selected = ggml_cuda_select_mtp_verify_fattn(cc, dst, &mtp_f16_policy);
+            if (selected != BEST_FATTN_KERNEL_NONE) {
+                return selected;
+            }
+        } else if (fa_inst_i32 == GGML_FATTN_INST_MTP_DRAFT_DECODE_QK) {
+            ggml_cuda_rocm_quant_prefill_f16_policy mtp_f16_policy = {};
+            const auto selected = ggml_cuda_select_mtp_draft_decode_fattn(cc, dst, &mtp_f16_policy);
             if (selected != BEST_FATTN_KERNEL_NONE) {
                 return selected;
             }

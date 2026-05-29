@@ -15,9 +15,21 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, struct ggml_t
 // underperform stable tiled/GQA FA. See
 // docs/rocm-tbq4-paths/23-q8k-dot4-fa-root-cause-and-next-plan.md before
 // changing these gates or promoting variants.
+// Route-contract family names:
+//   rocm_q8k_dot4_kq                          — broad/backcompat
+//   rocm_q8k_dot4_recthist_mtp_verify         — MTP verify recthist-v4
+//   rocm_q8k_dot4_decode_mtp_draft            — MTP draft decode (any)
+//   rocm_q8k_dot4_decode_bn64_mtp_draft       — BN64 decode
+//   rocm_q8k_dot4_decode_splitk_mtp_draft     — split-K decode
 static inline bool ggml_cuda_q8k_dot4_kq_route_required() {
     const char * required = getenv("GGML_CUDA_FA_ROUTE_REQUIRE");
-    return required && strcmp(required, "rocm_q8k_dot4_kq") == 0;
+    if (!required) return false;
+    // Broad contract plus all precise family names.
+    return strcmp(required, "rocm_q8k_dot4_kq") == 0
+        || strcmp(required, "rocm_q8k_dot4_recthist_mtp_verify") == 0
+        || strcmp(required, "rocm_q8k_dot4_decode_mtp_draft") == 0
+        || strcmp(required, "rocm_q8k_dot4_decode_bn64_mtp_draft") == 0
+        || strcmp(required, "rocm_q8k_dot4_decode_splitk_mtp_draft") == 0;
 }
 
 static inline bool ggml_cuda_q8k_dot4_kq_enabled() {
