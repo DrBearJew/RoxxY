@@ -1382,6 +1382,35 @@ static enum ggml_cuda_dot4_role ggml_cuda_dot4_role_from_instruction(
     return GGML_CUDA_DOT4_ROLE_NONE;
 }
 
+// ── DOT4 role resolver for MTP_VERIFY_QK ────────────────────────────
+
+static ggml_cuda_dot4_role ggml_cuda_dot4_role_for_mtp_verify(
+        const ggml_tensor * Q) {
+    if (!Q) {
+        return GGML_CUDA_DOT4_ROLE_NONE;
+    }
+
+    // nq == 1 is decode territory, not recthist.
+    if (Q->ne[1] == 1) {
+        return GGML_CUDA_DOT4_ROLE_NONE;
+    }
+
+    // nq >= 2 is recthist archetype for MTP_VERIFY_QK.
+    return GGML_CUDA_DOT4_ROLE_RECTHIST_V4_MTP_VERIFY;
+}
+
+static const char * ggml_cuda_fattn_instruction_name(
+        const ggml_fattn_instruction inst) {
+    switch (inst) {
+        case GGML_FATTN_INST_NONE:              return "none";
+        case GGML_FATTN_INST_MTP_DRAFT:         return "mtp_draft";
+        case GGML_FATTN_INST_MTP_VERIFY_QK:     return "mtp_verify_qk";
+        case GGML_FATTN_INST_MTP_DRAFT_DECODE_QK: return "mtp_draft_decode_qk";
+    }
+
+    return "unknown";
+}
+
 // ── MTP instruction selector ────────────────────────────────────────
 //
 // MTP_VERIFY_QK is a semantic FlashAttention instruction.
@@ -1637,51 +1666,37 @@ static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    const auto dot4_role = ggml_cuda_dot4_role_from_instruction(
-            GGML_FATTN_INST_MTP_VERIFY_QK, Q, K);
+    const ggml_cuda_dot4_role dot4_role =
+        ggml_cuda_dot4_role_for_mtp_verify(Q);
 
-    const auto log_mtp = [&](const char * impl_status, best_fattn_kernel selected) {
-        if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
-            if (log_env && atoi(log_env) != 0) {
-                const char * k_repr = ggml_cuda_dot4_k_repr_name(
-                        ggml_cuda_dot4_resolve_k_repr(Q, K, V));
-                const char * v_repr = ggml_cuda_dot4_v_repr_name(V);
-                const bool dot4_active = (selected == BEST_FATTN_KERNEL_Q8K_DOT4_KQ);
-                const auto family = dot4_active
-                    ? GGML_CUDA_FATTN_BACKEND_DOT4_RECTHIST_V4
-                    : GGML_CUDA_FATTN_BACKEND_EXISTING;
-                const char * family_name = ggml_cuda_fattn_backend_family_name(family);
-
-                GGML_LOG_INFO("%s: fa_instruction=mtp_verify_qk nq=%lld K=%s V=%s "
-                        "%s=%s v_repr=%s dot4_role=%s backend_family=%s impl_status=%s selected=%s\n",
-                        __func__, (long long) Q->ne[1],
-                        ggml_type_name(K->type), ggml_type_name(V->type),
-                        dot4_active ? "k_repr" : "k_repr_candidate", k_repr, v_repr,
-                        ggml_cuda_dot4_role_name(dot4_role),
-                        family_name,
-                        impl_status,
-                        selected == BEST_FATTN_KERNEL_Q8K_DOT4_KQ ? "rocm_q8k_dot4_kq" :
-                        selected == BEST_FATTN_KERNEL_Q8K_DOT4_PACKED16_VEC ? "q8k_dot4_packed16_vec" :
-                        selected == BEST_FATTN_KERNEL_Q8Q4_DOT4_PREFILL ? "q8q4_dot4_prefill" :
-                        selected == BEST_FATTN_KERNEL_Q8TBQ4_DOT4_PREFILL ? "q8tbq4_dot4_prefill" :
-                        selected == BEST_FATTN_KERNEL_WMMA_F16 ? "wmma_f16" :
-                        selected == BEST_FATTN_KERNEL_MMA_F16 ? "mma_f16" :
-                        selected == BEST_FATTN_KERNEL_VEC ? "vec" :
-                        selected == BEST_FATTN_KERNEL_Q8Q4_WMMA_I8 ? "q8q4_wmma_i8" :
-                        "<existing_policy>");
-            }
-        }
-    };
+    const ggml_cuda_dot4_k_repr k_repr =
+        ggml_cuda_dot4_resolve_k_repr(Q, K, V);
 
     // Archetype: MTP verify nq > 1 -> v4 recthist.
     // Current implementation gate: nq > 2 (DOT4 helpers reject nq <= 2).
     // nq == 2 behind explicit env.
     if (Q->ne[1] <= 1) {
-        log_mtp("nq_eq_1_decode_not_recthist", BEST_FATTN_KERNEL_NONE);
+        ggml_cuda_fattn_log_instruction_route(
+            dst,
+            "mtp_verify_qk",
+            ggml_cuda_dot4_role_name(GGML_CUDA_DOT4_ROLE_NONE),
+            GGML_CUDA_FATTN_BACKEND_EXISTING,
+            GGML_CUDA_DOT4_K_REPR_NONE,
+            "nq_eq_1_decode_not_recthist",
+            BEST_FATTN_KERNEL_NONE);
+
         return BEST_FATTN_KERNEL_NONE;
     }
     if (Q->ne[1] == 2 && !ggml_cuda_mtp_verify_dot4_nq2_enabled()) {
-        log_mtp("nq_eq_2_disabled", BEST_FATTN_KERNEL_NONE);
+        ggml_cuda_fattn_log_instruction_route(
+            dst,
+            "mtp_verify_qk",
+            ggml_cuda_dot4_role_name(dot4_role),
+            GGML_CUDA_FATTN_BACKEND_EXISTING,
+            k_repr,
+            "nq_eq_2_disabled",
+            BEST_FATTN_KERNEL_NONE);
+
         return BEST_FATTN_KERNEL_NONE;
     }
 
@@ -1689,7 +1704,16 @@ static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
     if (ggml_cuda_mtp_verify_dot4_recthist_supported(cc, dst)) {
         const auto selected = ggml_cuda_fattn_apply_route_contract(
                 dst, BEST_FATTN_KERNEL_Q8K_DOT4_KQ, f16_policy);
-        log_mtp("dot4_selected", selected);
+
+        ggml_cuda_fattn_log_instruction_route(
+            dst,
+            "mtp_verify_qk",
+            ggml_cuda_dot4_role_name(dot4_role),
+            GGML_CUDA_FATTN_BACKEND_DOT4_RECTHIST_V4,
+            k_repr,
+            "dot4_selected",
+            selected);
+
         return selected;
     }
 
@@ -1703,7 +1727,15 @@ static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
                             : f16_k && !adapter_on     ? "source_f16_materialization_disabled"
                             : f16_k && adapter_on      ? "shape_or_device_reject"
                             :                            "missing_legal_k_representation";
-        log_mtp(status, BEST_FATTN_KERNEL_NONE);
+
+        ggml_cuda_fattn_log_instruction_route(
+            dst,
+            "mtp_verify_qk",
+            ggml_cuda_dot4_role_name(dot4_role),
+            GGML_CUDA_FATTN_BACKEND_EXISTING,
+            k_repr,
+            status,
+            BEST_FATTN_KERNEL_NONE);
     }
 
     return BEST_FATTN_KERNEL_NONE; // signal: use existing policy
