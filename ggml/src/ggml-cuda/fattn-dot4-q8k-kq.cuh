@@ -104,6 +104,61 @@ static inline bool ggml_cuda_q8k_dot4_packed16_k_cache_enabled() {
     return env && atoi(env) != 0;
 }
 
+// ── Instruction-aware DOT4 gate helpers ──────────────────────────
+
+static inline bool ggml_cuda_q8k_dot4_kq_env_enabled() {
+    return ggml_cuda_q8k_dot4_kq_enabled();
+}
+
+static inline bool ggml_cuda_q8k_dot4_kq_route_for_instruction_ok(
+        ggml_fattn_instruction inst) {
+    // Route-contract env: if set, DOT4 must be explicitly required.
+    const char * required = getenv("GGML_CUDA_FA_ROUTE_REQUIRE");
+    if (!required) {
+        return true;
+    }
+
+    // Broad routes accepted by all DOT4 instruction paths.
+    if (strcmp(required, "rocm_q8k_dot4_kq") == 0) {
+        return true;
+    }
+    if (strcmp(required, "dot4_recthist") == 0 &&
+        (inst == GGML_FATTN_INST_MTP_VERIFY_QK ||
+         inst == GGML_FATTN_INST_PREFILL_QK ||
+         inst == GGML_FATTN_INST_SPEC_VERIFY_QK ||
+         inst == GGML_FATTN_INST_BATCH_VERIFY_QK)) {
+        return true;
+    }
+    if (strcmp(required, "dot4_decode") == 0 &&
+        (inst == GGML_FATTN_INST_MTP_DRAFT_DECODE_QK ||
+         inst == GGML_FATTN_INST_DECODE_QK)) {
+        return true;
+    }
+
+    return false;
+}
+
+static inline bool ggml_cuda_q8k_dot4_kq_allow_source_q4_0() {
+    // Q4_0 source K materialization to packed16 is experimental.
+    const char * env = getenv("GGML_CUDA_ROCM_DOT4_SOURCE_Q4_0_PACK16");
+    return env && atoi(env) != 0;
+}
+
+static inline bool ggml_cuda_q8k_dot4_kq_legal_kv(
+        const ggml_tensor * K, const ggml_tensor * V) {
+    // Legal K: persistent packed16 I32 (handled upstream), q8_0,
+    // or source f16 (materialized op-locally). Optionally q4_0.
+    const bool k_ok = K->type == GGML_TYPE_F16 ||
+                      K->type == GGML_TYPE_Q8_0 ||
+                      (K->type == GGML_TYPE_Q4_0 && ggml_cuda_q8k_dot4_kq_allow_source_q4_0());
+
+    const bool v_ok = V->type == GGML_TYPE_F16 ||
+                      V->type == GGML_TYPE_Q8_0 ||
+                      V->type == GGML_TYPE_Q4_0;
+
+    return k_ok && v_ok;
+}
+
 void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 #else

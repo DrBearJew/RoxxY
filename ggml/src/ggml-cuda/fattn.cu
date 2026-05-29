@@ -1375,35 +1375,363 @@ static enum ggml_cuda_fattn_fast_route route_for_instruction(
     }
 }
 
-// Rejection ledger: every VEC/TILE fallback must carry a reason.
-enum ggml_cuda_fattn_reject_reason {
-    FATTN_REJECT_NONE = 0,
-    FATTN_REJECT_ENV_DISABLED,
-    FATTN_REJECT_NOT_RDNA3,
-    FATTN_REJECT_NQ_WRONG_FOR_ROUTE,
-    FATTN_REJECT_D_NOT_256,
-    FATTN_REJECT_MASK_LAYOUT,
-    FATTN_REJECT_ALIBI,
-    FATTN_REJECT_LOGIT_SOFTCAP,
-    FATTN_REJECT_SINKS,
-    FATTN_REJECT_MISSING_K_REPR,
-    FATTN_REJECT_UNSUPPORTED_V,
-    FATTN_REJECT_WORKSPACE_BUDGET,
-    FATTN_REJECT_ROUTE_CONTRACT,
+// ── VEC/TILE fallback hunter ──────────────────────────────────────
+// Every FA instruction tries DOT4 first.
+// If DOT4 rejects, the reason is logged.
+// VEC/TILE fallbacks are recorded as debt with precise rejection causes.
+
+enum ggml_cuda_fa_reject_reason {
+    FA_REJECT_NONE = 0,
+    FA_REJECT_ENV_DISABLED,
+    FA_REJECT_NOT_RDNA3,
+    FA_REJECT_NQ_WRONG_FOR_ROUTE,
+    FA_REJECT_D_NOT_256,
+    FA_REJECT_MISSING_K_REPR,
+    FA_REJECT_UNSUPPORTED_V,
+    FA_REJECT_MASK_LAYOUT,
+    FA_REJECT_ALIBI,
+    FA_REJECT_LOGIT_SOFTCAP,
+    FA_REJECT_SINKS,
+    FA_REJECT_WORKSPACE,
+    FA_REJECT_ROUTE_CONTRACT,
 };
 
-// Fast-path result: selection + diagnostic.
-struct fattn_fastpath_result {
+static const char * ggml_cuda_fa_reject_reason_name(
+        const ggml_cuda_fa_reject_reason r) {
+    switch (r) {
+        case FA_REJECT_NONE:                return "none";
+        case FA_REJECT_ENV_DISABLED:        return "env_disabled";
+        case FA_REJECT_NOT_RDNA3:           return "not_rdna3";
+        case FA_REJECT_NQ_WRONG_FOR_ROUTE:  return "nq_wrong_for_route";
+        case FA_REJECT_D_NOT_256:           return "d_not_256";
+        case FA_REJECT_MISSING_K_REPR:      return "missing_k_repr";
+        case FA_REJECT_UNSUPPORTED_V:       return "unsupported_v";
+        case FA_REJECT_MASK_LAYOUT:         return "mask_layout";
+        case FA_REJECT_ALIBI:               return "alibi";
+        case FA_REJECT_LOGIT_SOFTCAP:       return "logit_softcap";
+        case FA_REJECT_SINKS:               return "sinks";
+        case FA_REJECT_WORKSPACE:           return "workspace";
+        case FA_REJECT_ROUTE_CONTRACT:      return "route_contract";
+    }
+
+    return "unknown";
+}
+
+// Fast-path result: selection + rejection diagnosis.
+struct ggml_cuda_fa_fastpath_result {
     best_fattn_kernel selected;
     const char * route;
-    const char * reason;
-    bool fastpath_selected;
+    ggml_cuda_fa_reject_reason reject;
 };
 
-// Strict mode: abort on VEC/TILE fallback for instruction paths.
-static bool ggml_cuda_fa_no_vec_tile_for_instructions_enabled() {
+// ── Env gates ─────────────────────────────────────────────────────
+
+static bool ggml_cuda_fa_hunt_vec_tile_enabled() {
+#ifdef GGML_USE_HIP
+    const char * env = getenv("GGML_CUDA_FA_HUNT_VEC_TILE");
+    return env && atoi(env) != 0;
+#else
+    return false;
+#endif
+}
+
+static bool ggml_cuda_fa_no_vec_tile_enabled() {
+#ifdef GGML_USE_HIP
     const char * env = getenv("GGML_CUDA_FA_NO_VEC_TILE_FOR_INSTRUCTIONS");
     return env && atoi(env) != 0;
+#else
+    return false;
+#endif
+}
+
+// ── Accepted fallback classifications ─────────────────────────────
+
+static bool ggml_cuda_fa_reject_is_accepted(ggml_cuda_fa_reject_reason r) {
+    // Structural / platform limitations are accepted. Missing
+    // adapters or unsupported types are actionable debt.
+    switch (r) {
+        case FA_REJECT_NOT_RDNA3:
+        case FA_REJECT_ALIBI:
+        case FA_REJECT_LOGIT_SOFTCAP:
+        case FA_REJECT_SINKS:
+        case FA_REJECT_MASK_LAYOUT:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static const char * ggml_cuda_fa_fallback_severity(ggml_cuda_fa_reject_reason r) {
+    return ggml_cuda_fa_reject_is_accepted(r) ? "accepted" : "bad";
+}
+
+// ── Fallback scoreboard ───────────────────────────────────────────
+
+struct ggml_cuda_fa_fallback_stats {
+    uint64_t total_vet_tile;
+    uint64_t by_reason[FA_REJECT_ROUTE_CONTRACT + 1];
+};
+
+static ggml_cuda_fa_fallback_stats g_fa_fallback_stats;
+
+static void ggml_cuda_fa_stats_record(ggml_cuda_fa_reject_reason r) {
+    g_fa_fallback_stats.total_vet_tile++;
+    if (r >= 0 && r <= FA_REJECT_ROUTE_CONTRACT) {
+        g_fa_fallback_stats.by_reason[r]++;
+    }
+}
+
+// ── Debt logger ───────────────────────────────────────────────────
+
+static void ggml_cuda_fa_log_vec_tile_debt(
+        const ggml_tensor * dst,
+        const ggml_fattn_instruction inst,
+        const ggml_cuda_fa_fastpath_result fast,
+        const best_fattn_kernel fallback) {
+    if (!ggml_cuda_fa_hunt_vec_tile_enabled()) {
+        return;
+    }
+
+    if (fallback != BEST_FATTN_KERNEL_VEC &&
+        fallback != BEST_FATTN_KERNEL_TILE) {
+        return;
+    }
+
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    GGML_LOG_INFO(
+        "fa_vec_tile_debt: inst=%s attempted_route=%s selected=%s "
+        "reject=%s severity=%s nq=%lld nk=%lld d=%lld K=%s V=%s\n",
+        ggml_cuda_fattn_instruction_name(inst),
+        fast.route ? fast.route : "-",
+        ggml_cuda_fattn_kernel_name(fallback),
+        ggml_cuda_fa_reject_reason_name(fast.reject),
+        ggml_cuda_fa_fallback_severity(fast.reject),
+        Q ? (long long) Q->ne[1] : -1LL,
+        K ? (long long) K->ne[1] : -1LL,
+        Q ? (long long) Q->ne[0] : -1LL,
+        K ? ggml_type_name(K->type) : "-",
+        V ? ggml_type_name(V->type) : "-");
+
+    ggml_cuda_fa_stats_record(fast.reject);
+}
+
+// ── Strict abort ──────────────────────────────────────────────────
+
+static void ggml_cuda_fa_abort_on_vec_tile(
+        const ggml_tensor * dst,
+        const ggml_fattn_instruction inst,
+        const ggml_cuda_fa_fastpath_result fast,
+        const best_fattn_kernel fallback) {
+    if (!ggml_cuda_fa_no_vec_tile_enabled()) {
+        return;
+    }
+
+    if (fallback != BEST_FATTN_KERNEL_VEC &&
+        fallback != BEST_FATTN_KERNEL_TILE) {
+        return;
+    }
+
+    // Accepted fallbacks do not abort even in strict mode.
+    if (ggml_cuda_fa_reject_is_accepted(fast.reject)) {
+        return;
+    }
+
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    GGML_ABORT(
+        "FA instruction fell to %s: inst=%s attempted_route=%s reject=%s "
+        "nq=%lld nk=%lld d=%lld K=%s V=%s",
+        ggml_cuda_fattn_kernel_name(fallback),
+        ggml_cuda_fattn_instruction_name(inst),
+        fast.route ? fast.route : "-",
+        ggml_cuda_fa_reject_reason_name(fast.reject),
+        Q ? (long long) Q->ne[1] : -1LL,
+        K ? (long long) K->ne[1] : -1LL,
+        Q ? (long long) Q->ne[0] : -1LL,
+        K ? ggml_type_name(K->type) : "-",
+        V ? ggml_type_name(V->type) : "-");
+}
+
+// ── Action mapper: convert reject reason to next patch action ─────
+
+static const char * ggml_cuda_fa_next_action_for_fallback(
+        ggml_cuda_fa_reject_reason reason,
+        ggml_type k_type,
+        ggml_type v_type,
+        int64_t d) {
+    switch (reason) {
+        case FA_REJECT_MISSING_K_REPR:
+            if (k_type == GGML_TYPE_F16) {
+                return "already_solved_source_f16_op_local_packed16";
+            }
+            if (k_type == GGML_TYPE_Q4_0) {
+                return "add_source_q4_0_to_packed16_materialization";
+            }
+            if (k_type == GGML_TYPE_Q8_0) {
+                return "add_source_q8_0_to_packed16_materialization";
+            }
+            if (k_type == GGML_TYPE_BF16) {
+                return "add_source_bf16_to_packed16_materialization";
+            }
+            return "unknown_k_repr_adapter";
+
+        case FA_REJECT_UNSUPPORTED_V:
+            if (v_type == GGML_TYPE_Q4_0 || v_type == GGML_TYPE_Q8_0) {
+                return "add_or_fix_v_loader";
+            }
+            return "unsupported_v_document_or_adapter";
+
+        case FA_REJECT_MASK_LAYOUT:
+            return "add_mask_layout_support_or_keep_fallback";
+
+        case FA_REJECT_ALIBI:
+            return "alibi_not_supported_keep_fallback";
+
+        case FA_REJECT_LOGIT_SOFTCAP:
+            return "softcap_support_needed_or_keep_fallback";
+
+        case FA_REJECT_D_NOT_256:
+            if (d == 128 || d == 64) {
+                return "add_d_variant_support";
+            }
+            return "unsupported_d_keep_fallback";
+
+        case FA_REJECT_WORKSPACE:
+            return "fix_workspace_planner";
+
+        default:
+            return "no_action";
+    }
+}
+
+// ── Unified fast-path attempt: DOT4 recthist ─────────────────────
+
+static ggml_cuda_fa_fastpath_result ggml_cuda_try_dot4_recthist(
+        const int cc,
+        const ggml_tensor * dst,
+        const ggml_fattn_instruction inst) {
+    if (!ggml_cuda_q8k_dot4_kq_env_enabled()) {
+        return { BEST_FATTN_KERNEL_NONE, "dot4_recthist", FA_REJECT_ENV_DISABLED };
+    }
+
+    if (!GGML_CUDA_CC_IS_RDNA3(cc)) {
+        return { BEST_FATTN_KERNEL_NONE, "dot4_recthist", FA_REJECT_NOT_RDNA3 };
+    }
+
+    const ggml_tensor * Q = dst->src[0];
+
+    if (Q->ne[1] <= 1) {
+        return { BEST_FATTN_KERNEL_NONE, "dot4_recthist", FA_REJECT_NQ_WRONG_FOR_ROUTE };
+    }
+
+    if (Q->ne[0] != 256) {
+        return { BEST_FATTN_KERNEL_NONE, "dot4_recthist", FA_REJECT_D_NOT_256 };
+    }
+
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    if (!ggml_cuda_q8k_dot4_kq_legal_kv(K, V)) {
+        // Legal K: persistent packed16 I32, q8_0, or source f16.
+        // Legal V: f16, q8_0, q4_0.
+        const bool k_ok = K->type == GGML_TYPE_F16 ||
+                          K->type == GGML_TYPE_Q8_0 ||
+                          (K->type == GGML_TYPE_Q4_0 && ggml_cuda_q8k_dot4_kq_allow_source_q4_0());
+        const bool v_ok = V->type == GGML_TYPE_F16 ||
+                          V->type == GGML_TYPE_Q8_0 ||
+                          V->type == GGML_TYPE_Q4_0;
+
+        if (!k_ok) {
+            return { BEST_FATTN_KERNEL_NONE, "dot4_recthist", FA_REJECT_MISSING_K_REPR };
+        }
+        if (!v_ok) {
+            return { BEST_FATTN_KERNEL_NONE, "dot4_recthist", FA_REJECT_UNSUPPORTED_V };
+        }
+
+        return { BEST_FATTN_KERNEL_NONE, "dot4_recthist", FA_REJECT_MISSING_K_REPR };
+    }
+
+    if (!ggml_cuda_q8k_dot4_kq_route_for_instruction_ok(inst)) {
+        return { BEST_FATTN_KERNEL_NONE, "dot4_recthist", FA_REJECT_ROUTE_CONTRACT };
+    }
+
+    return { BEST_FATTN_KERNEL_Q8K_DOT4_KQ, "dot4_recthist", FA_REJECT_NONE };
+}
+
+// ── Unified fast-path attempt: DOT4 decode ───────────────────────
+
+static ggml_cuda_fa_fastpath_result ggml_cuda_try_dot4_decode(
+        const int cc,
+        const ggml_tensor * dst,
+        const ggml_fattn_instruction inst) {
+    if (!ggml_cuda_q8k_dot4_kq_env_enabled()) {
+        return { BEST_FATTN_KERNEL_NONE, "dot4_decode", FA_REJECT_ENV_DISABLED };
+    }
+
+    if (!GGML_CUDA_CC_IS_RDNA3(cc)) {
+        return { BEST_FATTN_KERNEL_NONE, "dot4_decode", FA_REJECT_NOT_RDNA3 };
+    }
+
+    const ggml_tensor * Q = dst->src[0];
+
+    if (Q->ne[1] != 1) {
+        return { BEST_FATTN_KERNEL_NONE, "dot4_decode", FA_REJECT_NQ_WRONG_FOR_ROUTE };
+    }
+
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    // Decode requires source f16 or q8_0 K for DOT4.
+    if (K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_Q8_0) {
+        return { BEST_FATTN_KERNEL_NONE, "dot4_decode", FA_REJECT_MISSING_K_REPR };
+    }
+
+    if (V->type != GGML_TYPE_F16 && V->type != GGML_TYPE_Q8_0 && V->type != GGML_TYPE_Q4_0) {
+        return { BEST_FATTN_KERNEL_NONE, "dot4_decode", FA_REJECT_UNSUPPORTED_V };
+    }
+
+    if (!ggml_cuda_q8k_dot4_kq_route_for_instruction_ok(inst)) {
+        return { BEST_FATTN_KERNEL_NONE, "dot4_decode", FA_REJECT_ROUTE_CONTRACT };
+    }
+
+    return { BEST_FATTN_KERNEL_Q8K_DOT4_KQ, "dot4_decode", FA_REJECT_NONE };
+}
+
+// ── Top-level instruction fast-path dispatcher ────────────────────
+
+// File-scope tracker: the dispatch inside get_best_fattn_kernel populates
+// this when an instruction path falls through; the caller in
+// ggml_cuda_flash_attn_ext reads it to run hunter hooks.
+struct ggml_cuda_fa_inst_tracker {
+    bool active;
+    ggml_fattn_instruction inst;
+    ggml_cuda_fa_fastpath_result fast;
+};
+
+static ggml_cuda_fa_inst_tracker g_fa_inst_tracker;
+
+static ggml_cuda_fa_fastpath_result ggml_cuda_try_instruction_fastpath(
+        const int cc,
+        const ggml_tensor * dst,
+        const ggml_fattn_instruction inst) {
+    const ggml_tensor * Q = dst->src[0];
+    const enum ggml_cuda_fattn_fast_route wanted = route_for_instruction(inst, Q);
+
+    switch (wanted) {
+        case GGML_CUDA_FAST_ROUTE_DOT4_RECTHIST:
+            return ggml_cuda_try_dot4_recthist(cc, dst, inst);
+
+        case GGML_CUDA_FAST_ROUTE_DOT4_DECODE:
+            return ggml_cuda_try_dot4_decode(cc, dst, inst);
+
+        default:
+            return { BEST_FATTN_KERNEL_NONE, "none", FA_REJECT_NONE };
+    }
 }
 
 // ── Canonical log helper ──────────────────────────────────────────
@@ -2339,21 +2667,26 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
 
         // ── VEC/TILE fallback severity ──────────────────────────
-        // When an instruction path falls through to VEC/TILE, log it
-        // as fallback debt and optionally abort in strict mode.
+        // When an instruction path falls through to VEC/TILE, save
+        // context so the caller (ggml_cuda_flash_attn_ext) can run
+        // hunter hooks after the final kernel is selected.
         if (is_instruction_path) {
-            const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG");
-            if (log_env && atoi(log_env) != 0) {
-                // At this point, the instruction path returned NONE and
-                // we'll fall through to existing policy below. The actual
-                // kernel will be determined by the non-instruction code.
-                GGML_LOG_INFO("%s: fa_instruction=%s route=legacy_fallback "
-                    "nq=%lld K=%s V=%s fallback_severity=pending "
-                    "impl_status=instruction_path_fell_through\n",
-                    __func__,
-                    ggml_cuda_fattn_instruction_name(inst),
-                    (long long) Q->ne[1],
-                    ggml_type_name(K->type), ggml_type_name(V->type));
+            g_fa_inst_tracker.active = true;
+            g_fa_inst_tracker.inst = inst;
+            g_fa_inst_tracker.fast = ggml_cuda_try_instruction_fastpath(cc, dst, inst);
+
+            if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
+                if (log_env && atoi(log_env) != 0) {
+                    GGML_LOG_INFO("%s: fa_instruction=%s route=legacy_fallback "
+                        "attempted_route=%s reject=%s "
+                        "nq=%lld K=%s V=%s fallback_severity=pending\n",
+                        __func__,
+                        ggml_cuda_fattn_instruction_name(inst),
+                        g_fa_inst_tracker.fast.route ? g_fa_inst_tracker.fast.route : "-",
+                        ggml_cuda_fa_reject_reason_name(g_fa_inst_tracker.fast.reject),
+                        (long long) Q->ne[1],
+                        ggml_type_name(K->type), ggml_type_name(V->type));
+                }
             }
         }
     }
@@ -2637,6 +2970,17 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     const best_fattn_kernel best_kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
     ggml_cuda_fattn_log_selection(best_kernel, dst);
+
+    // ── VEC/TILE hunter hook ───────────────────────────────────
+    // If an instruction path fell through to VEC/TILE, the dispatch
+    // saved context in g_fa_inst_tracker. Now log debt + optionally abort.
+    if (g_fa_inst_tracker.active) {
+        ggml_cuda_fa_log_vec_tile_debt(dst, g_fa_inst_tracker.inst,
+            g_fa_inst_tracker.fast, best_kernel);
+        ggml_cuda_fa_abort_on_vec_tile(dst, g_fa_inst_tracker.inst,
+            g_fa_inst_tracker.fast, best_kernel);
+        g_fa_inst_tracker.active = false;
+    }
 
     switch (best_kernel) {
         case BEST_FATTN_KERNEL_NONE:
