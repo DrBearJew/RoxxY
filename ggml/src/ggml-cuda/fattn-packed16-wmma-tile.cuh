@@ -94,15 +94,46 @@ template<int BM, int D>
 static __device__ __forceinline__ void pwmma_q_load(
         const float * __restrict__ Q, half * __restrict__ q_smem,
         int64_t q_nb01, int64_t q_nb02, int64_t q_nb03,
-        int q_tile, int hq, int b, int nq) {
+        int q_tile, int hq, int b, int nq,
+        float attention_scale) {
     const int tid = threadIdx.x;
+#ifdef GGML_CUDA_PWMMA_DEBUG
+    if (blockIdx.x == 0 && blockIdx.z == 0 && threadIdx.x == 0) {
+        float max_abs_q = 0.0f;
+        for (int r = 0; r < BM; ++r) {
+            const int q = q_tile * BM + r;
+            if (q >= nq) continue;
+            const char * ptr = (const char *) Q + int64_t(b)*q_nb03 + int64_t(hq)*q_nb02 + int64_t(q)*q_nb01;
+            for (int dd = 0; dd < D; ++dd)
+                max_abs_q = fmaxf(max_abs_q, fabsf(((const float *) ptr)[dd]));
+        }
+        if (hq == 5 || hq == 12)
+            printf("PWMMA Q range hq=%d max_abs_raw=%f max_abs_scaled=%f\n",
+                   hq, max_abs_q, max_abs_q * attention_scale);
+    }
+#endif
     for (int r = 0; r < BM; ++r) {
         const int q = q_tile * BM + r;
         for (int d = tid; d < D; d += blockDim.x) {
             half v = __float2half(0.0f);
             if (q < nq) {
                 const char * ptr = (const char *) Q + int64_t(b)*q_nb03 + int64_t(hq)*q_nb02 + int64_t(q)*q_nb01;
-                v = __float2half(((const float *) ptr)[d]);
+                const float qf = ((const float *) ptr)[d] * attention_scale;
+#ifdef GGML_CUDA_PWMMA_DEBUG
+                if (!isfinite(qf)) {
+                    printf("PWMMA bad Q before half q=%d hq=%d d=%d qf=%f scale=%f\n",
+                           q, hq, d, qf, attention_scale);
+                    asm volatile("s_trap 20");
+                }
+#endif
+                v = __float2half(qf);
+#ifdef GGML_CUDA_PWMMA_DEBUG
+                if (!isfinite(__half2float(v))) {
+                    printf("PWMMA bad Q half q=%d hq=%d d=%d qf=%f half=%f scale=%f\n",
+                           q, hq, d, qf, __half2float(v), attention_scale);
+                    asm volatile("s_trap 21");
+                }
+#endif
             }
             q_smem[r * D + d] = v;
         }
@@ -201,7 +232,7 @@ static __global__ void packed16_wmma_tile_kernel(
     for (int i = threadIdx.x; i < PWMMA_BM * PWMMA_D; i += blockDim.x) out_smem[i] = 0.0f;
     __syncthreads();
 
-    pwmma_q_load<PWMMA_BM, PWMMA_D>(Q, (half*)q_tile_f16, q_nb01, q_nb02, q_nb03, q_tile, hq, b, nq);
+    pwmma_q_load<PWMMA_BM, PWMMA_D>(Q, (half*)q_tile_f16, q_nb01, q_nb02, q_nb03, q_tile, hq, b, nq, attention_scale);
 
     const int num_k_tiles = CEIL_DIV(nk, PWMMA_BN);
     for (int kt = 0; kt < num_k_tiles; ++kt) {
@@ -304,7 +335,7 @@ static __global__ void packed16_wmma_tile_kernel(
             const int r = idx / PWMMA_BN, c = idx % PWMMA_BN, qq = q_tile * PWMMA_BM + r;
             float v = logits_f32[r][c];
             if (qq >= nq || c >= valid_k) v = -FLT_MAX/2.0f;
-            else { v *= attention_scale; if (mask) v += pwmma_mask_val(mask, mask_nb30, mask_nb31, mask_nb33, mask_ne33, qq, k0+c, b); }
+            else { if (mask) v += pwmma_mask_val(mask, mask_nb30, mask_nb31, mask_nb33, mask_ne33, qq, k0+c, b); }
             logits_f32[r][c] = v;
         }
         __syncthreads();
