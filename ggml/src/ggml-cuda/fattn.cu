@@ -368,6 +368,8 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_Q8K_DOT4_PACKED16_VEC = 584, // experimental ROCm packed16 q8_0-K shadow inside stable VEC FA
 };
 
+static const char * ggml_cuda_fattn_instruction_name(const ggml_fattn_instruction inst);
+
 static const char * ggml_cuda_fattn_kernel_name(const best_fattn_kernel kernel) {
     switch (kernel) {
         case BEST_FATTN_KERNEL_NONE:               return "none";
@@ -907,9 +909,8 @@ static void ggml_cuda_fattn_log_selection(const best_fattn_kernel kernel, const 
     const ggml_tensor * V = dst->src[2];
 
     const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
-    const char * fa_inst_name = fa_inst_i32 == GGML_FATTN_INST_MTP_DRAFT ? "mtp_draft"
-        : fa_inst_i32 == GGML_FATTN_INST_MTP_VERIFY_QK ? "mtp_verify_qk"
-        : fa_inst_i32 == GGML_FATTN_INST_MTP_DRAFT_DECODE_QK ? "mtp_draft_decode_qk" : "none";
+    const char * fa_inst_name =
+        ggml_cuda_fattn_instruction_name((ggml_fattn_instruction)fa_inst_i32);
 
     const bool tbq4_vec_norm_hoist = kernel == BEST_FATTN_KERNEL_VEC && K->type == GGML_TYPE_TBQ4_0 && ggml_cuda_tbq4_vec_norm_hoist_enabled();
     const bool sparse_v_dequant = kernel == BEST_FATTN_KERNEL_VEC && V->type == GGML_TYPE_TBQ4_0 && Q->ne[1] == 1 && ggml_cuda_sparse_v_dequant_enabled();
@@ -1570,10 +1571,13 @@ static ggml_cuda_dot4_role ggml_cuda_dot4_role_for_mtp_verify(
 static const char * ggml_cuda_fattn_instruction_name(
         const ggml_fattn_instruction inst) {
     switch (inst) {
-        case GGML_FATTN_INST_NONE:              return "none";
-        case GGML_FATTN_INST_MTP_DRAFT:         return "mtp_draft";
-        case GGML_FATTN_INST_MTP_VERIFY_QK:     return "mtp_verify_qk";
+        case GGML_FATTN_INST_NONE:                return "none";
+        case GGML_FATTN_INST_MTP_DRAFT:           return "mtp_draft";
+        case GGML_FATTN_INST_MTP_VERIFY_QK:       return "mtp_verify_qk";
         case GGML_FATTN_INST_MTP_DRAFT_DECODE_QK: return "mtp_draft_decode_qk";
+        case GGML_FATTN_INST_PREFILL_QK:          return "prefill_qk";
+        case GGML_FATTN_INST_DECODE_QK:           return "decode_qk";
+        case GGML_FATTN_INST_SPEC_VERIFY_QK:      return "spec_verify_qk";
     }
 
     return "unknown";
@@ -1885,7 +1889,8 @@ static best_fattn_kernel ggml_cuda_select_mtp_draft_decode_fattn(
 static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
         const int cc,
         const ggml_tensor * dst,
-        const ggml_cuda_rocm_quant_prefill_f16_policy * f16_policy) {
+        const ggml_cuda_rocm_quant_prefill_f16_policy * f16_policy,
+        const ggml_fattn_instruction inst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -1896,13 +1901,15 @@ static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
     const ggml_cuda_dot4_k_repr k_repr =
         ggml_cuda_dot4_resolve_k_repr(Q, K, V);
 
-    // Archetype: MTP verify nq > 1 -> v4 recthist.
+    const char * inst_name = ggml_cuda_fattn_instruction_name(inst);
+
+    // Archetype: nq > 1 -> v4 recthist.
     // Current implementation gate: nq > 2 (DOT4 helpers reject nq <= 2).
-    // nq == 2 behind explicit env.
+    // nq == 2 behind explicit env for MTP_VERIFY_QK only.
     if (Q->ne[1] <= 1) {
         ggml_cuda_fattn_log_instruction_route(
             dst,
-            "mtp_verify_qk",
+            inst_name,
             ggml_cuda_dot4_role_name(GGML_CUDA_DOT4_ROLE_NONE),
             GGML_CUDA_FATTN_BACKEND_EXISTING,
             GGML_CUDA_DOT4_K_REPR_NONE,
@@ -1911,10 +1918,11 @@ static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
 
         return BEST_FATTN_KERNEL_NONE;
     }
-    if (Q->ne[1] == 2 && !ggml_cuda_mtp_verify_dot4_nq2_enabled()) {
+    if (Q->ne[1] == 2 && inst == GGML_FATTN_INST_MTP_VERIFY_QK &&
+            !ggml_cuda_mtp_verify_dot4_nq2_enabled()) {
         ggml_cuda_fattn_log_instruction_route(
             dst,
-            "mtp_verify_qk",
+            inst_name,
             ggml_cuda_dot4_role_name(dot4_role),
             GGML_CUDA_FATTN_BACKEND_EXISTING,
             k_repr,
@@ -1931,7 +1939,7 @@ static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
 
         ggml_cuda_fattn_log_instruction_route(
             dst,
-            "mtp_verify_qk",
+            inst_name,
             ggml_cuda_dot4_role_name(dot4_role),
             GGML_CUDA_FATTN_BACKEND_DOT4_RECTHIST_V4,
             k_repr,
@@ -1954,7 +1962,7 @@ static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
 
         ggml_cuda_fattn_log_instruction_route(
             dst,
-            "mtp_verify_qk",
+            inst_name,
             ggml_cuda_dot4_role_name(dot4_role),
             GGML_CUDA_FATTN_BACKEND_EXISTING,
             k_repr,
@@ -1971,7 +1979,7 @@ static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
 
         ggml_cuda_fattn_log_instruction_route(
             dst,
-            "mtp_verify_qk",
+            inst_name,
             ggml_cuda_dot4_role_name(dot4_role),
             GGML_CUDA_FATTN_BACKEND_WMMA_F16,
             GGML_CUDA_DOT4_K_REPR_NONE,
@@ -1986,7 +1994,7 @@ static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
 
         ggml_cuda_fattn_log_instruction_route(
             dst,
-            "mtp_verify_qk",
+            inst_name,
             ggml_cuda_dot4_role_name(dot4_role),
             GGML_CUDA_FATTN_BACKEND_MMA_F16,
             GGML_CUDA_DOT4_K_REPR_NONE,
@@ -2217,18 +2225,26 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // MTP_VERIFY_QK: run FA as QK/V backend for MTP verification.
     // MTP_DRAFT: run FA for draft generation (no DOT4 preference).
     //
-    // Instruction-first: MTP declares the instrument, then
+    // Instruction-first: workload declares the instrument, then
     // DOT4/WMMA/VEC are selected as implementations.
     {
         const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
-        if (fa_inst_i32 == GGML_FATTN_INST_MTP_VERIFY_QK) {
-            // Default f16 policy for non-quantized path.
+        const bool is_recthist_inst =
+            fa_inst_i32 == GGML_FATTN_INST_MTP_VERIFY_QK ||
+            fa_inst_i32 == GGML_FATTN_INST_PREFILL_QK ||
+            fa_inst_i32 == GGML_FATTN_INST_SPEC_VERIFY_QK;
+        const bool is_decode_inst =
+            fa_inst_i32 == GGML_FATTN_INST_MTP_DRAFT_DECODE_QK ||
+            fa_inst_i32 == GGML_FATTN_INST_DECODE_QK;
+
+        if (is_recthist_inst) {
             ggml_cuda_rocm_quant_prefill_f16_policy mtp_f16_policy = {};
-            const auto selected = ggml_cuda_select_mtp_verify_fattn(cc, dst, &mtp_f16_policy);
+            const auto selected = ggml_cuda_select_mtp_verify_fattn(
+                cc, dst, &mtp_f16_policy, (ggml_fattn_instruction)fa_inst_i32);
             if (selected != BEST_FATTN_KERNEL_NONE) {
                 return selected;
             }
-        } else if (fa_inst_i32 == GGML_FATTN_INST_MTP_DRAFT_DECODE_QK) {
+        } else if (is_decode_inst) {
             ggml_cuda_rocm_quant_prefill_f16_policy mtp_f16_policy = {};
             const auto selected = ggml_cuda_select_mtp_draft_decode_fattn(cc, dst, &mtp_f16_policy);
             if (selected != BEST_FATTN_KERNEL_NONE) {

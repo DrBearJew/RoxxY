@@ -2083,6 +2083,19 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
 
+        // ── General instruction stamping (non-MTP paths) ────────
+        // Classify workload before routing: prefill (nq>1), decode (nq==1),
+        // speculative verify (nq>1 with spec context). DOT4 recthist/decode
+        // paths fire when legal; fallback to existing policy otherwise.
+        if (gtype != LLM_GRAPH_TYPE_DECODER_MTP) {
+            // TODO: speculative verify graph type when available.
+            if (ubatch.n_tokens > 1) {
+                ggml_flash_attn_ext_set_instruction(cur, GGML_FATTN_INST_PREFILL_QK);
+            } else {
+                ggml_flash_attn_ext_set_instruction(cur, GGML_FATTN_INST_DECODE_QK);
+            }
+        }
+
         if (gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
             // MTP verify is hidden-state / h_pre_norm driven and maps to recthist-v4.
             // MTP draft decode (n_tokens==1) is scalar token generation → DOT4 BN64/split-K.
