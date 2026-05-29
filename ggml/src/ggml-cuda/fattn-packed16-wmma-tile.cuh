@@ -33,6 +33,28 @@ enum packed16_wmma_v_type {
 #if defined(GGML_USE_HIP) && defined(GGML_HIP_ROCWMMA_FATTN)
 #include <rocwmma/rocwmma.hpp>
 
+// ── Packed16 debug dump kernel ──────────────────────────────────
+static __global__ void pwmma_packed16_dump_kernel(
+        const int  * __restrict__ payload,
+        const half * __restrict__ scales,
+        int packed_rows, int nk, int n_heads_k) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    printf("PWMMA DEVICE DUMP: payload=%p scales=%p packed_rows=%d nk=%d n_heads_k=%d\n",
+           payload, scales, packed_rows, nk, n_heads_k);
+    const int head_stride = packed_rows / n_heads_k;
+    for (int hk = 0; hk < n_heads_k; ++hk) {
+        const int r_nk    = hk * nk;
+        const int r_stride = hk * head_stride;
+        printf("PWMMA hk=%d row_by_nk=%d p=%08x s=%g | row_by_stride=%d p=%08x s=%g\n",
+               hk, r_nk,
+               r_nk    < packed_rows ? payload[r_nk    * (PWMMA_D/4) + 0] : 0,
+               r_nk    < packed_rows ? (double)__half2float(scales[r_nk    * (PWMMA_D/QK8_0) + 0]) : 0.0,
+               r_stride,
+               r_stride < packed_rows ? payload[r_stride * (PWMMA_D/4) + 0] : 0,
+               r_stride < packed_rows ? (double)__half2float(scales[r_stride * (PWMMA_D/QK8_0) + 0]) : 0.0);
+    }
+}
+
 // ── Explicit packed-byte extraction (no pointer-pun on int) ────
 static __device__ __forceinline__ int8_t pwmma_i8_from_i32(const int packed, const int byte) {
     const uint32_t u = static_cast<uint32_t>(packed);
@@ -212,13 +234,23 @@ static __global__ void packed16_wmma_tile_kernel(
         int64_t mask_nb30, int64_t mask_nb31, int64_t mask_nb33, int64_t mask_ne33,
         const int  * __restrict__ k_payload, const half * __restrict__ k_scales,
         int nq, int nk, int n_heads_q, int n_heads_k, int gqa_ratio,
+        int packed_rows,
         float attention_scale) {
 
     const int q_tile = blockIdx.x, hq = blockIdx.y, b = blockIdx.z, hk = hq / gqa_ratio;
-    // k_head_base: packed16 payload has all heads flat in ne[1].
-    // Registry key maps to layer.k which covers all heads.
-    // Head offset = hk * nk (nk is rows per head, from K->ne[1]).
-    const size_t k_head_base = size_t(hk) * size_t(nk);
+    // packed16 payload has all heads flat in ne[1].
+    // Physical stride per head = packed_rows / n_heads_k (may differ from logical nk).
+    const int head_stride = packed_rows / n_heads_k;
+    const size_t k_head_base = size_t(hk) * size_t(head_stride);
+
+#ifdef GGML_CUDA_PWMMA_DEBUG
+    if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.z == 0) {
+        if (!isfinite(attention_scale)) {
+            printf("PWMMA bad attention_scale=%f\n", attention_scale);
+            asm volatile("s_trap 35");
+        }
+    }
+#endif
 
 #ifdef GGML_CUDA_PWMMA_ROUTE_TRAP
     if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0) {
@@ -280,6 +312,9 @@ static __global__ void packed16_wmma_tile_kernel(
 #endif
 
         // WMMA QK: raw RDNA3 builtins, B fragment from packed16 directly
+        // Zero-init logits before WMMA to prevent stale shared-mem NaN
+        for (int idx = threadIdx.x; idx < PWMMA_BM * PWMMA_BN; idx += blockDim.x) logits_f32[idx / PWMMA_BN][idx % PWMMA_BN] = 0.0f;
+        __syncthreads();
         if (threadIdx.x < 32) {
             const int lane = threadIdx.x, lane_lo = lane & 15, lane_hi = lane >> 4;
             const bool k_col_valid = lane_lo < valid_k;
@@ -310,13 +345,6 @@ static __global__ void packed16_wmma_tile_kernel(
                                    (unsigned long long)row, float(b_frag[i]));
                             asm volatile("s_trap 32");
                         }
-                        // K payload debug dump for odd lanes on affected heads
-                        if ((hq == 9 || hq == 11) && blockIdx.x == 0 && blockIdx.z == 0 && k0 == 0 && d0 == 0 && i == 0)
-                            printf("PWMMA KDBG hq=%d hk=%d lane_lo=%d row=%llu packed0=%08x scale0=%f packed=%08x byte=%d i8=%d\n",
-                                   hq, hk, lane_lo, (unsigned long long)row,
-                                   k_payload[row * (PWMMA_D / 4) + 0],
-                                   __half2float(k_scales[row * (PWMMA_D / QK8_0) + 0]),
-                                   packed, byte, (int)pwmma_i8_from_i32(packed, byte));
 #endif
                     } else {
                         b_frag[i] = (_Float16)0.0f;
@@ -408,14 +436,19 @@ static __global__ void packed16_wmma_tile_kernel(
         __syncthreads();
 
 #ifdef GGML_CUDA_PWMMA_DEBUG
-        // Range trap: bad logits (valid rows only)
+        // Range trap: bad logits (valid rows only) — split before/after
         for (int idx = threadIdx.x; idx < PWMMA_BM * PWMMA_BN; idx += blockDim.x) {
             const int r = idx / PWMMA_BN, c = idx % PWMMA_BN, qq = q_tile * PWMMA_BM + r;
             if (qq >= nq) continue;
             const float x = logits_f32[r][c];
             if (!isfinite(x) || fabsf(x) > 1.0e4f) {
-                printf("PWMMA bad logit block=(%d,%d,%d) r=%d c=%d x=%f (qq=%d valid_k=%d)\n",
-                       blockIdx.x, blockIdx.y, blockIdx.z, r, c, x, qq, valid_k);
+                // Re-compute before value from Q tile for debug
+                float before = 0.0f;
+                for (int d = 0; d < PWMMA_D; ++d)
+                    before += __half2float(q_tile_f16[r][d]) *
+                              pwmma_decode_k(k_payload, k_scales, k_head_base + size_t(k0 + c), d);
+                printf("PWMMA bad logit block=(%d,%d,%d) r=%d c=%d before=%f scale=%g after=%f (qq=%d valid_k=%d)\n",
+                       blockIdx.x, blockIdx.y, blockIdx.z, r, c, before, (double)attention_scale, x, qq, valid_k);
                 asm volatile("s_trap 10");
             }
         }
@@ -543,9 +576,17 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
 
     { static bool once = false; if (!once) { once = true;
         fprintf(stderr, "PWMMA v0.3 Q4fix=%d nq=%d nk=%d hq=%d hk=%d b=%d sc=%g "
-                "payload_ne1=%lld payload_ne2=%lld packed_kv_size=%d\n",
+                "payload_ne1=%lld payload_ne2=%lld packed_kv_size=%d head_stride=%d\n",
                 PWMMA_Q4_LAYOUT_FIXED, nq, nk, n_heads_q, n_heads_k, batch, (double)attention_scale,
-                (long long)packed16_payload->ne[1], (long long)packed16_payload->ne[2], packed_kv_size);
+                (long long)packed16_payload->ne[1], (long long)packed16_payload->ne[2],
+                packed_kv_size, packed_kv_size / n_heads_k);
+        // Dump packed16 via device kernel (host can't deref device ptrs)
+        if (getenv("GGML_CUDA_PWMMA_DUMP_PACKED16")) {
+            pwmma_packed16_dump_kernel<<<1, 1, 0, stream>>>(
+                k_payload, k_scales, packed_kv_size, nk, n_heads_k);
+            CUDA_CHECK(hipGetLastError());
+            CUDA_CHECK(hipStreamSynchronize(stream));
+        }
         if (!pbwmma_qk_probe_pass(stream)) GGML_ABORT("PBWMMA QK probe failed");
     }}
 
@@ -555,7 +596,7 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
         Q->nb[1], Q->nb[2], Q->nb[3], V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
         mask ? (const char*)mask->data : nullptr, mask_nb30, mask_nb31, mask_nb33, mask_ne33, \
         k_payload, k_scales, \
-        nq, nk, n_heads_q, n_heads_k, gqa_ratio, attention_scale)
+        nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_kv_size, attention_scale)
 
     switch (V->type) {
         case GGML_TYPE_Q4_0: LAUNCH(PACKED16_WMMA_V_Q4_0); break;

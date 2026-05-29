@@ -3348,6 +3348,18 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
             // Use GGML tensors directly — no hipMalloc needed.
             k_payload.ptr = (int *) payload_tensor->data;
             k_scales.ptr  = (half *) scales_tensor->data;
+            // One-time DOT4 packed16 registry dump
+            static bool dot4_registry_printed = false;
+            if (!dot4_registry_printed) {
+                dot4_registry_printed = true;
+                fprintf(stderr, "DOT4 packed16 registry: payload=%p scales=%p "
+                        "payload_ne=(%lld,%lld,%lld,%lld) scales_ne=(%lld,%lld,%lld,%lld)\n",
+                        (void*)payload_tensor->data, (void*)scales_tensor->data,
+                        (long long)payload_tensor->ne[0], (long long)payload_tensor->ne[1],
+                        (long long)payload_tensor->ne[2], (long long)payload_tensor->ne[3],
+                        (long long)scales_tensor->ne[0], (long long)scales_tensor->ne[1],
+                        (long long)scales_tensor->ne[2], (long long)scales_tensor->ne[3]);
+            }
             // Check if cache unchanged since last repack.
             std::lock_guard<std::mutex> lock(s_cache_mutex);
             size_t & prev_rows = s_cache_rows[K->data];
