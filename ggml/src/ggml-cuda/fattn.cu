@@ -1040,58 +1040,165 @@ static ggml_cuda_rocm_quant_prefill_f16_mode ggml_cuda_rocm_quant_prefill_f16_mo
 // selectors use the same K-repr concept, but with different roles.
 
 enum ggml_cuda_dot4_k_repr {
-    GGML_CUDA_DOT4_K_REPR_NONE                      = 0,
-    GGML_CUDA_DOT4_K_REPR_PERSISTENT_PACKED16_I32   = 1,
-    GGML_CUDA_DOT4_K_REPR_Q8_Q4                     = 2,
-    GGML_CUDA_DOT4_K_REPR_SOURCE_F16_OP_LOCAL_PACK  = 3,
+    GGML_CUDA_DOT4_K_REPR_NONE = 0,
+
+    // Persistent K tensor is already packed16/I32.
+    GGML_CUDA_DOT4_K_REPR_PERSISTENT_PACKED16_I32,
+
+    // Original q8_0/q4_0 path.
+    GGML_CUDA_DOT4_K_REPR_Q8_0,
+
+    // Source f16 K is materialized op-locally into packed16.
+    GGML_CUDA_DOT4_K_REPR_SOURCE_F16_OP_LOCAL_PACKED16,
 };
 
-static const char * ggml_cuda_dot4_k_repr_name(ggml_cuda_dot4_k_repr r) {
-    switch (r) {
-        case GGML_CUDA_DOT4_K_REPR_PERSISTENT_PACKED16_I32:  return "packed16_i32";
-        case GGML_CUDA_DOT4_K_REPR_Q8_Q4:                    return "q8q4";
-        case GGML_CUDA_DOT4_K_REPR_SOURCE_F16_OP_LOCAL_PACK: return "source_f16_op_local_packed16";
-        default:                                               return "-";
+static const char * ggml_cuda_dot4_k_repr_name(
+        const ggml_cuda_dot4_k_repr repr) {
+    switch (repr) {
+        case GGML_CUDA_DOT4_K_REPR_NONE:
+            return "-";
+        case GGML_CUDA_DOT4_K_REPR_PERSISTENT_PACKED16_I32:
+            return "persistent_packed16_i32";
+        case GGML_CUDA_DOT4_K_REPR_Q8_0:
+            return "q8_0";
+        case GGML_CUDA_DOT4_K_REPR_SOURCE_F16_OP_LOCAL_PACKED16:
+            return "source_f16_op_local_packed16";
+    }
+
+    return "unknown";
+}
+
+static const char * ggml_cuda_dot4_v_repr_name(const ggml_tensor * V) {
+    if (!V) {
+        return "-";
+    }
+
+    switch (V->type) {
+        case GGML_TYPE_F16:  return "f16";
+        case GGML_TYPE_Q8_0: return "q8_0";
+        case GGML_TYPE_Q4_0: return "q4_0";
+        default:             return ggml_type_name(V->type);
     }
 }
 
-static const char * ggml_cuda_dot4_v_repr_name(enum ggml_type type) {
-    return type == GGML_TYPE_F16  ? "f16"
-         : type == GGML_TYPE_Q8_0 ? "q8_0"
-         : type == GGML_TYPE_Q4_0 ? "q4_0"
-         :                          "-";
-}
+static ggml_cuda_dot4_k_repr ggml_cuda_dot4_resolve_k_repr(
+        const ggml_tensor * Q,
+        const ggml_tensor * K,
+        const ggml_tensor * V) {
+    if (!Q || !K || !V) {
+        return GGML_CUDA_DOT4_K_REPR_NONE;
+    }
 
-static ggml_cuda_dot4_k_repr ggml_cuda_dot4_k_repr_from_tensors(
-        const ggml_tensor * K, const ggml_tensor * V) {
-    if (K->type == GGML_TYPE_I32)
+    const bool persistent_packed16 =
+        K->type == GGML_TYPE_I32 &&
+        K->ne[0] * 4 == Q->ne[0];
+
+    if (persistent_packed16) {
         return GGML_CUDA_DOT4_K_REPR_PERSISTENT_PACKED16_I32;
-    if (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0)
-        return GGML_CUDA_DOT4_K_REPR_Q8_Q4;
-    if (K->type == GGML_TYPE_F16 &&
-        (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0))
-        return GGML_CUDA_DOT4_K_REPR_SOURCE_F16_OP_LOCAL_PACK;
+    }
+
+    const bool q8_k =
+        K->type == GGML_TYPE_Q8_0 &&
+        K->ne[0] == Q->ne[0];
+
+    if (q8_k) {
+        return GGML_CUDA_DOT4_K_REPR_Q8_0;
+    }
+
+    const bool source_f16_k =
+        K->type == GGML_TYPE_F16 &&
+        K->ne[0] == Q->ne[0];
+
+    if (source_f16_k) {
+        return GGML_CUDA_DOT4_K_REPR_SOURCE_F16_OP_LOCAL_PACKED16;
+    }
+
     return GGML_CUDA_DOT4_K_REPR_NONE;
 }
 
-// ── DOT4 guardrail: backend family ─────────────────────────────────
-// Prevents recthist/decode confusion. 'rocm_q8k_dot4_kq' is too broad
-// — it can mean recthist, BN64 decode, or split-K decode.
+// ── Backend family taxonomy ────────────────────────────────────────
+// Names the execution family before routing changes. 'selected=rocm_q8k_dot4_kq'
+// is too broad — it can mean recthist, BN64 decode, or split-K decode.
+// backend_family makes logs and route contracts readable.
 
 enum ggml_cuda_fattn_backend_family {
-    GGML_CUDA_FATTN_BACKEND_EXISTING             = 0,
-    GGML_CUDA_FATTN_BACKEND_DOT4_RECTHIST        = 1,
-    GGML_CUDA_FATTN_BACKEND_DOT4_DECODE_BN64     = 2,
-    GGML_CUDA_FATTN_BACKEND_DOT4_DECODE_SPLITK   = 3,
+    GGML_CUDA_FATTN_BACKEND_EXISTING = 0,
+
+    // DOT4 families
+    GGML_CUDA_FATTN_BACKEND_DOT4_RECTHIST_V4,
+    GGML_CUDA_FATTN_BACKEND_DOT4_DECODE_BN64,
+    GGML_CUDA_FATTN_BACKEND_DOT4_DECODE_SPLITK,
+
+    // Tensor-core / fallback families
+    GGML_CUDA_FATTN_BACKEND_WMMA_F16,
+    GGML_CUDA_FATTN_BACKEND_MMA_F16,
+    GGML_CUDA_FATTN_BACKEND_VEC,
+    GGML_CUDA_FATTN_BACKEND_TILE,
 };
 
-static const char * ggml_cuda_fattn_backend_family_name(enum ggml_cuda_fattn_backend_family f) {
-    switch (f) {
-        case GGML_CUDA_FATTN_BACKEND_DOT4_RECTHIST:        return "dot4_recthist";
-        case GGML_CUDA_FATTN_BACKEND_DOT4_DECODE_BN64:     return "dot4_decode_bn64";
-        case GGML_CUDA_FATTN_BACKEND_DOT4_DECODE_SPLITK:   return "dot4_decode_splitk";
-        default:                                             return "existing";
+static const char * ggml_cuda_fattn_backend_family_name(
+        const ggml_cuda_fattn_backend_family family) {
+    switch (family) {
+        case GGML_CUDA_FATTN_BACKEND_EXISTING:           return "existing";
+        case GGML_CUDA_FATTN_BACKEND_DOT4_RECTHIST_V4:   return "dot4_recthist_v4";
+        case GGML_CUDA_FATTN_BACKEND_DOT4_DECODE_BN64:   return "dot4_decode_bn64";
+        case GGML_CUDA_FATTN_BACKEND_DOT4_DECODE_SPLITK: return "dot4_decode_splitk";
+        case GGML_CUDA_FATTN_BACKEND_WMMA_F16:           return "wmma_f16";
+        case GGML_CUDA_FATTN_BACKEND_MMA_F16:            return "mma_f16";
+        case GGML_CUDA_FATTN_BACKEND_VEC:                return "vec";
+        case GGML_CUDA_FATTN_BACKEND_TILE:               return "tile";
     }
+
+    return "unknown";
+}
+
+// ── Canonical log helper ──────────────────────────────────────────
+// Centralized instruction-route logging for all MTP selectors.
+// Single format: fa_instruction, dot4_role, backend_family, k_repr, v_repr.
+
+static void ggml_cuda_fattn_log_instruction_route(
+        const ggml_tensor * dst,
+        const char * fa_instruction,
+        const char * dot4_role,
+        const ggml_cuda_fattn_backend_family backend_family,
+        const ggml_cuda_dot4_k_repr k_repr,
+        const char * impl_status,
+        const best_fattn_kernel selected) {
+#ifdef GGML_USE_HIP
+    const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG");
+    if (!log_env || atoi(log_env) == 0) {
+        return;
+    }
+
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    GGML_LOG_INFO(
+        "%s: fa_instruction=%s dot4_role=%s backend_family=%s "
+        "nq=%lld nk=%lld K=%s V=%s k_repr=%s v_repr=%s "
+        "impl_status=%s selected=%s\n",
+        __func__,
+        fa_instruction ? fa_instruction : "-",
+        dot4_role ? dot4_role : "-",
+        ggml_cuda_fattn_backend_family_name(backend_family),
+        Q ? (long long) Q->ne[1] : -1LL,
+        K ? (long long) K->ne[1] : -1LL,
+        K ? ggml_type_name(K->type) : "-",
+        V ? ggml_type_name(V->type) : "-",
+        ggml_cuda_dot4_k_repr_name(k_repr),
+        ggml_cuda_dot4_v_repr_name(V),
+        impl_status ? impl_status : "-",
+        ggml_cuda_fattn_kernel_name(selected));
+#else
+    GGML_UNUSED(dst);
+    GGML_UNUSED(fa_instruction);
+    GGML_UNUSED(dot4_role);
+    GGML_UNUSED(backend_family);
+    GGML_UNUSED(k_repr);
+    GGML_UNUSED(impl_status);
+    GGML_UNUSED(selected);
+#endif
 }
 
 // ── DOT4 guardrail: decode policy object ───────────────────────────
@@ -1243,21 +1350,6 @@ static enum ggml_cuda_dot4_role ggml_cuda_dot4_role_from_instruction(
             : GGML_CUDA_DOT4_ROLE_DECODE_BN64_MTP_DRAFT;
     }
     return GGML_CUDA_DOT4_ROLE_NONE;
-}
-
-static enum ggml_cuda_fattn_backend_family
-    ggml_cuda_fattn_backend_family_from_role(enum ggml_cuda_dot4_role role) {
-    switch (role) {
-        case GGML_CUDA_DOT4_ROLE_RECTHIST_V4_MTP_VERIFY:
-        case GGML_CUDA_DOT4_ROLE_PREFILL_RECTHIST_V4:
-            return GGML_CUDA_FATTN_BACKEND_DOT4_RECTHIST;
-        case GGML_CUDA_DOT4_ROLE_DECODE_BN64_MTP_DRAFT:
-            return GGML_CUDA_FATTN_BACKEND_DOT4_DECODE_BN64;
-        case GGML_CUDA_DOT4_ROLE_DECODE_SPLITK_MTP_DRAFT:
-            return GGML_CUDA_FATTN_BACKEND_DOT4_DECODE_SPLITK;
-        default:
-            return GGML_CUDA_FATTN_BACKEND_EXISTING;
-    }
 }
 
 // ── MTP instruction selector ────────────────────────────────────────
@@ -1435,18 +1527,22 @@ static best_fattn_kernel ggml_cuda_select_mtp_draft_decode_fattn(
         if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
             if (log_env && atoi(log_env) != 0) {
                 const char * k_repr = ggml_cuda_dot4_k_repr_name(
-                        ggml_cuda_dot4_k_repr_from_tensors(K, V));
-                const char * v_repr = ggml_cuda_dot4_v_repr_name(V->type);
+                        ggml_cuda_dot4_resolve_k_repr(Q, K, V));
+                const char * v_repr = ggml_cuda_dot4_v_repr_name(V);
                 const bool dot4_active = (selected == BEST_FATTN_KERNEL_Q8K_DOT4_KQ);
-                const char * family = ggml_cuda_fattn_backend_family_name(
-                        ggml_cuda_fattn_backend_family_from_role(dot4_role));
+                const auto family = dot4_active
+                    ? (dot4_role == GGML_CUDA_DOT4_ROLE_DECODE_SPLITK_MTP_DRAFT
+                        ? GGML_CUDA_FATTN_BACKEND_DOT4_DECODE_SPLITK
+                        : GGML_CUDA_FATTN_BACKEND_DOT4_DECODE_BN64)
+                    : GGML_CUDA_FATTN_BACKEND_EXISTING;
+                const char * family_name = ggml_cuda_fattn_backend_family_name(family);
                 GGML_LOG_INFO("%s: fa_instruction=mtp_draft_decode_qk "
                         "dot4_role=%s backend_family=%s nq=%lld nk=%lld K=%s V=%s "
                         "%s=%s v_repr=%s decode_impl=%s "
                         "impl_status=%s selected=%s\n",
                         __func__,
                         ggml_cuda_dot4_role_name(dot4_role),
-                        family,
+                        family_name,
                         (long long) Q->ne[1], (long long) K->ne[1],
                         ggml_type_name(K->type), ggml_type_name(V->type),
                         dot4_active ? "k_repr" : "k_repr_candidate", k_repr, v_repr,
@@ -1518,11 +1614,13 @@ static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
         if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
             if (log_env && atoi(log_env) != 0) {
                 const char * k_repr = ggml_cuda_dot4_k_repr_name(
-                        ggml_cuda_dot4_k_repr_from_tensors(K, V));
-                const char * v_repr = ggml_cuda_dot4_v_repr_name(V->type);
+                        ggml_cuda_dot4_resolve_k_repr(Q, K, V));
+                const char * v_repr = ggml_cuda_dot4_v_repr_name(V);
                 const bool dot4_active = (selected == BEST_FATTN_KERNEL_Q8K_DOT4_KQ);
-                const char * family = ggml_cuda_fattn_backend_family_name(
-                        ggml_cuda_fattn_backend_family_from_role(dot4_role));
+                const auto family = dot4_active
+                    ? GGML_CUDA_FATTN_BACKEND_DOT4_RECTHIST_V4
+                    : GGML_CUDA_FATTN_BACKEND_EXISTING;
+                const char * family_name = ggml_cuda_fattn_backend_family_name(family);
 
                 GGML_LOG_INFO("%s: fa_instruction=mtp_verify_qk nq=%lld K=%s V=%s "
                         "%s=%s v_repr=%s dot4_role=%s backend_family=%s impl_status=%s selected=%s\n",
@@ -1530,7 +1628,7 @@ static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
                         ggml_type_name(K->type), ggml_type_name(V->type),
                         dot4_active ? "k_repr" : "k_repr_candidate", k_repr, v_repr,
                         ggml_cuda_dot4_role_name(dot4_role),
-                        family,
+                        family_name,
                         impl_status,
                         selected == BEST_FATTN_KERNEL_Q8K_DOT4_KQ ? "rocm_q8k_dot4_kq" :
                         selected == BEST_FATTN_KERNEL_Q8K_DOT4_PACKED16_VEC ? "q8k_dot4_packed16_vec" :
