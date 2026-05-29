@@ -439,10 +439,14 @@ static bool ggml_cuda_mtp_verify_f16k_dot4_adapter_supported(
     }
     // nq==1 is decode (not recthist). nq==2 behind explicit env.
     const int nq_min = ggml_cuda_mtp_verify_dot4_nq2_enabled() ? 2 : 3;
+
+    // V must be f16, q8_0, or q4_0 for DOT4 with source-f16 K materialization.
+    const bool v_ok = V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0;
+
     return GGML_CUDA_CC_IS_RDNA3(cc) &&
            Q->type == GGML_TYPE_F32 &&
            K->type == GGML_TYPE_F16 &&
-           V->type == GGML_TYPE_F16 &&
+           v_ok &&
            dst->type == GGML_TYPE_F32 &&
            Q->ne[0] == 256 &&
            K->ne[0] == Q->ne[0] &&
@@ -615,7 +619,8 @@ static bool ggml_cuda_fattn_route_contract_applicable(
             (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0) ||
             (K->type == GGML_TYPE_I32 && (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0));
         const bool f16_adapter =
-            K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
+            K->type == GGML_TYPE_F16 &&
+            (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0) &&
             ggml_cuda_mtp_verify_f16k_dot4_adapter_enabled() &&
             ggml_cuda_fattn_get_instruction(dst) == GGML_FATTN_INST_MTP_VERIFY_QK;
         return (original_kv || f16_adapter) && ggml_cuda_q8k_dot4_kq_enabled();
@@ -1164,13 +1169,17 @@ static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
             if (log_env && atoi(log_env) != 0) {
                 const char * k_repr = K->type == GGML_TYPE_I32 ? "packed16_i32"
                     : (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0) ? "q8q4"
-                    : (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) ? "source_f16_op_local_packed16"
+                    : (K->type == GGML_TYPE_F16 && (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0)) ? "source_f16_op_local_packed16"
+                    : "-";
+                const char * v_repr = V->type == GGML_TYPE_F16 ? "f16"
+                    : V->type == GGML_TYPE_Q4_0 ? "q4_0"
+                    : V->type == GGML_TYPE_Q8_0 ? "q8_0"
                     : "-";
                 GGML_LOG_INFO("%s: fa_instruction=mtp_verify_qk nq=%lld K=%s V=%s "
-                        "k_repr=%s dot4_role=%s impl_status=%s selected=%s\n",
+                        "k_repr=%s v_repr=%s dot4_role=%s impl_status=%s selected=%s\n",
                         __func__, (long long) Q->ne[1],
                         ggml_type_name(K->type), ggml_type_name(V->type),
-                        k_repr,
+                        k_repr, v_repr,
                         ggml_cuda_dot4_role_name(dot4_role),
                         impl_status,
                         selected == BEST_FATTN_KERNEL_Q8K_DOT4_KQ ? "rocm_q8k_dot4_kq" :
