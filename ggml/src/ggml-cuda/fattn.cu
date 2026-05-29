@@ -2982,6 +2982,29 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         g_fa_inst_tracker.active = false;
     }
 
+    // ── Final select proof ─────────────────────────────────────
+    // Log the final kernel selection independent of the instruction
+    // path, so we can verify that DOT4 was actually the final choice.
+    {
+        const ggml_tensor * Q = dst->src[0];
+        const ggml_tensor * K = dst->src[1];
+        const ggml_tensor * V = dst->src[2];
+        const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
+        if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
+            if (log_env && atoi(log_env) != 0) {
+                GGML_LOG_INFO(
+                    "fa_final_select: inst=%s selected=%s nq=%lld nk=%lld d=%lld K=%s V=%s final=1\n",
+                    ggml_cuda_fattn_instruction_name((ggml_fattn_instruction)fa_inst_i32),
+                    ggml_cuda_fattn_kernel_name(best_kernel),
+                    Q ? (long long) Q->ne[1] : -1LL,
+                    K ? (long long) K->ne[1] : -1LL,
+                    Q ? (long long) Q->ne[0] : -1LL,
+                    K ? ggml_type_name(K->type) : "-",
+                    V ? ggml_type_name(V->type) : "-");
+            }
+        }
+    }
+
     switch (best_kernel) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");

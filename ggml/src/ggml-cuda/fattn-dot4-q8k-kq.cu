@@ -3126,6 +3126,22 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
     ggml_tensor * mask = dst->src[3];
     ggml_tensor * sinks = dst->src[4];
 
+    const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
+
+    // ── Launch proof: DOT4 actually dispatched ───────────────────
+    if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
+        if (log_env && atoi(log_env) != 0) {
+            GGML_LOG_INFO(
+                "fa_dot4_launch: fa_inst=%d nq=%lld nk=%lld d=%lld K=%s V=%s\n",
+                fa_inst_i32,
+                (long long) Q->ne[1],
+                (long long) K->ne[1],
+                (long long) Q->ne[0],
+                ggml_type_name(K->type),
+                ggml_type_name(V->type));
+        }
+    }
+
     // I32 packed16 K contract: DOT4-dispatch path only.
     const bool k_is_i32_packed16 = K->type == GGML_TYPE_I32;
 
