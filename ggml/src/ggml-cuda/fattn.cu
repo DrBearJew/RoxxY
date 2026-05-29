@@ -622,6 +622,21 @@ static bool ggml_cuda_fattn_route_contract_matches(const char * required, const 
     if (strcmp(required, "rocm_q8k_dot4_kq") == 0 && kernel == BEST_FATTN_KERNEL_Q8K_DOT4_KQ) {
         return true;
     }
+    if ((strcmp(required, "rocm_mtp_verify_dot4_recthist") == 0 ||
+         strcmp(required, "rocm_mtp_draft_dot4_decode") == 0 ||
+         strcmp(required, "rocm_mtp_draft_dot4_decode_bn64") == 0 ||
+         strcmp(required, "rocm_mtp_draft_dot4_decode_splitk") == 0) &&
+            kernel == BEST_FATTN_KERNEL_Q8K_DOT4_KQ) {
+        return true;
+    }
+    if (strcmp(required, "rocm_mtp_verify_wmma_f16") == 0 &&
+            kernel == BEST_FATTN_KERNEL_WMMA_F16) {
+        return true;
+    }
+    if (strcmp(required, "rocm_mtp_verify_mma_f16") == 0 &&
+            kernel == BEST_FATTN_KERNEL_MMA_F16) {
+        return true;
+    }
     if (strcmp(required, "rocm_q8k_dot4_packed16_vec") == 0 && kernel == BEST_FATTN_KERNEL_Q8K_DOT4_PACKED16_VEC) {
         return true;
     }
@@ -1437,6 +1452,24 @@ static bool ggml_cuda_dot4_source_f16_pack_disabled() {
     return env && atoi(env) != 0;
 }
 
+static bool ggml_cuda_mtp_verify_dot4_disabled() {
+#ifdef GGML_USE_HIP
+    const char * env = getenv("GGML_CUDA_ROCM_MTP_VERIFY_DOT4_DISABLE");
+    return env && atoi(env) != 0;
+#else
+    return false;
+#endif
+}
+
+static bool ggml_cuda_mtp_draft_decode_dot4_disabled() {
+#ifdef GGML_USE_HIP
+    const char * env = getenv("GGML_CUDA_ROCM_MTP_DRAFT_DECODE_DOT4_DISABLE");
+    return env && atoi(env) != 0;
+#else
+    return false;
+#endif
+}
+
 // ── DOT4 guardrail: fallback contract ──────────────────────────────
 // Single rule: if DOT4 instruction path is not legal, fall back to
 // existing policy UNLESS route contract explicitly requires DOT4.
@@ -1572,6 +1605,10 @@ static bool ggml_cuda_mtp_verify_dot4_recthist_supported(
         return false;
     }
 
+    if (ggml_cuda_mtp_verify_dot4_disabled()) {
+        return false;
+    }
+
     if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
     }
@@ -1702,6 +1739,11 @@ static bool ggml_cuda_mtp_draft_dot4_decode_supported(
     if (!ggml_cuda_q8k_dot4_kq_enabled()) {
         return false;
     }
+
+    if (ggml_cuda_mtp_draft_decode_dot4_disabled()) {
+        return false;
+    }
+
     if (!GGML_CUDA_CC_IS_RDNA3(cc)) {
         return false;
     }
