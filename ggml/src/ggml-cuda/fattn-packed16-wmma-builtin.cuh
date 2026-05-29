@@ -22,8 +22,6 @@ static constexpr int PBWMMA_BN = 16;
 
 // ── RDNA3 WMMA intrinsic helpers ──────────────────────────────────
 
-// RDNA3/gfx11 builtins. Compiles on any HIPCC targeting gfx11.
-// If targeting non-WMMA GPU, __builtin_amdgcn_wmma will fail at compile time.
 #if defined(__HIPCC__)
 #define PBWMMA_RDNA3_BUILTIN 1
 
@@ -146,7 +144,7 @@ static bool pbwmma_qk_probe_pass(hipStream_t stream) {
 #else
 static bool pbwmma_qk_probe_pass(hipStream_t stream) {
     GGML_UNUSED(stream);
-    fprintf(stderr, "PBWMMA QK probe SKIPPED (not RDNA3/gfx11)\n");
+    fprintf(stderr, "PBWMMA QK probe SKIPPED (not gfx1100)\n");
     return false;
 }
 #endif // __HIPCC__

@@ -183,6 +183,13 @@ static __global__ void packed16_wmma_tile_kernel(
     // Head offset = hk * nk (nk is rows per head, from K->ne[1]).
     const size_t k_head_base = size_t(hk) * size_t(nk);
 
+#ifdef GGML_CUDA_PWMMA_ROUTE_TRAP
+    if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0) {
+        printf("PWMMA DEVICE KERNEL ENTERED\n");
+        asm volatile("s_trap 7");
+    }
+#endif
+
     __shared__ half  q_tile_f16[PWMMA_BM][PWMMA_D];
     __shared__ half  v_tile_f16[PWMMA_BN][PWMMA_D];
     __shared__ float logits_f32[PWMMA_BM][PWMMA_BN];
@@ -207,6 +214,33 @@ static __global__ void packed16_wmma_tile_kernel(
             pwmma_v_q8_0_load<PWMMA_BN, PWMMA_D>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, kt, valid_k, hk, b, (half*)v_tile_f16);
         else
             pwmma_v_f16_load<PWMMA_BN, PWMMA_D>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, kt, valid_k, hk, b, (half*)v_tile_f16);
+
+#ifdef GGML_CUDA_PWMMA_DEBUG
+        // Diagnostic 2: V tile reference
+        if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
+            float max_v_err = 0.0f;
+            for (int c = 0; c < valid_k; ++c) {
+                const int kk = k0 + c;
+                for (int d = 0; d < PWMMA_D; ++d) {
+                    float ref = 0.0f;
+                    if ((V_TYPE) == PACKED16_WMMA_V_Q4_0)
+                        ref = pwmma_decode_v_q4_0(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, kk, hk, b, d);
+                    else if ((V_TYPE) == PACKED16_WMMA_V_Q8_0)
+                        ref = pwmma_decode_v_q8_0(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, kk, hk, b, d);
+                    else
+                        ref = pwmma_decode_v_f16(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, kk, hk, b, d);
+                    const float got = __half2float(v_tile_f16[c][d]);
+                    max_v_err = fmaxf(max_v_err, fabsf(ref - got));
+                }
+            }
+            if (max_v_err > 1e-3f) {
+                printf("PWMMA V TILE MISMATCH: max_v_err=%f block=(%d,%d,%d) k0=%d\n",
+                       max_v_err, blockIdx.x, blockIdx.y, blockIdx.z, k0);
+                asm volatile("s_trap 13");
+            }
+        }
+        __syncthreads();
+#endif
 
         // WMMA QK: raw RDNA3 builtins, B fragment from packed16 directly
         if (threadIdx.x < 32) {
@@ -236,6 +270,35 @@ static __global__ void packed16_wmma_tile_kernel(
         }
         __syncthreads();
 
+#ifdef GGML_CUDA_PWMMA_DEBUG
+        // Diagnostic 1: real-kernel QK reference (first tile per block)
+        if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.z == 0) {
+            float max_abs_err = 0.0f, max_ref_abs = 0.0f;
+            for (int r = 0; r < PWMMA_BM; ++r) {
+                const int qq = q_tile * PWMMA_BM + r;
+                if (qq >= nq) continue;
+                for (int c = 0; c < valid_k; ++c) {
+                    const size_t row = k_head_base + size_t(k0 + c);
+                    float ref = 0.0f;
+                    for (int d = 0; d < PWMMA_D; ++d) {
+                        ref += __half2float(q_tile_f16[r][d]) *
+                               pwmma_decode_k(k_payload, k_scales, row, d);
+                    }
+                    const float got = logits_f32[r][c];
+                    max_abs_err = fmaxf(max_abs_err, fabsf(ref - got));
+                    max_ref_abs = fmaxf(max_ref_abs, fabsf(ref));
+                }
+            }
+            const float rel = max_abs_err / fmaxf(max_ref_abs, 1e-6f);
+            if (max_abs_err > 0.25f && rel > 5e-3f) {
+                printf("PWMMA REAL QK MISMATCH: abs=%f rel=%f ref_abs=%f block=(%d,%d,%d) k0=%d\n",
+                       max_abs_err, rel, max_ref_abs, blockIdx.x, blockIdx.y, blockIdx.z, k0);
+                asm volatile("s_trap 9");
+            }
+        }
+        __syncthreads();
+#endif
+
         // Scale + mask
         for (int idx = threadIdx.x; idx < PWMMA_BM * PWMMA_BN; idx += blockDim.x) {
             const int r = idx / PWMMA_BN, c = idx % PWMMA_BN, qq = q_tile * PWMMA_BM + r;
@@ -246,7 +309,36 @@ static __global__ void packed16_wmma_tile_kernel(
         }
         __syncthreads();
 
-        // Online softmax
+#ifdef GGML_CUDA_PWMMA_DEBUG
+        // Range trap: bad logits (valid rows only)
+        for (int idx = threadIdx.x; idx < PWMMA_BM * PWMMA_BN; idx += blockDim.x) {
+            const int r = idx / PWMMA_BN, c = idx % PWMMA_BN, qq = q_tile * PWMMA_BM + r;
+            if (qq >= nq) continue;
+            const float x = logits_f32[r][c];
+            if (!isfinite(x) || fabsf(x) > 1.0e4f) {
+                printf("PWMMA bad logit block=(%d,%d,%d) r=%d c=%d x=%f (qq=%d valid_k=%d)\n",
+                       blockIdx.x, blockIdx.y, blockIdx.z, r, c, x, qq, valid_k);
+                asm volatile("s_trap 10");
+            }
+        }
+        __syncthreads();
+
+        // Row state trap after softmax
+        for (int r = threadIdx.x; r < PWMMA_BM; r += blockDim.x) {
+            const int qq = q_tile * PWMMA_BM + r;
+            if (qq < nq) {
+                const float m = row_m_smem[r], l = row_l_smem[r];
+                if (!isfinite(m) || !isfinite(l) || l <= 0.0f || l > float(nk) * 4.0f) {
+                    printf("PWMMA bad row state block=(%d,%d,%d) r=%d m=%f l=%f\n",
+                           blockIdx.x, blockIdx.y, blockIdx.z, r, m, l);
+                    asm volatile("s_trap 11");
+                }
+            }
+        }
+        __syncthreads();
+#endif
+
+        // Alpha scale + PV
         for (int r = threadIdx.x; r < PWMMA_BM; r += blockDim.x) {
             const int qq = q_tile * PWMMA_BM + r;
             if (qq >= nq) { alpha_smem[r] = 0.0f; continue; }
@@ -261,6 +353,22 @@ static __global__ void packed16_wmma_tile_kernel(
             alpha_smem[r] = alpha; row_m_smem[r] = new_m; row_l_smem[r] = row_l_smem[r] * alpha + p_sum;
         }
         __syncthreads();
+
+#ifdef GGML_CUDA_PWMMA_DEBUG
+        // Row state trap after softmax
+        for (int r = threadIdx.x; r < PWMMA_BM; r += blockDim.x) {
+            const int qq = q_tile * PWMMA_BM + r;
+            if (qq < nq) {
+                const float m = row_m_smem[r], l = row_l_smem[r];
+                if (!isfinite(m) || !isfinite(l) || l <= 0.0f || l > float(nk) * 4.0f) {
+                    printf("PWMMA bad row state block=(%d,%d,%d) r=%d m=%f l=%f\n",
+                           blockIdx.x, blockIdx.y, blockIdx.z, r, m, l);
+                    asm volatile("s_trap 11");
+                }
+            }
+        }
+        __syncthreads();
+#endif
 
         // Alpha scale + PV
         for (int idx = threadIdx.x; idx < PWMMA_BM * PWMMA_D; idx += blockDim.x) out_smem[idx] *= alpha_smem[idx / PWMMA_D];
@@ -310,19 +418,11 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
     GGML_ASSERT(packed16_payload->nb[0] == (int64_t)sizeof(int) && packed16_scales->nb[0] == (int64_t)sizeof(half));
     GGML_ASSERT(packed16_payload->nb[1] == (PWMMA_D/4)*(int64_t)sizeof(int));
     GGML_ASSERT(packed16_scales->nb[1] == (PWMMA_D/QK8_0)*(int64_t)sizeof(half));
-    // Assert compact head/batch layout
+    // Assert compact head/batch layout (required for k_head_base arithmetic)
     GGML_ASSERT(packed16_payload->nb[2] == packed16_payload->ne[1] * packed16_payload->nb[1]);
     GGML_ASSERT(packed16_scales->nb[2]  == packed16_scales->ne[1]  * packed16_scales->nb[1]);
     GGML_ASSERT(packed16_payload->nb[3] == packed16_payload->ne[2] * packed16_payload->nb[2]);
     GGML_ASSERT(packed16_scales->nb[3]  == packed16_scales->ne[2]  * packed16_scales->nb[2]);
-    // v0.3: single-batch only. Packed16 rows are flat [head][kv].
-    GGML_ASSERT(Q->ne[3] == 1);
-    GGML_ASSERT(packed16_payload->ne[1] >= K->ne[1] * K->ne[2]);
-    GGML_ASSERT(packed16_scales->ne[1]  >= K->ne[1] * K->ne[2]);
-    GGML_ASSERT(packed16_payload->ne[2] == 1);
-    GGML_ASSERT(packed16_scales->ne[2]  == 1);
-    GGML_ASSERT(packed16_payload->ne[3] == 1);
-    GGML_ASSERT(packed16_scales->ne[3]  == 1);
     // Packed16 stores all heads flat in ne[1]: rows = kv_size * n_heads_k
     // ne[2] = n_stream (batch), not n_heads_k
     (void)0;
@@ -333,7 +433,8 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
     const int nq = (int)Q->ne[1], nk = (int)K->ne[1], n_heads_q = (int)Q->ne[2], n_heads_k = (int)K->ne[2];
     const int gqa_ratio = n_heads_q / n_heads_k, batch = (int)Q->ne[3];
     const float attention_scale = ((const float*)dst->op_params)[0];
-    const int packed_kv_size = (int)packed16_payload->ne[1]; // unused in v0.3 single-batch, kept for future multi-batch
+    const int packed_kv_size = (int)packed16_payload->ne[1]; // total flat rows (all heads)
+    const int packed_batch   = (int)packed16_payload->ne[3];
     const int64_t v_ne13 = V->ne[3] > 0 ? V->ne[3] : 1;
     const int64_t mask_nb30 = mask ? mask->nb[0] : 0, mask_nb31 = mask ? mask->nb[1] : 0;
     const int64_t mask_nb33 = mask ? mask->nb[3] : 0, mask_ne33 = mask ? mask->ne[3] : 1;

@@ -652,10 +652,9 @@ static bool ggml_cuda_fattn_route_contract_matches(const char * required, const 
     if (strcmp(required, "rocm_packed16_wmma_tile") == 0 && kernel == BEST_FATTN_KERNEL_PACKED16_WMMA_TILE) {
         return true;
     }
-    // packed16_wmma_tile delegates to DOT4 for nq==1 decode.
-    if (strcmp(required, "rocm_packed16_wmma_tile") == 0 && kernel == BEST_FATTN_KERNEL_Q8K_DOT4_KQ) {
-        return true;
-    }
+    // DOT4 is NOT accepted for packed16_wmma_tile in the route contract.
+    // nq==1 decode will naturally route to DOT4 (I32 decode path always returns DOT4),
+    // and the contract_final check allows nq==1 DOT4. See ggml_cuda_fattn_apply_route_contract.
     if ((strcmp(required, "q8q4_dot4_prefill") == 0 || strcmp(required, "rocm_q8q4_dot4") == 0 ||
          strcmp(required, "q8q4_dot4") == 0) && kernel == BEST_FATTN_KERNEL_Q8Q4_DOT4_PREFILL) {
         return true;
@@ -891,6 +890,16 @@ static best_fattn_kernel ggml_cuda_fattn_apply_route_contract(
         return selected;
     }
     if (ggml_cuda_fattn_route_contract_matches(required, selected)) {
+        // Final guard: packed16_wmma_tile must never accept DOT4 for nq>1.
+        if ((strcmp(required, "rocm_packed16_wmma_tile") == 0 ||
+             strcmp(required, "packed16_wmma_tile") == 0) &&
+            selected != BEST_FATTN_KERNEL_PACKED16_WMMA_TILE) {
+            const ggml_tensor * Q = dst->src[0];
+            if (Q->ne[1] > 1) {
+                GGML_ABORT("route contract violation: rocm_packed16_wmma_tile required but selected %s (nq=%d)",
+                    ggml_cuda_fattn_kernel_name(selected), (int)Q->ne[1]);
+            }
+        }
         ggml_cuda_fattn_log_route_contract(required, "selected", selected, dst, f16_policy);
         return selected;
     }
@@ -2627,6 +2636,21 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
         const ggml_fattn_instruction inst = (ggml_fattn_instruction)fa_inst_i32;
 
+        // Hard gate: if packed16_wmma_tile is explicitly required, force it or abort.
+        const char * required_route = getenv("GGML_CUDA_FA_ROUTE_REQUIRE");
+        const bool require_packed16_wmma =
+            required_route &&
+            (strcmp(required_route, "rocm_packed16_wmma_tile") == 0 ||
+             strcmp(required_route, "packed16_wmma_tile") == 0);
+        if (require_packed16_wmma && ggml_cuda_packed16_wmma_tile_enabled()) {
+            if (Q->ne[1] == 1) {
+                // nq==1 decode: WMMA kernel doesn't support decode. Allow DOT4.
+                return BEST_FATTN_KERNEL_Q8K_DOT4_KQ;
+            }
+            // Force WMMA for nq>1.
+            return BEST_FATTN_KERNEL_PACKED16_WMMA_TILE;
+        }
+
         const bool prefill_or_verify =
             Q->ne[1] > 1 &&
             (inst == GGML_FATTN_INST_PREFILL_QK ||
@@ -2636,6 +2660,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
         // nq == 1 decode: always route to DOT4 (BN64/split-K).
         // packed16_wmma_tile only supports nq > 1.
+        // When WMMA is explicitly required via env, nq==1 is still
+        // allowed to use DOT4 (WMMA decode kernel doesn't exist).
         if (Q->ne[1] == 1) {
             return BEST_FATTN_KERNEL_Q8K_DOT4_KQ;
         }
