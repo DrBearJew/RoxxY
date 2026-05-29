@@ -23,7 +23,11 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, struct ggml_t
 //   rocm_q8k_dot4_decode_splitk_mtp_draft     — split-K decode
 static inline bool ggml_cuda_q8k_dot4_kq_route_required() {
     const char * required = getenv("GGML_CUDA_FA_ROUTE_REQUIRE");
-    if (!required) return true; // No route requirement → DOT4 allowed
+    if (!required || required[0] == '\0' || strcmp(required, "any") == 0) {
+        // DOT4 recthist is a lab route. Only auto-select with explicit opt-in.
+        const char * auto_env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_KQ_AUTO");
+        return auto_env && atoi(auto_env) != 0;
+    }
     // Broad contract plus all precise family names.
     return strcmp(required, "rocm_q8k_dot4_kq") == 0
         || strcmp(required, "rocm_q8k_dot4_recthist_mtp_verify") == 0
@@ -33,12 +37,17 @@ static inline bool ggml_cuda_q8k_dot4_kq_route_required() {
 }
 
 static inline bool ggml_cuda_q8k_dot4_kq_enabled() {
-    const char * unsafe = getenv("GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE");
-    if (!unsafe) {
-        unsafe = getenv("GGML_CUDA_ROCM_UNSAFE_EXPERIMENTS");
+    // Default-enabled. Explicitly disabled by EXPERIMENTAL_UNSAFE=0 or Q8K_DOT4_KQ=0.
+    {
+        const char * v = getenv("GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE");
+        if (!v) v = getenv("GGML_CUDA_ROCM_UNSAFE_EXPERIMENTS");
+        if (v && atoi(v) == 0) return false;
     }
-    const char * env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_KQ");
-    return unsafe && atoi(unsafe) != 0 && env && atoi(env) != 0 && ggml_cuda_q8k_dot4_kq_route_required();
+    {
+        const char * v = getenv("GGML_CUDA_ROCM_Q8K_DOT4_KQ");
+        if (v && atoi(v) == 0) return false;
+    }
+    return ggml_cuda_q8k_dot4_kq_route_required();
 }
 
 static inline bool ggml_cuda_q8k_dot4_kq_supported(const int cc, const ggml_tensor * dst) {

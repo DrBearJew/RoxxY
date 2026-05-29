@@ -662,6 +662,13 @@ private:
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
+    // Prompt cache mode derived from seq_rm capability
+    enum slot_cache_mode {
+        SLOT_CACHE_PARTIAL_SEQ_RM,
+        SLOT_CACHE_CHECKPOINT_FULL,
+        SLOT_CACHE_FULL_REPROCESS,
+    } cache_mode = SLOT_CACHE_FULL_REPROCESS;
+
     common_speculative_ptr spec;
 
     bool add_bos_token = true;
@@ -934,6 +941,16 @@ private:
 
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
             SRV_WRN("%s", "speculative decoding will use checkpoints\n");
+        }
+
+        // Resolve prompt cache mode
+        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+            ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+            cache_mode = SLOT_CACHE_PARTIAL_SEQ_RM;
+        } else if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+            cache_mode = SLOT_CACHE_CHECKPOINT_FULL;
+        } else {
+            cache_mode = SLOT_CACHE_FULL_REPROCESS;
         }
 
         // initialize slots
@@ -2612,6 +2629,21 @@ private:
 
                                     SLT_DBG(slot, "after context reuse, new n_past = %d\n", n_past);
                                 }
+
+                                // For non-PARTIAL cache modes: only safe to reuse cache
+                                // when the new prompt exactly extends the cached prefix.
+                                // If we'd need to trim the suffix, force full reprocessing.
+                                if (cache_mode != SLOT_CACHE_PARTIAL_SEQ_RM) {
+                                    if (n_past > slot.task->n_tokens()) {
+                                        SLT_WRN(slot, "%s", "non-PARTIAL cache mode: cached suffix would need trimming, forcing n_past=0\n");
+                                        n_past = 0;
+                                        slot.n_prompt_tokens_cache = 0;
+                                        slot.n_prompt_tokens_processed = 0;
+                                        // Clear KV cache state so batch init starts from empty
+                                        common_context_seq_rm(ctx_tgt, slot.id, 0, -1);
+                                        if (ctx_dft) common_context_seq_rm(ctx_dft.get(), slot.id, 0, -1);
+                                    }
+                                }
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
                                 n_past = 0;
@@ -2702,6 +2734,13 @@ private:
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
                                         pos_next = 0;
                                         n_past = 0;
+                                        if (cache_mode != SLOT_CACHE_PARTIAL_SEQ_RM) {
+                                            slot.n_prompt_tokens_cache = 0;
+                                            slot.n_prompt_tokens_processed = 0;
+                                        }
+                                        // p0=0 is safe for all seq_rm types
+                                        common_context_seq_rm(ctx_tgt, slot.id, 0, -1);
+                                        if (ctx_dft) common_context_seq_rm(ctx_dft.get(), slot.id, 0, -1);
                                     }
                                 }
                             }
@@ -2723,8 +2762,17 @@ private:
                         // [TAG_PROMPT_LOGITS]
                         if (n_past == slot.task->n_tokens() && n_past > 0) {
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
-                            n_past--;
-                            SLT_WRN(slot, "n_past was set to %d\n", n_past);
+                            if (cache_mode == SLOT_CACHE_PARTIAL_SEQ_RM) {
+                                n_past--;
+                                SLT_WRN(slot, "n_past was set to %d\n", n_past);
+                            } else {
+                                // For CHECKPOINT_FULL/FULL_REPROCESS: cannot do partial removal.
+                                // Force full reprocessing when we'd need to trim the suffix.
+                                SLT_WRN(slot, "%s", "forcing full re-processing (context does not support partial seq_rm)\n");
+                                n_past = 0;
+                                slot.n_prompt_tokens_cache = 0;
+                                slot.n_prompt_tokens_processed = 0;
+                            }
                         }
 
                         slot.n_prompt_tokens_cache = n_past;
@@ -2753,11 +2801,15 @@ private:
                     // truncate any tokens that are beyond n_past for this slot
                     const llama_pos p0 = slot.prompt.tokens.pos_next();
 
-                    SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
+                    SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end) cache_mode=%d\n", slot.prompt.n_tokens(), p0, (int)cache_mode);
 
-                    common_context_seq_rm(ctx_tgt, slot.id, p0, -1);
-                    if (ctx_dft) {
-                        common_context_seq_rm(ctx_dft.get(), slot.id, p0, -1);
+                    // Only call seq_rm for PARTIAL mode. CHECKPOINT_FULL and
+                    // FULL_REPROCESS manage state through checkpoints or full reprocessing.
+                    if (cache_mode == SLOT_CACHE_PARTIAL_SEQ_RM) {
+                        common_context_seq_rm(ctx_tgt, slot.id, p0, -1);
+                        if (ctx_dft) {
+                            common_context_seq_rm(ctx_dft.get(), slot.id, p0, -1);
+                        }
                     }
 
                     // If using an alora, there may be uncached tokens that come

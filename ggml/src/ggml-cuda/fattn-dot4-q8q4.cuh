@@ -7,11 +7,10 @@
 
 static inline bool ggml_cuda_dot4_prefill_unsafe_enabled() {
 #ifdef GGML_USE_HIP
-    const char * env = getenv("GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE");
-    if (!env) {
-        env = getenv("GGML_CUDA_ROCM_UNSAFE_EXPERIMENTS");
-    }
-    return env && atoi(env) != 0;
+    // Default-enabled. Explicitly disabled by EXPERIMENTAL_UNSAFE=0.
+    const char * v = getenv("GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE");
+    if (!v) v = getenv("GGML_CUDA_ROCM_UNSAFE_EXPERIMENTS");
+    return !(v && atoi(v) == 0);
 #else
     return false;
 #endif
@@ -19,8 +18,9 @@ static inline bool ggml_cuda_dot4_prefill_unsafe_enabled() {
 
 static inline bool ggml_cuda_q8q4_dot4_prefill_enabled() {
 #ifdef GGML_USE_HIP
-    const char * env = getenv("GGML_CUDA_ROCM_Q8Q4_DOT4_PREFILL");
-    return ggml_cuda_dot4_prefill_unsafe_enabled() && env && atoi(env) != 0;
+    // Default-enabled. Explicitly disabled by EXPERIMENTAL_UNSAFE=0 or Q8Q4_DOT4_PREFILL=0.
+    const char * v = getenv("GGML_CUDA_ROCM_Q8Q4_DOT4_PREFILL");
+    return ggml_cuda_dot4_prefill_unsafe_enabled() && !(v && atoi(v) == 0);
 #else
     return false;
 #endif
@@ -95,8 +95,9 @@ static inline bool ggml_cuda_q8q4_dot4_prefill_supported(const int cc, const ggm
 
 static inline bool ggml_cuda_q8tbq4_dot4_prefill_enabled() {
 #ifdef GGML_USE_HIP
-    const char * env = getenv("GGML_CUDA_ROCM_Q8TBQ4_DOT4_PREFILL");
-    return ggml_cuda_dot4_prefill_unsafe_enabled() && env && atoi(env) != 0;
+    // Default-enabled. Explicitly disabled by EXPERIMENTAL_UNSAFE=0 or Q8TBQ4_DOT4_PREFILL=0.
+    const char * v = getenv("GGML_CUDA_ROCM_Q8TBQ4_DOT4_PREFILL");
+    return ggml_cuda_dot4_prefill_unsafe_enabled() && !(v && atoi(v) == 0);
 #else
     return false;
 #endif
@@ -168,8 +169,9 @@ static inline bool ggml_cuda_q8tbq4_dot4_prefill_supported(const int cc, const g
 
 static inline bool ggml_cuda_tbq4_dot4_prefill_enabled() {
 #ifdef GGML_USE_HIP
-    const char * env = getenv("GGML_CUDA_ROCM_TBQ4_DOT4_PREFILL");
-    return ggml_cuda_dot4_prefill_unsafe_enabled() && env && atoi(env) != 0;
+    // Default-enabled. Explicitly disabled by EXPERIMENTAL_UNSAFE=0 or TBQ4_DOT4_PREFILL=0.
+    const char * v = getenv("GGML_CUDA_ROCM_TBQ4_DOT4_PREFILL");
+    return ggml_cuda_dot4_prefill_unsafe_enabled() && !(v && atoi(v) == 0);
 #else
     return false;
 #endif

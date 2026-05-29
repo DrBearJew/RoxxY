@@ -84,7 +84,10 @@ static inline bool ggml_cuda_tbq4_lds_route_d_k_enabled() {
 static inline bool ggml_cuda_q8k_dot4_packed16_vec_route_required() {
 #ifdef GGML_USE_HIP
     const char * required = getenv("GGML_CUDA_FA_ROUTE_REQUIRE");
-    return required && strcmp(required, "rocm_q8k_dot4_packed16_vec") == 0;
+    if (!required || required[0] == '\0' || strcmp(required, "any") == 0) {
+        return true;
+    }
+    return strcmp(required, "rocm_q8k_dot4_packed16_vec") == 0;
 #else
     return false;
 #endif
@@ -92,12 +95,36 @@ static inline bool ggml_cuda_q8k_dot4_packed16_vec_route_required() {
 
 static inline bool ggml_cuda_q8k_dot4_packed16_vec_enabled() {
 #ifdef GGML_USE_HIP
-    const char * unsafe = getenv("GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE");
-    if (!unsafe) {
-        unsafe = getenv("GGML_CUDA_ROCM_UNSAFE_EXPERIMENTS");
+    // Default-enabled. Explicitly disabled by EXPERIMENTAL_UNSAFE=0 or PACKED16_VEC=0.
+    {
+        const char * v = getenv("GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE");
+        if (!v) v = getenv("GGML_CUDA_ROCM_UNSAFE_EXPERIMENTS");
+        if (v && atoi(v) == 0) return false;
     }
-    const char * env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_VEC");
-    return unsafe && atoi(unsafe) != 0 && env && atoi(env) != 0 && ggml_cuda_q8k_dot4_packed16_vec_route_required();
+    {
+        const char * v = getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_VEC");
+        if (v && atoi(v) == 0) return false;
+    }
+    return ggml_cuda_q8k_dot4_packed16_vec_route_required();
+#else
+    return false;
+#endif
+}
+
+static inline bool ggml_cuda_packed16_wmma_tile_enabled() {
+#ifdef GGML_USE_HIP
+    // Opt-in packed16→f16 tile materializer + WMMA/MFMA FA path.
+    // Requires persistent packed16 K cache (GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE=1).
+    {
+        const char * v = getenv("GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE");
+        if (!v) v = getenv("GGML_CUDA_ROCM_UNSAFE_EXPERIMENTS");
+        if (v && atoi(v) == 0) return false;
+    }
+    {
+        const char * v = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_TILE");
+        if (!v || atoi(v) == 0) return false;
+    }
+    return true;
 #else
     return false;
 #endif

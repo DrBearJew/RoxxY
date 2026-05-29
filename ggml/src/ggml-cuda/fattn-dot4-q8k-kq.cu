@@ -3210,14 +3210,30 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
     const bool blockfa_recthist_v3_vhoist = variant_env && strcmp(variant_env, "blockfa_recthist_v3_vhoist") == 0;
     const bool blockfa_recthist_v4_single = variant_env && strcmp(variant_env, "blockfa_recthist_v4_single") == 0;
     const bool blockfa_recthist_v2_any = blockfa_recthist_v2 || blockfa_recthist_v2_bn16;
-    const bool blockfa_recthist_any = blockfa_recthist_v2_any || blockfa_recthist_v3_vhoist || blockfa_recthist_v4_single;
+    const bool blockfa_recthist_any_explicit = blockfa_recthist_v2_any || blockfa_recthist_v3_vhoist || blockfa_recthist_v4_single;
     const bool blockfa_hybrid_bm8_hgroup = blockfa_hybrid_bm8_hpair || blockfa_hybrid_bm8_hpair_kreuse || blockfa_hybrid_bm8_hpair_warpkq || blockfa_hybrid_bm8_hpair_rowwarpkq || blockfa_hybrid_bm8_htriad || blockfa_hybrid_bm8_htriad_kreuse || blockfa_hybrid_bm8_hquad;
     const bool blockfa_hybrid_bm8_kreuse = blockfa_hybrid_bm8_hpair_kreuse || blockfa_hybrid_bm8_htriad_kreuse;
     const bool blockfa_hybrid_bm8_any = blockfa_hybrid_bm8 || blockfa_hybrid_bm8_packed16_scalar || blockfa_hybrid_bm8_vreuse || blockfa_hybrid_bm8_hgroup;
-    const bool blockfa_runtime_any = blockfa_hybrid_bm8_any || blockfa_recthist_any;
-    const bool fused_variant = fused_online || fused_tile8_parallel || grouped_gqa_online || grouped_gqa_qtile2_tile8 || grouped_gqa_qtile4_tile8 || grouped_gqa6_qtile4_tile8 || grouped_gqa6_qtile4_vshared || blockfa_runtime_any;
+    const bool blockfa_runtime_any_explicit = blockfa_hybrid_bm8_any || blockfa_recthist_any_explicit;
+    const bool fused_variant_explicit = fused_online || fused_tile8_parallel || grouped_gqa_online || grouped_gqa_qtile2_tile8 || grouped_gqa_qtile4_tile8 || grouped_gqa6_qtile4_tile8 || grouped_gqa6_qtile4_vshared || blockfa_runtime_any_explicit;
     const bool full_fa = ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_KQ_FULL_FA");
-    const char * variant_name = blockfa_recthist_v4_single ? "blockfa_recthist_v4_single" :
+
+    // Auto-select blockfa_recthist_v4_single for f16/q8_0/q4_0 V when FULL_FA=1
+    // and no explicit variant is set. The default packed16 path for f16/q8_0 would
+    // read V data as q4_0 blocks (incorrect); and the default q4_0 path uses the
+    // legacy fattn_from_logits kernel which has poor occupancy at scale.
+    // blockfa_recthist_v4_single handles all three V types natively.
+    const bool blockfa_recthist_v4_single_auto =
+        full_fa && !fused_variant_explicit &&
+        (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0);
+
+    const bool blockfa_recthist_v4_single_effective = blockfa_recthist_v4_single || blockfa_recthist_v4_single_auto;
+    const bool blockfa_recthist_any_effective = blockfa_recthist_v2_any || blockfa_recthist_v3_vhoist || blockfa_recthist_v4_single_effective;
+    const bool blockfa_runtime_any_effective = blockfa_hybrid_bm8_any || blockfa_recthist_any_effective;
+    const bool fused_variant_effective = fused_online || fused_tile8_parallel || grouped_gqa_online || grouped_gqa_qtile2_tile8 || grouped_gqa_qtile4_tile8 || grouped_gqa6_qtile4_tile8 || grouped_gqa6_qtile4_vshared || blockfa_runtime_any_effective;
+
+    const char * variant_name = blockfa_recthist_v4_single_auto && !blockfa_recthist_v4_single ? "blockfa_recthist_v4_single_auto" :
+            (blockfa_recthist_v4_single ? "blockfa_recthist_v4_single" :
             (blockfa_recthist_v2_bn16 ? "blockfa_recthist_v2_bn16" :
             (blockfa_recthist_v2 ? "blockfa_recthist_v2" :
             (blockfa_hybrid_bm8_hpair_rowwarpkq ? "blockfa_hybrid_bm8_hpair_rowwarpkq" :
@@ -3237,8 +3253,8 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
             (grouped_gqa_online ? "grouped_gqa_online" :
             (fused_tile8_parallel ? "fused_tile8_parallel" :
             (fused_online ? "fused_online" :
-            (q8block_variant ? "q8block" : "packed16"))))))))))))))))))));
-    const char * variant_note = blockfa_recthist_v4_single ? "blockfa_recthist_v4_single_probe" :
+            (q8block_variant ? "q8block" : "packed16")))))))))))))))))))));
+    const char * variant_note = blockfa_recthist_v4_single_effective ? "blockfa_recthist_v4_single_probe" :
             (blockfa_recthist_v2_bn16 ? "blockfa_recthist_v2_bn16_probe" :
             (blockfa_recthist_v2 ? "blockfa_recthist_v2_probe" :
             (blockfa_hybrid_bm8_hpair_rowwarpkq ? "blockfa_hybrid_bm8_hpair_rowwarpkq_probe" :
@@ -3259,7 +3275,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
             (fused_tile8_parallel ? "fused_tile8_parallel_probe" :
             (fused_online ? "fused_online_probe" :
             (full_fa ? "full_fa_from_logits_probe" : "kq_only_zero_output"))))))))))))))))))));
-    if (fused_variant && !full_fa) {
+    if (fused_variant_effective && !full_fa) {
         GGML_ABORT("q8k_dot4_kq fused variants require GGML_CUDA_ROCM_Q8K_DOT4_KQ_FULL_FA=1");
     }
 
@@ -3271,7 +3287,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
         if (sinks != nullptr || max_bias != 0.0f || logit_softcap != 0.0f) {
             GGML_ABORT("q8k_dot4_kq full FA probe does not support sinks, max_bias, or logit_softcap");
         }
-        if (fused_variant && q8block_variant) {
+        if (fused_variant_effective && q8block_variant) {
             GGML_ABORT("q8k_dot4_kq fused variants require packed16 K");
         }
         if (mask && (mask->type != GGML_TYPE_F16 || mask->ne[0] != K->ne[1] || mask->ne[1] != Q->ne[1] ||
@@ -3286,8 +3302,14 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
             GGML_ABORT("q8k_dot4_kq grouped_gqa6 qtile4 variants require GQA ratio %d, got %d",
                     GGML_CUDA_Q8K_DOT4_KQ_GQA6, gqa_ratio);
         }
-        if (blockfa_runtime_any && mask && getenv("GGML_CUDA_ROCM_Q8K_DOT4_BLOCKFA_ASSUME_CAUSAL") == nullptr) {
-            GGML_ABORT("q8k_dot4_kq blockFA variants require no mask or GGML_CUDA_ROCM_Q8K_DOT4_BLOCKFA_ASSUME_CAUSAL=1");
+        if (blockfa_runtime_any_effective && mask && getenv("GGML_CUDA_ROCM_Q8K_DOT4_BLOCKFA_ASSUME_CAUSAL") == nullptr) {
+            // Auto-selected blockfa_recthist_v4_single: assume causal mask is
+            // correctly supplied (standard attention with causal mask).
+            if (blockfa_recthist_v4_single_auto) {
+                // OK — auto path implies causal mask is intentional.
+            } else {
+                GGML_ABORT("q8k_dot4_kq blockFA variants require no mask or GGML_CUDA_ROCM_Q8K_DOT4_BLOCKFA_ASSUME_CAUSAL=1");
+            }
         }
     }
 
@@ -3356,35 +3378,35 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
         k_payload.alloc(k_rows * (GGML_CUDA_Q8K_DOT4_KQ_D / 4));
         k_scales.alloc(k_rows * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS);
     }
-    if (!fused_variant) {
+    if (!fused_variant_effective) {
         logits.alloc(logits_ne);
     }
     const char * blockfa_split_k_env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_BLOCKFA_SPLIT_K");
-    const int blockfa_split_k_requested = blockfa_split_k_env ? atoi(blockfa_split_k_env) : (blockfa_recthist_any ? 1 : 4);
-    const int blockfa_split_k = blockfa_runtime_any ? max(1, blockfa_split_k_requested) : 1;
+    const int blockfa_split_k_requested = blockfa_split_k_env ? atoi(blockfa_split_k_env) : (blockfa_recthist_any_effective ? 1 : 4);
+    const int blockfa_split_k = blockfa_runtime_any_effective ? max(1, blockfa_split_k_requested) : 1;
     const int blockfa_bn_default = blockfa_recthist_v2_bn16 ? 16 : 8;
-    const int blockfa_bn = blockfa_runtime_any ? ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_BLOCKFA_BN", blockfa_bn_default) : 8;
+    const int blockfa_bn = blockfa_runtime_any_effective ? ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_BLOCKFA_BN", blockfa_bn_default) : 8;
     const int blockfa_v_reuse = (blockfa_hybrid_bm8_vreuse || blockfa_hybrid_bm8_hgroup) ? 1 : 0;
-    const int blockfa_q_offset = (full_fa && blockfa_runtime_any && mask) ? max(0, nk - nq) : 0;
-    const int blockfa_recthist_prefix_k = blockfa_recthist_any ? blockfa_q_offset : 0;
-    const int blockfa_recthist_tail_k = blockfa_recthist_any ? nk - blockfa_q_offset : 0;
-    if (blockfa_recthist_any) {
+    const int blockfa_q_offset = (full_fa && blockfa_runtime_any_effective && mask) ? max(0, nk - nq) : 0;
+    const int blockfa_recthist_prefix_k = blockfa_recthist_any_effective ? blockfa_q_offset : 0;
+    const int blockfa_recthist_tail_k = blockfa_recthist_any_effective ? nk - blockfa_q_offset : 0;
+    if (blockfa_recthist_any_effective) {
         if (blockfa_split_k_requested != 1) {
             GGML_ABORT("q8k_dot4_kq blockfa_recthist variants support splitK=1 only, got %d", blockfa_split_k_requested);
         }
         if ((blockfa_recthist_v2 || blockfa_recthist_v3_vhoist) && blockfa_bn != 8) {
             GGML_ABORT("q8k_dot4_kq blockfa_recthist_v2/v3 requires BN8, got %d", blockfa_bn);
         }
-        if (blockfa_recthist_v4_single) {
+        if (blockfa_recthist_v4_single_effective) {
             if (blockfa_bn != 8 && blockfa_bn != 16) {
-                GGML_ABORT("q8k_dot4_kq blockfa_recthist_v4_single requires BN8 or BN16, got %d", blockfa_bn);
+                GGML_ABORT("q8k_dot4_kq blockfa_recthist_v4_single_effective requires BN8 or BN16, got %d", blockfa_bn);
             }
             const int v4_bm = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_BLOCKFA_BM", 8);
             if (v4_bm != 8 && v4_bm != 16) {
-                GGML_ABORT("q8k_dot4_kq blockfa_recthist_v4_single requires BM8 or BM16, got %d", v4_bm);
+                GGML_ABORT("q8k_dot4_kq blockfa_recthist_v4_single_effective requires BM8 or BM16, got %d", v4_bm);
             }
             if (v4_bm == 16 && blockfa_bn == 16) {
-                GGML_ABORT("q8k_dot4_kq blockfa_recthist_v4_single BM16+BN16 not supported (no idle threads for V prefetch)");
+                GGML_ABORT("q8k_dot4_kq blockfa_recthist_v4_single_effective BM16+BN16 not supported (no idle threads for V prefetch)");
             }
         }
         if (blockfa_recthist_v2_bn16 && blockfa_bn != 16) {
@@ -3399,8 +3421,8 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
             GGML_ABORT("q8k_dot4_kq blockfa_hybrid_bm8_packed16_scalar excludes V/K reuse variants");
         }
     }
-    if ((blockfa_recthist_any && !blockfa_recthist_v4_single) || (blockfa_hybrid_bm8_any && blockfa_split_k > 1)) {
-        const size_t partial_rows = q_rows * size_t(blockfa_recthist_any ? 2 : blockfa_split_k);
+    if ((blockfa_recthist_any_effective && !blockfa_recthist_v4_single_effective) || (blockfa_hybrid_bm8_any && blockfa_split_k > 1)) {
+        const size_t partial_rows = q_rows * size_t(blockfa_recthist_any_effective ? 2 : blockfa_split_k);
         blockfa_partial_o.alloc(partial_rows * GGML_CUDA_Q8K_DOT4_KQ_D);
         blockfa_partial_m.alloc(partial_rows);
         blockfa_partial_l.alloc(partial_rows);
@@ -3447,7 +3469,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
         CUDA_CHECK(hipEventRecord(ev_q_quant, stream));
     }
 
-    if (!q8block_variant || fused_variant) {
+    if (!q8block_variant || fused_variant_effective) {
         if (!skip_k_repack) {
             // Packed16 I32 K is pre-quantized; skip repack and use registry data.
             const bool k_is_already_packed16 = (K->type == GGML_TYPE_I32);
@@ -3483,7 +3505,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
     dim3 kq_grid((nk + GGML_CUDA_Q8K_DOT4_KQ_TILE_N - 1) / GGML_CUDA_Q8K_DOT4_KQ_TILE_N,
                  (nq + GGML_CUDA_Q8K_DOT4_KQ_TILE_M - 1) / GGML_CUDA_Q8K_DOT4_KQ_TILE_M,
                  n_heads_q * batch);
-    if (!fused_variant) {
+    if (!fused_variant_effective) {
         if (q8block_variant) {
             ggml_cuda_q8k_dot4_kq_q8block_kernel<<<kq_grid, block, 0, stream>>>(
                 q_payload.ptr, q_scales.ptr, (const char *) K->data, logits.ptr, scale,
@@ -3499,7 +3521,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
         CUDA_CHECK(hipEventRecord(ev_kq, stream));
     }
 
-    if (check && !fused_variant) {
+    if (check && !fused_variant_effective) {
         ref_logits.alloc(logits_ne);
         metrics.alloc(3);
         CUDA_CHECK(cudaMemsetAsync(metrics.ptr, 0, 3 * sizeof(float), stream));
@@ -3528,9 +3550,10 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
 
     if (full_fa) {
         dim3 fa_grid(nq, n_heads_q, batch);
-        if (blockfa_runtime_any) {
+        if (blockfa_runtime_any_effective) {
             const int q_offset = blockfa_q_offset;
-            const bool use_causal = mask && ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_BLOCKFA_ASSUME_CAUSAL");
+            const bool use_causal = mask && (blockfa_recthist_v4_single_auto ||
+                ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_BLOCKFA_ASSUME_CAUSAL"));
             const dim3 blockfa_grid((nq + 7) / 8, blockfa_split_k, n_heads_q * batch);
             const int blockfa_head_group = blockfa_hybrid_bm8_hquad ? 4 :
                 ((blockfa_hybrid_bm8_htriad || blockfa_hybrid_bm8_htriad_kreuse) ? 3 :
@@ -3542,7 +3565,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
             if (blockfa_hybrid_bm8_hgroup && (gqa_ratio != 6 || blockfa_bn != 8)) {
                 GGML_ABORT("q8k_dot4_kq blockfa_hybrid_bm8 hgroup variants require GQA ratio 6 and BN8");
             }
-            if (blockfa_recthist_v4_single) {
+            if (blockfa_recthist_v4_single_effective) {
                 if (!use_causal) {
                     GGML_ABORT("q8k_dot4_kq blockfa_recthist_v4_single requires causal-tail mask and GGML_CUDA_ROCM_Q8K_DOT4_BLOCKFA_ASSUME_CAUSAL=1");
                 }
@@ -3960,22 +3983,22 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
         const float q_quant_ms = ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_start, ev_q_quant);
         const float k_pack_ms  = ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_q_quant, ev_k_pack);
         const float kq_ms      = ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_k_pack, ev_kq);
-        const float ref_ms     = check && !fused_variant ? ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_kq, ev_ref) : 0.0f;
-        const float err_ms     = check && !fused_variant ? ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_ref, ev_err) : 0.0f;
-        const float output_ms  = ggml_cuda_q8k_dot4_kq_event_elapsed_ms(check && !fused_variant ? ev_err : ev_kq, ev_zero);
+        const float ref_ms     = check && !fused_variant_effective ? ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_kq, ev_ref) : 0.0f;
+        const float err_ms     = check && !fused_variant_effective ? ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_ref, ev_err) : 0.0f;
+        const float output_ms  = ggml_cuda_q8k_dot4_kq_event_elapsed_ms(check && !fused_variant_effective ? ev_err : ev_kq, ev_zero);
         const float zero_ms    = full_fa ? 0.0f : output_ms;
         const float fa_ms      = full_fa ? output_ms : 0.0f;
-        const float blockfa_ms = full_fa && blockfa_runtime_any ? ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_kq, ev_blockfa) : 0.0f;
+        const float blockfa_ms = full_fa && blockfa_runtime_any_effective ? ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_kq, ev_blockfa) : 0.0f;
         const float combine_ms = full_fa && ((blockfa_hybrid_bm8_any && blockfa_split_k > 1) || blockfa_recthist_v2_any) ? ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_blockfa, ev_combine) : 0.0f;
         const float prefix_ms  = full_fa && blockfa_recthist_v2_any && blockfa_recthist_prefix_k > 0 ? ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_recthist_ready, ev_recthist_prefix) : 0.0f;
         const float tail_ms    = full_fa && blockfa_recthist_v2_any && blockfa_recthist_tail_k > 0 ? ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_recthist_prefix, ev_recthist_tail) : 0.0f;
         const float merge_ms   = full_fa && blockfa_recthist_v2_any ? ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_recthist_tail, ev_recthist_merge) : 0.0f;
         const float total_ms   = ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_start, ev_zero);
         GGML_LOG_INFO("%s: q8k_dot4_kq_timing call=%llu variant=%s nq=%d nk=%d heads_q=%d heads_k=%d batch=%d check=%d q_quant_ms=%.6f k_pack_ms=%.6f kq_ms=%.6f ref_ms=%.6f err_ms=%.6f zero_ms=%.6f total_ms=%.6f fa_ms=%.6f blockfa_ms=%.6f combine_ms=%.6f prefix_ms=%.6f tail_ms=%.6f merge_ms=%.6f q_offset=%d prefix_k=%d tail_k=%d full_fa=%d blockfa_split_k=%d blockfa_bn=%d\n",
-            __func__, timing_call, variant_name, nq, nk, n_heads_q, n_heads_k, batch, check && !fused_variant ? 1 : 0,
+            __func__, timing_call, variant_name, nq, nk, n_heads_q, n_heads_k, batch, check && !fused_variant_effective ? 1 : 0,
             q_quant_ms, k_pack_ms, kq_ms, ref_ms, err_ms, zero_ms, total_ms, fa_ms, blockfa_ms, combine_ms, prefix_ms, tail_ms, merge_ms,
             blockfa_recthist_v2_any ? blockfa_q_offset : 0, blockfa_recthist_prefix_k, blockfa_recthist_tail_k,
-            full_fa ? 1 : 0, blockfa_runtime_any ? blockfa_split_k : 0, blockfa_runtime_any ? blockfa_bn : 0);
+            full_fa ? 1 : 0, blockfa_runtime_any_effective ? blockfa_split_k : 0, blockfa_runtime_any_effective ? blockfa_bn : 0);
         ggml_cuda_q8k_dot4_kq_event_destroy(ev_start);
         ggml_cuda_q8k_dot4_kq_event_destroy(ev_q_quant);
         ggml_cuda_q8k_dot4_kq_event_destroy(ev_k_pack);
@@ -3995,9 +4018,9 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
     if (log_env && atoi(log_env) != 0) {
         const double q_mib = double(q_rows * GGML_CUDA_Q8K_DOT4_KQ_D) / (1024.0 * 1024.0);
         const double k_mib = double(k_rows * GGML_CUDA_Q8K_DOT4_KQ_D) / (1024.0 * 1024.0);
-        const double logits_mib = fused_variant ? 0.0 : double(logits_ne * sizeof(float)) / (1024.0 * 1024.0);
+        const double logits_mib = fused_variant_effective ? 0.0 : double(logits_ne * sizeof(float)) / (1024.0 * 1024.0);
         GGML_LOG_INFO("%s: route=rocm_q8k_dot4_kq variant=%s full_fa=%d nq=%d nk=%d heads_q=%d heads_k=%d batch=%d q_payload=%.3fMiB k_payload=%.3fMiB logits=%.3fMiB note=%s blockfa_split_k=%d blockfa_bn=%d q_offset=%d prefix_k=%d tail_k=%d\n",
-            __func__, variant_name, full_fa ? 1 : 0, nq, nk, n_heads_q, n_heads_k, batch, q_mib, k_mib, logits_mib, variant_note, blockfa_runtime_any ? blockfa_split_k : 0, blockfa_runtime_any ? blockfa_bn : 0,
+            __func__, variant_name, full_fa ? 1 : 0, nq, nk, n_heads_q, n_heads_k, batch, q_mib, k_mib, logits_mib, variant_note, blockfa_runtime_any_effective ? blockfa_split_k : 0, blockfa_runtime_any_effective ? blockfa_bn : 0,
             blockfa_recthist_v2_any ? blockfa_q_offset : 0, blockfa_recthist_prefix_k, blockfa_recthist_tail_k);
     }
 

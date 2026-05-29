@@ -242,6 +242,10 @@ endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
 
+# DOT4 correctness harness
+add_executable(test-dot4-harness test-dot4-harness.cpp)
+target_link_libraries(test-dot4-harness PRIVATE llama llama-common ggml ggml-cpu ggml-base)
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")

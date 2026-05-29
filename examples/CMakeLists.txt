@@ -31,7 +31,7 @@ else()
     add_subdirectory(simple)
     add_subdirectory(simple-chat)
     add_subdirectory(speculative)
-    add_subdirectory(speculative-simple)
+    #add_subdirectory(speculative-simple)  # disabled: API mismatch after upstream MTP merge
     add_subdirectory(gen-docs)
     add_subdirectory(training)
     add_subdirectory(diffusion)
