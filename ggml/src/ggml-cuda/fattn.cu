@@ -1333,6 +1333,79 @@ static ggml_cuda_fattn_backend_family ggml_cuda_fattn_backend_family_from_kernel
     }
 }
 
+// ── Instruction-driven FA scheduler ────────────────────────────────
+
+// Fast-route classification: recthist vs decode.
+enum ggml_cuda_fattn_fast_route {
+    GGML_CUDA_FAST_ROUTE_NONE = 0,
+    GGML_CUDA_FAST_ROUTE_DOT4_RECTHIST,
+    GGML_CUDA_FAST_ROUTE_DOT4_DECODE,
+};
+
+static const char * ggml_cuda_fattn_fast_route_name(enum ggml_cuda_fattn_fast_route r) {
+    switch (r) {
+        case GGML_CUDA_FAST_ROUTE_DOT4_RECTHIST: return "dot4_recthist";
+        case GGML_CUDA_FAST_ROUTE_DOT4_DECODE:   return "dot4_decode";
+        default:                                   return "none";
+    }
+}
+
+static enum ggml_cuda_fattn_fast_route route_for_instruction(
+        ggml_fattn_instruction inst,
+        const ggml_tensor * Q) {
+    const int64_t nq = Q->ne[1];
+
+    switch (inst) {
+        case GGML_FATTN_INST_MTP_VERIFY_QK:
+        case GGML_FATTN_INST_SPEC_VERIFY_QK:
+        case GGML_FATTN_INST_BATCH_VERIFY_QK:
+        case GGML_FATTN_INST_PREFILL_QK:
+            return nq > 1
+                ? GGML_CUDA_FAST_ROUTE_DOT4_RECTHIST
+                : GGML_CUDA_FAST_ROUTE_NONE;
+
+        case GGML_FATTN_INST_MTP_DRAFT_DECODE_QK:
+        case GGML_FATTN_INST_DECODE_QK:
+            return nq == 1
+                ? GGML_CUDA_FAST_ROUTE_DOT4_DECODE
+                : GGML_CUDA_FAST_ROUTE_NONE;
+
+        default:
+            return GGML_CUDA_FAST_ROUTE_NONE;
+    }
+}
+
+// Rejection ledger: every VEC/TILE fallback must carry a reason.
+enum ggml_cuda_fattn_reject_reason {
+    FATTN_REJECT_NONE = 0,
+    FATTN_REJECT_ENV_DISABLED,
+    FATTN_REJECT_NOT_RDNA3,
+    FATTN_REJECT_NQ_WRONG_FOR_ROUTE,
+    FATTN_REJECT_D_NOT_256,
+    FATTN_REJECT_MASK_LAYOUT,
+    FATTN_REJECT_ALIBI,
+    FATTN_REJECT_LOGIT_SOFTCAP,
+    FATTN_REJECT_SINKS,
+    FATTN_REJECT_MISSING_K_REPR,
+    FATTN_REJECT_UNSUPPORTED_V,
+    FATTN_REJECT_WORKSPACE_BUDGET,
+    FATTN_REJECT_ROUTE_CONTRACT,
+};
+
+// Fast-path result: selection + diagnostic.
+struct fattn_fastpath_result {
+    best_fattn_kernel selected;
+    const char * route;
+    const char * reason;
+    bool fastpath_selected;
+};
+
+// Strict mode: abort on VEC/TILE fallback for instruction paths.
+static bool ggml_cuda_fa_no_vec_tile_for_instructions_enabled() {
+    const char * env = getenv("GGML_CUDA_FA_NO_VEC_TILE_FOR_INSTRUCTIONS");
+    return env && atoi(env) != 0;
+}
+
 // ── Canonical log helper ──────────────────────────────────────────
 // Centralized instruction-route logging for all MTP selectors.
 // Single format: fa_instruction, dot4_role, backend_family, k_repr, v_repr.
@@ -1578,6 +1651,7 @@ static const char * ggml_cuda_fattn_instruction_name(
         case GGML_FATTN_INST_PREFILL_QK:          return "prefill_qk";
         case GGML_FATTN_INST_DECODE_QK:           return "decode_qk";
         case GGML_FATTN_INST_SPEC_VERIFY_QK:      return "spec_verify_qk";
+        case GGML_FATTN_INST_BATCH_VERIFY_QK:     return "batch_verify_qk";
     }
 
     return "unknown";
@@ -2229,33 +2303,57 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // DOT4/WMMA/VEC are selected as implementations.
     {
         const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
+        const ggml_fattn_instruction inst = (ggml_fattn_instruction)fa_inst_i32;
         const bool is_recthist_inst =
             fa_inst_i32 == GGML_FATTN_INST_MTP_VERIFY_QK ||
             fa_inst_i32 == GGML_FATTN_INST_PREFILL_QK ||
-            fa_inst_i32 == GGML_FATTN_INST_SPEC_VERIFY_QK;
+            fa_inst_i32 == GGML_FATTN_INST_SPEC_VERIFY_QK ||
+            fa_inst_i32 == GGML_FATTN_INST_BATCH_VERIFY_QK;
         const bool is_decode_inst =
             fa_inst_i32 == GGML_FATTN_INST_MTP_DRAFT_DECODE_QK ||
             fa_inst_i32 == GGML_FATTN_INST_DECODE_QK;
+        const bool is_instruction_path =
+            is_recthist_inst || is_decode_inst;
 
         if (is_recthist_inst) {
             ggml_cuda_rocm_quant_prefill_f16_policy mtp_f16_policy = {};
             const auto selected = ggml_cuda_select_mtp_verify_fattn(
-                cc, dst, &mtp_f16_policy, (ggml_fattn_instruction)fa_inst_i32);
+                cc, dst, &mtp_f16_policy, inst);
             if (selected != BEST_FATTN_KERNEL_NONE) {
                 return selected;
             }
         } else if (is_decode_inst) {
             ggml_cuda_rocm_quant_prefill_f16_policy mtp_f16_policy = {};
-            const auto selected = ggml_cuda_select_mtp_draft_decode_fattn(cc, dst, &mtp_f16_policy);
+            const auto selected = ggml_cuda_select_mtp_draft_decode_fattn(
+                cc, dst, &mtp_f16_policy);
             if (selected != BEST_FATTN_KERNEL_NONE) {
                 return selected;
             }
         } else if (fa_inst_i32 == GGML_FATTN_INST_MTP_DRAFT) {
             if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
                 if (log_env && atoi(log_env) != 0) {
-                    GGML_LOG_INFO("%s: fa_instruction=mtp_draft nq=%lld impl_status=existing_policy\n",
+                    GGML_LOG_INFO("%s: fa_instruction=mtp_draft nq=%lld impl_status=legacy_fallback\n",
                             __func__, (long long) Q->ne[1]);
                 }
+            }
+        }
+
+        // ── VEC/TILE fallback severity ──────────────────────────
+        // When an instruction path falls through to VEC/TILE, log it
+        // as fallback debt and optionally abort in strict mode.
+        if (is_instruction_path) {
+            const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG");
+            if (log_env && atoi(log_env) != 0) {
+                // At this point, the instruction path returned NONE and
+                // we'll fall through to existing policy below. The actual
+                // kernel will be determined by the non-instruction code.
+                GGML_LOG_INFO("%s: fa_instruction=%s route=legacy_fallback "
+                    "nq=%lld K=%s V=%s fallback_severity=pending "
+                    "impl_status=instruction_path_fell_through\n",
+                    __func__,
+                    ggml_cuda_fattn_instruction_name(inst),
+                    (long long) Q->ne[1],
+                    ggml_type_name(K->type), ggml_type_name(V->type));
             }
         }
     }

@@ -2455,6 +2455,7 @@ extern "C" {
         GGML_FATTN_INST_PREFILL_QK          = 4,
         GGML_FATTN_INST_DECODE_QK           = 5,
         GGML_FATTN_INST_SPEC_VERIFY_QK      = 6,
+        GGML_FATTN_INST_BATCH_VERIFY_QK     = 7,
     };
 
     GGML_API void ggml_flash_attn_ext_set_instruction(
