@@ -122,24 +122,13 @@ static inline bool ggml_cuda_packed16_dot4_mmq_route_required() {
 }
 
 static inline bool ggml_cuda_packed16_dot4_mmq_enabled() {
-    // DOT4-MMQ is auto-enabled when packed16 K cache is active
-    // and not explicitly disabled, OR when GGML_CUDA_ROCM_PACKED16_AUTO=1.
-    // To disable: GGML_CUDA_ROCM_PACKED16_DOT4_MMQ=0
+    // Auto-enabled when packed16 K cache is active.
+    // Disable: GGML_CUDA_ROCM_PACKED16_DOT4_MMQ=0
     {
         const char * v = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ");
         if (v && atoi(v) == 0) return false;
-        if (v && atoi(v) != 0) return true;
     }
-    // Auto-enable: packed16 K cache active
-    {
-        const char * v = getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE");
-        if (v && atoi(v) != 0) return true;
-    }
-    {
-        const char * v = getenv("GGML_CUDA_ROCM_PACKED16_AUTO");
-        if (v && atoi(v) != 0) return true;
-    }
-    return ggml_cuda_packed16_dot4_mmq_route_required();
+    return ggml_cuda_q8k_dot4_packed16_k_cache_enabled();
 }
 
 static inline bool ggml_cuda_packed16_dot4_mmq_supported(const int cc, const ggml_tensor * dst) {

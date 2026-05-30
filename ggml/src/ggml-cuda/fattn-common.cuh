@@ -5,6 +5,9 @@
 #include "vecdotq.cuh"
 #include "fattn-mma-tbq4.cuh"
 
+// Forward declaration from fattn-dot4-q8k-kq.cuh
+static inline bool ggml_cuda_q8k_dot4_packed16_k_cache_enabled();
+
 // AMD_BFE: recognized by ROCm LLVM codegen as v_bfe_u32
 #ifndef AMD_BFE
 #define AMD_BFE(val, offset, width) (((val) >> (offset)) & ((1u << (width)) - 1u))
@@ -95,12 +98,6 @@ static inline bool ggml_cuda_q8k_dot4_packed16_vec_route_required() {
 
 static inline bool ggml_cuda_q8k_dot4_packed16_vec_enabled() {
 #ifdef GGML_USE_HIP
-    // Default-enabled. Explicitly disabled by EXPERIMENTAL_UNSAFE=0 or PACKED16_VEC=0.
-    {
-        const char * v = getenv("GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE");
-        if (!v) v = getenv("GGML_CUDA_ROCM_UNSAFE_EXPERIMENTS");
-        if (v && atoi(v) == 0) return false;
-    }
     {
         const char * v = getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_VEC");
         if (v && atoi(v) == 0) return false;
@@ -113,24 +110,13 @@ static inline bool ggml_cuda_q8k_dot4_packed16_vec_enabled() {
 
 static inline bool ggml_cuda_packed16_wmma_tile_enabled() {
 #ifdef GGML_USE_HIP
-    // PWMMA tile is auto-enabled when packed16 K cache is active
-    // and not explicitly disabled, OR when GGML_CUDA_ROCM_PACKED16_AUTO=1.
-    // To disable: GGML_CUDA_ROCM_PACKED16_WMMA_TILE=0
+    // Auto-enabled when packed16 K cache is active.
+    // Disable: GGML_CUDA_ROCM_PACKED16_WMMA_TILE=0
     {
         const char * v = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_TILE");
         if (v && atoi(v) == 0) return false;
-        if (v && atoi(v) != 0) return true;
     }
-    // Auto-enable: packed16 K cache active
-    {
-        const char * v = getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE");
-        if (v && atoi(v) != 0) return true;
-    }
-    {
-        const char * v = getenv("GGML_CUDA_ROCM_PACKED16_AUTO");
-        if (v && atoi(v) != 0) return true;
-    }
-    return false;
+    return ggml_cuda_q8k_dot4_packed16_k_cache_enabled();
 #else
     return false;
 #endif
