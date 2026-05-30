@@ -1316,6 +1316,10 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    return get_v(ctx, il, n_kv, sinfo, LLAMA_KV_V_LAYOUT_DEFAULT);
+}
+
+ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, llama_kv_v_layout_request layout) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * v = layers[ikv].v;
@@ -1327,6 +1331,10 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+
+    const bool use_trans = (layout == LLAMA_KV_V_LAYOUT_DEFAULT)
+        ? v_trans
+        : (layout == LLAMA_KV_V_LAYOUT_FOR_NON_FA);
 
     if (v->type == GGML_TYPE_TBQ3_0 || v->type == GGML_TYPE_TBQ4_0) {
         ggml_tensor * v_view = ggml_view_3d(ctx, v,
@@ -1348,7 +1356,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
         return v_view;
     }
 
-    if (!v_trans) {
+    if (!use_trans) {
         // note: v->nb[1] <= v->nb[2]
         ggml_tensor * v_view = ggml_view_4d(ctx, v,
                 hparams.n_embd_head_v(il), hparams.n_head_kv(il), n_kv, ns,
@@ -2664,7 +2672,11 @@ ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) cons
 }
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
-    return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+    return kv->get_v(ctx, il, n_kv, sinfos[i_cur], LLAMA_KV_V_LAYOUT_DEFAULT);
+}
+
+ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il, llama_kv_v_layout_request layout) const {
+    return kv->get_v(ctx, il, n_kv, sinfos[i_cur], layout);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {

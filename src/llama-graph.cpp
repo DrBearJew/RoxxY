@@ -2375,7 +2375,16 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+    const bool use_fa =
+        (cparams.flash_attn || k->type == GGML_TYPE_I32) &&
+        kq_b == nullptr;
+
+    ggml_tensor * v = mctx_cur->get_v(
+        ctx0,
+        il,
+        use_fa ? LLAMA_KV_V_LAYOUT_FOR_FA
+               : LLAMA_KV_V_LAYOUT_FOR_NON_FA);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
@@ -2554,7 +2563,16 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+    const bool use_fa =
+        (kq_b == nullptr) &&
+        (cparams.flash_attn || k->type == GGML_TYPE_I32);
+
+    ggml_tensor * v = mctx_cur->get_v(
+        ctx0,
+        il,
+        use_fa ? LLAMA_KV_V_LAYOUT_FOR_FA
+               : LLAMA_KV_V_LAYOUT_FOR_NON_FA);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
@@ -2642,7 +2660,16 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = src_cur->get_k(ctx0, il_src);
-    ggml_tensor * v = src_cur->get_v(ctx0, il_src);
+
+    const bool use_fa =
+        (kq_b == nullptr) &&
+        (cparams.flash_attn || k->type == GGML_TYPE_I32);
+
+    ggml_tensor * v = src_cur->get_v(
+        ctx0,
+        il_src,
+        use_fa ? LLAMA_KV_V_LAYOUT_FOR_FA
+               : LLAMA_KV_V_LAYOUT_FOR_NON_FA);
 
     // build_attn_mha splits q across k->ne[3] (the trunk's stream count). When the
     // trunk runs kv_unified=false the assistant's ubatch only references a subset

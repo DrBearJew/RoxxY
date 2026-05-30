@@ -5269,6 +5269,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     op->src[2] && op->src[2]->type == GGML_TYPE_F16) {
                     return true;
                 }
+
+                // Fallback: if K is I32 (packed16), CUDA must claim the op even if
+                // the standard FA probe returns NONE.  DOT4 dispatch handles I32 K
+                // at compute time; support-probe doesn't know about it.
+                if (op->src[1] && op->src[1]->type == GGML_TYPE_I32) {
+                    return true;
+                }
+
                 return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
             }
         case GGML_OP_CROSS_ENTROPY_LOSS:

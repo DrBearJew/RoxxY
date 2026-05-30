@@ -2714,6 +2714,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
 
         if (!ggml_cuda_q8k_dot4_kq_enabled()) {
+            // Auto-enable DOT4_KQ when packed16 K cache is active but no
+            // explicit kernel env was provided.  Without this, I32 K ops
+            // have no FA kernel for nq>1 and fall through to abort.
+            if (getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE")) {
+                return BEST_FATTN_KERNEL_Q8K_DOT4_KQ;
+            }
             return BEST_FATTN_KERNEL_NONE;
         }
 

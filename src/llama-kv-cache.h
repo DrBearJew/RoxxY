@@ -13,6 +13,16 @@ struct llama_hparams;
 struct llama_model;
 struct llama_context;
 
+// Consumer-requested V layout for get_v() overload.
+// DEFAULT delegates to the legacy v_trans heuristic.
+// FOR_FA forces the D-contiguous (FlashAttention-compatible) view.
+// FOR_NON_FA forces the transposed (legacy ggml_mul_mat) view.
+enum llama_kv_v_layout_request {
+    LLAMA_KV_V_LAYOUT_DEFAULT = 0,
+    LLAMA_KV_V_LAYOUT_FOR_FA,
+    LLAMA_KV_V_LAYOUT_FOR_NON_FA,
+};
+
 //
 // llama_kv_cache
 //
@@ -165,6 +175,7 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, llama_kv_v_layout_request layout) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
@@ -376,6 +387,7 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, llama_kv_v_layout_request layout) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory
