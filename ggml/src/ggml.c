@@ -3300,16 +3300,15 @@ struct ggml_tensor * ggml_mul_mat(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
         struct ggml_tensor  * b) {
-    write(2, "ENTER ggml_mul_mat\n", 20);
     if (!ggml_can_mul_mat(a, b)) {
         char buf[1024];
         int n = snprintf(buf, sizeof(buf),
-            "BAD MUL_MAT A_name=%s A_op=%s A_type=%s A_ne=(%lld,%lld,%lld,%lld) "
-            "B_name=%s B_op=%s B_type=%s B_ne=(%lld,%lld,%lld,%lld)\n",
-            a ? a->name : "(null)", a ? ggml_op_name(a->op) : "(null)", a ? ggml_type_name(a->type) : "(null)",
+            "BAD MUL_MAT A_name=%s A_type=%s A_ne=(%lld,%lld,%lld,%lld) "
+            "B_name=%s B_type=%s B_ne=(%lld,%lld,%lld,%lld)\n",
+            a ? a->name : "(null)", a ? ggml_type_name(a->type) : "(null)",
             a ? (long long)a->ne[0] : -1, a ? (long long)a->ne[1] : -1,
             a ? (long long)a->ne[2] : -1, a ? (long long)a->ne[3] : -1,
-            b ? b->name : "(null)", b ? ggml_op_name(b->op) : "(null)", b ? ggml_type_name(b->type) : "(null)",
+            b ? b->name : "(null)", b ? ggml_type_name(b->type) : "(null)",
             b ? (long long)b->ne[0] : -1, b ? (long long)b->ne[1] : -1,
             b ? (long long)b->ne[2] : -1, b ? (long long)b->ne[3] : -1);
         write(2, buf, n);

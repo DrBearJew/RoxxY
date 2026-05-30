@@ -5257,7 +5257,20 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
 #endif // GGML_USE_MUSA
         case GGML_OP_FLASH_ATTN_EXT:
-            return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+            {
+                // Force CUDA when PWMMA route is required — never fall back to CPU.
+                const char * req = getenv("GGML_CUDA_FA_ROUTE_REQUIRE");
+                const bool require_pwmma = req &&
+                    (strcmp(req, "rocm_packed16_wmma_tile") == 0 ||
+                     strcmp(req, "packed16_wmma_tile") == 0);
+                if (require_pwmma &&
+                    op->src[0] && op->src[0]->type == GGML_TYPE_F32 &&
+                    op->src[1] && op->src[1]->type == GGML_TYPE_I32 &&
+                    op->src[2] && op->src[2]->type == GGML_TYPE_F16) {
+                    return true;
+                }
+                return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+            }
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
