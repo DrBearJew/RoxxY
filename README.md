@@ -270,7 +270,7 @@ GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE=1 \
   --device ROCm0 \
   --model /path/to/Qwen3.6-35B-A3B-IQ4_XS-00001-of-00002.gguf \
   --flash-attn on \
-  --cache-type-k q8_0 --cache-type-v q4_0 \
+  --cache-type-v q4_0 \
   --ctx-size 40960 --parallel 1
 ```
 
@@ -315,7 +315,7 @@ MTP is supported for both 27B and 35B. Key settings:
 
 ```bash
 --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0
---cache-type-k-draft q8_0 --cache-type-v-draft q4_0
+--cache-type-v-draft q4_0
 LLAMA_MTP_PREFILL_CHUNK=1024  # match --ubatch-size
 ```
 
