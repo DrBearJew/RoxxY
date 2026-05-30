@@ -58,11 +58,59 @@ static constexpr int PDMQ_Q_WORDS_PAD   = PDMQ_Q_WORDS + 1;
 static constexpr int PDMQ_Q_BLOCKS_PAD  = PDMQ_Q_BLOCKS + 1;
 static constexpr int PDMQ_D_PAD         = PDMQ_D + 1;
 
+// ── Experiment envs ──────────────────────────────────────────────
+// PDMQ_IMPL: baseline | kshared | kshared_stagev | kshared_directv
+static const char * pdmq_impl_env() {
+    const char * v = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_IMPL");
+    return v ? v : "";
+}
+static inline bool pdmq_kshared_enabled() {
+    const char * v = pdmq_impl_env();
+    return strcmp(v, "kshared") == 0 || strcmp(v, "kshared_stagev") == 0 || strcmp(v, "kshared_directv") == 0;
+}
+static inline bool pdmq_stagev_enabled() {
+    const char * v = pdmq_impl_env();
+    // stagev is default; directv is opt-in
+    return strcmp(v, "kshared_directv") != 0;
+}
+
 enum packed16_dot4_mmq_v_type {
     PACKED16_DOT4_MMQ_V_Q4_0,
     PACKED16_DOT4_MMQ_V_Q8_0,
     PACKED16_DOT4_MMQ_V_F16,
 };
+
+// Helpers shared by host (probe validation) and device (kernel). Pure math, no HIP deps.
+#if defined(__HIPCC__) || defined(__CUDACC__)
+static __host__ __device__ __forceinline__ int8_t pdmq_i8_from_i32(const int packed, const int byte) {
+#else
+static inline int8_t pdmq_i8_from_i32(const int packed, const int byte) {
+#endif
+    const uint32_t u = static_cast<uint32_t>(packed);
+    return static_cast<int8_t>((u >> (8 * byte)) & 0xffu);
+}
+
+#if defined(__HIPCC__) || defined(__CUDACC__)
+static __host__ __device__ __forceinline__ int pdmq_pack_i8x4(const int q0, const int q1, const int q2, const int q3) {
+#else
+static inline int pdmq_pack_i8x4(const int q0, const int q1, const int q2, const int q3) {
+#endif
+    const uint32_t b0 = static_cast<uint8_t>(static_cast<int8_t>(q0));
+    const uint32_t b1 = static_cast<uint8_t>(static_cast<int8_t>(q1));
+    const uint32_t b2 = static_cast<uint8_t>(static_cast<int8_t>(q2));
+    const uint32_t b3 = static_cast<uint8_t>(static_cast<int8_t>(q3));
+    return static_cast<int>((b0 << 0) | (b1 << 8) | (b2 << 16) | (b3 << 24));
+}
+
+#if defined(__HIPCC__) || defined(__CUDACC__)
+static __host__ __device__ __forceinline__ int pdmq_clamp_i8(const int x) {
+    return x < -127 ? -127 : (x > 127 ? 127 : x);
+}
+#else
+static inline int pdmq_clamp_i8(const int x) {
+    return x < -127 ? -127 : (x > 127 ? 127 : x);
+}
+#endif
 
 #ifdef GGML_USE_HIP
 
@@ -74,16 +122,21 @@ static inline bool ggml_cuda_packed16_dot4_mmq_route_required() {
 }
 
 static inline bool ggml_cuda_packed16_dot4_mmq_enabled() {
-    // DOT4-MMQ is opt-in unless explicitly route-required. This prevents it from
-    // stealing packed16-WMMA while the WMMA mask route is still being stabilized.
-    {
-        const char * v = getenv("GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE");
-        if (!v) v = getenv("GGML_CUDA_ROCM_UNSAFE_EXPERIMENTS");
-        if (v && atoi(v) == 0) return false;
-    }
+    // DOT4-MMQ is auto-enabled when packed16 K cache is active
+    // and not explicitly disabled, OR when GGML_CUDA_ROCM_PACKED16_AUTO=1.
+    // To disable: GGML_CUDA_ROCM_PACKED16_DOT4_MMQ=0
     {
         const char * v = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ");
         if (v && atoi(v) == 0) return false;
+        if (v && atoi(v) != 0) return true;
+    }
+    // Auto-enable: packed16 K cache active
+    {
+        const char * v = getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE");
+        if (v && atoi(v) != 0) return true;
+    }
+    {
+        const char * v = getenv("GGML_CUDA_ROCM_PACKED16_AUTO");
         if (v && atoi(v) != 0) return true;
     }
     return ggml_cuda_packed16_dot4_mmq_route_required();
@@ -140,23 +193,6 @@ static __device__ __forceinline__ float pdmq_neg() {
 
 static __device__ __forceinline__ bool pdmq_logit_is_live(const float x) {
     return x > -FLT_MAX / 4.0f;
-}
-
-static __device__ __forceinline__ int8_t pdmq_i8_from_i32(const int packed, const int byte) {
-    const uint32_t u = static_cast<uint32_t>(packed);
-    return static_cast<int8_t>((u >> (8 * byte)) & 0xffu);
-}
-
-static __device__ __forceinline__ int pdmq_pack_i8x4(const int q0, const int q1, const int q2, const int q3) {
-    const uint32_t b0 = static_cast<uint8_t>(static_cast<int8_t>(q0));
-    const uint32_t b1 = static_cast<uint8_t>(static_cast<int8_t>(q1));
-    const uint32_t b2 = static_cast<uint8_t>(static_cast<int8_t>(q2));
-    const uint32_t b3 = static_cast<uint8_t>(static_cast<int8_t>(q3));
-    return static_cast<int>((b0 << 0) | (b1 << 8) | (b2 << 16) | (b3 << 24));
-}
-
-static __device__ __forceinline__ int pdmq_clamp_i8(const int x) {
-    return x < -127 ? -127 : (x > 127 ? 127 : x);
 }
 
 static __device__ __forceinline__ int pdmq_quant_i8(const float x, const float inv_scale) {
@@ -352,7 +388,197 @@ static __device__ __forceinline__ float pdmq_qk_dot(
     return sum;
 }
 
-template<packed16_dot4_mmq_v_type V_TYPE, int BM, int BN, int D, bool CAUSAL_MASK, bool STAGE_V>
+// ── GQA2 Kernel (2 Q heads per CTA, M16N16 only) ──────────────
+template<packed16_dot4_mmq_v_type V_TYPE, bool CAUSAL_MASK, bool STAGE_V, bool KSHARED>
+static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqa2_kernel(
+        const float * __restrict__ Q,
+        const char  * __restrict__ V,
+        float       * __restrict__ dst,
+        int64_t q_nb01, int64_t q_nb02, int64_t q_nb03,
+        int64_t v_nb10, int64_t v_nb11, int64_t v_nb12, int64_t v_nb13, int64_t v_ne13,
+        const char * __restrict__ mask,
+        int64_t mask_ne00, int64_t mask_ne01, int64_t mask_ne03,
+        int64_t mask_nb00, int64_t mask_nb01, int64_t mask_nb03,
+        const int  * __restrict__ k_payload,
+        const half * __restrict__ k_scales,
+        int nq, int nk, int n_heads_q, int n_heads_k, int gqa_ratio,
+        int packed_rows, int q_offset, float attention_scale) {
+
+    static constexpr int GQA_GROUP = 2;
+    static constexpr int BM = 16;
+    static constexpr int BN = 16;
+    static constexpr int D  = PDMQ_D;
+
+    const int tid = int(threadIdx.x);
+    const int q_tile = int(blockIdx.x);
+    const int gy     = int(blockIdx.y);
+    const int b      = int(blockIdx.z);
+
+    const int groups_per_kv = CEIL_DIV(gqa_ratio, GQA_GROUP);
+    const int hk            = gy / groups_per_kv;
+    const int local_group   = gy - hk * groups_per_kv;
+    const int hq0 = hk * gqa_ratio + local_group * GQA_GROUP + 0;
+    const int hq1 = hk * gqa_ratio + local_group * GQA_GROUP + 1;
+    const bool slot_valid_0 = hq0 < n_heads_q && hq0 < (hk + 1) * gqa_ratio;
+    const bool slot_valid_1 = hq1 < n_heads_q && hq1 < (hk + 1) * gqa_ratio;
+    const int q0 = q_tile * BM;
+
+    if (q0 >= nq) return;
+
+    const int head_stride = packed_rows / n_heads_k;
+    const size_t k_head_base = size_t(hk) * size_t(head_stride);
+
+    __shared__ int   q_tile_i32[GQA_GROUP][BM][D / 4 + 1];
+    __shared__ float q_tile_scales[GQA_GROUP][BM][D / QK8_0 + 1];
+    __shared__ float logits[BM][BN + 1];
+    __shared__ float row_m[GQA_GROUP][BM + 1];
+    __shared__ float row_l[GQA_GROUP][BM + 1];
+    __shared__ float old_s[GQA_GROUP][BM + 1];
+    __shared__ float v_tile[STAGE_V ? BN * (D + 1) : 1];
+    __shared__ int   k_payload_s[KSHARED ? BN * (PDMQ_D / 4 + 1) : 1];
+    __shared__ half  k_scales_s [KSHARED ? BN * (PDMQ_D / QK8_0 + 1) : 1];
+
+    for (int s = 0; s < GQA_GROUP; ++s) {
+        if (tid < BM) { row_m[s][tid] = pdmq_neg(); row_l[s][tid] = 0.0f; old_s[s][tid] = 0.0f; }
+    }
+
+    float out[GQA_GROUP][BM];
+    for (int s = 0; s < GQA_GROUP; ++s)
+        for (int qr = 0; qr < BM; ++qr) out[s][qr] = 0.0f;
+    __syncthreads();
+
+    // Quantize Q for both slots
+    if (slot_valid_0)
+        pdmq_quantize_q_tile<BM, D>(Q, q_nb01, q_nb02, q_nb03, q0, hq0, b, nq, q_tile_i32[0], q_tile_scales[0]);
+    if (slot_valid_1)
+        pdmq_quantize_q_tile<BM, D>(Q, q_nb01, q_nb02, q_nb03, q0, hq1, b, nq, q_tile_i32[1], q_tile_scales[1]);
+
+    for (int k0 = 0; k0 < nk; k0 += BN) {
+        const int tile_n = pdmq_min_i(BN, nk - k0);
+
+        if constexpr (CAUSAL_MASK) {
+            const int q_last = pdmq_min_i(q0 + BM - 1, nq - 1);
+            if (k0 > q_offset + q_last) break;
+        }
+
+        // V load: once per K tile, shared by both slots
+        if constexpr (STAGE_V) {
+            for (int v_idx = tid; v_idx < BN * D; v_idx += int(blockDim.x)) {
+                const int kk = v_idx / D, d = v_idx - kk * D, k = k0 + kk;
+                v_tile[kk * (D + 1) + d] = kk < tile_n
+                    ? pdmq_decode_v<V_TYPE>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k, hk, b, d) : 0.0f;
+            }
+            __syncthreads();
+        }
+
+        // KSHARED: stage K payload + scales into shared memory once per K tile
+        if constexpr (KSHARED) {
+            constexpr int KP_PER_ROW = PDMQ_D / 4;
+            constexpr int KS_PER_ROW = PDMQ_D / QK8_0;
+            for (int idx = tid; idx < tile_n * KP_PER_ROW; idx += int(blockDim.x)) {
+                const int kk = idx / KP_PER_ROW, w = idx - kk * KP_PER_ROW;
+                const size_t k_row = k_head_base + size_t(k0 + kk);
+                k_payload_s[kk * (KP_PER_ROW + 1) + w] = k_payload[k_row + w];
+            }
+            for (int idx = tid; idx < tile_n * KS_PER_ROW; idx += int(blockDim.x)) {
+                const int kk = idx / KS_PER_ROW, s_val = idx - kk * KS_PER_ROW;
+                const size_t k_row = k_head_base + size_t(k0 + kk);
+                k_scales_s[kk * (KS_PER_ROW + 1) + s_val] = k_scales[k_row + s_val];
+            }
+            __syncthreads();
+        }
+
+        // Process both Q slots
+        for (int s = 0; s < GQA_GROUP; ++s) {
+            const bool slot_valid = (s == 0) ? slot_valid_0 : slot_valid_1;
+            if (!slot_valid) continue;
+
+            const int hq_slot = (s == 0) ? hq0 : hq1;
+
+            // QK compute
+            for (int idx = tid; idx < BM * BN; idx += int(blockDim.x)) {
+                const int qr = idx / BN, kk = idx - qr * BN, q = q0 + qr, k = k0 + kk;
+                float s_val = pdmq_neg();
+                bool valid = q < nq && kk < tile_n && k < nk;
+                if constexpr (CAUSAL_MASK) valid = valid && (k <= q_offset + q);
+                if (valid) {
+                    const int  * kp_row;
+                    const half * ks_row;
+                    if constexpr (KSHARED) {
+                        kp_row = &k_payload_s[kk * (PDMQ_D / 4 + 1)];
+                        ks_row = &k_scales_s [kk * (PDMQ_D / QK8_0 + 1)];
+                    } else {
+                        const size_t k_row = k_head_base + size_t(k);
+                        kp_row = k_payload + k_row * (D / 4);
+                        ks_row = k_scales  + k_row * (D / QK8_0);
+                    }
+                    s_val = pdmq_qk_dot<BM, D>(q_tile_i32[s], q_tile_scales[s], qr, kp_row, ks_row) * attention_scale;
+                    if (!CAUSAL_MASK && mask)
+                        s_val += pdmq_mask_val(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q, k, b);
+                }
+                logits[qr][kk] = s_val;
+            }
+            __syncthreads();
+
+            // Online softmax
+            if (tid < BM) {
+                const int qr = tid, q = q0 + qr;
+                float tile_m = pdmq_neg();
+                if (q < nq) {
+                    for (int kk = 0; kk < BN; ++kk) tile_m = fmaxf(tile_m, logits[qr][kk]);
+                }
+                const float m_new = fmaxf(row_m[s][qr], tile_m);
+                const float alpha = row_l[s][qr] > 0.0f && pdmq_logit_is_live(row_m[s][qr]) && pdmq_logit_is_live(m_new)
+                    ? expf(row_m[s][qr] - m_new) : 0.0f;
+                float tile_l = 0.0f;
+                for (int kk = 0; kk < BN; ++kk) {
+                    const float lv = logits[qr][kk];
+                    const float p = pdmq_logit_is_live(lv) && pdmq_logit_is_live(m_new) ? expf(lv - m_new) : 0.0f;
+                    logits[qr][kk] = p; tile_l += p;
+                }
+                row_l[s][qr] = row_l[s][qr] * alpha + tile_l;
+                row_m[s][qr] = m_new;
+                old_s[s][qr] = alpha;
+            }
+            __syncthreads();
+
+            // PV accumulate
+            if (tid < D) {
+                for (int qr = 0; qr < BM; ++qr) {
+                    const int q = q0 + qr;
+                    if (q >= nq) continue;
+                    float acc = out[s][qr] * old_s[s][qr];
+                    for (int kk = 0; kk < BN; ++kk) {
+                        const float p = logits[qr][kk];
+                        if (p != 0.0f)
+                            acc += p * (STAGE_V ? v_tile[kk * (D + 1) + tid]
+                                               : pdmq_decode_v<V_TYPE>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k0 + kk, hk, b, tid));
+                    }
+                    out[s][qr] = acc;
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    // Final write: slot 0 → hq0, slot 1 → hq1
+    if (tid < D) {
+        if (slot_valid_0) for (int qr = 0; qr < BM; ++qr) {
+            const int q = q0 + qr;
+            if (q >= nq) continue;
+            const float denom = row_l[0][qr];
+            dst[((size_t(b) * nq + q) * n_heads_q + hq0) * D + tid] = denom > 0.0f ? out[0][qr] / denom : 0.0f;
+        }
+        if (slot_valid_1) for (int qr = 0; qr < BM; ++qr) {
+            const int q = q0 + qr;
+            if (q >= nq) continue;
+            const float denom = row_l[1][qr];
+            dst[((size_t(b) * nq + q) * n_heads_q + hq1) * D + tid] = denom > 0.0f ? out[1][qr] / denom : 0.0f;
+        }
+    }
+}
+
+template<packed16_dot4_mmq_v_type V_TYPE, int BM, int BN, int D, bool CAUSAL_MASK, bool STAGE_V, bool KSHARED>
 static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_kernel(
         const float * __restrict__ Q,
         const char  * __restrict__ V,
@@ -406,6 +632,8 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_kern
     __shared__ float row_l[BM + 1];
     __shared__ float old_s[BM + 1];
     __shared__ float v_tile[STAGE_V ? BN * (D + 1) : 1];
+    __shared__ int   k_payload_s[KSHARED ? BN * (PDMQ_D / 4 + 1) : 1];
+    __shared__ half  k_scales_s [KSHARED ? BN * (PDMQ_D / QK8_0 + 1) : 1];
 
     if (tid < BM) {
         row_m[tid] = pdmq_neg();
@@ -443,6 +671,23 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_kern
         __syncthreads();
         }
 
+        // KSHARED: stage K payload + scales into shared memory once per K tile
+        if constexpr (KSHARED) {
+            constexpr int KP_PER_ROW = PDMQ_D / 4;
+            constexpr int KS_PER_ROW = PDMQ_D / QK8_0;
+            for (int idx = tid; idx < tile_n * KP_PER_ROW; idx += int(blockDim.x)) {
+                const int kk = idx / KP_PER_ROW, w = idx - kk * KP_PER_ROW;
+                const size_t k_row = k_head_base + size_t(k0 + kk);
+                k_payload_s[kk * (KP_PER_ROW + 1) + w] = k_payload[k_row + w];
+            }
+            for (int idx = tid; idx < tile_n * KS_PER_ROW; idx += int(blockDim.x)) {
+                const int kk = idx / KS_PER_ROW, s = idx - kk * KS_PER_ROW;
+                const size_t k_row = k_head_base + size_t(k0 + kk);
+                k_scales_s[kk * (KS_PER_ROW + 1) + s] = k_scales[k_row + s];
+            }
+            __syncthreads();
+        }
+
         const bool full_q = q0 + BM <= nq;
         const bool full_k = tile_n == BN;
         bool exact_tile = full_q && full_k && mask == nullptr;
@@ -463,9 +708,16 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_kern
             }
 
             if (valid) {
-                const size_t k_row = k_head_base + size_t(k);
-                const int  * k_row_payload = k_payload + k_row * (D / 4);
-                const half * k_row_scales  = k_scales  + k_row * (D / QK8_0);
+                const int  * k_row_payload;
+                const half * k_row_scales;
+                if constexpr (KSHARED) {
+                    k_row_payload = &k_payload_s[kk * (PDMQ_D / 4 + 1)];
+                    k_row_scales  = &k_scales_s [kk * (PDMQ_D / QK8_0 + 1)];
+                } else {
+                    const size_t k_row = k_head_base + size_t(k);
+                    k_row_payload = k_payload + k_row * (D / 4);
+                    k_row_scales  = k_scales  + k_row * (D / QK8_0);
+                }
                 s = pdmq_qk_dot<BM, D>(q_tile_i32, q_tile_scales, qr, k_row_payload, k_row_scales) * attention_scale;
                 if (!exact_tile && mask && !CAUSAL_MASK) {
                     s += pdmq_mask_val(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q, k, b);
@@ -541,6 +793,325 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_kern
             dst[((size_t(b) * size_t(nq) + size_t(q)) * size_t(n_heads_q) + size_t(hq)) * size_t(D) + size_t(tid)] = val;
         }
     }
+}
+
+// ── QK probe ────────────────────────────────────────────────────
+//
+// Validates DOT4-MMQ QK math against same-quantized scalar reference.
+// Q tile: [16][256] f32, quantized per 32-D block to int8.
+// K tile: [16][256] represented as packed int8 payload + half scales.
+// Output: [16][16] QK = int8xint8 DOT4 + scale application.
+//
+// Launch: <<<1, PDMQ_THREADS, 0, stream>>>
+
+static __global__ void pdmq_qk_probe_kernel(
+        const float * __restrict__ q_probe,
+        const int   * __restrict__ k_payload,
+        const half  * __restrict__ k_scales,
+        float       * __restrict__ out) {
+
+    constexpr int BM = 16;
+    constexpr int BN = 16;
+    constexpr int D  = PDMQ_D;
+
+    __shared__ int   q_tile_i32[BM][D / 4 + 1];
+    __shared__ float q_tile_scales[BM][D / QK8_0 + 1];
+
+    pdmq_quantize_q_tile<BM, D>(q_probe, sizeof(float) * D, 0, 0, 0, 0, 0, BM, q_tile_i32, q_tile_scales);
+
+    for (int idx = int(threadIdx.x); idx < BM * BN; idx += int(blockDim.x)) {
+        const int qr = idx / BN;
+        const int kk = idx - qr * BN;
+
+        const int  * k_row_payload = k_payload + size_t(kk) * (D / 4);
+        const half * k_row_scales  = k_scales  + size_t(kk) * (D / QK8_0);
+        float s = pdmq_qk_dot<BM, D>(q_tile_i32, q_tile_scales, qr, k_row_payload, k_row_scales);
+        out[qr * BN + kk] = s;
+    }
+}
+
+static bool pdmq_qk_probe_pass(hipStream_t stream) {
+    constexpr int NQ   = 16;
+    constexpr int NK   = 16;
+    constexpr int D    = PDMQ_D;
+    constexpr int QBLOCKS = D / QK8_0;
+    constexpr int WORDS_PER_BLOCK = QK8_0 / 4;
+
+    constexpr size_t qk_bytes    = NQ  * D * sizeof(float);
+    constexpr size_t kp_bytes    = NK  * (D / 4) * sizeof(int);
+    constexpr size_t ks_bytes    = NK  * (D / QK8_0) * sizeof(half);
+    constexpr size_t out_bytes   = NQ  * NK * sizeof(float);
+
+    float * h_q  = (float *) malloc(qk_bytes);
+    int   * h_kp = (int   *) malloc(kp_bytes);
+    half  * h_ks = (half  *) malloc(ks_bytes);
+    float * h_ref = (float *) malloc(out_bytes);
+    float * h_gpu = (float *) malloc(out_bytes);
+
+    srand(87123);
+    for (size_t i = 0; i < NQ * D; i++) {
+        h_q[i] = ((float)rand() / RAND_MAX * 2.0f - 1.0f) * 4.0f;
+    }
+
+    srand(45678);
+    for (int kk = 0; kk < NK; ++kk) {
+        for (int qb = 0; qb < QBLOCKS; ++qb) {
+            float k_amax = 0.0f;
+            int8_t k_raw[QK8_0];
+            for (int i = 0; i < QK8_0; ++i) {
+                k_raw[i] = (int8_t)((rand() % 255) - 127);
+                k_amax = fmaxf(k_amax, fabsf((float)k_raw[i]));
+            }
+            float ks = k_amax > 0.0f ? k_amax / 127.0f : 0.0f;
+            h_ks[kk * QBLOCKS + qb] = __float2half(ks);
+            for (int w = 0; w < WORDS_PER_BLOCK; ++w) {
+                h_kp[kk * (D / 4) + qb * WORDS_PER_BLOCK + w] =
+                    pdmq_pack_i8x4(k_raw[w*4+0], k_raw[w*4+1], k_raw[w*4+2], k_raw[w*4+3]);
+            }
+        }
+    }
+
+    // Scalar reference: same quantization, same DOT4 math
+    for (int qr = 0; qr < NQ; ++qr) {
+        float q_scales[QBLOCKS];
+        float q_invscales[QBLOCKS];
+        int8_t q_i8[QBLOCKS * QK8_0];
+
+        for (int qb = 0; qb < QBLOCKS; ++qb) {
+            float amax = 0.0f;
+            for (int i = 0; i < QK8_0; ++i) amax = fmaxf(amax, fabsf(h_q[qr * D + qb * QK8_0 + i]));
+            q_scales[qb] = amax > 0.0f ? amax / 127.0f : 0.0f;
+            q_invscales[qb] = amax > 0.0f ? 127.0f / amax : 0.0f;
+            for (int i = 0; i < QK8_0; ++i)
+                q_i8[qb * QK8_0 + i] = (int8_t) pdmq_clamp_i8((int) lrintf(h_q[qr * D + qb * QK8_0 + i] * q_invscales[qb]));
+        }
+
+        for (int kk = 0; kk < NK; ++kk) {
+            float sum = 0.0f;
+            for (int qb = 0; qb < QBLOCKS; ++qb) {
+                int acc = 0;
+                for (int w = 0; w < WORDS_PER_BLOCK; ++w) {
+                    int q_packed = pdmq_pack_i8x4(
+                        q_i8[qb * QK8_0 + w*4 + 0], q_i8[qb * QK8_0 + w*4 + 1],
+                        q_i8[qb * QK8_0 + w*4 + 2], q_i8[qb * QK8_0 + w*4 + 3]);
+                    int dot = 0;
+                    for (int b = 0; b < 4; ++b) {
+                        dot += (int)pdmq_i8_from_i32(q_packed, b) *
+                               (int)pdmq_i8_from_i32(h_kp[kk * (D / 4) + qb * WORDS_PER_BLOCK + w], b);
+                    }
+                    acc += dot;
+                }
+                sum += float(acc) * q_scales[qb] * __half2float(h_ks[kk * QBLOCKS + qb]);
+            }
+            h_ref[qr * NK + kk] = sum;
+        }
+    }
+
+    float * d_q = nullptr;
+    int   * d_kp = nullptr;
+    half  * d_ks = nullptr;
+    float * d_out = nullptr;
+    CUDA_CHECK(hipMalloc(&d_q,   qk_bytes));
+    CUDA_CHECK(hipMalloc(&d_kp,  kp_bytes));
+    CUDA_CHECK(hipMalloc(&d_ks,  ks_bytes));
+    CUDA_CHECK(hipMalloc(&d_out, out_bytes));
+    CUDA_CHECK(hipMemcpyAsync(d_q,   h_q,  qk_bytes,  hipMemcpyHostToDevice, stream));
+    CUDA_CHECK(hipMemcpyAsync(d_kp,  h_kp, kp_bytes,  hipMemcpyHostToDevice, stream));
+    CUDA_CHECK(hipMemcpyAsync(d_ks,  h_ks, ks_bytes,  hipMemcpyHostToDevice, stream));
+    CUDA_CHECK(hipMemsetAsync(d_out, 0, out_bytes, stream));
+
+    pdmq_qk_probe_kernel<<<1, PDMQ_THREADS, 0, stream>>>(d_q, d_kp, d_ks, d_out);
+    CUDA_CHECK(hipGetLastError());
+    CUDA_CHECK(hipMemcpyAsync(h_gpu, d_out, out_bytes, hipMemcpyDeviceToHost, stream));
+    CUDA_CHECK(hipStreamSynchronize(stream));
+
+    float max_err = 0.0f;
+    for (int i = 0; i < NQ * NK; i++)
+        max_err = fmaxf(max_err, fabsf(h_gpu[i] - h_ref[i]));
+
+    CUDA_CHECK(hipFree(d_q));
+    CUDA_CHECK(hipFree(d_kp));
+    CUDA_CHECK(hipFree(d_ks));
+    CUDA_CHECK(hipFree(d_out));
+    free(h_q); free(h_kp); free(h_ks); free(h_ref); free(h_gpu);
+
+    if (max_err > 1e-3f) {
+        fprintf(stderr, "PDMQ QK probe FAILED: max_err=%f\n", max_err);
+        return false;
+    }
+    fprintf(stderr, "PDMQ QK probe PASSED: max_err=%f\n", max_err);
+    return true;
+}
+
+// ── GQA group selector ────────────────────────────────────────────
+static inline int ggml_cuda_rocm_packed16_dot4_mmq_gqa_group() {
+    const char * s = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQA_GROUP");
+    if (!s || !*s) return 1;
+    const int g = atoi(s);
+    if (g == 1 || g == 2) return g;
+    GGML_ABORT("invalid GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQA_GROUP=%s; expected 1 or 2", s);
+}
+
+// ── GQA2 QK probe ───────────────────────────────────────────────
+// Validates GQA2 QK mapping: two Q slots, same K tile.
+// Launch: <<<1, PDMQ_THREADS, 0, stream>>>
+
+static __global__ void pdmq_qk_probe_gqa2_kernel(
+        const float * __restrict__ q_probe,
+        const int   * __restrict__ k_payload,
+        const half  * __restrict__ k_scales,
+        float       * __restrict__ out) {
+
+    constexpr int GQA_GROUP = 2;
+    constexpr int BM = 16;
+    constexpr int BN = 16;
+    constexpr int D  = PDMQ_D;
+
+    __shared__ int   q_tile_i32[GQA_GROUP][BM][D / 4 + 1];
+    __shared__ float q_tile_scales[GQA_GROUP][BM][D / QK8_0 + 1];
+
+    for (int slot = 0; slot < GQA_GROUP; ++slot) {
+        pdmq_quantize_q_tile<BM, D>(q_probe + slot * BM * D, sizeof(float) * D, 0, 0, 0, 0, 0, BM,
+                                     q_tile_i32[slot], q_tile_scales[slot]);
+    }
+
+    for (int idx = int(threadIdx.x); idx < GQA_GROUP * BM * BN; idx += int(blockDim.x)) {
+        const int slot = idx / (BM * BN);
+        const int qr   = (idx / BN) % BM;
+        const int kk   = idx % BN;
+
+        const int  * k_row_payload = k_payload + size_t(kk) * (D / 4);
+        const half * k_row_scales  = k_scales  + size_t(kk) * (D / QK8_0);
+        float s = pdmq_qk_dot<BM, D>(q_tile_i32[slot], q_tile_scales[slot], qr, k_row_payload, k_row_scales);
+        out[(slot * BM + qr) * BN + kk] = s;
+    }
+}
+
+static bool pdmq_qk_probe_gqa2_pass(hipStream_t stream) {
+    constexpr int GQA_GROUP = 2;
+    constexpr int NQ   = PDMQ_BM_PREFILL * GQA_GROUP;
+    constexpr int NK   = PDMQ_BN_PREFILL;
+    constexpr int D    = PDMQ_D;
+    constexpr int QBLOCKS = D / QK8_0;
+    constexpr int WORDS_PER_BLOCK = QK8_0 / 4;
+
+    constexpr size_t qk_bytes    = NQ  * D * sizeof(float);
+    constexpr size_t kp_bytes    = NK  * (D / 4) * sizeof(int);
+    constexpr size_t ks_bytes    = NK  * (D / QK8_0) * sizeof(half);
+    constexpr size_t out_bytes   = NQ  * NK * sizeof(float);
+
+    float * h_q  = (float *) malloc(qk_bytes);
+    int   * h_kp = (int   *) malloc(kp_bytes);
+    half  * h_ks = (half  *) malloc(ks_bytes);
+    float * h_ref = (float *) malloc(out_bytes);
+    float * h_gpu = (float *) malloc(out_bytes);
+
+    // Fill slot 0 and slot 1 with DIFFERENT random values to catch aliasing
+    srand(615243);
+    for (int slot = 0; slot < GQA_GROUP; ++slot) {
+        srand(615243 + slot * 7919);
+        for (size_t i = 0; i < PDMQ_BM_PREFILL * D; i++) {
+            h_q[slot * PDMQ_BM_PREFILL * D + i] =
+                ((float)rand() / RAND_MAX * 2.0f - 1.0f) * (slot == 0 ? 3.0f : 5.0f);
+        }
+    }
+
+    srand(45678);
+    for (int kk = 0; kk < NK; ++kk) {
+        for (int qb = 0; qb < QBLOCKS; ++qb) {
+            int8_t k_raw[QK8_0];
+            float k_amax = 0.0f;
+            for (int i = 0; i < QK8_0; ++i) {
+                k_raw[i] = (int8_t)((rand() % 255) - 127);
+                k_amax = fmaxf(k_amax, fabsf((float)k_raw[i]));
+            }
+            float ks = k_amax > 0.0f ? k_amax / 127.0f : 0.0f;
+            h_ks[kk * QBLOCKS + qb] = __float2half(ks);
+            for (int w = 0; w < WORDS_PER_BLOCK; ++w)
+                h_kp[kk * (D / 4) + qb * WORDS_PER_BLOCK + w] =
+                    pdmq_pack_i8x4(k_raw[w*4+0], k_raw[w*4+1], k_raw[w*4+2], k_raw[w*4+3]);
+        }
+    }
+
+    // Scalar reference: same-quantized DOT4-MMQ
+    for (int slot = 0; slot < GQA_GROUP; ++slot) {
+        for (int qr = 0; qr < PDMQ_BM_PREFILL; ++qr) {
+            float q_scales[QBLOCKS], q_invscales[QBLOCKS];
+            int8_t q_i8[QBLOCKS * QK8_0];
+            for (int qb = 0; qb < QBLOCKS; ++qb) {
+                float amax = 0.0f;
+                for (int i = 0; i < QK8_0; ++i)
+                    amax = fmaxf(amax, fabsf(h_q[(slot * PDMQ_BM_PREFILL + qr) * D + qb * QK8_0 + i]));
+                q_scales[qb] = amax > 0.0f ? amax / 127.0f : 0.0f;
+                q_invscales[qb] = amax > 0.0f ? 127.0f / amax : 0.0f;
+                for (int i = 0; i < QK8_0; ++i)
+                    q_i8[qb * QK8_0 + i] = (int8_t) pdmq_clamp_i8(
+                        (int) lrintf(h_q[(slot * PDMQ_BM_PREFILL + qr) * D + qb * QK8_0 + i] * q_invscales[qb]));
+            }
+            for (int kk = 0; kk < NK; ++kk) {
+                float sum = 0.0f;
+                for (int qb = 0; qb < QBLOCKS; ++qb) {
+                    int acc = 0;
+                    for (int w = 0; w < WORDS_PER_BLOCK; ++w) {
+                        int q_packed = pdmq_pack_i8x4(
+                            q_i8[qb * QK8_0 + w*4 + 0], q_i8[qb * QK8_0 + w*4 + 1],
+                            q_i8[qb * QK8_0 + w*4 + 2], q_i8[qb * QK8_0 + w*4 + 3]);
+                        int dot = 0;
+                        for (int b = 0; b < 4; ++b)
+                            dot += (int)pdmq_i8_from_i32(q_packed, b) *
+                                   (int)pdmq_i8_from_i32(h_kp[kk * (D / 4) + qb * WORDS_PER_BLOCK + w], b);
+                        acc += dot;
+                    }
+                    sum += float(acc) * q_scales[qb] * __half2float(h_ks[kk * QBLOCKS + qb]);
+                }
+                h_ref[(slot * PDMQ_BM_PREFILL + qr) * NK + kk] = sum;
+            }
+        }
+    }
+
+    float * d_q = nullptr; int * d_kp = nullptr; half * d_ks = nullptr; float * d_out = nullptr;
+    CUDA_CHECK(hipMalloc(&d_q,   qk_bytes));
+    CUDA_CHECK(hipMalloc(&d_kp,  kp_bytes));
+    CUDA_CHECK(hipMalloc(&d_ks,  ks_bytes));
+    CUDA_CHECK(hipMalloc(&d_out, out_bytes));
+    CUDA_CHECK(hipMemcpyAsync(d_q,   h_q,  qk_bytes,  hipMemcpyHostToDevice, stream));
+    CUDA_CHECK(hipMemcpyAsync(d_kp,  h_kp, kp_bytes,  hipMemcpyHostToDevice, stream));
+    CUDA_CHECK(hipMemcpyAsync(d_ks,  h_ks, ks_bytes,  hipMemcpyHostToDevice, stream));
+    CUDA_CHECK(hipMemsetAsync(d_out, 0, out_bytes, stream));
+
+    pdmq_qk_probe_gqa2_kernel<<<1, PDMQ_THREADS, 0, stream>>>(d_q, d_kp, d_ks, d_out);
+    CUDA_CHECK(hipGetLastError());
+    CUDA_CHECK(hipMemcpyAsync(h_gpu, d_out, out_bytes, hipMemcpyDeviceToHost, stream));
+    CUDA_CHECK(hipStreamSynchronize(stream));
+
+    float max_err = 0.0f;
+    for (int i = 0; i < NQ * NK; i++)
+        max_err = fmaxf(max_err, fabsf(h_gpu[i] - h_ref[i]));
+
+    // Check for slot aliasing
+    bool dup_found = false;
+    for (int r1 = 0; r1 < PDMQ_BM_PREFILL && !dup_found; r1++) {
+        for (int r2 = 0; r2 < PDMQ_BM_PREFILL && !dup_found; r2++) {
+            bool same = true;
+            for (int c = 0; c < NK && same; c++)
+                if (fabsf(h_gpu[r1 * NK + c] - h_gpu[(PDMQ_BM_PREFILL + r2) * NK + c]) > 1e-4f) same = false;
+            if (same) { fprintf(stderr, "PDMQ GQA2 slot ALIAS: slot0_r=%d slot1_r=%d\n", r1, r2); dup_found = true; }
+        }
+    }
+
+    CUDA_CHECK(hipFree(d_q)); CUDA_CHECK(hipFree(d_kp)); CUDA_CHECK(hipFree(d_ks)); CUDA_CHECK(hipFree(d_out));
+    free(h_q); free(h_kp); free(h_ks); free(h_ref); free(h_gpu);
+
+    if (max_err > 1e-3f) {
+        fprintf(stderr, "PDMQ GQA2 QK probe FAILED: max_err=%f\n", max_err);
+        return false;
+    }
+    if (dup_found) {
+        fprintf(stderr, "PDMQ GQA2 QK probe FAILED: slot aliasing\n");
+        return false;
+    }
+    fprintf(stderr, "PDMQ GQA2 QK probe PASSED: max_err=%f\n", max_err);
+    return true;
 }
 
 enum pdmq_shape { PDMQ_SHAPE_M16N16, PDMQ_SHAPE_M8N32, PDMQ_SHAPE_M4N64 };
@@ -667,23 +1238,48 @@ static void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     const int launch_bm = shape == PDMQ_SHAPE_M16N16 ? PDMQ_BM_PREFILL : (shape == PDMQ_SHAPE_M8N32 ? PDMQ_BM_SMALL : PDMQ_BM_LONGK);
     const int launch_bn = shape == PDMQ_SHAPE_M16N16 ? PDMQ_BN_PREFILL : (shape == PDMQ_SHAPE_M8N32 ? PDMQ_BN_SMALL : PDMQ_BN_LONGK);
 
-    dim3 grid(CEIL_DIV(nq, launch_bm), n_heads_q, batch);
+    const int gqa_group = ggml_cuda_rocm_packed16_dot4_mmq_gqa_group();
+    const bool is_gqa2 = (gqa_group == 2);
+    const bool gqa2_supported = is_gqa2 && (shape == PDMQ_SHAPE_M16N16) && (gqa_ratio >= 2) && (nq > 1);
+    if (is_gqa2 && !gqa2_supported) {
+        GGML_ABORT("PDMQ GQA2 requested but unsupported: shape=%s nq=%d hq=%d hk=%d gqa_ratio=%d",
+                   pdmq_shape_name(shape), nq, n_heads_q, n_heads_k, gqa_ratio);
+    }
+
+    const int groups_per_kv = CEIL_DIV(gqa_ratio, 2);
+    const int grid_y_gqa2  = n_heads_k * groups_per_kv;
+    const int grid_y_old   = n_heads_q;
+
+    dim3 grid(is_gqa2
+        ? CEIL_DIV(nq, PDMQ_BM_PREFILL)
+        : CEIL_DIV(nq, launch_bm),
+        is_gqa2 ? grid_y_gqa2 : n_heads_q,
+        batch);
     dim3 block(PDMQ_THREADS);
     hipStream_t stream = ctx.stream();
 
+    const bool kshared = pdmq_kshared_enabled();
+    const bool directv = kshared && !pdmq_stagev_enabled();  // direct-V = kshared with V staging off
+
     { static bool once = false; if (!once) { once = true;
         fprintf(stderr,
-            "PDMQ v%d route=rocm_packed16_dot4_mmq shape=%s(%dx%d) auto=%d nq=%d nk=%d hq=%d hk=%d b=%d sc=%g "
-            "V=%s packed_rows=%d head_stride=%d causal=%d stage_v=%d lds_pad=1\n",
+            "PDMQ v%d route=rocm_packed16_dot4_mmq variant=%s shape=%s(%dx%d) nq=%d nk=%d hq=%d hk=%d "
+            "gqa_ratio=%d group=%d grid_y_old=%d grid_y_new=%d b=%d sc=%g "
+            "V=%s packed_rows=%d head_stride=%d causal=%d stage_v=%d kshared=%d directv=%d\n",
             PACKED16_DOT4_MMQ_VERSION,
-            pdmq_shape_name(shape), launch_bm, launch_bn, shape_auto ? 1 : 0,
-            nq, nk, n_heads_q, n_heads_k, batch, (double) attention_scale,
+            is_gqa2 ? "GQA2" : "GQA1",
+            pdmq_shape_name(shape), launch_bm, launch_bn,
+            nq, nk, n_heads_q, n_heads_k, gqa_ratio, gqa_group,
+            grid_y_old, is_gqa2 ? grid_y_gqa2 : grid_y_old,
+            batch, (double) attention_scale,
             ggml_type_name(V->type), packed_rows, packed_rows / n_heads_k, assume_causal ? 1 : 0,
-            shape == PDMQ_SHAPE_M4N64 ? 0 : 1);
+            directv ? 0 : 1, kshared ? 1 : 0, directv ? 1 : 0);
+        if (!pdmq_qk_probe_pass(stream)) GGML_ABORT("PDMQ QK probe failed");
+        if (is_gqa2 && !pdmq_qk_probe_gqa2_pass(stream)) GGML_ABORT("PDMQ GQA2 QK probe failed");
     }}
 
-#define PDMQ_LAUNCH_SHAPE(VT, BM_VAL, BN_VAL, CAUSAL, STAGE_V) \
-    packed16_dot4_mmq_kernel<VT, BM_VAL, BN_VAL, PDMQ_D, CAUSAL, STAGE_V><<<grid, block, 0, stream>>>( \
+#define PDMQ_LAUNCH_SHAPE(VT, BM_VAL, BN_VAL, CAUSAL, STAGE_V, KSHARED) \
+    packed16_dot4_mmq_kernel<VT, BM_VAL, BN_VAL, PDMQ_D, CAUSAL, STAGE_V, KSHARED><<<grid, block, 0, stream>>>( \
         (const float *) Q->data, (const char *) V->data, (float *) dst->data, \
         Q->nb[1], Q->nb[2], Q->nb[3], \
         V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
@@ -691,21 +1287,84 @@ static void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
         nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale)
 
-#define PDMQ_LAUNCH_TYPED(VT, CAUSAL) do { \
-    if (shape == PDMQ_SHAPE_M16N16) { \
-        PDMQ_LAUNCH_SHAPE(VT, PDMQ_BM_PREFILL, PDMQ_BN_PREFILL, CAUSAL, true); \
-    } else if (shape == PDMQ_SHAPE_M8N32) { \
-        PDMQ_LAUNCH_SHAPE(VT, PDMQ_BM_SMALL, PDMQ_BN_SMALL, CAUSAL, true); \
+#define PDMQ_LAUNCH_GQA2(VT, CAUSAL, kshared_var, directv_var) do { \
+    if (kshared_var && !(directv_var)) { \
+        packed16_dot4_mmq_gqa2_kernel<VT, CAUSAL, true, true><<<grid, block, 0, stream>>>( \
+            (const float *) Q->data, (const char *) V->data, (float *) dst->data, \
+            Q->nb[1], Q->nb[2], Q->nb[3], \
+            V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
+            mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+            (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
+            nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale); \
+    } else if (kshared_var) { \
+        packed16_dot4_mmq_gqa2_kernel<VT, CAUSAL, false, true><<<grid, block, 0, stream>>>( \
+            (const float *) Q->data, (const char *) V->data, (float *) dst->data, \
+            Q->nb[1], Q->nb[2], Q->nb[3], \
+            V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
+            mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+            (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
+            nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale); \
+    } else if (!(directv_var)) { \
+        packed16_dot4_mmq_gqa2_kernel<VT, CAUSAL, true, false><<<grid, block, 0, stream>>>( \
+            (const float *) Q->data, (const char *) V->data, (float *) dst->data, \
+            Q->nb[1], Q->nb[2], Q->nb[3], \
+            V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
+            mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+            (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
+            nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale); \
     } else { \
-        PDMQ_LAUNCH_SHAPE(VT, PDMQ_BM_LONGK, PDMQ_BN_LONGK, CAUSAL, false); \
+        packed16_dot4_mmq_gqa2_kernel<VT, CAUSAL, false, false><<<grid, block, 0, stream>>>( \
+            (const float *) Q->data, (const char *) V->data, (float *) dst->data, \
+            Q->nb[1], Q->nb[2], Q->nb[3], \
+            V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
+            mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+            (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
+            nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale); \
     } \
 } while (0)
 
+#define PDMQ_LAUNCH_TYPED_IMPL(VT, CAUSAL, kshared_val, stagev_val) do { \
+    if (shape == PDMQ_SHAPE_M16N16) { \
+        PDMQ_LAUNCH_SHAPE(VT, PDMQ_BM_PREFILL, PDMQ_BN_PREFILL, CAUSAL, stagev_val, kshared_val); \
+    } else if (shape == PDMQ_SHAPE_M8N32) { \
+        PDMQ_LAUNCH_SHAPE(VT, PDMQ_BM_SMALL, PDMQ_BN_SMALL, CAUSAL, stagev_val, kshared_val); \
+    } else { \
+        PDMQ_LAUNCH_SHAPE(VT, PDMQ_BM_LONGK, PDMQ_BN_LONGK, CAUSAL, false, kshared_val); \
+    } \
+} while (0)
+
+#define PDMQ_LAUNCH_TYPED(VT, CAUSAL, kshared_var, directv_var) do { \
+    if (kshared_var && directv_var) { \
+        PDMQ_LAUNCH_TYPED_IMPL(VT, CAUSAL, true, false); \
+    } else if (kshared_var) { \
+        PDMQ_LAUNCH_TYPED_IMPL(VT, CAUSAL, true, true); \
+    } else { \
+        PDMQ_LAUNCH_TYPED_IMPL(VT, CAUSAL, false, true); \
+    } \
+} while (0)
+
+if (is_gqa2) {
+    if (assume_causal) {
+        switch (V->type) {
+            case GGML_TYPE_Q4_0: PDMQ_LAUNCH_GQA2(PACKED16_DOT4_MMQ_V_Q4_0, true, kshared, directv); break;
+            case GGML_TYPE_Q8_0: PDMQ_LAUNCH_GQA2(PACKED16_DOT4_MMQ_V_Q8_0, true, kshared, directv); break;
+            case GGML_TYPE_F16:  PDMQ_LAUNCH_GQA2(PACKED16_DOT4_MMQ_V_F16,  true, kshared, directv); break;
+            default: GGML_ABORT("packed16_dot4_mmq gqa2: unsupported V type");
+        }
+    } else {
+        switch (V->type) {
+            case GGML_TYPE_Q4_0: PDMQ_LAUNCH_GQA2(PACKED16_DOT4_MMQ_V_Q4_0, false, kshared, directv); break;
+            case GGML_TYPE_Q8_0: PDMQ_LAUNCH_GQA2(PACKED16_DOT4_MMQ_V_Q8_0, false, kshared, directv); break;
+            case GGML_TYPE_F16:  PDMQ_LAUNCH_GQA2(PACKED16_DOT4_MMQ_V_F16,  false, kshared, directv); break;
+            default: GGML_ABORT("packed16_dot4_mmq gqa2: unsupported V type");
+        }
+    }
+} else {
 #define PDMQ_SWITCH_V(CAUSAL) \
     switch (V->type) { \
-        case GGML_TYPE_Q4_0: PDMQ_LAUNCH_TYPED(PACKED16_DOT4_MMQ_V_Q4_0, CAUSAL); break; \
-        case GGML_TYPE_Q8_0: PDMQ_LAUNCH_TYPED(PACKED16_DOT4_MMQ_V_Q8_0, CAUSAL); break; \
-        case GGML_TYPE_F16:  PDMQ_LAUNCH_TYPED(PACKED16_DOT4_MMQ_V_F16,  CAUSAL); break; \
+        case GGML_TYPE_Q4_0: PDMQ_LAUNCH_TYPED(PACKED16_DOT4_MMQ_V_Q4_0, CAUSAL, kshared, directv); break; \
+        case GGML_TYPE_Q8_0: PDMQ_LAUNCH_TYPED(PACKED16_DOT4_MMQ_V_Q8_0, CAUSAL, kshared, directv); break; \
+        case GGML_TYPE_F16:  PDMQ_LAUNCH_TYPED(PACKED16_DOT4_MMQ_V_F16,  CAUSAL, kshared, directv); break; \
         default: GGML_ABORT("packed16_dot4_mmq: unsupported V type"); \
     }
 
@@ -716,7 +1375,9 @@ static void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     }
 
 #undef PDMQ_SWITCH_V
+}
 #undef PDMQ_LAUNCH_TYPED
+#undef PDMQ_LAUNCH_GQA2
 #undef PDMQ_LAUNCH_SHAPE
 
     CUDA_CHECK(hipGetLastError());

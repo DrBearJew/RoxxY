@@ -2702,28 +2702,84 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_Q8K_DOT4_KQ;
         }
 
-        // nq > 1 prefill/verify: DOT4-MMQ is opt-in and checked before WMMA only
-        // when explicitly enabled. Otherwise WMMA keeps priority.
-        if (prefill_or_verify && ggml_cuda_packed16_dot4_mmq_supported(cc, dst)) {
-            return BEST_FATTN_KERNEL_PACKED16_DOT4_MMQ;
-        }
+        // nq > 1 prefill/verify: DOT4-MMQ is first priority (fastest packed16 path).
+        // PWMMA BM32 is preferred fallback. DOT4_KQ is last resort.
+        const bool auto_verbose =
+            (getenv("GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE") && atoi(getenv("GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE"))) ||
+            (getenv("COMPRESSED_KV_FATTN_LOG") && atoi(getenv("COMPRESSED_KV_FATTN_LOG")));
+        const bool dot4_sup = ggml_cuda_packed16_dot4_mmq_supported(cc, dst);
+        const bool wmma_sup = ggml_cuda_packed16_wmma_tile_enabled();
+        best_fattn_kernel packed16_kernel = BEST_FATTN_KERNEL_NONE;
+        const char * packed16_route_name = "none";
 
-        // nq > 1 prefill/verify: prefer packed16_wmma_tile when enabled.
-        if (prefill_or_verify && ggml_cuda_packed16_wmma_tile_enabled()) {
-            return BEST_FATTN_KERNEL_PACKED16_WMMA_TILE;
-        }
+        if (prefill_or_verify && dot4_sup) {
+            // ── BM32_regout_directv auto-selection ──────────
+            // Wins on 27B at all pp ≥512 and on 35B at pp ≥1024.
+            const char * explicit_impl = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL");
+            const bool impl_is_wmma =
+                explicit_impl && (
+                    strcmp(explicit_impl, "bm32_regout_directv") == 0 ||
+                    strcmp(explicit_impl, "bm32_regout_stagev") == 0 ||
+                    strcmp(explicit_impl, "bm64_regout_directv") == 0 ||
+                    strcmp(explicit_impl, "bm64_regout_stagev") == 0);
+            const bool impl_auto = (!explicit_impl || !*explicit_impl || strcmp(explicit_impl, "smem") == 0);
+            // 27B-like shape: gqa_ratio=6, heads_q=24, heads_k=4
+            const bool is_27b_like = (gqa_ratio == 6 && K->ne[1] >= 1024);
+            // 35B-like or general: nk >= 1024 (context length, not query chunk size)
+            const bool is_long_context = (K->ne[1] >= 1024);
+            const bool wmma_available = wmma_sup;
+            const bool use_bm32_regout = impl_auto && wmma_available && (is_27b_like || is_long_context);
 
-        if (!ggml_cuda_q8k_dot4_kq_enabled()) {
-            // Auto-enable DOT4_KQ when packed16 K cache is active but no
-            // explicit kernel env was provided.  Without this, I32 K ops
-            // have no FA kernel for nq>1 and fall through to abort.
-            if (getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE")) {
-                return BEST_FATTN_KERNEL_Q8K_DOT4_KQ;
+            // Once we auto-select WMMA for long context, keep using it for
+            // subsequent calls (IMPL is already set to bm32_regout_directv).
+            if (use_bm32_regout || (impl_is_wmma && wmma_available)) {
+                if (use_bm32_regout) {
+                    setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL", "bm32_regout_directv", 1);
+                    setenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM", "32", 1);
+                    setenv("GGML_CUDA_ROCM_PACKED16_WMMA_CAUSAL_SKIP", "1", 1);
+                }
+                packed16_kernel = BEST_FATTN_KERNEL_PACKED16_WMMA_TILE;
+                packed16_route_name = "pwmma_bm32_regout_directv";
+            } else {
+                packed16_kernel = BEST_FATTN_KERNEL_PACKED16_DOT4_MMQ;
+                packed16_route_name = "dot4_mmq_gqa1";
             }
-            return BEST_FATTN_KERNEL_NONE;
+        } else if (prefill_or_verify && wmma_sup) {
+            packed16_kernel = BEST_FATTN_KERNEL_PACKED16_WMMA_TILE;
+            // Auto-select BM32_regout_directv as best PWMMA impl
+            const char * explicit_impl = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL");
+            const bool impl_auto = (!explicit_impl || !*explicit_impl || strcmp(explicit_impl, "smem") == 0);
+            if (impl_auto) {
+                setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL", "bm32_regout_directv", 1);
+                setenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM", "32", 1);
+                setenv("GGML_CUDA_ROCM_PACKED16_WMMA_CAUSAL_SKIP", "1", 1);
+                packed16_route_name = "pwmma_bm32_regout_directv";
+            } else {
+                const int bm = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM") ? atoi(getenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM")) : 32;
+                packed16_route_name = (bm == 16) ? "pwmma_bm16" : (bm == 32 ? "pwmma_bm32" : "pwmma_bm64");
+            }
+        } else if (ggml_cuda_q8k_dot4_kq_enabled() || getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE")) {
+            packed16_kernel = BEST_FATTN_KERNEL_Q8K_DOT4_KQ;
+            packed16_route_name = "dot4_kq_oracle";
+        } else {
+            packed16_kernel = BEST_FATTN_KERNEL_NONE;
+            packed16_route_name = "none";
         }
 
-        return BEST_FATTN_KERNEL_Q8K_DOT4_KQ;
+        if (auto_verbose && g_fattn_select_ctx == GGML_CUDA_FATTN_SELECT_DISPATCH) {
+            fprintf(stderr, "%s: PACKED16 FA ROUTE nq=%lld nk=%lld D=%lld hq=%lld hk=%lld gqa=%d"
+                " K=I32 V=%s auto=1 selected=%s"
+                " dot4_mmq_sup=%d wmma_sup=%d forced_route=%s\n",
+                __func__,
+                (long long)Q->ne[1], (long long)K->ne[1], (long long)Q->ne[0],
+                (long long)Q->ne[2], (long long)K->ne[2], gqa_ratio,
+                ggml_type_name(V->type),
+                packed16_route_name,
+                dot4_sup ? 1 : 0, wmma_sup ? 1 : 0,
+                required_route ? required_route : "none");
+        }
+
+        return packed16_kernel;
     }
 
     // ── Instruction dispatch: try BEFORE shape/type switch ──────────

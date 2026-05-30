@@ -113,18 +113,24 @@ static inline bool ggml_cuda_q8k_dot4_packed16_vec_enabled() {
 
 static inline bool ggml_cuda_packed16_wmma_tile_enabled() {
 #ifdef GGML_USE_HIP
-    // Opt-in packed16→f16 tile materializer + WMMA/MFMA FA path.
-    // Requires persistent packed16 K cache (GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE=1).
-    {
-        const char * v = getenv("GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE");
-        if (!v) v = getenv("GGML_CUDA_ROCM_UNSAFE_EXPERIMENTS");
-        if (v && atoi(v) == 0) return false;
-    }
+    // PWMMA tile is auto-enabled when packed16 K cache is active
+    // and not explicitly disabled, OR when GGML_CUDA_ROCM_PACKED16_AUTO=1.
+    // To disable: GGML_CUDA_ROCM_PACKED16_WMMA_TILE=0
     {
         const char * v = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_TILE");
-        if (!v || atoi(v) == 0) return false;
+        if (v && atoi(v) == 0) return false;
+        if (v && atoi(v) != 0) return true;
     }
-    return true;
+    // Auto-enable: packed16 K cache active
+    {
+        const char * v = getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE");
+        if (v && atoi(v) != 0) return true;
+    }
+    {
+        const char * v = getenv("GGML_CUDA_ROCM_PACKED16_AUTO");
+        if (v && atoi(v) != 0) return true;
+    }
+    return false;
 #else
     return false;
 #endif
