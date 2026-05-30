@@ -2065,18 +2065,26 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             (strcmp(req, "rocm_packed16_wmma_tile") == 0 ||
              strcmp(req, "packed16_wmma_tile") == 0);
     }();
-    if (!(v_trans && pwmma_forced && v->type == GGML_TYPE_F16)) {
-        v = ggml_permute(ctx0, v, 0, 2, 1, 3);
-    }
+    v = ggml_permute(ctx0, v, 0, 2, 1, 3);  // global permute for all paths
 
     ggml_tensor * cur;
 
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
-        // PWMMA uses native v_trans V directly — no transpose/permute needed.
-        if (v_trans && !pwmma_forced) {
-            v = ggml_transpose(ctx0, v);
+        // For PWMMA+v_trans: use native V directly (undo global permute).
+        // Do NOT modify the general `v` variable — keep it for downstream graph consistency.
+        ggml_tensor * v_for_fa = v;
+        if (v_trans && pwmma_forced && v->type == GGML_TYPE_F16) {
+            v_for_fa = ggml_permute(ctx0, v, 0, 2, 1, 3);  // undo → [n_kv,heads,D,batch]
+            fprintf(stderr, "BUILD FA NATIVE V: name=%s ne=(%lld,%lld,%lld,%lld) nb=(%lld,%lld,%lld,%lld)\n",
+                v_for_fa->name ? v_for_fa->name : "(null)",
+                (long long)v_for_fa->ne[0], (long long)v_for_fa->ne[1],
+                (long long)v_for_fa->ne[2], (long long)v_for_fa->ne[3],
+                (long long)v_for_fa->nb[0], (long long)v_for_fa->nb[1],
+                (long long)v_for_fa->nb[2], (long long)v_for_fa->nb[3]);
+        } else if (v_trans) {
+            v_for_fa = ggml_transpose(ctx0, v);
         }
 
         // this can happen when KV cache is not used (e.g. an embedding model with non-causal attn)
@@ -2084,8 +2092,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             k = ggml_cast(ctx0, k, GGML_TYPE_F16);
         }
 
-        if (v->type == GGML_TYPE_F32) {
-            v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+        if (v_for_fa->type == GGML_TYPE_F32) {
+            v_for_fa = ggml_cast(ctx0, v_for_fa, GGML_TYPE_F16);
         }
 
         // When FA is forced for packed16 I32 K but cparams.flash_attn was false,
@@ -2094,7 +2102,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
         }
 
-        cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+        cur = ggml_flash_attn_ext(ctx0, q, k, v_for_fa, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         cb(cur, LLAMA_TENSOR_NAME_FATTN, il);
 
