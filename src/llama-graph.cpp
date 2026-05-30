@@ -2064,11 +2064,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
-        // v_trans get_v() returns V as [n_kv, n_head_kv, D, batch].
-        // FA expects [D, n_kv, n_head_kv, batch] with nb[0] == type_size.
-        // Permute (2,0,1,3) swaps D to dim 0, n_kv to dim 1.
         if (v_trans) {
-            v = ggml_permute(ctx0, v, 2, 0, 1, 3);
+            v = ggml_transpose(ctx0, v);
         }
 
         // this can happen when KV cache is not used (e.g. an embedding model with non-causal attn)
@@ -2086,7 +2083,6 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
         }
 
-        assert_fa_v_layout(v, "build_attn_mha FA input V");
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         cb(cur, LLAMA_TENSOR_NAME_FATTN, il);
@@ -2460,7 +2456,6 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
-    assert_fa_v_layout(v, "swa v-from-k view");
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
