@@ -2057,10 +2057,6 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     if (!k_is_packed16_i32) {
         k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     }
-    fprintf(stderr, "build_attn_mha: V pre-permute ne=(%lld,%lld,%lld,%lld) nb=(%lld,%lld,%lld,%lld) v_type=%s v_name=%s\n",
-        (long long)v->ne[0], (long long)v->ne[1], (long long)v->ne[2], (long long)v->ne[3],
-        (long long)v->nb[0], (long long)v->nb[1], (long long)v->nb[2], (long long)v->nb[3],
-        ggml_type_name(v->type), v->name ? v->name : "(null)");
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
 
     ggml_tensor * cur;
