@@ -2064,13 +2064,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
-        if (v_trans) {
-            // v_trans get_v() returns V as [n_kv, n_head_kv, D, batch].
-            // FA expects [D, n_kv, n_head_kv, batch] with nb[0] == type_size.
-            // Permute (2,0,1,3) swaps D to dim 0, n_kv to dim 1.
+        // v_trans get_v() returns V as [n_kv, n_head_kv, D, batch].
+        // FA expects [D, n_kv, n_head_kv, batch] with nb[0] == type_size.
+        // Permute (2,0,1,3) swaps D to dim 0, n_kv to dim 1.
         if (v_trans) {
             v = ggml_permute(ctx0, v, 2, 0, 1, 3);
         }
+
         // this can happen when KV cache is not used (e.g. an embedding model with non-causal attn)
         if (k->type == GGML_TYPE_F32) {
             k = ggml_cast(ctx0, k, GGML_TYPE_F16);

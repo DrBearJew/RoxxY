@@ -8902,15 +8902,32 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     // input tensor rows must be contiguous
     GGML_ASSERT(nbq0 == ggml_type_size(q->type));
     GGML_ASSERT(nbk0 == ggml_type_size(k->type));
-    if (nbv0 != ggml_type_size(v->type)) {
-        fprintf(stderr, "FLASH_ATTN BAD V: nq=%lld nk=%lld nv=%lld "
-                "v_type=%s v_ne=(%lld,%lld,%lld,%lld) v_nb=(%lld,%lld,%lld,%lld) nbv0=%lld type_size=%zu\n",
-                (long long)neq1, (long long)nek1, (long long)nev1,
-                ggml_type_name(v->type),
-                (long long)v->ne[0], (long long)v->ne[1], (long long)v->ne[2], (long long)v->ne[3],
-                (long long)v->nb[0], (long long)v->nb[1], (long long)v->nb[2], (long long)v->nb[3],
-                (long long)nbv0, ggml_type_size(v->type));
-        GGML_ABORT("V tensor nb[0] mismatch");
+    {
+        const bool v_dim0_contig = (nbv0 == (int64_t) ggml_type_size(v->type));
+        // PWMMA custom backend reads V stride-aware; allow strided V when forced.
+        static bool require_pwmma = []() {
+            const char * req = getenv("GGML_CUDA_FA_ROUTE_REQUIRE");
+            return req && (strcmp(req, "rocm_packed16_wmma_tile") == 0);
+        }();
+        const bool allow_strided_v = require_pwmma && v->type == GGML_TYPE_F16;
+        if (!v_dim0_contig && !allow_strided_v) {
+            fprintf(stderr, "FLASH_ATTN BAD V: nq=%lld nk=%lld nv=%lld "
+                    "v_type=%s v_ne=(%lld,%lld,%lld,%lld) v_nb=(%lld,%lld,%lld,%lld) nbv0=%lld type_size=%zu\n",
+                    (long long)neq1, (long long)nek1, (long long)nev1,
+                    ggml_type_name(v->type),
+                    (long long)v->ne[0], (long long)v->ne[1], (long long)v->ne[2], (long long)v->ne[3],
+                    (long long)v->nb[0], (long long)v->nb[1], (long long)v->nb[2], (long long)v->nb[3],
+                    (long long)nbv0, ggml_type_size(v->type));
+            GGML_ABORT("V tensor nb[0] mismatch");
+        }
+        if (!v_dim0_contig && allow_strided_v) {
+            fprintf(stderr, "PWMMA accepting strided V: nq=%lld nk=%lld nv=%lld "
+                    "type=%s ne=(%lld,%lld,%lld,%lld) nb=(%lld,%lld,%lld,%lld)\n",
+                    (long long)neq1, (long long)nek1, (long long)nev1,
+                    ggml_type_name(v->type),
+                    (long long)v->ne[0], (long long)v->ne[1], (long long)v->ne[2], (long long)v->ne[3],
+                    (long long)v->nb[0], (long long)v->nb[1], (long long)v->nb[2], (long long)v->nb[3]);
+        }
     }
 
     // I32 packed16 K has per-head dimension D/4 vs Q's D; only check for non-I32 K
