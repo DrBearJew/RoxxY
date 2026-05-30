@@ -2632,8 +2632,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // I32 packed16 K: DOT4-only format.  Bypass generic shape switch that
     // would reject K->ne[0]=64 vs V->ne[0]=128/256 mismatch.
     if (K->type == GGML_TYPE_I32) {
+        // Route requirement detection (must be before shape checks)
+        const char * required_route = getenv("GGML_CUDA_FA_ROUTE_REQUIRE");
+        const bool require_packed16_wmma =
+            required_route &&
+            (strcmp(required_route, "rocm_packed16_wmma_tile") == 0 ||
+             strcmp(required_route, "packed16_wmma_tile") == 0);
+
         const bool k_shape_ok = K->ne[0] * 4 == Q->ne[0];  // D/4 * 4 == D
-        const bool v_shape_ok = V->ne[0] == Q->ne[0];
+        // V layout: FA expects [D,n_kv,heads,batch], native v_trans is [n_kv,heads,D,batch]
+        const bool v_shape_fa    = V->ne[0] == Q->ne[0];
+        const bool v_shape_trans = V->type == GGML_TYPE_F16 && V->ne[0] == K->ne[1] && V->ne[1] == K->ne[2] && V->ne[2] == Q->ne[0];
+        const bool v_shape_ok    = v_shape_fa || (require_packed16_wmma && v_shape_trans);
         const bool head_ok    = Q->ne[2] > 0 && K->ne[2] > 0 && Q->ne[2] % K->ne[2] == 0;
 
         if (!(Q->type == GGML_TYPE_F32 && (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0) && dst->type == GGML_TYPE_F32 &&
@@ -2656,12 +2666,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
         const ggml_fattn_instruction inst = (ggml_fattn_instruction)fa_inst_i32;
 
-        // Hard gate: if packed16_wmma_tile is explicitly required, force it or abort.
-        const char * required_route = getenv("GGML_CUDA_FA_ROUTE_REQUIRE");
-        const bool require_packed16_wmma =
-            required_route &&
-            (strcmp(required_route, "rocm_packed16_wmma_tile") == 0 ||
-             strcmp(required_route, "packed16_wmma_tile") == 0);
         const bool require_packed16_dot4_mmq =
             required_route &&
             (strcmp(required_route, "rocm_packed16_dot4_mmq") == 0 ||
@@ -2676,12 +2680,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_PACKED16_DOT4_MMQ;
         }
         if (require_packed16_wmma && ggml_cuda_packed16_wmma_tile_enabled()) {
-        fprintf(stderr, "ROUTE: require_packed16_wmma=%d enabled=%d\n", (int)require_packed16_wmma, (int)ggml_cuda_packed16_wmma_tile_enabled());
+        fprintf(stderr, "ROUTE: require_packed16_wmma=1 enabled=1 nq=%lld\n", (long long)Q->ne[1]);
             if (Q->ne[1] == 1) {
-                // nq==1 decode: WMMA kernel doesn't support decode. Allow DOT4.
-                return BEST_FATTN_KERNEL_Q8K_DOT4_KQ;
+                return BEST_FATTN_KERNEL_Q8K_DOT4_KQ;  // decode: DOT4 fallback
             }
-            // Force WMMA for nq>1.
             return BEST_FATTN_KERNEL_PACKED16_WMMA_TILE;
         }
 
@@ -3216,7 +3218,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 
     g_fattn_select_ctx = GGML_CUDA_FATTN_SELECT_DISPATCH;
+    fprintf(stderr, "FATTN COMPUTE ENTER dst=%p\n", (void*)dst); fflush(stderr);
     const best_fattn_kernel best_kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    fprintf(stderr, "FATTN COMPUTE SELECT selected=%d name=%s dst=%p\n", (int)best_kernel, ggml_cuda_fattn_kernel_name(best_kernel), (void*)dst); fflush(stderr);
+    if (best_kernel == BEST_FATTN_KERNEL_PACKED16_WMMA_TILE) {
+        fprintf(stderr, "PWMMA COMPUTE SELECTED: immediate abort proof\n"); fflush(stderr);
+        GGML_ABORT("PWMMA compute selection reached");
+    }
+
     ggml_cuda_fattn_log_selection(best_kernel, dst);
 
     // ── VEC/TILE hunter hook ───────────────────────────────────
@@ -3251,6 +3260,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             }
         }
     }
+
+    fprintf(stderr, "PWMMA DISPATCH selected=%d name=%s\n", (int) best_kernel, ggml_cuda_fattn_kernel_name(best_kernel));
 
     switch (best_kernel) {
         case BEST_FATTN_KERNEL_NONE:
@@ -3310,6 +3321,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_PACKED16_WMMA_TILE:
+            fprintf(stderr, "PWMMA SWITCH CASE HIT\n");
             ggml_cuda_flash_attn_ext_packed16_wmma_tile(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_PACKED16_DOT4_MMQ:
@@ -3322,7 +3334,9 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     g_fattn_select_ctx = GGML_CUDA_FATTN_SELECT_SUPPORT_PROBE;
     const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
     const ggml_tensor * Q = dst->src[0];
+    fprintf(stderr, "FATTN SUPPORT ENTER dst=%p\n", (void*)dst); fflush(stderr);
     const best_fattn_kernel k = ggml_cuda_get_best_fattn_kernel(device, dst);
+    fprintf(stderr, "FATTN SUPPORT SELECT selected=%d name=%s dst=%p\n", (int)k, ggml_cuda_fattn_kernel_name(k), (void*)dst); fflush(stderr);
     const bool result = k != BEST_FATTN_KERNEL_NONE;
     if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
         if (log_env && atoi(log_env) != 0) {

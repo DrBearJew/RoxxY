@@ -2059,9 +2059,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     }
     // PWMMA can consume native v_trans V [n_kv, heads, D, batch] directly.
     // Skip the global permute for PWMMA+v_trans to keep native layout.
-    static bool pwmma_forced = []() {
+    const bool pwmma_forced = []() {
         const char * req = getenv("GGML_CUDA_FA_ROUTE_REQUIRE");
-        return req && strcmp(req, "rocm_packed16_wmma_tile") == 0;
+        return req &&
+            (strcmp(req, "rocm_packed16_wmma_tile") == 0 ||
+             strcmp(req, "packed16_wmma_tile") == 0);
     }();
     if (!(v_trans && pwmma_forced && v->type == GGML_TYPE_F16)) {
         v = ggml_permute(ctx0, v, 0, 2, 1, 3);
