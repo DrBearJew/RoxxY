@@ -2682,7 +2682,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         if (require_packed16_wmma && ggml_cuda_packed16_wmma_tile_enabled()) {
         fprintf(stderr, "ROUTE: require_packed16_wmma=1 enabled=1 nq=%lld\n", (long long)Q->ne[1]);
             if (Q->ne[1] == 1) {
-                return BEST_FATTN_KERNEL_Q8K_DOT4_KQ;  // decode: DOT4 fallback
+                return BEST_FATTN_KERNEL_Q8K_DOT4_KQ;  // nq==1 decode has no WMMA kernel yet
             }
             return BEST_FATTN_KERNEL_PACKED16_WMMA_TILE;
         }
@@ -3188,6 +3188,7 @@ static void ggml_cuda_flash_attn_ext_mma_tbq4(ggml_backend_cuda_context & ctx, g
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
 
+    setbuf(stderr, NULL);
     // ── Entry proof: every FA op must pass through here ──────────
     {
         const ggml_tensor * Q = dst->src[0];
@@ -3221,11 +3222,6 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     fprintf(stderr, "FATTN COMPUTE ENTER dst=%p\n", (void*)dst); fflush(stderr);
     const best_fattn_kernel best_kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
     fprintf(stderr, "FATTN COMPUTE SELECT selected=%d name=%s dst=%p\n", (int)best_kernel, ggml_cuda_fattn_kernel_name(best_kernel), (void*)dst); fflush(stderr);
-    if (best_kernel == BEST_FATTN_KERNEL_PACKED16_WMMA_TILE) {
-        fprintf(stderr, "PWMMA COMPUTE SELECTED: immediate abort proof\n"); fflush(stderr);
-        GGML_ABORT("PWMMA compute selection reached");
-    }
-
     ggml_cuda_fattn_log_selection(best_kernel, dst);
 
     // ── VEC/TILE hunter hook ───────────────────────────────────

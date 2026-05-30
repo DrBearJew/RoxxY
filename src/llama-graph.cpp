@@ -2072,18 +2072,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
-        // For PWMMA+v_trans: use native V directly (undo global permute).
-        // Do NOT modify the general `v` variable — keep it for downstream graph consistency.
+        // PWMMA backend detects V layout natively (NATIVE_KDH mode from strides).
+        // Pass the globally-permuted V directly — no undo-permute needed.
         ggml_tensor * v_for_fa = v;
-        if (v_trans && pwmma_forced && v->type == GGML_TYPE_F16) {
-            v_for_fa = ggml_permute(ctx0, v, 0, 2, 1, 3);  // undo → [n_kv,heads,D,batch]
-            fprintf(stderr, "BUILD FA NATIVE V: name=%s ne=(%lld,%lld,%lld,%lld) nb=(%lld,%lld,%lld,%lld)\n",
-                v_for_fa->name ? v_for_fa->name : "(null)",
-                (long long)v_for_fa->ne[0], (long long)v_for_fa->ne[1],
-                (long long)v_for_fa->ne[2], (long long)v_for_fa->ne[3],
-                (long long)v_for_fa->nb[0], (long long)v_for_fa->nb[1],
-                (long long)v_for_fa->nb[2], (long long)v_for_fa->nb[3]);
-        } else if (v_trans) {
+        if (v_trans && !pwmma_forced) {
             v_for_fa = ggml_transpose(ctx0, v);
         }
 

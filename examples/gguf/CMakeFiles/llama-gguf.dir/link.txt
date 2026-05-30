@@ -1,0 +1,1 @@
+/usr/lib/ccache/c++ -O2 -g -DNDEBUG "CMakeFiles/llama-gguf.dir/gguf.cpp.o" -o ../../bin/llama-gguf  -Wl,-rpath,/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/bin:/opt/rocm-7.2.3/lib:/opt/rocm/lib: ../../bin/libggml.so.0.11.0 ../../bin/libggml-cpu.so.0.11.0 ../../bin/libggml-hip.so.0.11.0 ../../bin/libggml-base.so.0.11.0 -Wl,-rpath-link,/opt/rocm-7.2.3/lib:/opt/rocm/lib 

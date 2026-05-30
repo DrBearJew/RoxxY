@@ -1,0 +1,2 @@
+/home/mrtrent/.local/bin/ar qc libllama-common-base.a "CMakeFiles/llama-common-base.dir/build-info.cpp.o"
+/home/mrtrent/.local/bin/ranlib libllama-common-base.a

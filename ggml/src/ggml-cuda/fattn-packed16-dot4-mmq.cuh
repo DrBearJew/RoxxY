@@ -6,7 +6,12 @@
 //   - QK: sudot4/dp4a int8xint8 -> int32, then q_scale*k_scale
 //   - FA: online softmax + P@V, with the same packed16 row convention as WMMA
 //
-// Initial target: D=256, BM=8, BN=32, Q=f32, K=I32 packed16, V=q4_0/q8_0/f16, dst=f32.
+// Initial target: D=256, Q=f32, K=I32 packed16, V=q4_0/q8_0/f16, dst=f32.
+//
+// Shapes:
+//   M16N16: prefill/MMQ-oriented default for nq >= 16. More Q rows per CTA, lower V LDS.
+//   M8N32:  small-prefill fallback. Fewer Q rows, wider K tile.
+//   M4N64:  optional long-K/small-Q debug shape; higher V LDS, not default.
 
 #pragma once
 
@@ -27,15 +32,31 @@ void llama_kv_cache_get_packed16_tensors(const void * k_view_data,
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
 #endif
 
-#define PACKED16_DOT4_MMQ_VERSION 20260530
+#define PACKED16_DOT4_MMQ_VERSION 20260531
 
 static constexpr int PDMQ_D       = 256;
-static constexpr int PDMQ_BM      = 8;
-static constexpr int PDMQ_BN      = 32;
 static constexpr int PDMQ_THREADS = 256;
 
+static constexpr int PDMQ_BM_PREFILL = 16;
+static constexpr int PDMQ_BN_PREFILL = 16;
+static constexpr int PDMQ_BM_SMALL   = 8;
+static constexpr int PDMQ_BN_SMALL   = 32;
+static constexpr int PDMQ_BM_LONGK   = 4;
+static constexpr int PDMQ_BN_LONGK   = 64;
+
 static_assert(PDMQ_D % QK8_0 == 0, "packed16_dot4_mmq requires D multiple of QK8_0");
-static_assert(PDMQ_BM * PDMQ_BN == PDMQ_THREADS, "packed16_dot4_mmq maps one QK logit per thread");
+static_assert(PDMQ_BM_PREFILL * PDMQ_BN_PREFILL == PDMQ_THREADS, "M16N16 maps one QK logit per thread");
+static_assert(PDMQ_BM_SMALL   * PDMQ_BN_SMALL   == PDMQ_THREADS, "M8N32 maps one QK logit per thread");
+static_assert(PDMQ_BM_LONGK   * PDMQ_BN_LONGK   == PDMQ_THREADS, "M4N64 maps one QK logit per thread");
+
+// +1 row padding mirrors the useful MMQ/RDNA LDS trick: avoid perfect
+// power-of-two row strides in shared memory without materially increasing LDS.
+// Keep this local to DOT4-MMQ; do not reuse normal MMQ env knobs here.
+static constexpr int PDMQ_Q_WORDS       = PDMQ_D / 4;
+static constexpr int PDMQ_Q_BLOCKS      = PDMQ_D / QK8_0;
+static constexpr int PDMQ_Q_WORDS_PAD   = PDMQ_Q_WORDS + 1;
+static constexpr int PDMQ_Q_BLOCKS_PAD  = PDMQ_Q_BLOCKS + 1;
+static constexpr int PDMQ_D_PAD         = PDMQ_D + 1;
 
 enum packed16_dot4_mmq_v_type {
     PACKED16_DOT4_MMQ_V_Q4_0,
@@ -268,8 +289,8 @@ static __device__ __forceinline__ void pdmq_quantize_q_tile(
         const int hq,
         const int b,
         const int nq,
-        int   (&q_payload)[BM][D / 4],
-        float (&q_scales) [BM][D / QK8_0]) {
+        int   (&q_payload)[BM][D / 4 + 1],
+        float (&q_scales) [BM][D / QK8_0 + 1]) {
     constexpr int QBLOCKS = D / QK8_0;
     constexpr int WORDS_PER_BLOCK = QK8_0 / 4;
 
@@ -309,8 +330,8 @@ static __device__ __forceinline__ void pdmq_quantize_q_tile(
 
 template<int BM, int D>
 static __device__ __forceinline__ float pdmq_qk_dot(
-        const int   (&q_payload)[BM][D / 4],
-        const float (&q_scales) [BM][D / QK8_0],
+        const int   (&q_payload)[BM][D / 4 + 1],
+        const float (&q_scales) [BM][D / QK8_0 + 1],
         const int qr,
         const int * __restrict__ k_row_payload,
         const half * __restrict__ k_row_scales) {
@@ -331,7 +352,7 @@ static __device__ __forceinline__ float pdmq_qk_dot(
     return sum;
 }
 
-template<packed16_dot4_mmq_v_type V_TYPE, int BM, int BN, int D, bool CAUSAL_MASK>
+template<packed16_dot4_mmq_v_type V_TYPE, int BM, int BN, int D, bool CAUSAL_MASK, bool STAGE_V>
 static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_kernel(
         const float * __restrict__ Q,
         const char  * __restrict__ V,
@@ -360,14 +381,10 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_kern
         int gqa_ratio,
         int packed_rows,
         int q_offset,
-        float attention_scale,
-        int debug_q_row,
-        int debug_qk_max_k) {
+        float attention_scale) {
 
     static_assert(D == PDMQ_D, "packed16_dot4_mmq is D256-only");
-    static_assert(BM == PDMQ_BM, "unexpected BM");
-    static_assert(BN == PDMQ_BN, "unexpected BN");
-
+    
     const int tid = int(threadIdx.x);
     const int q_tile = int(blockIdx.x);
     const int hq = int(blockIdx.y);
@@ -382,13 +399,13 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_kern
     const int head_stride = packed_rows / n_heads_k;
     const size_t k_head_base = size_t(hk) * size_t(head_stride);
 
-    __shared__ int   q_tile_i32[BM][D / 4];
-    __shared__ float q_tile_scales[BM][D / QK8_0];
-    __shared__ float logits[BM * BN];
-    __shared__ float row_m[BM];
-    __shared__ float row_l[BM];
-    __shared__ float old_s[BM];
-    __shared__ float v_tile[BN * D];
+    __shared__ int   q_tile_i32[BM][D / 4 + 1];
+    __shared__ float q_tile_scales[BM][D / QK8_0 + 1];
+    __shared__ float logits[BM][BN + 1];
+    __shared__ float row_m[BM + 1];
+    __shared__ float row_l[BM + 1];
+    __shared__ float old_s[BM + 1];
+    __shared__ float v_tile[STAGE_V ? BN * (D + 1) : 1];
 
     if (tid < BM) {
         row_m[tid] = pdmq_neg();
@@ -414,15 +431,17 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_kern
             }
         }
 
+        if constexpr (STAGE_V) {
         for (int v_idx = tid; v_idx < BN * D; v_idx += int(blockDim.x)) {
             const int kk = v_idx / D;
             const int d  = v_idx - kk * D;
             const int k  = k0 + kk;
-            v_tile[v_idx] = kk < tile_n
+            v_tile[kk * (D + 1) + d] = kk < tile_n
                 ? pdmq_decode_v<V_TYPE>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k, hk, b, d)
                 : 0.0f;
         }
         __syncthreads();
+        }
 
         const bool full_q = q0 + BM <= nq;
         const bool full_k = tile_n == BN;
@@ -447,54 +466,12 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_kern
                 const size_t k_row = k_head_base + size_t(k);
                 const int  * k_row_payload = k_payload + k_row * (D / 4);
                 const half * k_row_scales  = k_scales  + k_row * (D / QK8_0);
-
-                // ── QK dot product (inlined for debug instrumentation) ──
-                constexpr int QBLOCKS = D / QK8_0;
-                constexpr int WORDS_PER_BLOCK = QK8_0 / 4;
-                const bool do_debug = (debug_q_row >= 0 && q == debug_q_row && k < debug_qk_max_k);
-
-                float qk_raw = 0.0f;
-#pragma unroll
-                for (int qb = 0; qb < QBLOCKS; ++qb) {
-                    int acc = 0;
-#pragma unroll
-                    for (int w = 0; w < WORDS_PER_BLOCK; ++w) {
-                        const int idx = qb * WORDS_PER_BLOCK + w;
-                        acc = pdmq_dot4_i8_i8(q_tile_i32[qr][idx], k_row_payload[idx], acc);
-                    }
-                    const float qs = q_tile_scales[qr][qb];
-                    const float ks = __half2float(k_row_scales[qb]);
-                    qk_raw += float(acc) * qs * ks;
-
-                    if (do_debug) {
-                        printf("PDMQ_QK b=%d hq=%d q=%d ik=%d blk=%d q_scale=%.6e k_scale=%.6e acc=%d qk_blk=%.6e",
-                            b, hq, q, k, qb, (double)qs, (double)ks, acc, (double)(float(acc) * qs * ks));
-                        printf(" qw=[%d,%d,%d,%d,%d,%d,%d,%d]",
-                            q_tile_i32[qr][qb*WORDS_PER_BLOCK+0], q_tile_i32[qr][qb*WORDS_PER_BLOCK+1],
-                            q_tile_i32[qr][qb*WORDS_PER_BLOCK+2], q_tile_i32[qr][qb*WORDS_PER_BLOCK+3],
-                            q_tile_i32[qr][qb*WORDS_PER_BLOCK+4], q_tile_i32[qr][qb*WORDS_PER_BLOCK+5],
-                            q_tile_i32[qr][qb*WORDS_PER_BLOCK+6], q_tile_i32[qr][qb*WORDS_PER_BLOCK+7]);
-                        printf(" kw=[%d,%d,%d,%d,%d,%d,%d,%d]\n",
-                            k_row_payload[qb*WORDS_PER_BLOCK+0], k_row_payload[qb*WORDS_PER_BLOCK+1],
-                            k_row_payload[qb*WORDS_PER_BLOCK+2], k_row_payload[qb*WORDS_PER_BLOCK+3],
-                            k_row_payload[qb*WORDS_PER_BLOCK+4], k_row_payload[qb*WORDS_PER_BLOCK+5],
-                            k_row_payload[qb*WORDS_PER_BLOCK+6], k_row_payload[qb*WORDS_PER_BLOCK+7]);
-                    }
-                }
-
-                const float qk_scaled = qk_raw * attention_scale;
-                float mask_val = 0.0f;
+                s = pdmq_qk_dot<BM, D>(q_tile_i32, q_tile_scales, qr, k_row_payload, k_row_scales) * attention_scale;
                 if (!exact_tile && mask && !CAUSAL_MASK) {
-                    mask_val = pdmq_mask_val(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q, k, b);
-                }
-                s = qk_scaled + mask_val;
-
-                if (do_debug) {
-                    printf("PDMQ_LOGIT b=%d hq=%d q=%d ik=%d raw=%.6e scaled=%.6e mask=%.6e final=%.6e\n",
-                        b, hq, q, k, (double)qk_raw, (double)qk_scaled, (double)mask_val, (double)s);
+                    s += pdmq_mask_val(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q, k, b);
                 }
             }
-            logits[tid] = s;
+            logits[qr][kk] = s;
         }
         __syncthreads();
 
@@ -505,7 +482,7 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_kern
             if (q < nq) {
 #pragma unroll
                 for (int kk = 0; kk < BN; ++kk) {
-                    const float s = logits[qr * BN + kk];
+                    const float s = logits[qr][kk];
                     tile_m = fmaxf(tile_m, s);
                 }
             }
@@ -517,9 +494,9 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_kern
             float tile_l = 0.0f;
 #pragma unroll
             for (int kk = 0; kk < BN; ++kk) {
-                const float s = logits[qr * BN + kk];
+                const float s = logits[qr][kk];
                 const float p = pdmq_logit_is_live(s) && pdmq_logit_is_live(m_new) ? expf(s - m_new) : 0.0f;
-                logits[qr * BN + kk] = p;
+                logits[qr][kk] = p;
                 tile_l += p;
             }
             row_l[qr] = row_l[qr] * alpha + tile_l;
@@ -538,9 +515,12 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_kern
                 float acc = out[qr] * old_s[qr];
 #pragma unroll
                 for (int kk = 0; kk < BN; ++kk) {
-                    const float p = logits[qr * BN + kk];
+                    const float p = logits[qr][kk];
                     if (p != 0.0f) {
-                        acc += p * v_tile[kk * D + tid];
+                        const float vv = STAGE_V
+                            ? v_tile[kk * (D + 1) + tid]
+                            : pdmq_decode_v<V_TYPE>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k0 + kk, hk, b, tid);
+                        acc += p * vv;
                     }
                 }
                 out[qr] = acc;
@@ -561,6 +541,53 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_kern
             dst[((size_t(b) * size_t(nq) + size_t(q)) * size_t(n_heads_q) + size_t(hq)) * size_t(D) + size_t(tid)] = val;
         }
     }
+}
+
+enum pdmq_shape { PDMQ_SHAPE_M16N16, PDMQ_SHAPE_M8N32, PDMQ_SHAPE_M4N64 };
+
+static inline const char * pdmq_shape_name(const pdmq_shape shape) {
+    switch (shape) {
+        case PDMQ_SHAPE_M16N16: return "16x16";
+        case PDMQ_SHAPE_M8N32:  return "8x32";
+        case PDMQ_SHAPE_M4N64:  return "4x64";
+        default:                return "unknown";
+    }
+}
+
+static inline pdmq_shape pdmq_parse_shape_env(const char * env) {
+    if (strcmp(env, "16x16") == 0 || strcmp(env, "m16n16") == 0) {
+        return PDMQ_SHAPE_M16N16;
+    }
+    if (strcmp(env, "8x32") == 0 || strcmp(env, "m8n32") == 0) {
+        return PDMQ_SHAPE_M8N32;
+    }
+    if (strcmp(env, "4x64") == 0 || strcmp(env, "m4n64") == 0) {
+        return PDMQ_SHAPE_M4N64;
+    }
+    GGML_ABORT("packed16_dot4_mmq: bad GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_SHAPE=%s, expected 16x16, 8x32, or 4x64", env);
+}
+
+static inline pdmq_shape pdmq_select_shape_auto(
+        const int nq,
+        const int nk,
+        const ggml_type v_type) {
+    // Attention equivalent of the MMQ max-x lesson: do not maximize tile width
+    // on gfx1100 just because it exists. M4N64 is env-only/debug because even
+    // without V staging it tends to add pressure and has worse Q-row reuse.
+    //
+    // V quantized paths have extra decode work; give them more Q rows to
+    // amortize K/QK setup. F16 V is cheaper to decode, so 8x32 is more useful
+    // for very small nq and long-K verification.
+    if (nq >= 16) {
+        return PDMQ_SHAPE_M16N16;
+    }
+    if (nq >= 8 && v_type != GGML_TYPE_F16) {
+        return PDMQ_SHAPE_M16N16;
+    }
+    if (nk <= 32 && nq >= 4) {
+        return PDMQ_SHAPE_M16N16;
+    }
+    return PDMQ_SHAPE_M8N32;
 }
 
 static void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
@@ -624,54 +651,61 @@ static void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     }();
     const int q_offset = assume_causal ? (nk > nq ? nk - nq : 0) : 0;
 
-    // ── QK debug oracle: dump per-block dot4 intermediates for one selected row ──
-    // Env: GGML_CUDA_PACKED16_DOT4_MMQ_QK_DEBUG=b,q_row[,max_k]
-    //   b     = batch index (0-based)
-    //   q_row = absolute query row to dump (0-based)
-    //   max_k = max K positions to dump (default 128)
-    int debug_q_row = -1;
-    int debug_qk_max_k = 128;
-    {
-        const char * env = getenv("GGML_CUDA_PACKED16_DOT4_MMQ_QK_DEBUG");
-        if (env) {
-            int dbg_b = 0, dbg_q = 0, dbg_k = 128;
-            if (sscanf(env, "%d,%d,%d", &dbg_b, &dbg_q, &dbg_k) >= 2) {
-                if (dbg_b == 0 && dbg_q >= 0 && dbg_q < nq) {
-                    debug_q_row = dbg_q;
-                    debug_qk_max_k = dbg_k > 0 ? dbg_k : 128;
-                    fprintf(stderr, "PDMQ QK_DEBUG: dumping b=%d q=%d max_k=%d\n", dbg_b, debug_q_row, debug_qk_max_k);
-                }
-            }
-        }
+    const bool shape_auto = []() {
+        const char * v = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_SHAPE_AUTO");
+        return !v || atoi(v) != 0;
+    }();
+
+    pdmq_shape shape = shape_auto
+        ? pdmq_select_shape_auto(nq, nk, V->type)
+        : (nq >= 16 ? PDMQ_SHAPE_M16N16 : PDMQ_SHAPE_M8N32);
+
+    if (const char * env = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_SHAPE")) {
+        shape = pdmq_parse_shape_env(env);
     }
 
-    dim3 grid(CEIL_DIV(nq, PDMQ_BM), n_heads_q, batch);
+    const int launch_bm = shape == PDMQ_SHAPE_M16N16 ? PDMQ_BM_PREFILL : (shape == PDMQ_SHAPE_M8N32 ? PDMQ_BM_SMALL : PDMQ_BM_LONGK);
+    const int launch_bn = shape == PDMQ_SHAPE_M16N16 ? PDMQ_BN_PREFILL : (shape == PDMQ_SHAPE_M8N32 ? PDMQ_BN_SMALL : PDMQ_BN_LONGK);
+
+    dim3 grid(CEIL_DIV(nq, launch_bm), n_heads_q, batch);
     dim3 block(PDMQ_THREADS);
     hipStream_t stream = ctx.stream();
 
     { static bool once = false; if (!once) { once = true;
         fprintf(stderr,
-            "PDMQ v%d route=rocm_packed16_dot4_mmq nq=%d nk=%d hq=%d hk=%d b=%d sc=%g "
-            "V=%s packed_rows=%d head_stride=%d causal=%d\n",
+            "PDMQ v%d route=rocm_packed16_dot4_mmq shape=%s(%dx%d) auto=%d nq=%d nk=%d hq=%d hk=%d b=%d sc=%g "
+            "V=%s packed_rows=%d head_stride=%d causal=%d stage_v=%d lds_pad=1\n",
             PACKED16_DOT4_MMQ_VERSION,
+            pdmq_shape_name(shape), launch_bm, launch_bn, shape_auto ? 1 : 0,
             nq, nk, n_heads_q, n_heads_k, batch, (double) attention_scale,
-            ggml_type_name(V->type), packed_rows, packed_rows / n_heads_k, assume_causal ? 1 : 0);
+            ggml_type_name(V->type), packed_rows, packed_rows / n_heads_k, assume_causal ? 1 : 0,
+            shape == PDMQ_SHAPE_M4N64 ? 0 : 1);
     }}
 
-#define PDMQ_LAUNCH(VT, CAUSAL) \
-    packed16_dot4_mmq_kernel<VT, PDMQ_BM, PDMQ_BN, PDMQ_D, CAUSAL><<<grid, block, 0, stream>>>( \
+#define PDMQ_LAUNCH_SHAPE(VT, BM_VAL, BN_VAL, CAUSAL, STAGE_V) \
+    packed16_dot4_mmq_kernel<VT, BM_VAL, BN_VAL, PDMQ_D, CAUSAL, STAGE_V><<<grid, block, 0, stream>>>( \
         (const float *) Q->data, (const char *) V->data, (float *) dst->data, \
         Q->nb[1], Q->nb[2], Q->nb[3], \
         V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
         mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
         (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
-        nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, debug_q_row, debug_qk_max_k)
+        nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale)
+
+#define PDMQ_LAUNCH_TYPED(VT, CAUSAL) do { \
+    if (shape == PDMQ_SHAPE_M16N16) { \
+        PDMQ_LAUNCH_SHAPE(VT, PDMQ_BM_PREFILL, PDMQ_BN_PREFILL, CAUSAL, true); \
+    } else if (shape == PDMQ_SHAPE_M8N32) { \
+        PDMQ_LAUNCH_SHAPE(VT, PDMQ_BM_SMALL, PDMQ_BN_SMALL, CAUSAL, true); \
+    } else { \
+        PDMQ_LAUNCH_SHAPE(VT, PDMQ_BM_LONGK, PDMQ_BN_LONGK, CAUSAL, false); \
+    } \
+} while (0)
 
 #define PDMQ_SWITCH_V(CAUSAL) \
     switch (V->type) { \
-        case GGML_TYPE_Q4_0: PDMQ_LAUNCH(PACKED16_DOT4_MMQ_V_Q4_0, CAUSAL); break; \
-        case GGML_TYPE_Q8_0: PDMQ_LAUNCH(PACKED16_DOT4_MMQ_V_Q8_0, CAUSAL); break; \
-        case GGML_TYPE_F16:  PDMQ_LAUNCH(PACKED16_DOT4_MMQ_V_F16,  CAUSAL); break; \
+        case GGML_TYPE_Q4_0: PDMQ_LAUNCH_TYPED(PACKED16_DOT4_MMQ_V_Q4_0, CAUSAL); break; \
+        case GGML_TYPE_Q8_0: PDMQ_LAUNCH_TYPED(PACKED16_DOT4_MMQ_V_Q8_0, CAUSAL); break; \
+        case GGML_TYPE_F16:  PDMQ_LAUNCH_TYPED(PACKED16_DOT4_MMQ_V_F16,  CAUSAL); break; \
         default: GGML_ABORT("packed16_dot4_mmq: unsupported V type"); \
     }
 
@@ -682,7 +716,8 @@ static void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     }
 
 #undef PDMQ_SWITCH_V
-#undef PDMQ_LAUNCH
+#undef PDMQ_LAUNCH_TYPED
+#undef PDMQ_LAUNCH_SHAPE
 
     CUDA_CHECK(hipGetLastError());
 }

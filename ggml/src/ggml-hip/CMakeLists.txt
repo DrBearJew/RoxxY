@@ -132,7 +132,7 @@ if (GGML_HIP_RCCL)
 endif()
 
 if (GGML_HIP_EXPORT_METRICS)
-    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Rpass-analysis=kernel-resource-usage --save-temps")
+    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Rpass-analysis=kernel-resource-usage --save-temps -Wno-gpu-maybe-exceed-local-memory")
 endif()
 
 if (NOT GGML_CUDA_FA)

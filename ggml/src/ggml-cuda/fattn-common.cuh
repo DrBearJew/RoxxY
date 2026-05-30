@@ -1859,3 +1859,56 @@ void launch_fattn(
     }
     CUDA_CHECK(cudaGetLastError());
 }
+
+// ── Shared packed16 KV checker (DOT4 + WMMA debug oracle) ───────────
+
+// Decode one packed16 K value: int8 payload × half scale at logical (row,d).
+// row = flat index into packed16_payload->ne[1] (head_stride * hk + k).
+static __device__ __forceinline__ float packed16_kv_decode_k(
+        const int  * __restrict__ payload,
+        const half * __restrict__ scales,
+        int row, int d) {
+    constexpr int I32_PER_ROW  = 256 / 4;   // 64 int32 words per row
+    constexpr int SCALES_PER_ROW = 256 / 32; // 8 half scales per row
+
+    const int qb    = d / 32;
+    const int inner = d & 31;
+    const int word  = inner >> 2;
+    const int byte  = inner & 3;
+
+    const int packed = payload[row * I32_PER_ROW + qb * 8 + word];
+    const int8_t q = static_cast<int8_t>((static_cast<uint32_t>(packed) >> (8 * byte)) & 0xffu);
+    const float s = __half2float(scales[row * SCALES_PER_ROW + qb]);
+
+    return float(q) * s;
+}
+
+// Dump a few packed16 K values for DOT4 vs WMMA row-base comparison.
+// Called from host launcher when GGML_CUDA_PACKED16_KV_CHECK=1.
+static __global__ void packed16_kv_check_kernel(
+        const int  * __restrict__ payload,
+        const half * __restrict__ scales,
+        int packed_rows,
+        int nk,
+        int n_heads_k,
+        int head_stride) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+
+    printf("KVCHECK: packed_rows=%d nk=%d n_heads_k=%d head_stride=%d\n",
+        packed_rows, nk, n_heads_k, head_stride);
+
+    for (int hk = 0; hk < n_heads_k; ++hk) {
+        const int row_base = hk * head_stride;
+        for (int k = -1; k <= nk; ++k) {
+            int k_actual = k < 0 ? 0 : (k == nk ? nk - 1 : k);
+            int row = row_base + k_actual;
+            if (k < 0) k_actual = 0;  // first row
+            if (row >= packed_rows) continue;
+            for (int d : {0, 31, 32, 255}) {
+                float val = packed16_kv_decode_k(payload, scales, row, d);
+                printf("KVCHECK K: hk=%d k=%d row=%d d=%d val=%f\n",
+                    hk, k_actual, row, d, val);
+            }
+        }
+    }
+}

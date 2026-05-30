@@ -32,8 +32,9 @@ enum packed16_wmma_v_type {
 
 // Layout modes for V tensor: FA = [D,n_kv,heads,batch], TRANS = [n_kv,heads,D,batch]
 enum pwmma_v_layout {
-    PWMMA_V_LAYOUT_FA    = 0,
-    PWMMA_V_LAYOUT_TRANS = 1,
+    PWMMA_V_LAYOUT_FA       = 0,
+    PWMMA_V_LAYOUT_TRANS    = 1,
+    PWMMA_V_LAYOUT_NATIVE_KDH = 2,
 };
 
 #if defined(GGML_USE_HIP) && defined(GGML_HIP_ROCWMMA_FATTN)
@@ -202,6 +203,8 @@ static __device__ __forceinline__ void pwmma_v_f16_load(
             const char * p;
             if (v_layout == PWMMA_V_LAYOUT_FA) {
                 p = V + int64_t(vb)*v_nb13 + int64_t(hk)*v_nb12 + int64_t(k)*v_nb11 + int64_t(d)*v_nb10;
+            } else if (v_layout == PWMMA_V_LAYOUT_NATIVE_KDH) {
+                p = V + int64_t(vb)*v_nb13 + int64_t(hk)*v_nb12 + int64_t(d)*v_nb11 + int64_t(k)*v_nb10;
             } else {
                 p = V + int64_t(vb)*v_nb13 + int64_t(d)*v_nb12  + int64_t(hk)*v_nb11 + int64_t(k)*v_nb10;
             }
@@ -364,8 +367,18 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
         V->ne[1] == K->ne[2] &&
         V->ne[2] == Q->ne[0];
 
+    const bool v_layout_native_kdh =
+        V->type == GGML_TYPE_F16 &&
+        V->ne[0] == Q->ne[0] &&
+        V->ne[1] == K->ne[1] &&
+        V->ne[2] == K->ne[2] &&
+        V->nb[1] == (int64_t) ggml_type_size(V->type);
+
     int v_layout = -1;
-    if (v_layout_fa) {
+    if (v_layout_native_kdh) {
+        v_layout = PWMMA_V_LAYOUT_NATIVE_KDH;
+        GGML_ASSERT(V->nb[1] == (int64_t)ggml_type_size(V->type));
+    } else if (v_layout_fa) {
         v_layout = PWMMA_V_LAYOUT_FA;
         GGML_ASSERT(V->nb[0] == (int64_t)ggml_type_size(V->type));
     } else if (v_layout_trans) {
@@ -448,6 +461,13 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
             CUDA_CHECK(hipStreamSynchronize(stream));
         }
         if (!pbwmma_qk_probe_pass(stream)) GGML_ABORT("PBWMMA QK probe failed");
+        if (getenv("GGML_CUDA_PACKED16_KV_CHECK")) {
+            const int head_stride_chk = packed_kv_size / n_heads_k;
+            packed16_kv_check_kernel<<<1, 1, 0, stream>>>(
+                k_payload, k_scales, packed_kv_size, nk, n_heads_k, head_stride_chk);
+            CUDA_CHECK(hipGetLastError());
+            CUDA_CHECK(hipStreamSynchronize(stream));
+        }
     }}
 
 #define LAUNCH(VT) \
@@ -467,6 +487,8 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
     }
 #undef LAUNCH
     CUDA_CHECK(hipGetLastError());
+    CUDA_CHECK(hipDeviceSynchronize());
+    fprintf(stderr, "PWMMA EXIT OK\n"); fflush(stderr);
 }
 
 #else
