@@ -351,6 +351,7 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     const ggml_tensor * Q = dst->src[0], * K = dst->src[1], * V = dst->src[2], * mask = dst->src[3];
+    fprintf(stderr, "PWMMA ENTRY: Q_ne=(%lld,%lld) K_ne=(%lld,%lld) V_ne=(%lld,%lld)\n", (long long)Q->ne[0], (long long)Q->ne[1], (long long)K->ne[0], (long long)K->ne[1], (long long)V->ne[0], (long long)V->ne[1]);
 
     // V layout detection
     const bool v_layout_fa =
@@ -384,7 +385,10 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
         (long long)V->nb[0], (long long)V->nb[1], (long long)V->nb[2], (long long)V->nb[3]);
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(Q->ne[0] == 256 && K->ne[0]*4 == Q->ne[0] && V->ne[0] == Q->ne[0]);
+    GGML_ASSERT(Q->ne[0] == 256 && K->ne[0]*4 == Q->ne[0]);
+    if (getenv("GGML_CUDA_PWMMA_ABORT_AFTER_LAYOUT")) {
+        GGML_ABORT("PWMMA layout debug abort");
+    }
     GGML_ASSERT(Q->ne[1] > 1 && Q->ne[2] % K->ne[2] == 0);
     GGML_ASSERT(V->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_F16);
 

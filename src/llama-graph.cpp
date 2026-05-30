@@ -2057,24 +2057,23 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     if (!k_is_packed16_i32) {
         k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     }
-    v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+    // PWMMA can consume native v_trans V [n_kv, heads, D, batch] directly.
+    // Skip the global permute for PWMMA+v_trans to keep native layout.
+    static bool pwmma_forced = []() {
+        const char * req = getenv("GGML_CUDA_FA_ROUTE_REQUIRE");
+        return req && strcmp(req, "rocm_packed16_wmma_tile") == 0;
+    }();
+    if (!(v_trans && pwmma_forced && v->type == GGML_TYPE_F16)) {
+        v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+    }
 
     ggml_tensor * cur;
 
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
-        // PWMMA can consume native v_trans V layout [n_kv, heads, D, batch] directly.
-        // Undo global permute to get back native layout instead of transpose.
-        static bool pwmma_forced = []() {
-            const char * req = getenv("GGML_CUDA_FA_ROUTE_REQUIRE");
-            return req && strcmp(req, "rocm_packed16_wmma_tile") == 0;
-        }();
-        if (v_trans && pwmma_forced && v->type == GGML_TYPE_F16) {
-            // After global permute (0,2,1,3): [n_kv, D, heads, batch]
-            // Undo: (0,2,1,3) → [n_kv, heads, D, batch] native v_trans
-            v = ggml_permute(ctx0, v, 0, 2, 1, 3);
-        } else if (v_trans) {
+        // PWMMA uses native v_trans V directly — no transpose/permute needed.
+        if (v_trans && !pwmma_forced) {
             v = ggml_transpose(ctx0, v);
         }
 
