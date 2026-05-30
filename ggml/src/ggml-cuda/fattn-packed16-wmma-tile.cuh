@@ -30,6 +30,12 @@ enum packed16_wmma_v_type {
     PACKED16_WMMA_V_F16,
 };
 
+// Layout modes for V tensor: FA = [D,n_kv,heads,batch], TRANS = [n_kv,heads,D,batch]
+enum pwmma_v_layout {
+    PWMMA_V_LAYOUT_FA    = 0,
+    PWMMA_V_LAYOUT_TRANS = 1,
+};
+
 #if defined(GGML_USE_HIP) && defined(GGML_HIP_ROCWMMA_FATTN)
 #include <rocwmma/rocwmma.hpp>
 
@@ -77,6 +83,7 @@ static __device__ __forceinline__ float pwmma_decode_k(
 }
 
 static __device__ __forceinline__ float pwmma_decode_v_q4_0(
+
         const char * __restrict__ V, int64_t v_nb10, int64_t v_nb11, int64_t v_nb12,
         int64_t v_nb13, int64_t v_ne13, int k, int hk, int b, int d) {
     const int vb = v_ne13 > 1 ? (b % v_ne13) : 0;
@@ -185,15 +192,21 @@ static __device__ __forceinline__ void pwmma_v_q8_0_load(
 template<int BN, int D>
 static __device__ __forceinline__ void pwmma_v_f16_load(
         const char * __restrict__ V, int64_t v_nb10, int64_t v_nb11, int64_t v_nb12,
-        int64_t v_nb13, int64_t v_ne13, int k_tile, int valid_rows, int hk, int b,
+        int64_t v_nb13, int64_t v_ne13, int v_layout, int k_tile, int valid_rows, int hk, int b,
         half * __restrict__ v_tile) {
     const int tid = threadIdx.x, vb = v_ne13 > 1 ? (b % v_ne13) : 0;
     for (int r = 0; r < BN; ++r) {
         if (r >= valid_rows) { for (int d = tid; d < D; d += blockDim.x) v_tile[r*D+d] = __float2half(0.0f); continue; }
         const int k = k_tile*BN + r;
-        const char * ptr = V + int64_t(vb)*v_nb13 + int64_t(hk)*v_nb12 + int64_t(k)*v_nb11;
-        for (int d = tid; d < D; d += blockDim.x)
-            v_tile[r*D + d] = *(const half *)(ptr + int64_t(d)*v_nb10);
+        for (int d = tid; d < D; d += blockDim.x) {
+            const char * p;
+            if (v_layout == PWMMA_V_LAYOUT_FA) {
+                p = V + int64_t(vb)*v_nb13 + int64_t(hk)*v_nb12 + int64_t(k)*v_nb11 + int64_t(d)*v_nb10;
+            } else {
+                p = V + int64_t(vb)*v_nb13 + int64_t(d)*v_nb12  + int64_t(hk)*v_nb11 + int64_t(k)*v_nb10;
+            }
+            v_tile[r*D + d] = *(const half *)p;
+        }
     }
     __syncthreads();
 }
@@ -204,6 +217,7 @@ static __global__ void packed16_wmma_tile_kernel(
         const float * __restrict__ Q, const char * __restrict__ V, float * __restrict__ dst,
         int64_t q_nb01, int64_t q_nb02, int64_t q_nb03,
         int64_t v_nb10, int64_t v_nb11, int64_t v_nb12, int64_t v_nb13, int64_t v_ne13,
+        int v_layout,
         const char * __restrict__ mask,
         int64_t mask_ne00, int64_t mask_ne01, int64_t mask_ne03,
         int64_t mask_nb00, int64_t mask_nb01, int64_t mask_nb03,
@@ -243,7 +257,7 @@ static __global__ void packed16_wmma_tile_kernel(
         else if (V_TYPE == PACKED16_WMMA_V_Q8_0)
             pwmma_v_q8_0_load<PWMMA_BN, PWMMA_D>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, kt, valid_k, hk, b, (half*)v_tile_f16);
         else
-            pwmma_v_f16_load<PWMMA_BN, PWMMA_D>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, kt, valid_k, hk, b, (half*)v_tile_f16);
+            pwmma_v_f16_load<PWMMA_BN, PWMMA_D>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, v_layout, kt, valid_k, hk, b, (half*)v_tile_f16);
 
 
         // WMMA QK: raw RDNA3 builtins, B fragment from packed16 directly
@@ -338,6 +352,37 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
 
     const ggml_tensor * Q = dst->src[0], * K = dst->src[1], * V = dst->src[2], * mask = dst->src[3];
 
+    // V layout detection
+    const bool v_layout_fa =
+        V->ne[0] == Q->ne[0] &&
+        V->ne[1] == K->ne[1] &&
+        V->ne[2] == K->ne[2];
+    const bool v_layout_trans =
+        V->type == GGML_TYPE_F16 &&
+        V->ne[0] == K->ne[1] &&
+        V->ne[1] == K->ne[2] &&
+        V->ne[2] == Q->ne[0];
+
+    int v_layout = -1;
+    if (v_layout_fa) {
+        v_layout = PWMMA_V_LAYOUT_FA;
+        GGML_ASSERT(V->nb[0] == (int64_t)ggml_type_size(V->type));
+    } else if (v_layout_trans) {
+        v_layout = PWMMA_V_LAYOUT_TRANS;
+        GGML_ASSERT(V->type == GGML_TYPE_F16);
+        GGML_ASSERT(V->nb[0] == (int64_t)ggml_type_size(V->type));
+        GGML_ASSERT(V->ne[2] == Q->ne[0]);
+    } else {
+        GGML_ABORT("PWMMA unsupported V layout: ne=(%lld,%lld,%lld,%lld) nb=(%lld,%lld,%lld,%lld) QD=%lld nk=%lld hk=%lld",
+            (long long)V->ne[0], (long long)V->ne[1], (long long)V->ne[2], (long long)V->ne[3],
+            (long long)V->nb[0], (long long)V->nb[1], (long long)V->nb[2], (long long)V->nb[3],
+            (long long)Q->ne[0], (long long)K->ne[1], (long long)K->ne[2]);
+    }
+    fprintf(stderr, "PWMMA V layout=%s ne=(%lld,%lld,%lld,%lld) nb=(%lld,%lld,%lld,%lld)\n",
+        v_layout == PWMMA_V_LAYOUT_FA ? "FA" : "TRANS",
+        (long long)V->ne[0], (long long)V->ne[1], (long long)V->ne[2], (long long)V->ne[3],
+        (long long)V->nb[0], (long long)V->nb[1], (long long)V->nb[2], (long long)V->nb[3]);
+
     GGML_ASSERT(Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32);
     GGML_ASSERT(Q->ne[0] == 256 && K->ne[0]*4 == Q->ne[0] && V->ne[0] == Q->ne[0]);
     GGML_ASSERT(Q->ne[1] > 1 && Q->ne[2] % K->ne[2] == 0);
@@ -405,6 +450,7 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
     packed16_wmma_tile_kernel<VT><<<grid, block, 0, stream>>>( \
         (const float*)Q->data, (const char*)V->data, (float*)dst->data, \
         Q->nb[1], Q->nb[2], Q->nb[3], V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
+        v_layout, \
         mask ? (const char*)mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
         k_payload, k_scales, \
         nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_kv_size, attention_scale)
