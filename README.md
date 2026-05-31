@@ -22,9 +22,6 @@ physical I32 K payload/scales:
 ```bash
 LLAMA_MTP_ENABLE_FA=1 \
 LLAMA_MTP_PREFILL_CHUNK=1024 \
-LLAMA_MTP_PREFILL_FORCE_MMQ=1 \
-GGML_CUDA_ROCM_QUANT_PREFILL_F16=1 \
-LLAMA_MTP_DISABLE_PACKED16_FA=0 \
 GGML_CUDA_ROCM_PACKED16_DOT4_MMQ=1 \
 GGML_CUDA_FA_ROUTE_REQUIRE=rocm_packed16_dot4_mmq \
 ./build-rocm/bin/llama-server \
@@ -38,6 +35,11 @@ GGML_CUDA_FA_ROUTE_REQUIRE=rocm_packed16_dot4_mmq \
   --spec-draft-n-max 3 --spec-draft-p-min 0 \
   --spec-draft-prio 2 --spec-draft-prio-batch 2
 ```
+
+The generic quantized-matmul/f16-temp knobs `LLAMA_MTP_PREFILL_FORCE_MMQ` and
+`GGML_CUDA_ROCM_QUANT_PREFILL_F16` are intentionally omitted here; the packed16
+FlashAttention route is governed by `GGML_CUDA_ROCM_PACKED16_DOT4_MMQ` plus the
+route contract above.
 
 Use one of these V choices:
 
