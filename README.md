@@ -83,6 +83,25 @@ Takeaway: q4_0 is the default compression choice; q8_0 is the higher-precision
 choice and is measurably closer to f16 V on this smoke. Evidence:
 [`.harness/research/i32-vformat-wikitext-kld-ppl-20260531.md`](.harness/research/i32-vformat-wikitext-kld-ppl-20260531.md).
 
+### 128k active MTP VRAM smoke
+
+A 128k-context server-ready VRAM smoke on the 27B MTP GGUF with active
+`draft-mtp`, `q4_0` V, and `--spec-draft-type-v q4_0`. The ROCm packed16 run
+omits main and draft K CLI overrides; the Vulkan comparison uses normal f16 main
+K plus q4 V.
+
+![128k active MTP VRAM smoke](docs/assets/active-mtp-vram-128k-20260531.png)
+
+| Run | Total VRAM used | Delta over idle |
+|---|---:|---:|
+| ROCm packed16/I32 route + q4 V active MTP | `21.760 GiB` | `21.079 GiB` |
+| Vulkan f16 K + q4 V active MTP | `23.180 GiB` | `22.500 GiB` |
+
+Measured saving: Vulkan uses `+1.420 GiB` more total VRAM (`+1.422 GiB` delta
+over idle). ROCm route evidence included `rocm_packed16_dot4_mmq` and `PDMQ QK
+probe PASSED`. Evidence:
+[`.harness/research/active-mtp-vram-128k-20260531.md`](.harness/research/active-mtp-vram-128k-20260531.md).
+
 ---
 
 ## Quick start
