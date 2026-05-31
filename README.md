@@ -42,15 +42,16 @@ GGML_CUDA_FA_ROUTE_REQUIRE=rocm_packed16_dot4_mmq \
 Use one of these V choices:
 
 ```text
---cache-type-v q4_0       # default recommendation: 18B/32 values = 4.5 bits/value
---cache-type-v q8_0       # higher-precision V: 34B/32 values = 8.5 bits/value
+--cache-type-v q4_0       # default: 4.5 bits/V-value; 2.25-bit contribution to total K+V average
+--cache-type-v q8_0       # higher precision: 8.5 bits/V-value; 4.25-bit contribution to total K+V average
 ```
 
 The intended q4 architecture is **not i16 V**. It is packed q4 V payload plus
 f16 scales feeding only the `P @ V` side; QK remains packed16 I32 DOT4 K.
 For users who want more V precision, `q8_0` V keeps the same packed16 I32 K path
-and raises V from 4.5 to 8.5 bits/value, so packed16-K + q8-V is about
-17 bits per K+V pair.
+and raises V from 4.5 to 8.5 bits/V-value. In whole-KV VRAM accounting, q4 V
+contributes 2.25 bits to the total K+V average, while q8 V contributes 4.25 bits;
+packed16-K + q8-V is about 17 bits per K+V pair.
 
 `tbq4_0` is no longer a proper starting option. Treat it, plus `planar3_0` and
 `iso3_0`, as legacy/experimental V-format research only.
