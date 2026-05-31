@@ -760,7 +760,11 @@ void llama_context::synchronize() {
         return env && atoi(env) != 0;
     }();
 
-    if (skip_redundant_sync && n_queued_tokens == 0 && t_compute_start_us == 0) {
+    // Do not skip synchronization when backend sampling output buffers exist:
+    // sampled-token D2H copies are async and may be the only pending work before
+    // llama_get_sampled_token_ith() reads the host buffer. Skipping here can make
+    // the server consume a stale/invalid token on prompt-only completions.
+    if (skip_redundant_sync && !sampling.sampled.has_data() && n_queued_tokens == 0 && t_compute_start_us == 0) {
         return;
     }
 
