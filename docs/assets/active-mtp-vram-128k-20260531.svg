@@ -4,7 +4,6 @@
   <text x="90" y="105" font-family="Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif" font-size="40" font-weight="850" fill="#111827">128k active MTP VRAM smoke</text>
   <text x="90" y="148" font-family="Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif" font-size="23" fill="#4b5563">27B MTP GGUF · ctx=131072 · q4_0 V · active draft-mtp · no main/spec K CLI override on ROCm</text>
   <g font-family="Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif">
-    <text x="130" y="218" font-size="22" fill="#4b5563">Total GPU VRAM used after server-ready steady state</text>
     <line x1="130.0" y1="235" x2="130.0" y2="500" stroke="#e5e7eb" stroke-width="1"/><line x1="256.7" y1="235" x2="256.7" y2="500" stroke="#e5e7eb" stroke-width="1"/><line x1="383.3" y1="235" x2="383.3" y2="500" stroke="#e5e7eb" stroke-width="1"/><line x1="510.0" y1="235" x2="510.0" y2="500" stroke="#e5e7eb" stroke-width="1"/><line x1="636.7" y1="235" x2="636.7" y2="500" stroke="#e5e7eb" stroke-width="1"/><line x1="763.3" y1="235" x2="763.3" y2="500" stroke="#e5e7eb" stroke-width="1"/><line x1="890.0" y1="235" x2="890.0" y2="500" stroke="#e5e7eb" stroke-width="1"/>
     
     <text x="130" y="234" font-size="27" font-weight="700" fill="#111827">ROCm packed16/I32 route</text>
