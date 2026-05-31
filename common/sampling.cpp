@@ -11,6 +11,7 @@
 #include <cctype>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
@@ -184,6 +185,40 @@ std::string common_params_sampling::print() const {
     return std::string(result);
 }
 
+static bool common_sampler_backend_greedy_fastpath_enabled() {
+    const char * env = getenv("LLAMA_BACKEND_GREEDY_FASTPATH");
+    return env && atoi(env) != 0;
+}
+
+static bool common_sampler_backend_greedy_fastpath_allowed(
+        const common_params_sampling & params,
+        const llama_sampler * grmr,
+        const llama_sampler * rbudget) {
+    if (!common_sampler_backend_greedy_fastpath_enabled()) {
+        return false;
+    }
+
+    // Experimental no-logits-readback path: only deterministic greedy sampling
+    // can skip top-k/top-p/min-p filters without changing the selected argmax.
+    // Keep it opt-in and disable it whenever CPU-only samplers or probability
+    // outputs are requested.
+    if (!params.backend_sampling || params.temp > 0.0f || params.mirostat != 0 || params.n_probs > 0) {
+        return false;
+    }
+    if (grmr || rbudget) {
+        return false;
+    }
+    if (params.dry_multiplier != 0.0f || params.adaptive_target >= 0.0f || params.top_n_sigma >= 0.0f) {
+        return false;
+    }
+    if (params.penalty_last_n != 0 &&
+            (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f)) {
+        return false;
+    }
+
+    return true;
+}
+
 struct common_sampler * common_sampler_init(const struct llama_model * model, struct common_params_sampling & params) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
@@ -311,7 +346,10 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), params.logit_bias.size(), params.logit_bias.data()));
     }
 
-    if (params.mirostat == 0) {
+    if (common_sampler_backend_greedy_fastpath_allowed(params, grmr, rbudget)) {
+        LOG_INF("%s: LLAMA_BACKEND_GREEDY_FASTPATH active; using backend logit-bias + greedy sampler only\n", __func__);
+        samplers.push_back(llama_sampler_init_greedy());
+    } else if (params.mirostat == 0) {
 
         bool use_adaptive_p = false; // see below
 

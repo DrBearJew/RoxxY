@@ -3273,25 +3273,31 @@ void llm_graph_context::build_sampling() const {
         assert(sampler->iface->backend_apply);
         sampler->iface->backend_apply(sampler, ctx0, gf, &data);
 
+        const bool sampled_token_only = []() {
+            const char * env = getenv("LLAMA_BACKEND_SAMPLING_TOKEN_ONLY");
+            return env && atoi(env) != 0;
+        }();
+        const bool skip_sampling_payloads = sampled_token_only && data.sampled != nullptr;
+
         if (data.sampled != nullptr) {
             res->t_sampled[seq_id] = data.sampled;
             outs[1] = data.sampled;
             ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
         }
 
-        if (data.probs != nullptr) {
+        if (!skip_sampling_payloads && data.probs != nullptr) {
             res->t_sampled_probs[seq_id] = data.probs;
             outs[1] = data.probs;
             ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
         }
 
-        if (data.logits != nullptr) {
+        if (!skip_sampling_payloads && data.logits != nullptr) {
             res->t_sampled_logits[seq_id] = data.logits;
             outs[1] = data.logits;
             ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
         }
 
-        if (data.candidates != nullptr) {
+        if (!skip_sampling_payloads && data.candidates != nullptr) {
             res->t_candidates[seq_id] = data.candidates;
             outs[1] = data.candidates;
             ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
