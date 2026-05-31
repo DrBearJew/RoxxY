@@ -167,6 +167,26 @@ Most users can stop here. For internals and debugging, see
 
 ---
 
+## Credits and further reading
+
+This branch builds on upstream `llama.cpp`, the MTP/TurboQuant fork work, and
+community AMD/RDNA experiments. Special thanks to the authors of:
+
+- [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
+- [Indras-Mirror/llama.cpp-mtp](https://github.com/Indras-Mirror/llama.cpp-mtp)
+- [DrBearJew/dot4-flash-attention](https://github.com/DrBearJew/dot4-flash-attention)
+  — earlier DOT4 FlashAttention prototype notes and experiment history
+- [adelj88/rocm_wmma_gemm](https://github.com/adelj88/rocm_wmma_gemm)
+- [ROCm/amd_matrix_instruction_calculator](https://github.com/ROCm/amd_matrix_instruction_calculator)
+- [Kaden-Schutt/hipfire](https://github.com/Kaden-Schutt/hipfire)
+- [Stormrage34/llama.cpp-turboquant-hip](https://github.com/Stormrage34/llama.cpp-turboquant-hip)
+- [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant)
+
+For the longer lineage and technical references, see
+[Packed16 RDNA3 technical notes](docs/PACKED16_RDNA3_DETAILS.md).
+
+---
+
 ## License
 
 Follows upstream `llama.cpp` licensing terms.

@@ -257,7 +257,7 @@ LLAMA_MTP_PREFILL_CHUNK=1024  # match --ubatch-size
 ---
 
 
-## Related work
+## Credits and related work
 
 This branch builds on:
 
@@ -265,6 +265,9 @@ This branch builds on:
   ggml backends, FlashAttention, and upstream infrastructure.
 - [Indras-Mirror/llama.cpp-mtp](https://github.com/Indras-Mirror/llama.cpp-mtp)
   — MTP/TurboQuant fork foundation, tensor sharing, CUDA TBQ4 FA.
+- [DrBearJew/dot4-flash-attention](https://github.com/DrBearJew/dot4-flash-attention)
+  — earlier DOT4 FlashAttention prototype, packed16 K-cache experiment notes,
+  and the path that led to this branch.
 - [adelj88/rocm_wmma_gemm](https://github.com/adelj88/rocm_wmma_gemm) — RDNA3
   rocWMMA GEMM reference, autotuner, config lookup, LDS buffering.
 - [ROCm/amd_matrix_instruction_calculator](https://github.com/ROCm/amd_matrix_instruction_calculator)
