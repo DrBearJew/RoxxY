@@ -1,113 +1,12 @@
 # llama.cpp — Packed16 FlashAttention for RDNA3
 
-Experimental `llama.cpp` branch for RDNA3 FlashAttention performance on
-RX 7900 XTX / gfx1100. This branch adds a **packed16 K-cache** representation
-and routes quantized-KV attention through RDNA3 DOT4/WMMA kernels.
+RDNA3-focused `llama.cpp` branch for packed16 K-cache FlashAttention. The
+normal path is simple: build the branch, run `llama-server` or `llama-bench`,
+and let the route selector pick the packed16 kernels automatically.
 
-The goal is narrow and practical: make Qwen3.6 27B/35B prefill faster on
-consumer AMD GPUs by avoiding per-tile K dequantization and V transposition
-work in FlashAttention.
-
-| Item | Value |
-|---|---|
-| Base project | [`ggml-org/llama.cpp`](https://github.com/ggml-org/llama.cpp) fork |
-| Branch | `tbq4-rdna3-experiment` |
-| Primary GPU | RX 7900 XTX / gfx1100 |
-| Tested stack | ROCm 6.4, `amdclang++`, Linux |
-| Target models | Qwen3.6 35B-A3B MoE, Qwen3.6 27B MTP |
-| Main feature | packed16 K-cache FlashAttention |
-| Default prefill route | DOT4-MMQ GQA1 |
-| Champion/fallback route | PWMMA BM32 reg-out direct-V |
-| Decode route | DOT4 decode BN64 / split-K |
-| Status | experimental, source-build only |
-
----
-
-## Status
-
-This is a research/performance branch, not a general replacement for upstream
-`llama.cpp`.
-
-Tested:
-
-- RX 7900 XTX / gfx1100
-- ROCm 6.4 with `amdclang++`
-- `llama-bench` and `llama-server`
-- Qwen3.6 35B-A3B MoE GGUF
-- Qwen3.6 27B MTP GGUF
-- packed16 K cache, DOT4-MMQ prefill, PWMMA BM32, DOT4 decode
-
-Not guaranteed yet:
-
-- non-RDNA3 GPUs
-- NVIDIA/CUDA parity
-- broad GGUF model-family coverage
-- stable environment-variable names
-- upstream merge compatibility
-- daily-driver behavior for arbitrary workloads
-
-Use upstream `llama.cpp` if you need broad hardware/model support or stable
-CLI behavior. Use this branch if you are specifically testing RDNA3 packed16
-FlashAttention on Qwen3.6-style 27B/35B workloads.
-
-## Should you use this branch?
-
-Use this branch if:
-
-- you have an RX 7900 XTX / gfx1100-class RDNA3 GPU;
-- you are testing Qwen3.6 27B/35B GGUF models;
-- you care about packed16 FlashAttention prefill performance;
-- you are comfortable building `llama.cpp` from source.
-
-Use upstream `llama.cpp` if:
-
-- you need broad hardware or model support;
-- you are not on RDNA3;
-- you want stable daily-driver behavior;
-- you do not need packed16 KV-cache experiments.
-
-**Packed16 is a runtime K-cache layout, not a new GGUF model format.** The
-branch stores K as I32 payload rows, with each 32-bit word carrying four packed
-8-bit K values, and keeps f16 scales separately.
-
----
-
-## Headline results
-
-RX 7900 XTX / gfx1100, ROCm 6.4, `amdclang++`, `llama-bench -fa 1 -ngl 99`.
-
-### Prefill (`nq > 1`)
-
-| Model | Route | pp512 | pp1024 | pp2048 | pp4096 |
-|---|---|---:|---:|---:|---:|
-| 35B | DOT4-MMQ GQA1, default | 2628 | 2541 | 2320 | 2050 |
-| 35B | DOT4-MMQ KSHARED, opt-in | 2649 | 2533 | — | — |
-| 35B | PWMMA BM32 reg-out direct-V | **2707** | **2633** | — | 2569* |
-| 35B | PWMMA BM16 | 2590 | 2394 | — | — |
-| 35B | PWMMA BM64 512t | 2612 | 2578 | — | — |
-| 27B | DOT4-MMQ GQA1, default | 894 | — | — | — |
-| 27B | DOT4-MMQ KSHARED, opt-in | 905 | — | — | — |
-| 27B | PWMMA BM32 reg-out direct-V | **929** | — | — | — |
-| 27B | PWMMA BM64 512t | 922 | — | — | — |
-
-\* pp1024+ configuration.
-
-### Decode (`nq = 1`)
-
-Decode uses DOT4 decode kernels, not the prefill WMMA kernels.
-
-| Model | tg128, packed16 + DOT4 decode |
-|---|---:|
-| 35B | 92.8 tok/s |
-| 27B | 28.7 tok/s |
-
-### What these numbers show
-
-- DOT4-MMQ is the production default packed16 prefill route.
-- PWMMA BM32 reg-out direct-V is the fastest measured prefill route on the
-  listed workloads: +3.0% over DOT4-MMQ on 35B pp512 and +3.9% on 27B pp512.
-- A clean upstream q8_0 VEC FA baseline table is still TODO; current tables
-  compare the packed16 route family and measured variants.
+Packed16 is a **runtime K-cache layout**, not a new GGUF model format. K is
+stored as I32 payload rows, with each 32-bit word carrying four packed 8-bit K
+values, while f16 scales remain separate.
 
 ---
 
@@ -147,8 +46,8 @@ Benchmark prefill:
   -fa 1 -ngl 99 -p 512 -n 1
 ```
 
-Expected on RX 7900 XTX / ROCm 6.4: approximately **2628 tok/s** for 35B
-pp512 on the default packed16 route.
+On the benchmark system used for the results below, this was approximately
+**2628 tok/s** for 35B pp512 on the default packed16 route.
 
 Optional: add route logging when benchmarking or debugging:
 
@@ -175,6 +74,46 @@ measuring the new kernels in this branch.
 | Confirm route | add `GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE=1` |
 | Compare kernels | [Advanced route-forcing section](#advanced-route-forcing-and-ab-tests) |
 | Disable packed16 | [Runtime flags](#runtime-flags) |
+
+---
+
+## Headline results
+
+RX 7900 XTX / gfx1100, `llama-bench -fa 1 -ngl 99`. Record your ROCm
+and compiler versions when rerunning these numbers.
+
+### Prefill (`nq > 1`)
+
+| Model | Route | pp512 | pp1024 | pp2048 | pp4096 |
+|---|---|---:|---:|---:|---:|
+| 35B | DOT4-MMQ GQA1, default | 2628 | 2541 | 2320 | 2050 |
+| 35B | DOT4-MMQ KSHARED, opt-in | 2649 | 2533 | — | — |
+| 35B | PWMMA BM32 reg-out direct-V | **2707** | **2633** | — | 2569* |
+| 35B | PWMMA BM16 | 2590 | 2394 | — | — |
+| 35B | PWMMA BM64 512t | 2612 | 2578 | — | — |
+| 27B | DOT4-MMQ GQA1, default | 894 | — | — | — |
+| 27B | DOT4-MMQ KSHARED, opt-in | 905 | — | — | — |
+| 27B | PWMMA BM32 reg-out direct-V | **929** | — | — | — |
+| 27B | PWMMA BM64 512t | 922 | — | — | — |
+
+\* pp1024+ configuration.
+
+### Decode (`nq = 1`)
+
+Decode uses DOT4 decode kernels, not the prefill WMMA kernels.
+
+| Model | tg128, packed16 + DOT4 decode |
+|---|---:|
+| 35B | 92.8 tok/s |
+| 27B | 28.7 tok/s |
+
+### What these numbers show
+
+- DOT4-MMQ is the production default packed16 prefill route.
+- PWMMA BM32 reg-out direct-V is the fastest measured prefill route on the
+  listed workloads: +3.0% over DOT4-MMQ on 35B pp512 and +3.9% on 27B pp512.
+- A clean upstream q8_0 VEC FA baseline table is still TODO; current tables
+  compare the packed16 route family and measured variants.
 
 ---
 
@@ -205,6 +144,27 @@ Model sources used during development include GGUF releases from
 [HauhauCS](https://huggingface.co/HauhauCS),
 [havenoammo](https://huggingface.co/havenoammo), and
 [Radamanthys11](https://huggingface.co/Radamanthys11).
+
+---
+
+## Scope
+
+This is a research/performance branch, not a general replacement for upstream
+`llama.cpp`.
+
+Use this branch if:
+
+- you have an RX 7900 XTX / gfx1100-class RDNA3 GPU;
+- you are testing Qwen3.6 27B/35B GGUF models;
+- you care about packed16 FlashAttention prefill performance;
+- you are comfortable building `llama.cpp` from source.
+
+Use upstream `llama.cpp` if:
+
+- you need broad hardware or model support;
+- you are not on RDNA3;
+- you want stable daily-driver behavior;
+- you do not need packed16 KV-cache experiments.
 
 ---
 
@@ -249,9 +209,8 @@ cmake --build . --target llama-bench llama-server -j$(nproc)
 
 Requirements:
 
-- ROCm 6.2+; ROCm 6.4 used for headline measurements
-- `/opt/rocm/bin/amdclang++`
-- gfx1100-class RDNA3 GPU; RX 7900 XTX is the measured target
+- ROCm HIP toolchain with `amdclang++`
+- gfx1100-class RDNA3 GPU; RX 7900 XTX is the primary target
 
 Key CMake settings used by the helper script:
 
