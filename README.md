@@ -29,10 +29,11 @@ GGML_CUDA_FA_ROUTE_REQUIRE=rocm_packed16_dot4_mmq \
   --model /path/to/Qwen3.6-27B-Q4_K_M-mtp.gguf \
   --flash-attn on \
   --cache-type-v q4_0 \
-  --ctx-size 40960 --batch-size 1024 --ubatch-size 1024 \
+  --ctx-size 40960 --batch-size 2048 --ubatch-size 2048 \
   --parallel 1 --no-warmup \
   --spec-type draft-mtp --spec-default \
   --spec-draft-n-max 3 --spec-draft-p-min 0 \
+  --spec-draft-type-v q4_0 \
   --spec-draft-prio 2 --spec-draft-prio-batch 2
 ```
 
