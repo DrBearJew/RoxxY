@@ -98,7 +98,7 @@ K plus q4 V.
 | Vulkan f16 K + q4 V active MTP | `23.180 GiB` | `22.500 GiB` |
 
 Measured saving: Vulkan uses `+1.420 GiB` more total VRAM (`+1.422 GiB` delta
-over idle). ROCm route evidence included `rocm_packed16_dot4_mmq` and `PDMQ QK
+over idle). ROCm route evidence included the packed16 DOT4/MMQ route and `PDMQ QK
 probe PASSED`. Evidence:
 [`.harness/research/active-mtp-vram-128k-20260531.md`](.harness/research/active-mtp-vram-128k-20260531.md).
 

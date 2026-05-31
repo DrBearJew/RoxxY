@@ -24,7 +24,7 @@
     <text x="118" y="630" font-size="33" font-weight="850" fill="#15803d">1.420 GiB less VRAM</text>
     <rect x="610" y="560" width="500" height="86" rx="22" fill="#eff6ff" stroke="#93c5fd"/>
     <text x="638" y="594" font-size="22" font-weight="750" fill="#1e40af">Route evidence</text>
-    <text x="638" y="630" font-size="25" font-weight="800" fill="#1d4ed8">rocm_packed16_dot4_mmq · PDMQ probe PASSED</text>
+    <text x="638" y="630" font-size="25" font-weight="800" fill="#1d4ed8">P16-DOT4/MMQ · probe PASSED</text>
     <text x="90" y="690" font-size="18" fill="#4b5563">ROCm: 21.760 GiB used / 21.079 GiB over idle. Vulkan: 23.180 GiB used / 22.500 GiB over idle. Artifact: .harness/tmp/vram-128k-active-mtp-q4v-20260531-112745</text>
   </g>
 </svg>
