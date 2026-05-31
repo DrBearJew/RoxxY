@@ -193,22 +193,14 @@ cmake -S . -B build-rocm \
 cmake --build build-rocm --target llama-bench llama-server -j$(nproc)
 ```
 
+This builds both route families documented below: `GGML_HIP=ON` builds the ROCm
+backend and DOT4-MMQ path, while `GGML_HIP_ROCWMMA_FATTN=ON` adds PWMMA support.
+
 Requirements:
 
 - ROCm HIP toolchain
 - rocWMMA headers/libraries available to CMake for the PWMMA path
 - gfx1100-class RDNA3 GPU; RX 7900 XTX is the primary target
-
-Optional helper script:
-
-```bash
-bash scripts/configure-rocm-gfx1100-wmma.sh
-```
-
-The helper script is only a convenience wrapper around CMake. It creates
-`build-rocm-fixed`, sets `GPU_TARGETS=gfx1100`, uses `/opt/rocm/bin/amdclang++`,
-and enables the ROCm/FlashAttention options used during development. You do not
-need it if your normal CMake ROCm build works.
 
 Optional ROCm + Vulkan build:
 
