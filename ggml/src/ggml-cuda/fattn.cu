@@ -2650,7 +2650,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         const bool v_shape_ok    = v_shape_fa || (require_packed16_wmma && v_shape_trans);
         const bool head_ok    = Q->ne[2] > 0 && K->ne[2] > 0 && Q->ne[2] % K->ne[2] == 0;
 
-        if (!(Q->type == GGML_TYPE_F32 && (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0) && dst->type == GGML_TYPE_F32 &&
+        if (!(Q->type == GGML_TYPE_F32 && ggml_cuda_packed16_dot4_mmq_v_supported(V->type) && dst->type == GGML_TYPE_F32 &&
               k_shape_ok && v_shape_ok && K->ne[1] > 0 && head_ok)) {
             // Log why I32 K was rejected so we can debug shape mismatches.
             static bool i32_reject_printed = false;
@@ -2710,7 +2710,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             required_route &&
             (strcmp(required_route, "rocm_packed16_dot4_mmq") == 0 ||
              strcmp(required_route, "packed16_dot4_mmq") == 0);
-        if (require_packed16_dot4_mmq && Q->ne[1] > 1) {
+        if (require_packed16_dot4_mmq && (Q->ne[1] > 1 || V->type == GGML_TYPE_TBQ4_0)) {
             if (!ggml_cuda_packed16_dot4_mmq_supported(cc, dst)) {
                 GGML_ABORT("required rocm_packed16_dot4_mmq route was not selected; Q=[%lld,%lld,%lld,%lld] K=[%lld,%lld,%lld,%lld] V=%s",
                     (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3],
@@ -2739,12 +2739,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
              inst == GGML_FATTN_INST_SPEC_VERIFY_QK ||
              inst == GGML_FATTN_INST_BATCH_VERIFY_QK ||
              (mtp_packed16_experiment && inst == GGML_FATTN_INST_MTP_VERIFY_QK));
+        const bool v_requires_dot4_mmq = V->type == GGML_TYPE_TBQ4_0 || V->type == GGML_TYPE_PLANAR3_0 || V->type == GGML_TYPE_ISO3_0;
 
         // nq == 1 decode: always route to DOT4 (BN64/split-K).
         // packed16_wmma_tile only supports nq > 1.
         // When WMMA is explicitly required via env, nq==1 is still
         // allowed to use DOT4 (WMMA decode kernel doesn't exist).
         if (Q->ne[1] == 1) {
+            if (v_requires_dot4_mmq && ggml_cuda_packed16_dot4_mmq_supported(cc, dst)) {
+                return BEST_FATTN_KERNEL_PACKED16_DOT4_MMQ;
+            }
             return BEST_FATTN_KERNEL_Q8K_DOT4_KQ;
         }
 
@@ -2758,7 +2762,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         best_fattn_kernel packed16_kernel = BEST_FATTN_KERNEL_NONE;
         const char * packed16_route_name = "none";
 
-        if (prefill_or_verify && dot4_sup) {
+        if ((prefill_or_verify || v_requires_dot4_mmq) && dot4_sup) {
             // ── BM32_regout_directv auto-selection ──────────
             // Wins on 27B at all pp ≥512 and on 35B at pp ≥1024.
             const char * explicit_impl = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL");
@@ -2774,11 +2778,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             // 35B-like or general: nk >= 1024 (context length, not query chunk size)
             const bool is_long_context = (K->ne[1] >= 1024);
             const bool wmma_available = wmma_sup;
-            const bool use_bm32_regout = impl_auto && wmma_available && (is_27b_like || is_long_context);
+            const bool use_bm32_regout = !v_requires_dot4_mmq && impl_auto && wmma_available && (is_27b_like || is_long_context);
 
             // Once we auto-select WMMA for long context, keep using it for
             // subsequent calls (IMPL is already set to bm32_regout_directv).
-            if (use_bm32_regout || (impl_is_wmma && wmma_available)) {
+            if (!v_requires_dot4_mmq && (use_bm32_regout || (impl_is_wmma && wmma_available))) {
                 if (use_bm32_regout) {
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL", "bm32_regout_directv", 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM", "32", 1);
@@ -2788,7 +2792,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 packed16_route_name = "pwmma_bm32_regout_directv";
             } else {
                 packed16_kernel = BEST_FATTN_KERNEL_PACKED16_DOT4_MMQ;
-                packed16_route_name = "dot4_mmq_gqa1";
+                packed16_route_name =
+                    V->type == GGML_TYPE_TBQ4_0    ? "dot4_mmq_tbq4" :
+                    V->type == GGML_TYPE_PLANAR3_0 ? "dot4_mmq_planar3" :
+                    V->type == GGML_TYPE_ISO3_0    ? "dot4_mmq_iso3" : "dot4_mmq_gqa1";
             }
         } else if (prefill_or_verify && wmma_sup) {
             packed16_kernel = BEST_FATTN_KERNEL_PACKED16_WMMA_TILE;

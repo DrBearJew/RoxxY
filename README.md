@@ -10,6 +10,53 @@ values, while f16 scales remain separate.
 
 ---
 
+## PROPER STARTING OPTIONS — I32/DOT4 FlashAttention
+
+For this branch's RDNA3 FlashAttention work, **K is the packed16/I32 route**.
+Do **not** pass a K cache-type flag for this path. In particular, do not use
+`--cache-type-k q8_0` when testing the I32/DOT4 route.
+
+Use the V cache type to choose the value format, and let packed16 allocate the
+physical I32 K payload/scales:
+
+```bash
+LLAMA_MTP_ENABLE_FA=1 \
+LLAMA_MTP_PREFILL_CHUNK=1024 \
+LLAMA_MTP_PREFILL_FORCE_MMQ=1 \
+GGML_CUDA_ROCM_QUANT_PREFILL_F16=1 \
+LLAMA_MTP_DISABLE_PACKED16_FA=0 \
+GGML_CUDA_ROCM_PACKED16_DOT4_MMQ=1 \
+GGML_CUDA_FA_ROUTE_REQUIRE=rocm_packed16_dot4_mmq \
+./build-rocm/bin/llama-server \
+  --device ROCm0 \
+  --model /path/to/Qwen3.6-27B-Q4_K_M-mtp.gguf \
+  --flash-attn on \
+  --cache-type-v tbq4_0 \
+  --ctx-size 40960 --batch-size 1024 --ubatch-size 1024 \
+  --parallel 1 --no-warmup \
+  --spec-type draft-mtp --spec-default \
+  --spec-draft-n-max 3 --spec-draft-p-min 0 \
+  --spec-draft-prio 2 --spec-draft-prio-batch 2
+```
+
+For current I32/DOT4 V-format experiments, replace only the V flag:
+
+```text
+--cache-type-v tbq4_0
+--cache-type-v planar3_0
+--cache-type-v iso3_0
+```
+
+Expected route evidence:
+
+```text
+selected=rocm_packed16_dot4_mmq K=i32 V=<value-type>
+```
+
+If the log says K is q8_0 for FlashAttention, you are not validating this path.
+
+---
+
 ## Quick start
 
 Build the branch, run a model, and let the branch pick the right packed16 route
