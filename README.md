@@ -43,6 +43,7 @@ For current I32/DOT4 V-format experiments, replace only the V flag:
 
 ```text
 --cache-type-v q4_0       # primary packed q4 V target: 18B/32 values = 4.5 bits/value
+--cache-type-v q8_0       # higher-precision V target: 34B/32 values = 8.5 bits/value
 --cache-type-v tbq4_0     # experimental rotated q4 V
 --cache-type-v planar3_0  # experimental 3-bit V
 --cache-type-v iso3_0     # experimental 3-bit V
@@ -50,6 +51,9 @@ For current I32/DOT4 V-format experiments, replace only the V flag:
 
 The intended q4 architecture is **not i16 V**. It is packed q4 V payload plus
 f16 scales feeding only the `P @ V` side; QK remains packed16 I32 DOT4 K.
+For users who want more V precision, `q8_0` V keeps the same packed16 I32 K path
+and raises V from 4.5 to 8.5 bits/value, so packed16-K + q8-V is about
+17 bits per K+V pair.
 
 Expected route evidence:
 
