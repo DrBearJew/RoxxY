@@ -71,6 +71,8 @@ Short WikiText-2 raw smoke on the 27B MTP model, `ctx=512`, `chunks=4`
 `selected=rocm_packed16_dot4_mmq`. This is a fast sanity check, not a full
 quality benchmark.
 
+![WikiText-2 V-cache quality smoke](docs/assets/wikitext-v-cache-quality-20260531.png)
+
 | V cache | PPL / ratio vs f16 V | Mean KLD vs f16 V | Median KLD | Same top token |
 |---|---:|---:|---:|---:|
 | f16 | `5.6891 ± 0.4459` | baseline | baseline | baseline |
