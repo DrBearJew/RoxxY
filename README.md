@@ -90,7 +90,7 @@ A 128k-context server-ready VRAM smoke on the 27B MTP GGUF with active
 omits main and draft K CLI overrides; the Vulkan comparison uses normal f16 main
 K plus q4 V.
 
-![128k active MTP VRAM smoke](docs/assets/active-mtp-vram-128k-20260531.png)
+![128k active MTP VRAM smoke](docs/assets/active-mtp-vram-128k-20260531-v2.png)
 
 | Run | Total VRAM used | Delta over idle |
 |---|---:|---:|
