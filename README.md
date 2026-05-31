@@ -23,14 +23,18 @@ git clone https://github.com/DrBearJew/llama.cpp
 cd llama.cpp
 git checkout tbq4-rdna3-experiment
 
-bash scripts/configure-rocm-gfx1100-wmma.sh
-cmake --build build-rocm-fixed --target llama-server llama-bench -j$(nproc)
+cmake -S . -B build-rocm \
+  -DGGML_HIP=ON \
+  -DGGML_HIP_ROCWMMA_FATTN=ON \
+  -DGPU_TARGETS=gfx1100 \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build-rocm --target llama-server llama-bench -j$(nproc)
 ```
 
 Run a server:
 
 ```bash
-./build-rocm-fixed/bin/llama-server \
+./build-rocm/bin/llama-server \
   --device ROCm0 \
   --model /path/to/Qwen3.6-35B-A3B-IQ4_XS-00001-of-00002.gguf \
   --flash-attn on \
@@ -41,7 +45,7 @@ Run a server:
 Benchmark prefill:
 
 ```bash
-./build-rocm-fixed/bin/llama-bench \
+./build-rocm/bin/llama-bench \
   -m /path/to/Qwen3.6-35B-A3B-IQ4_XS.gguf \
   -fa 1 -ngl 99 -p 512 -n 1
 ```
@@ -53,7 +57,7 @@ Optional: add route logging when benchmarking or debugging:
 
 ```bash
 GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE=1 \
-./build-rocm-fixed/bin/llama-bench \
+./build-rocm/bin/llama-bench \
   -m /path/to/Qwen3.6-35B-A3B-IQ4_XS.gguf \
   -fa 1 -ngl 99 -p 512 -n 1
 ```
@@ -147,27 +151,6 @@ Model sources used during development include GGUF releases from
 
 ---
 
-## Scope
-
-This is a research/performance branch, not a general replacement for upstream
-`llama.cpp`.
-
-Use this branch if:
-
-- you have an RX 7900 XTX / gfx1100-class RDNA3 GPU;
-- you are testing Qwen3.6 27B/35B GGUF models;
-- you care about packed16 FlashAttention prefill performance;
-- you are comfortable building `llama.cpp` from source.
-
-Use upstream `llama.cpp` if:
-
-- you need broad hardware or model support;
-- you are not on RDNA3;
-- you want stable daily-driver behavior;
-- you do not need packed16 KV-cache experiments.
-
----
-
 ## How it works
 
 Standard q8_0 KV-cache attention spends work inside the attention kernel
@@ -199,24 +182,33 @@ This branch changes the K-cache representation and route policy:
 
 ## Build
 
-WMMA-focused gfx1100 build:
+Standard ROCm build for gfx1100:
 
 ```bash
-bash scripts/configure-rocm-gfx1100-wmma.sh
-cd build-rocm-fixed
-cmake --build . --target llama-bench llama-server -j$(nproc)
+cmake -S . -B build-rocm \
+  -DGGML_HIP=ON \
+  -DGGML_HIP_ROCWMMA_FATTN=ON \
+  -DGPU_TARGETS=gfx1100 \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build-rocm --target llama-bench llama-server -j$(nproc)
 ```
 
 Requirements:
 
-- ROCm HIP toolchain with `amdclang++`
+- ROCm HIP toolchain
+- rocWMMA headers/libraries available to CMake for the PWMMA path
 - gfx1100-class RDNA3 GPU; RX 7900 XTX is the primary target
 
-Key CMake settings used by the helper script:
+Optional helper script:
 
-- `CMAKE_HIP_COMPILER=/opt/rocm/bin/amdclang++`
-- `GPU_TARGETS=gfx1100`
-- `-Wno-gpu-maybe-exceed-local-memory` for WMMA LDS-size warnings
+```bash
+bash scripts/configure-rocm-gfx1100-wmma.sh
+```
+
+The helper script is only a convenience wrapper around CMake. It creates
+`build-rocm-fixed`, sets `GPU_TARGETS=gfx1100`, uses `/opt/rocm/bin/amdclang++`,
+and enables the ROCm/FlashAttention options used during development. You do not
+need it if your normal CMake ROCm build works.
 
 Optional ROCm + Vulkan build:
 
@@ -401,7 +393,7 @@ contract tests, and debugging.
 GGML_CUDA_FA_ROUTE_REQUIRE=rocm_packed16_wmma_tile \
 GGML_CUDA_ROCM_PACKED16_WMMA_IMPL=bm32_regout_directv \
 GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE=1 \
-./build-rocm-fixed/bin/llama-bench \
+./build-rocm/bin/llama-bench \
   -m /path/to/Qwen3.6-35B-A3B-IQ4_XS.gguf \
   -fa 1 -ngl 99 -p 512,1024,2048 -n 1
 ```
@@ -411,7 +403,7 @@ GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE=1 \
 ```bash
 GGML_CUDA_FA_ROUTE_REQUIRE=rocm_packed16_dot4_mmq \
 GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE=1 \
-./build-rocm-fixed/bin/llama-bench \
+./build-rocm/bin/llama-bench \
   -m /path/to/Qwen3.6-35B-A3B-IQ4_XS.gguf \
   -fa 1 -ngl 99 -p 512,1024,2048 -n 1
 ```
@@ -422,7 +414,7 @@ GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE=1 \
 GGML_CUDA_FA_ROUTE_REQUIRE=rocm_packed16_dot4_mmq \
 GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_IMPL=kshared \
 GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE=1 \
-./build-rocm-fixed/bin/llama-bench \
+./build-rocm/bin/llama-bench \
   -m /path/to/Qwen3.6-35B-A3B-IQ4_XS.gguf \
   -fa 1 -ngl 99 -p 512,1024 -n 1
 ```
