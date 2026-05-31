@@ -86,6 +86,169 @@
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
+struct ggml_cuda_copy_sync_trace_row {
+    std::string kind;
+    std::string direction;
+    std::string site;
+    std::string tensor;
+    uint64_t calls = 0;
+    uint64_t bytes = 0;
+    uint64_t syncs = 0;
+};
+
+static std::mutex & ggml_cuda_copy_sync_trace_mutex() {
+    static std::mutex * mutex = new std::mutex();
+    return *mutex;
+}
+
+static std::map<std::string, ggml_cuda_copy_sync_trace_row> & ggml_cuda_copy_sync_trace_rows() {
+    static std::map<std::string, ggml_cuda_copy_sync_trace_row> * rows = new std::map<std::string, ggml_cuda_copy_sync_trace_row>();
+    return *rows;
+}
+
+static uint64_t & ggml_cuda_copy_sync_trace_record_count() {
+    static uint64_t * count = new uint64_t(0);
+    return *count;
+}
+
+static bool ggml_cuda_copy_sync_trace_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_CUDA_COPY_SYNC_TRACE");
+        return env && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static std::string ggml_cuda_copy_sync_trace_raw_name(const ggml_tensor * tensor) {
+    if (!tensor || !tensor->name[0]) {
+        return "(unnamed)";
+    }
+    size_t len = 0;
+    while (len < GGML_MAX_NAME && tensor->name[len] != '\0') {
+        ++len;
+    }
+    return std::string(tensor->name, len);
+}
+
+static std::string ggml_cuda_copy_sync_trace_tensor_name(const ggml_tensor * tensor) {
+    std::string name = ggml_cuda_copy_sync_trace_raw_name(tensor);
+    if (tensor && tensor->view_src && tensor->view_src->name[0]) {
+        const std::string src_name = ggml_cuda_copy_sync_trace_raw_name(tensor->view_src);
+        if (name == "(unnamed)" || name.find("(view)") != std::string::npos) {
+            name = src_name + " -> " + name;
+        }
+    }
+    return name;
+}
+
+static void ggml_cuda_copy_sync_trace_print() {
+    if (!ggml_cuda_copy_sync_trace_enabled()) {
+        return;
+    }
+
+    std::vector<ggml_cuda_copy_sync_trace_row> rows;
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_copy_sync_trace_mutex());
+        rows.reserve(ggml_cuda_copy_sync_trace_rows().size());
+        for (const auto & kv : ggml_cuda_copy_sync_trace_rows()) {
+            rows.push_back(kv.second);
+        }
+    }
+
+    const char * sort_env = getenv("GGML_CUDA_COPY_SYNC_TRACE_SORT");
+    const bool sort_bytes = sort_env && strcmp(sort_env, "bytes") == 0;
+    std::sort(rows.begin(), rows.end(), [sort_bytes](const auto & a, const auto & b) {
+        if (sort_bytes) {
+            if (a.bytes != b.bytes) {
+                return a.bytes > b.bytes;
+            }
+            return a.calls > b.calls;
+        }
+        if (a.calls != b.calls) {
+            return a.calls > b.calls;
+        }
+        return a.bytes > b.bytes;
+    });
+
+    FILE * out = stderr;
+    const char * path = getenv("GGML_CUDA_COPY_SYNC_TRACE_FILE");
+    if (path && path[0]) {
+        FILE * f = fopen(path, "w");
+        if (f) {
+            out = f;
+        }
+    }
+
+    fprintf(out, "GGML_CUDA_COPY_SYNC_TRACE summary rows=%zu\n", rows.size());
+    fprintf(out, "kind\tdirection\tsite\ttensor\tcalls\tbytes\tsyncs\tavg_bytes\n");
+    for (const auto & row : rows) {
+        const double avg = row.calls ? (double) row.bytes / (double) row.calls : 0.0;
+        fprintf(out, "%s\t%s\t%s\t%s\t%llu\t%llu\t%llu\t%.1f\n",
+            row.kind.c_str(), row.direction.c_str(), row.site.c_str(), row.tensor.c_str(),
+            (unsigned long long) row.calls,
+            (unsigned long long) row.bytes,
+            (unsigned long long) row.syncs,
+            avg);
+    }
+
+    if (out != stderr) {
+        fclose(out);
+    }
+}
+
+static uint64_t ggml_cuda_copy_sync_trace_flush_every() {
+    static const uint64_t flush_every = []() {
+        const char * env = getenv("GGML_CUDA_COPY_SYNC_TRACE_FLUSH_EVERY");
+        return env && env[0] ? strtoull(env, nullptr, 10) : 0ULL;
+    }();
+    return flush_every;
+}
+
+static void ggml_cuda_copy_sync_trace_register() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+        if (ggml_cuda_copy_sync_trace_enabled()) {
+            atexit(ggml_cuda_copy_sync_trace_print);
+        }
+    });
+}
+
+static void ggml_cuda_copy_sync_trace_record(
+        const char * kind, const char * direction, const char * site, const ggml_tensor * tensor,
+        size_t bytes, bool stream_synchronized) {
+    if (!ggml_cuda_copy_sync_trace_enabled()) {
+        return;
+    }
+    ggml_cuda_copy_sync_trace_register();
+
+    const std::string tensor_name = ggml_cuda_copy_sync_trace_tensor_name(tensor);
+    std::string key = std::string(kind) + "\t" + direction + "\t" + site + "\t" + tensor_name;
+
+    bool do_flush = false;
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_copy_sync_trace_mutex());
+        auto & row = ggml_cuda_copy_sync_trace_rows()[key];
+        if (row.calls == 0) {
+            row.kind = kind;
+            row.direction = direction;
+            row.site = site;
+            row.tensor = tensor_name;
+        }
+        row.calls++;
+        row.bytes += bytes;
+        row.syncs += stream_synchronized ? 1 : 0;
+
+        const uint64_t flush_every = ggml_cuda_copy_sync_trace_flush_every();
+        uint64_t & record_count = ggml_cuda_copy_sync_trace_record_count();
+        record_count++;
+        do_flush = flush_every != 0 && (record_count % flush_every) == 0;
+    }
+
+    if (do_flush) {
+        ggml_cuda_copy_sync_trace_print();
+    }
+}
+
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
     int id = -1; // in case cudaGetDevice fails
@@ -673,6 +836,7 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_cuda_copy_sync_trace_record("memset", "device", __func__, tensor, size, true);
 }
 
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
@@ -681,6 +845,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_cuda_copy_sync_trace_record("copy", "H2D", __func__, tensor, size, true);
 }
 
 static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -689,6 +854,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_cuda_copy_sync_trace_record("copy", "D2H", __func__, tensor, size, true);
 }
 
 static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data,
@@ -699,6 +865,7 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_cuda_copy_sync_trace_record("copy2d", "H2D", __func__, tensor, size*n_copies, true);
 }
 
 static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data,
@@ -709,6 +876,7 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_cuda_copy_sync_trace_record("copy2d", "D2H", __func__, tensor, size*n_copies, true);
 }
 
 static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
@@ -725,6 +893,7 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
 #endif
         }
         CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        ggml_cuda_copy_sync_trace_record("copy", "D2D", __func__, dst, ggml_nbytes(src), true);
         return true;
     }
     return false;
@@ -738,6 +907,7 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_cuda_copy_sync_trace_record("memset", "device", __func__, nullptr, buffer->size, true);
 }
 
 static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
@@ -1003,10 +1173,12 @@ static void ggml_backend_cuda_split_buffer_set_tensor(ggml_backend_buffer_t buff
 
         const char * buf_host = (const char *)data + offset_split;
         CUDA_CHECK(cudaMemcpyAsync(extra->data_device[id], buf_host, original_size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+        ggml_cuda_copy_sync_trace_record("copy", "H2D", __func__, tensor, original_size, false);
     }
 
     for (int id = 0; id < ggml_backend_cuda_get_device_count(); ++id) {
         CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        ggml_cuda_copy_sync_trace_record("sync", "stream", __func__, tensor, 0, true);
     }
 }
 
@@ -1042,10 +1214,12 @@ static void ggml_backend_cuda_split_buffer_get_tensor(ggml_backend_buffer_t buff
 
         char * buf_host = (char *)data + offset_split;
         CUDA_CHECK(cudaMemcpyAsync(buf_host, extra->data_device[id], original_size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+        ggml_cuda_copy_sync_trace_record("copy", "D2H", __func__, tensor, original_size, false);
     }
 
     for (int id = 0; id < ggml_backend_cuda_get_device_count(); ++id) {
         CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        ggml_cuda_copy_sync_trace_record("sync", "stream", __func__, tensor, 0, true);
     }
 }
 
@@ -2999,6 +3173,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    ggml_cuda_copy_sync_trace_record("copy", "H2D", __func__, tensor, size, false);
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -3008,6 +3183,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+    ggml_cuda_copy_sync_trace_record("copy", "D2H", __func__, tensor, size, false);
 }
 
 static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data,
@@ -3019,6 +3195,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
 
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    ggml_cuda_copy_sync_trace_record("copy2d", "H2D", __func__, tensor, size*n_copies, false);
 }
 
 static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data,
@@ -3030,6 +3207,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+    ggml_cuda_copy_sync_trace_record("copy2d", "D2H", __func__, tensor, size*n_copies, false);
 }
 
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
@@ -3084,6 +3262,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         // src and dst are on the same backend
         CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
     }
+    ggml_cuda_copy_sync_trace_record("copy", "D2D", __func__, dst, ggml_nbytes(dst), false);
     return true;
 }
 
@@ -3091,6 +3270,7 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    ggml_cuda_copy_sync_trace_record("sync", "stream", __func__, nullptr, 0, true);
 
     GGML_UNUSED(backend);
 }
