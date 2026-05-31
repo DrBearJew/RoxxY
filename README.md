@@ -64,6 +64,23 @@ selected=rocm_packed16_dot4_mmq K=i32 V=<value-type>
 
 If the log says K is q8_0 for FlashAttention, you are not validating this path.
 
+### Fast WikiText quality smoke
+
+Short WikiText-2 raw smoke on the 27B MTP model, `ctx=512`, `chunks=4`
+(~1020 evaluated tokens/candidate), all with `K=i32` and
+`selected=rocm_packed16_dot4_mmq`. This is a fast sanity check, not a full
+quality benchmark.
+
+| V cache | PPL / ratio vs f16 V | Mean KLD vs f16 V | Median KLD | Same top token |
+|---|---:|---:|---:|---:|
+| f16 | `5.6891 ± 0.4459` | baseline | baseline | baseline |
+| q4_0 | `1.00198 ± 0.00422` ratio | `0.004550 ± 0.000338` | `0.001818` | `97.06%` |
+| q8_0 | `1.00101 ± 0.00336` ratio | `0.002825 ± 0.000334` | `0.000863` | `97.94%` |
+
+Takeaway: q4_0 is the default compression choice; q8_0 is the higher-precision
+choice and is measurably closer to f16 V on this smoke. Evidence:
+[`.harness/research/i32-vformat-wikitext-kld-ppl-20260531.md`](.harness/research/i32-vformat-wikitext-kld-ppl-20260531.md).
+
 ---
 
 ## Quick start
