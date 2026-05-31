@@ -3296,7 +3296,12 @@ static void ggml_cuda_flash_attn_ext_mma_tbq4(ggml_backend_cuda_context & ctx, g
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
 
-    setbuf(stderr, NULL);
+    const bool fattn_dispatch_trace =
+        (getenv("COMPRESSED_KV_FATTN_LOG") && atoi(getenv("COMPRESSED_KV_FATTN_LOG")) != 0) ||
+        (getenv("GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE") && atoi(getenv("GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE")) != 0);
+    if (fattn_dispatch_trace) {
+        setbuf(stderr, NULL);
+    }
     // ── Entry proof: every FA op must pass through here ──────────
     {
         const ggml_tensor * Q = dst->src[0];
@@ -3327,9 +3332,13 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 
     g_fattn_select_ctx = GGML_CUDA_FATTN_SELECT_DISPATCH;
-    fprintf(stderr, "FATTN COMPUTE ENTER dst=%p\n", (void*)dst); fflush(stderr);
+    if (fattn_dispatch_trace) {
+        fprintf(stderr, "FATTN COMPUTE ENTER dst=%p\n", (void*)dst); fflush(stderr);
+    }
     const best_fattn_kernel best_kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
-    fprintf(stderr, "FATTN COMPUTE SELECT selected=%d name=%s dst=%p\n", (int)best_kernel, ggml_cuda_fattn_kernel_name(best_kernel), (void*)dst); fflush(stderr);
+    if (fattn_dispatch_trace) {
+        fprintf(stderr, "FATTN COMPUTE SELECT selected=%d name=%s dst=%p\n", (int)best_kernel, ggml_cuda_fattn_kernel_name(best_kernel), (void*)dst); fflush(stderr);
+    }
     ggml_cuda_fattn_log_selection(best_kernel, dst);
 
     // ── VEC/TILE hunter hook ───────────────────────────────────
@@ -3365,7 +3374,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         }
     }
 
-    fprintf(stderr, "PWMMA DISPATCH selected=%d name=%s\n", (int) best_kernel, ggml_cuda_fattn_kernel_name(best_kernel));
+    if (fattn_dispatch_trace) {
+        fprintf(stderr, "PWMMA DISPATCH selected=%d name=%s\n", (int) best_kernel, ggml_cuda_fattn_kernel_name(best_kernel));
+    }
 
     switch (best_kernel) {
         case BEST_FATTN_KERNEL_NONE:
