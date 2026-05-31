@@ -82,7 +82,6 @@ if [[ -n "$EXTRA_ENV" ]]; then
     -ub "$UBATCH_SIZE" \
     -p "$PROMPT_TOKENS" \
     -n "$GEN_TOKENS" \
-    -pg pp,tg \
     -d "$DEPTH_CSV" \
     -r "$REPETITIONS" \
     -o jsonl \
@@ -100,7 +99,6 @@ else
     -ub "$UBATCH_SIZE" \
     -p "$PROMPT_TOKENS" \
     -n "$GEN_TOKENS" \
-    -pg pp,tg \
     -d "$DEPTH_CSV" \
     -r "$REPETITIONS" \
     -o jsonl \
