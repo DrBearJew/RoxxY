@@ -755,6 +755,15 @@ void llama_context::synchronize() {
         return;
     }
 
+    const bool skip_redundant_sync = []() {
+        const char * env = getenv("LLAMA_SKIP_REDUNDANT_SYNCHRONIZE");
+        return env && atoi(env) != 0;
+    }();
+
+    if (skip_redundant_sync && n_queued_tokens == 0 && t_compute_start_us == 0) {
+        return;
+    }
+
     ggml_backend_sched_synchronize(sched.get());
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
