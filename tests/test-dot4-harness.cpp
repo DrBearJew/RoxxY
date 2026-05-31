@@ -1,9 +1,12 @@
 // tests/test-dot4-harness.cpp
 // DOT4 correctness harness: compares DOT4 flash_attn output against reference (VEC/TILE fallback).
 // Usage:
-//   FULL_FA=1:  ./build-rocm-rdna3-fa/bin/test-dot4-harness
-//   FULL_FA=0:  GGML_CUDA_ROCM_Q8K_DOT4_KQ_FULL_FA=0 ./build-rocm-rdna3-fa/bin/test-dot4-harness
-//   Compare:     diff /tmp/dot4_out.txt /tmp/ref_out.txt (human review)
+//   ./build-rocm-fixed/bin/test-dot4-harness
+//   DOT4_HARNESS_TEST=1 GGML_CUDA_DOT4_DEBUG=1 ./build-rocm-fixed/bin/test-dot4-harness
+//
+// The harness forces DOT4 only for the DOT4 leg and disables DOT4 for the REF leg.
+// This avoids false comparisons where both legs silently take VEC/TILE/WMMA or both
+// legs take q8k_dot4_kq with FULL_FA=0.
 
 #include <ggml.h>
 #include <ggml-alloc.h>
@@ -28,11 +31,11 @@ static void fill_f32(float * data, size_t n, float scale, int seed) {
 
 static void fill_f16(uint16_t * data, size_t n, float scale, int seed) {
     srand(seed);
+    std::vector<float> tmp(n);
     for (size_t i = 0; i < n; i++) {
-        float v = ((float)rand() / RAND_MAX * 2.0f - 1.0f) * scale;
-        uint32_t bits; memcpy(&bits, &v, 4);
-        data[i] = (uint16_t)(bits >> 16);
+        tmp[i] = ((float)rand() / RAND_MAX * 2.0f - 1.0f) * scale;
     }
+    ggml_fp32_to_fp16_row(tmp.data(), (ggml_fp16_t *) data, (int64_t) n);
 }
 
 static float max_abs_diff(const float * a, const float * b, size_t n) {
@@ -192,9 +195,22 @@ static fa_result run_flash_attn(
     r.D = (size_t)D;
     r.n_heads = (size_t)n_heads;
 
-    // Set env for this run
-    if (env_full_fa) {
-        setenv("GGML_CUDA_ROCM_Q8K_DOT4_KQ_FULL_FA", env_full_fa, 1);
+    // Set env for this run.  The two legs must be isolated:
+    //   DOT4 leg: force q8k_dot4_kq + FULL_FA + source-f16 K materialization.
+    //   REF  leg: disable q8k_dot4_kq and clear route contracts so VEC/TILE/WMMA runs.
+    if (env_full_fa && strcmp(env_full_fa, "1") == 0) {
+        setenv("GGML_CUDA_ROCM_Q8K_DOT4_KQ_FULL_FA", "1", 1);
+        setenv("GGML_CUDA_FA_ROUTE_REQUIRE", "rocm_q8k_dot4_kq", 1);
+        setenv("GGML_CUDA_ROCM_Q8K_DOT4_KQ", "1", 1);
+        setenv("GGML_CUDA_ROCM_MTP_VERIFY_F16K_DOT4_ADAPTER", "1", 1);
+        setenv("GGML_CUDA_ROCM_MTP_DRAFT_DOT4_DECODE", "1", 1);
+    } else {
+        setenv("GGML_CUDA_ROCM_Q8K_DOT4_KQ_FULL_FA", "0", 1);
+        setenv("GGML_CUDA_ROCM_Q8K_DOT4_KQ", "0", 1);
+        unsetenv("GGML_CUDA_FA_ROUTE_REQUIRE");
+        unsetenv("GGML_CUDA_ROCM_Q8K_DOT4_KQ_AUTO");
+        unsetenv("GGML_CUDA_ROCM_MTP_VERIFY_F16K_DOT4_ADAPTER");
+        unsetenv("GGML_CUDA_ROCM_MTP_DRAFT_DOT4_DECODE");
     }
 
     // Init backends — use GPU backend, not name-based which won't match ROCm
@@ -223,16 +239,17 @@ static fa_result run_flash_attn(
 
     ggml_set_name(Q, "Q"); ggml_set_name(K, "K"); ggml_set_name(V, "V"); ggml_set_name(mask, "mask");
 
-    // Causal mask: lower triangular, -inf in masked positions
+    // Causal mask: lower triangular, -inf in masked positions.
+    // Use ggml conversion; truncating float bits is bfloat-like and creates bad half values.
+    std::vector<float> mask_f32(nk * nq);
     std::vector<uint16_t> mask_f16(nk * nq);
     for (int q = 0; q < nq; q++) {
         for (int k = 0; k < nk; k++) {
-            bool visible = (k <= nk - nq + q); // causal
-            float v = visible ? 0.0f : -1e9f;
-            uint32_t bits; memcpy(&bits, &v, 4);
-            mask_f16[q * nk + k] = (uint16_t)(bits >> 16);
+            const bool visible = (k <= nk - nq + q); // causal tail alignment
+            mask_f32[q * nk + k] = visible ? 0.0f : -INFINITY;
         }
     }
+    ggml_fp32_to_fp16_row(mask_f32.data(), (ggml_fp16_t *) mask_f16.data(), (int64_t) mask_f16.size());
 
     // Build op
     ggml_tensor * out = ggml_flash_attn_ext(ctx, Q, K, V, mask, sm_scale, max_bias, 0.0f);
@@ -289,10 +306,11 @@ static fa_result run_flash_attn(
 
 int main(int argc, char ** argv) {
     const char * env_full_fa = getenv("GGML_CUDA_ROCM_Q8K_DOT4_KQ_FULL_FA");
-    bool force_fa = (env_full_fa && strcmp(env_full_fa, "1") == 0);
+    const int only_test = getenv("DOT4_HARNESS_TEST") ? atoi(getenv("DOT4_HARNESS_TEST")) : 0;
 
     printf("=== DOT4 Correctness Harness ===\n");
-    printf("FULL_FA env: %s\n\n", env_full_fa ? env_full_fa : "(unset)");
+    printf("FULL_FA env on entry: %s\n", env_full_fa ? env_full_fa : "(unset)");
+    printf("DOT4_HARNESS_TEST: %s\n\n", only_test ? getenv("DOT4_HARNESS_TEST") : "all");
 
     // Test configurations
     struct {
@@ -320,6 +338,9 @@ int main(int argc, char ** argv) {
     bool all_ok = true;
 
     for (int ti = 0; ti < n_tests; ti++) {
+        if (only_test && only_test != ti + 1) {
+            continue;
+        }
         auto & tc = tests[ti];
         printf("═══ Test %d: %s ═══\n", ti+1, tc.name);
         printf("nq=%d nk=%d D=%d heads=%d\n", tc.nq, tc.nk, tc.D, tc.nh);

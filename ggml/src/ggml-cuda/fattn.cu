@@ -637,7 +637,11 @@ static bool ggml_cuda_fattn_route_contract_matches(const char * required, const 
     if ((strcmp(required, "rocm_mtp_verify_dot4_recthist") == 0 ||
          strcmp(required, "rocm_mtp_draft_dot4_decode") == 0 ||
          strcmp(required, "rocm_mtp_draft_dot4_decode_bn64") == 0 ||
-         strcmp(required, "rocm_mtp_draft_dot4_decode_splitk") == 0) &&
+         strcmp(required, "rocm_mtp_draft_dot4_decode_splitk") == 0 ||
+         strcmp(required, "rocm_q8k_dot4_recthist_mtp_verify") == 0 ||
+         strcmp(required, "rocm_q8k_dot4_decode_mtp_draft") == 0 ||
+         strcmp(required, "rocm_q8k_dot4_decode_bn64_mtp_draft") == 0 ||
+         strcmp(required, "rocm_q8k_dot4_decode_splitk_mtp_draft") == 0) &&
             kernel == BEST_FATTN_KERNEL_Q8K_DOT4_KQ) {
         return true;
     }
@@ -2662,15 +2666,51 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_NONE;
         }
 
+        // Debug policy: keep MTP off persistent packed16 I32-K routes by
+        // default. MTP DOT4 route experiments use instruction-specific
+        // f16-source materialization/decoding; set LLAMA_MTP_DISABLE_PACKED16_FA=0
+        // only for focused packed16 MTP experiments.
+        {
+            const int32_t fi = ((const int32_t *)dst->op_params)[4];
+            if (fi == GGML_FATTN_INST_MTP_VERIFY_QK ||
+                fi == GGML_FATTN_INST_MTP_DRAFT ||
+                fi == GGML_FATTN_INST_MTP_DRAFT_DECODE_QK) {
+                const char * mtp_disable_p16 = getenv("LLAMA_MTP_DISABLE_PACKED16_FA");
+                const bool disable_p16_mtp = mtp_disable_p16 == nullptr || atoi(mtp_disable_p16) != 0;
+                if (disable_p16_mtp) {
+                    if (getenv("LLAMA_MTP_FA_ROUTE")) {
+                        fprintf(stderr, "MTP_FA_ROUTE: inst=%d k_type=%d selected=none reason=packed16_mtp_disabled_by_default\n",
+                            fi, K->type);
+                    }
+                    return BEST_FATTN_KERNEL_NONE;
+                }
+            }
+        }
+
         // ── Route dispatch ───────────────────────────────────
         const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
         const ggml_fattn_instruction inst = (ggml_fattn_instruction)fa_inst_i32;
+
+        const bool require_q8k_dot4_kq =
+            required_route &&
+            (strcmp(required_route, "rocm_q8k_dot4_kq") == 0 ||
+             strcmp(required_route, "rocm_mtp_verify_dot4_recthist") == 0 ||
+             strcmp(required_route, "rocm_mtp_draft_dot4_decode") == 0 ||
+             strcmp(required_route, "rocm_mtp_draft_dot4_decode_bn64") == 0 ||
+             strcmp(required_route, "rocm_mtp_draft_dot4_decode_splitk") == 0 ||
+             strcmp(required_route, "rocm_q8k_dot4_recthist_mtp_verify") == 0 ||
+             strcmp(required_route, "rocm_q8k_dot4_decode_mtp_draft") == 0 ||
+             strcmp(required_route, "rocm_q8k_dot4_decode_bn64_mtp_draft") == 0 ||
+             strcmp(required_route, "rocm_q8k_dot4_decode_splitk_mtp_draft") == 0);
+        if (require_q8k_dot4_kq) {
+            return BEST_FATTN_KERNEL_Q8K_DOT4_KQ;
+        }
 
         const bool require_packed16_dot4_mmq =
             required_route &&
             (strcmp(required_route, "rocm_packed16_dot4_mmq") == 0 ||
              strcmp(required_route, "packed16_dot4_mmq") == 0);
-        if (require_packed16_dot4_mmq) {
+        if (require_packed16_dot4_mmq && Q->ne[1] > 1) {
             if (!ggml_cuda_packed16_dot4_mmq_supported(cc, dst)) {
                 GGML_ABORT("required rocm_packed16_dot4_mmq route was not selected; Q=[%lld,%lld,%lld,%lld] K=[%lld,%lld,%lld,%lld] V=%s",
                     (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3],
@@ -2687,12 +2727,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_PACKED16_WMMA_TILE;
         }
 
+        // MTP_VERIFY_QK must NOT use packed16 I32 K — the MTP draft head is
+        // trained on exact f16 K, and even small differences from lossy 4-bit
+        // packed16 K cause 100%% draft rejection.  Route MTP verify through the
+        // instruction fastpath (q8k_dot4_kq / VEC / WMMA_F16) instead.
+        const char * mtp_disable_p16_env = getenv("LLAMA_MTP_DISABLE_PACKED16_FA");
+        const bool mtp_packed16_experiment = mtp_disable_p16_env && atoi(mtp_disable_p16_env) == 0;
         const bool prefill_or_verify =
             Q->ne[1] > 1 &&
             (inst == GGML_FATTN_INST_PREFILL_QK ||
-             inst == GGML_FATTN_INST_MTP_VERIFY_QK ||
              inst == GGML_FATTN_INST_SPEC_VERIFY_QK ||
-             inst == GGML_FATTN_INST_BATCH_VERIFY_QK);
+             inst == GGML_FATTN_INST_BATCH_VERIFY_QK ||
+             (mtp_packed16_experiment && inst == GGML_FATTN_INST_MTP_VERIFY_QK));
 
         // nq == 1 decode: always route to DOT4 (BN64/split-K).
         // packed16_wmma_tile only supports nq > 1.

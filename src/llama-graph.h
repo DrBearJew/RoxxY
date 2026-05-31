@@ -122,6 +122,22 @@ public:
     const int64_t n_embd = 0;
 };
 
+class llm_graph_input_embd_h : public llm_graph_input_i {
+public:
+    llm_graph_input_embd_h(int64_t n_embd) : n_embd(n_embd) {}
+    virtual ~llm_graph_input_embd_h() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * tokens = nullptr; // I32 [n_batch]
+    ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
+    ggml_tensor * h      = nullptr; // F32 [n_embd, n_batch]
+
+    const int64_t n_embd = 0;
+};
+
 class llm_graph_input_pos : public llm_graph_input_i {
 public:
     llm_graph_input_pos(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {}
@@ -686,8 +702,9 @@ public:
     ggml_tensor * get_inp_tokens()  const { return t_inp_tokens; }
     ggml_tensor * get_logits()      const { return t_logits; }
     ggml_tensor * get_embd()        const { return t_embd; }
-    ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
-    ggml_tensor * get_h_pre_norm()  const { return t_h_pre_norm; }
+    ggml_tensor * get_embd_pooled()   const { return t_embd_pooled; }
+    ggml_tensor * get_h_pre_norm()    const { return t_h_pre_norm; }
+    ggml_tensor * get_mtp_h_capture() const { return t_mtp_h_capture; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -714,12 +731,13 @@ public:
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
-    ggml_tensor * t_embd        = nullptr;
-    ggml_tensor * t_embd_pooled = nullptr;
-    ggml_tensor * t_h_pre_norm  = nullptr; // [n_embd, n_outputs] hidden state before final output norm; required for MTP
+    ggml_tensor * t_embd          = nullptr;
+    ggml_tensor * t_embd_pooled   = nullptr;
+    ggml_tensor * t_h_pre_norm    = nullptr; // [n_embd, n_outputs] hidden state before final output norm; generic extraction/debug path
 
     // MTP related inputs/outputs
-    ggml_tensor * t_mtp_out     = nullptr; // [n_embd, n_tokens]
+    ggml_tensor * t_mtp_h_capture = nullptr; // [n_embd, n_tokens|n_outputs] materialized target hidden state for MTP draft input
+    ggml_tensor * t_mtp_out       = nullptr; // [n_embd, n_tokens]
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;

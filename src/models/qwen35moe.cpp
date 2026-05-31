@@ -235,6 +235,13 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
     cb(cur, "h_pre_norm", -1);
     res->t_h_pre_norm = cur;
 
+    if (cparams.embeddings_pre_norm) {
+        ggml_tensor * h_mtp_capture = ggml_dup(ctx0, cur);
+        cb(h_mtp_capture, "mtp_h_capture", -1);
+        res->t_mtp_h_capture = h_mtp_capture;
+        ggml_build_forward_expand(gf, h_mtp_capture);
+    }
+
     if (!cparams.embeddings_pre_norm_masked && inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
@@ -577,27 +584,41 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
-    auto inp = std::make_unique<llm_graph_input_embd>(hparams.n_embd);
+    // TODO: extract in a common llm_graph_context::build_inp_embd_h()
+    GGML_ASSERT(hparams.n_embd_inp() == hparams.n_embd && "MTP embd/h input dimensions must match until llm_graph_input_embd_h tracks both dimensions");
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd);
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp->tokens);
 
-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
     ggml_set_input(inp->embd);
-    ggml_set_name(inp->embd, "mtp_h_input");
 
-    ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
-
-    ggml_tensor * h_input  = inp->embd;
-    ggml_tensor * tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+    // TODO: make static using `ggml_build_forward_select()`
+    //       see llm_graph_context::build_inp_embd() for reference
+    ggml_tensor * tok_embd;
+    if (ubatch.token) {
+        ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
+        tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+    } else {
+        tok_embd = inp->embd;
+    }
     cb(tok_embd, "mtp_tok_embd", il);
+
+    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+    ggml_set_input(inp->h);
+    ggml_set_name(inp->h, "mtp_h_input");
+
+    ggml_tensor * h_embd = inp->h;
 
     res->add_input(std::move(inp));
 
-    ggml_tensor * inp_pos = build_inp_pos();
-    auto * inp_attn       = build_attn_inp_kv();
+    ggml_tensor * inp_pos     = build_inp_pos();
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    ggml_tensor * h_norm = build_norm(h_input, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
+    auto * inp_attn = build_attn_inp_kv();
+
+    ggml_tensor * h_norm = build_norm(h_embd, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
     cb(h_norm, "mtp_hnorm", il);
 
     ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
@@ -606,7 +627,7 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, /*dim=*/ 0);
     cb(concat, "mtp_concat", il);
 
-    ggml_tensor * cur = build_lora_mm(layer.nextn.eh_proj, concat);
+    ggml_tensor * cur = build_lora_mm(layer.nextn.eh_proj, concat, layer.nextn.eh_proj_s);
     cb(cur, "mtp_eh_proj", il);
 
     ggml_tensor * inpSA = cur;
@@ -655,10 +676,13 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     cur = build_attn(inp_attn,
             nullptr, nullptr, nullptr,
             Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    ggml_tensor * attn_pregate = cur;
     cb(cur, "mtp_attn_pregate", il);
 
     cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
+    ggml_tensor * attn_gated = cur;
     cur = build_lora_mm(layer.wo, cur, layer.wo_s);
+    ggml_tensor * attn_out = cur;
     cb(cur, "mtp_attn_out", il);
 
     cur = ggml_add(ctx0, cur, inpSA);
@@ -712,6 +736,27 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     cur = ggml_add(ctx0, cur, ffn_residual);
     cb(cur, "mtp_post_ffn", il);
 
+    if (const char * bypass = getenv("LLAMA_MTP_BYPASS_CORE")) {
+        if (strcmp(bypass, "h") == 0) {
+            cur = h_embd;
+        } else if (strcmp(bypass, "h_norm") == 0) {
+            cur = h_norm;
+        } else if (strcmp(bypass, "eh_proj") == 0) {
+            cur = inpSA;
+        } else if (strcmp(bypass, "attn_pregate") == 0) {
+            cur = attn_pregate;
+        } else if (strcmp(bypass, "attn_gated") == 0) {
+            cur = attn_gated;
+        } else if (strcmp(bypass, "attn_out") == 0) {
+            cur = attn_out;
+        } else if (strcmp(bypass, "attn_residual") == 0) {
+            cur = ffn_residual;
+        }
+        fprintf(stderr, "MTP_BYPASS(qwen35moe): stage=%s cur=[%lld,%lld]\n",
+            bypass, (long long) cur->ne[0], (long long) cur->ne[1]);
+    }
+
+    cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
     // Pre-norm hidden state: used by the AR draft loop to seed the next MTP step.
     cb(cur, "h_pre_norm", -1);
     res->t_h_pre_norm = cur;
@@ -725,7 +770,20 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     GGML_ASSERT(head_w && "QWEN35MOE MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur);
+    ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+    // LLAMA_MTP_HEAD_PROBE: dump output tensor dimensions
+    if (getenv("LLAMA_MTP_HEAD_PROBE")) {
+        fprintf(stderr, "MTP_HEAD_PROBE output: head_w=[%lld,%lld] cur_before=[%lld,%lld] cur_after=[%lld,%lld] n_vocab=%d\n",
+            (long long)head_w->ne[0], (long long)head_w->ne[1],
+            (long long)cur->ne[0], (long long)cur->ne[1],
+            0LL, 0LL,
+            llama_vocab_n_tokens(llama_model_get_vocab(&model)));
+    }
+    cur = build_lora_mm(head_w, cur, head_s);
+    if (getenv("LLAMA_MTP_HEAD_PROBE")) {
+        fprintf(stderr, "MTP_HEAD_PROBE after_mm: cur=[%lld,%lld]\n",
+            (long long)cur->ne[0], (long long)cur->ne[1]);
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;

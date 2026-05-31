@@ -1,6 +1,8 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
+#include "../ggml/src/ggml-impl.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -1197,8 +1199,15 @@ void llama_context::set_embeddings(bool value) {
 void llama_context::set_embeddings_pre_norm(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
+    const bool changed = cparams.embeddings_pre_norm        != value ||
+                         cparams.embeddings_pre_norm_masked != masked;
+
     cparams.embeddings_pre_norm        = value;
     cparams.embeddings_pre_norm_masked = masked;
+
+    if (changed) {
+        sched_need_reserve = true;
+    }
 }
 
 void llama_context::set_mtp_source(llama_context * src) {
@@ -1208,9 +1217,27 @@ void llama_context::set_mtp_source(llama_context * src) {
     llama_assert_gemma4_mtp_source_placement(this, src);
     src_ctx = src;
     src_mctx_for_decode.reset();
+
+    if (cparams.flash_attn &&
+        !(getenv("LLAMA_MTP_ENABLE_FA") && atoi(getenv("LLAMA_MTP_ENABLE_FA")) != 0)) {
+        // This context is the MTP draft. Keep target FA enabled, but reserve/build
+        // the draft graph and draft KV cache in the upstream-like non-FA layout.
+        // LLAMA_MTP_ENABLE_FA=1 remains a debug override for draft FA experiments.
+        cparams.flash_attn = false;
+        cparams.auto_fa    = false;
+        LLAMA_LOG_WARN("%s: disabling Flash Attention in the MTP draft context; target Flash Attention remains enabled\n", __func__);
+    }
+
     // worst-case compute buffers were reserved without knowing about the source
-    // memory; force a re-reserve so the next decode sees src views
+    // memory or draft FA policy; force a re-reserve so the next decode sees them
     sched_need_reserve = true;
+
+    // Wire reverse hook: source (target) knows about this (draft) so that
+    // handle_mtp_for_ubatch can feed hidden states to the MTP draft during decode.
+    // Guarded by LLAMA_MTP_HOOK_WIRE=1 until GPU synchronization issue is resolved.
+    if (getenv("LLAMA_MTP_HOOK_WIRE") && !src->mtp.ctx_mtp) {
+        src->set_mtp(this);
+    }
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -1402,6 +1429,43 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
+    if (getenv("LLAMA_MTP_FINITE_PROBE") && gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+        ggml_cgraph * gf_probe = res->get_gf();
+        const char * names_env = getenv("LLAMA_MTP_FINITE_PROBE");
+        const bool all_names = strcmp(names_env, "1") == 0 || strcmp(names_env, "all") == 0;
+        for (int i = 0; i < gf_probe->n_nodes; ++i) {
+            ggml_tensor * t = gf_probe->nodes[i];
+            const char * tn = t->name;
+            const bool want = all_names ||
+                strstr(tn, "mtp_Qcur_full") || strstr(tn, "mtp_Qcur_normed") ||
+                strstr(tn, "mtp_Kcur_normed") || strstr(tn, "mtp_Vcur") ||
+                strstr(tn, "mtp_gate") || strstr(tn, "mtp_attn_pregate") ||
+                strstr(tn, "mtp_attn_out") || strstr(tn, "mtp_attn_residual") ||
+                strstr(tn, "mtp_ffn_out") || strstr(tn, "mtp_post_ffn") ||
+                strstr(tn, "h_pre_norm") || strstr(tn, "result_output");
+            if (!want || t->buffer == nullptr || t->type != GGML_TYPE_F32) {
+                continue;
+            }
+            const int64_t n = ggml_nelements(t);
+            const int64_t n_check = std::min<int64_t>(n, 4096);
+            std::vector<float> tmp(n_check);
+            ggml_backend_tensor_get(t, tmp.data(), 0, n_check*sizeof(float));
+            int bad = 0;
+            float mn = INFINITY, mx = -INFINITY;
+            for (int64_t j = 0; j < n_check; ++j) {
+                const float v = tmp[j];
+                if (!std::isfinite(v)) { ++bad; continue; }
+                mn = std::min(mn, v);
+                mx = std::max(mx, v);
+            }
+            fprintf(stderr, "MTP_FINITE: node=%d name=%s type=%d ne=[%lld,%lld,%lld,%lld] checked=%lld bad=%d min=%.6g max=%.6g\n",
+                i, tn, t->type,
+                (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3],
+                (long long)n_check, bad, mn, mx);
+        }
+    }
+
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1497,7 +1561,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
     auto * t_logits        = res->get_logits();
     auto * t_embd          = res->get_embd_pooled() ? res->get_embd_pooled() : res->get_embd();
-    auto * t_h_pre_norm    = cparams.embeddings_pre_norm ? res->get_h_pre_norm() : nullptr;
+    auto * t_h_pre_norm    = cparams.embeddings_pre_norm ? (res->get_mtp_h_capture() ? res->get_mtp_h_capture() : res->get_h_pre_norm()) : nullptr;
 
     // extract logits
     if (logits.data && t_logits) {
@@ -1941,7 +2005,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         auto * t_logits        = res->get_logits();
         auto * t_embd          = cparams.embeddings          ? res->get_embd()        : nullptr;
-        auto * t_h_pre_norm    = cparams.embeddings_pre_norm ? res->get_h_pre_norm()  : nullptr;
+        auto * t_h_pre_norm    = cparams.embeddings_pre_norm ? (res->get_mtp_h_capture() ? res->get_mtp_h_capture() : res->get_h_pre_norm()) : nullptr;
 
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
@@ -2358,6 +2422,18 @@ ggml_cgraph * llama_context::graph_reserve(
 
     llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
     llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs);
+
+    // MTP draft graphs consume both the token id and the target hidden state
+    // through llm_graph_input_embd_h. Reservation/support probes are synthetic
+    // token-mode batches, so provide a zeroed hidden-state backing store here;
+    // otherwise FA-enabled MTP probe graphs can leave/read mtp_h_input without a
+    // valid ubatch.embd, then poison/reuse the topology before real MTP decode.
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        GGML_ASSERT(ubatch.data);
+        const uint32_t n_embd_mtp = model.hparams.n_embd;
+        ubatch.data->embd.assign((size_t) ubatch.n_tokens * n_embd_mtp, 0.0f);
+        ubatch.embd = ubatch.data->embd.data();
+    }
 
     // set one output token per sequence in order to activate all backend samplers
     std::vector<llama_seq_id> seq_ids(n_seqs);

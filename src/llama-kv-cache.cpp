@@ -258,10 +258,14 @@ llama_kv_cache::llama_kv_cache(
             }
         }
 
-        // MTP draft contexts must not create persistent packed16 K.
-        // MTP_VERIFY may materialize packed16 op-locally inside FA,
-        // but the MTP draft KV cache remains non-packed16.
-        const bool packed16_active = has_k && !is_mtp_draft
+        // MTP draft contexts keep source-F16 K by default. For persistent
+        // packed16/MMQ experiments, reuse the existing opt-out debug knob:
+        // LLAMA_MTP_ENABLE_FA=1 LLAMA_MTP_DISABLE_PACKED16_FA=0.
+        const char * mtp_disable_p16_env = getenv("LLAMA_MTP_DISABLE_PACKED16_FA");
+        const bool mtp_packed16_experiment = is_mtp_draft &&
+            getenv("LLAMA_MTP_ENABLE_FA") && atoi(getenv("LLAMA_MTP_ENABLE_FA")) != 0 &&
+            mtp_disable_p16_env && atoi(mtp_disable_p16_env) == 0;
+        const bool packed16_active = has_k && (!is_mtp_draft || mtp_packed16_experiment)
             && !(getenv("GGML_CUDA_ROCM_PACKED16_DISABLE") && atoi(getenv("GGML_CUDA_ROCM_PACKED16_DISABLE")) != 0)
             && !(getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE") && atoi(getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE")) == 0);
 
@@ -1826,6 +1830,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && "KQ mask input is written as float data; FA paths must cast a separate graph tensor to F16");
     float * data = (float *) dst->data;
 
     const int64_t n_kv     = dst->ne[0];

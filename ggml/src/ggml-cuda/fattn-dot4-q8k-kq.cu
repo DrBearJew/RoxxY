@@ -2081,7 +2081,8 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_blockfa_rect
         int batch,
         int q_offset,
         int k_head_stride_rows,
-        int k_batch_stride_rows) {
+        int k_batch_stride_rows,
+        int debug) {
     static constexpr int BM_VAL = BM;
     static constexpr bool F16_V = USE_F16_V;
     static constexpr bool Q8_V  = USE_Q8_V;
@@ -2174,6 +2175,9 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_blockfa_rect
                 }
             }
             __syncthreads();
+            if (debug && b == 0 && hq == 0 && q0 == 0 && k0 == 0 && tid < min(8, BN)) {
+                printf("dot4_debug_qk: q=0 h=0 k=%d logit=%.8e scale=%.8e q_offset=%d\n", tid, logits[tid], scale, q_offset);
+            }
             // Softmax
             if (tid < BM_VAL) {
                 float tile_m = -FLT_MAX / 2.0f;
@@ -2186,6 +2190,9 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_blockfa_rect
                 row_m[tid] = m_new; old_s[tid] = old_scale;
             }
             __syncthreads();
+            if (debug && b == 0 && hq == 0 && q0 == 0 && (k0 == 0 || !have_next) && tid == 0) {
+                printf("dot4_debug_ml: q=0 h=0 k0=%d m=%.8e l=%.8e\n", k0, row_m[0], row_l[0]);
+            }
             // V accumulation from current v_tile
             if (tid < GGML_CUDA_Q8K_DOT4_KQ_D) {
                 for (int qr = 0; qr < BM_VAL; ++qr) {
@@ -2232,6 +2239,9 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_blockfa_rect
             }
         }
         __syncthreads();
+        if (debug && b == 0 && hq == 0 && q0 == 0 && k0 == 0 && tid < min(8, BN)) {
+            printf("dot4_debug_qk: q=0 h=0 k=%d logit=%.8e scale=%.8e q_offset=%d\n", tid, logits[tid], scale, q_offset);
+        }
         if (tid < BM_VAL) {
             float tile_m = -FLT_MAX / 2.0f;
             for (int kk = 0; kk < BN; ++kk) tile_m = fmaxf(tile_m, logits[tid * BN + kk]);
@@ -2243,6 +2253,9 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_blockfa_rect
             row_m[tid] = m_new; old_s[tid] = old_scale;
         }
         __syncthreads();
+        if (debug && b == 0 && hq == 0 && q0 == 0 && (k0 == 0 || !have_next) && tid == 0) {
+            printf("dot4_debug_ml: q=0 h=0 k0=%d m=%.8e l=%.8e\n", k0, row_m[0], row_l[0]);
+        }
         if (tid < GGML_CUDA_Q8K_DOT4_KQ_D) {
             for (int qr = 0; qr < BM_VAL; ++qr) {
                 const int q = q0 + qr;
@@ -2268,9 +2281,15 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_blockfa_rect
     if (tid < GGML_CUDA_Q8K_DOT4_KQ_D) {
         for (int qr = 0; qr < BM_VAL; ++qr) {
             const int q = q0 + qr;
-            if (q < nq)
-                dst[((size_t(b) * nq + q) * (size_t)n_heads_q + hq) * GGML_CUDA_Q8K_DOT4_KQ_D + tid] =
-                    out[qr] / fmaxf(row_l[qr], 1.0e-20f);
+            if (q < nq) {
+                const float denom = fmaxf(row_l[qr], 1.0e-20f);
+                const float val = out[qr] / denom;
+                if (debug && b == 0 && hq == 0 && q == 0 && tid < 8) {
+                    const bool bad = !isfinite(row_m[qr]) || !isfinite(row_l[qr]) || row_l[qr] <= 0.0f || !isfinite(val) || fabsf(val) > 1.0e6f;
+                    printf("dot4_debug_o: q=0 h=0 d=%d m=%.8e l=%.8e dst=%.8e bad=%d\n", tid, row_m[qr], row_l[qr], val, (int) bad);
+                }
+                dst[((size_t(b) * nq + q) * (size_t)n_heads_q + hq) * GGML_CUDA_Q8K_DOT4_KQ_D + tid] = val;
+            }
         }
     }
 }
@@ -3314,6 +3333,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
     }
 
     const bool timing_requested = ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_KQ_TIMING");
+    const int dot4_debug = ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_DOT4_DEBUG") ? 1 : 0;
     bool stream_is_capturing = false;
 #ifdef USE_CUDA_GRAPH
     hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
@@ -3655,19 +3675,19 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                             q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
                             (float *) dst->data, scale,
                             V->nb[0], V->nb[1], V->nb[2], V->nb[3],
-                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows);
+                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows, dot4_debug);
                     } else if (use_q8_v) {
                         ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_single_kernel<false, true, 8, 16><<<recthist_grid, block, smem_v4, stream>>>(
                             q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
                             (float *) dst->data, scale,
                             V->nb[0], V->nb[1], V->nb[2], V->nb[3],
-                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows);
+                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows, dot4_debug);
                     } else {
                         ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_single_kernel<false, false, 8, 16><<<recthist_grid, block, smem_v4, stream>>>(
                             q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
                             (float *) dst->data, scale,
                             V->nb[0], V->nb[1], V->nb[2], V->nb[3],
-                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows);
+                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows, dot4_debug);
                     }
                 } else if (v4_bm == 8 && v4_bn == 16) {
                     if (use_f16_v) {
@@ -3675,19 +3695,19 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                             q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
                             (float *) dst->data, scale,
                             V->nb[0], V->nb[1], V->nb[2], V->nb[3],
-                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows);
+                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows, dot4_debug);
                     } else if (use_q8_v) {
                         ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_single_kernel<false, true, 16, 8><<<recthist_grid, block, smem_v4, stream>>>(
                             q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
                             (float *) dst->data, scale,
                             V->nb[0], V->nb[1], V->nb[2], V->nb[3],
-                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows);
+                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows, dot4_debug);
                     } else {
                         ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_single_kernel<false, false, 16, 8><<<recthist_grid, block, smem_v4, stream>>>(
                             q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
                             (float *) dst->data, scale,
                             V->nb[0], V->nb[1], V->nb[2], V->nb[3],
-                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows);
+                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows, dot4_debug);
                     }
                 } else {
                     if (use_f16_v) {
@@ -3695,19 +3715,19 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                             q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
                             (float *) dst->data, scale,
                             V->nb[0], V->nb[1], V->nb[2], V->nb[3],
-                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows);
+                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows, dot4_debug);
                     } else if (use_q8_v) {
                         ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_single_kernel<false, true, 8, 8><<<recthist_grid, block, smem_v4, stream>>>(
                             q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
                             (float *) dst->data, scale,
                             V->nb[0], V->nb[1], V->nb[2], V->nb[3],
-                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows);
+                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows, dot4_debug);
                     } else {
                         ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_single_kernel<false, false, 8, 8><<<recthist_grid, block, smem_v4, stream>>>(
                             q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
                             (float *) dst->data, scale,
                             V->nb[0], V->nb[1], V->nb[2], V->nb[3],
-                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows);
+                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, k_head_stride_rows, k_batch_stride_rows, dot4_debug);
                     }
                 }
                 if (timing) {
