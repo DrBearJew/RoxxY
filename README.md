@@ -31,7 +31,7 @@ GGML_CUDA_FA_ROUTE_REQUIRE=rocm_packed16_dot4_mmq \
   --device ROCm0 \
   --model /path/to/Qwen3.6-27B-Q4_K_M-mtp.gguf \
   --flash-attn on \
-  --cache-type-v tbq4_0 \
+  --cache-type-v q4_0 \
   --ctx-size 40960 --batch-size 1024 --ubatch-size 1024 \
   --parallel 1 --no-warmup \
   --spec-type draft-mtp --spec-default \
@@ -42,10 +42,14 @@ GGML_CUDA_FA_ROUTE_REQUIRE=rocm_packed16_dot4_mmq \
 For current I32/DOT4 V-format experiments, replace only the V flag:
 
 ```text
---cache-type-v tbq4_0
---cache-type-v planar3_0
---cache-type-v iso3_0
+--cache-type-v q4_0       # primary packed q4 V target: 18B/32 values = 4.5 bits/value
+--cache-type-v tbq4_0     # experimental rotated q4 V
+--cache-type-v planar3_0  # experimental 3-bit V
+--cache-type-v iso3_0     # experimental 3-bit V
 ```
+
+The intended q4 architecture is **not i16 V**. It is packed q4 V payload plus
+f16 scales feeding only the `P @ V` side; QK remains packed16 I32 DOT4 K.
 
 Expected route evidence:
 

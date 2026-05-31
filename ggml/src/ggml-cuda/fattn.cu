@@ -2710,7 +2710,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             required_route &&
             (strcmp(required_route, "rocm_packed16_dot4_mmq") == 0 ||
              strcmp(required_route, "packed16_dot4_mmq") == 0);
-        if (require_packed16_dot4_mmq && (Q->ne[1] > 1 || V->type == GGML_TYPE_TBQ4_0)) {
+        if (require_packed16_dot4_mmq) {
+            // Route-require is a hard contract, including nq==1 decode.  This is
+            // the opt-in path for validating packed16 I32 K + q4_0 V entirely in
+            // the DOT4/MMQ attention family instead of silently falling back to
+            // the older q8k_dot4_kq decode kernel.
             if (!ggml_cuda_packed16_dot4_mmq_supported(cc, dst)) {
                 GGML_ABORT("required rocm_packed16_dot4_mmq route was not selected; Q=[%lld,%lld,%lld,%lld] K=[%lld,%lld,%lld,%lld] V=%s",
                     (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3],
