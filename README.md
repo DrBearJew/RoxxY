@@ -1,237 +1,245 @@
 # llama.cpp — Packed16 FlashAttention for RDNA3
 
-This is an RDNA3-focused llama.cpp fork (RX 7900 XTX / gfx1100) with two
-production FlashAttention backends for quantized KV caches:
+Experimental `llama.cpp` branch for RDNA3 FlashAttention performance on
+RX 7900 XTX / gfx1100. This branch adds a **packed16 K-cache** representation
+and routes quantized-KV attention through RDNA3 DOT4/WMMA kernels.
 
-1. **DOT4-MMQ** — 2628 tok/s pp512 (35B), production default
-2. **PWMMA BM32 reg-out** — 2707 tok/s pp512 (35B), champion fallback
+The goal is narrow and practical: make Qwen3.6 27B/35B prefill faster on
+consumer AMD GPUs by avoiding per-tile K dequantization and V transposition
+work in FlashAttention.
 
-Both operate on a **packed16 K cache** — an I32-packed persistent K
-representation that eliminates per-tile dequantization and enables
-high-throughput matrix-multiply attention on RDNA3.
-
-Target models: Qwen3.6 27B MTP and Qwen3.6 35B-A3B MoE.
-
----
-
-## Why packed16 FlashAttention matters
-
-### The problem
-
-Standard q8_0 KV caches require per-tile dequantization inside the attention
-kernel: for every K tile, the kernel unpacks 8-bit integers to f16, multiplying
-by per-group scales. This dequantization competes with the actual Q·K^T matmul
-for memory bandwidth and ALU throughput. At 256 dimensions and batch sizes of
-512-4096, the dequant overhead is significant — often 30-50% of attention time.
-
-A second problem is **V tensor transposition**. Standard FA expects V in
-transposed layout (sequence-major), but KV caches store V contiguously
-(sequence-first). The transposition cost shows up as either a GPU-side copy
-or indirect indexing inside the attention kernel.
-
-### The solution: packed16 K cache + direct-V
-
-**Packed16 K cache** stores K as dense 32-bit integer rows. Each 32-bit word
-holds four 8-bit packed values (one per byte). Scales are stored separately as
-f16. This gives three key advantages:
-
-1. **Zero-copy KQ**: The DOT4-MMQ and PWMMA kernels read packed integers
-   directly — extract one byte with bitmask, multiply by scale, feed into
-   matrix multiply. No intermediate dequant buffer.
-
-2. **Coalesced global reads**: 32-bit words are naturally aligned and coalesced
-   on RDNA3's L1/L2 cache hierarchy. Standard q8_0 reads 8-bit bytes with
-   non-unit stride.
-
-3. **I32 selector**: The packed16 K cache uses a 32-bit integer per element
-   instead of 8-bit. This is detectable by the FA route selector
-   (`get_best_fattn_kernel()`), enabling automatic backend dispatch.
-
-**Direct-V** eliminates the V transposition copy by having each kernel declare
-its preferred V layout. FA kernels request D-contiguous V (layout=FA), VEC
-kernels request transposed V. The KV cache stores V contiguously and the
-scheduler assigns the correct view per consumer — zero copies.
-
-### What we gain
-
-| Metric | Before (q8_0 VEC FA) | After (packed16 DOT4-MMQ) |
-|--------|---------------------|---------------------------|
-| K dequant per tile | Full 8→f16 + scale multiply | Byte extract + f16 scale |
-| K memory per row (D=256) | 256 bytes + 8 scales | 64 ints (256 bytes) + 8 scales |
-| V transposition | GPU-side copy or indirect | Zero — consumer-driven layout |
-| K coalescing | 8-bit, non-unit stride | 32-bit, unit stride |
+| Item | Value |
+|---|---|
+| Base project | [`ggml-org/llama.cpp`](https://github.com/ggml-org/llama.cpp) fork |
+| Branch | `tbq4-rdna3-experiment` |
+| Primary GPU | RX 7900 XTX / gfx1100 |
+| Tested stack | ROCm 6.4, `amdclang++`, Linux |
+| Target models | Qwen3.6 35B-A3B MoE, Qwen3.6 27B MTP |
+| Main feature | packed16 K-cache FlashAttention |
+| Default prefill route | DOT4-MMQ GQA1 |
+| Champion/fallback route | PWMMA BM32 reg-out direct-V |
+| Decode route | DOT4 decode BN64 / split-K |
+| Status | experimental, source-build only |
 
 ---
 
-## Performance
+## Status
 
-All numbers on RX 7900 XTX (gfx1100, 24 GB), ROCm 6.4, amdclang++.
-Benchmarked with `llama-bench -fa 1 -ngl 99`.
+This is a research/performance branch, not a general replacement for upstream
+`llama.cpp`.
 
-### Prefill (nq > 1)
+Tested:
 
-| Variant | 35B pp512 | 35B pp1024 | 35B pp2048 | 35B pp4096 |
-|---------|----------|-----------|-----------|-----------|
-| **DOT4-MMQ GQA1** (default) | 2628 | 2541 | 2320 | 2050 |
-| DOT4-MMQ KSHARED (opt-in) | 2649 | 2533 | — | — |
-| **PWMMA BM32 reg-out** (champion) | **2707** | **2633** | — | 2569* |
-| PWMMA BM16 | 2590 | 2394 | — | — |
-| PWMMA BM64 512t | 2612 | 2578 | — | — |
+- RX 7900 XTX / gfx1100
+- ROCm 6.4 with `amdclang++`
+- `llama-bench` and `llama-server`
+- Qwen3.6 35B-A3B MoE GGUF
+- Qwen3.6 27B MTP GGUF
+- packed16 K cache, DOT4-MMQ prefill, PWMMA BM32, DOT4 decode
 
-| Variant | 27B pp512 | 27B pp1024 |
-|---------|----------|-----------|
-| DOT4-MMQ GQA1 | 894 | — |
-| **PWMMA BM32 reg-out** | **929** | — |
-| PWMMA BM64 512t | 922 | — |
-| DOT4-MMQ KSHARED | 905 | — |
+Not guaranteed yet:
 
-\* pp1024+
+- non-RDNA3 GPUs
+- NVIDIA/CUDA parity
+- broad GGUF model-family coverage
+- stable environment-variable names
+- upstream merge compatibility
+- daily-driver behavior for arbitrary workloads
 
-### Decode (nq = 1)
+Use upstream `llama.cpp` if you need broad hardware/model support or stable
+CLI behavior. Use this branch if you are specifically testing RDNA3 packed16
+FlashAttention on Qwen3.6-style 27B/35B workloads.
 
-| Model | tg128 (packed16 + DOT4 decode) |
-|-------|-------------------------------|
+## Should you use this branch?
+
+Use this branch if:
+
+- you have an RX 7900 XTX / gfx1100-class RDNA3 GPU;
+- you are testing Qwen3.6 27B/35B GGUF models;
+- you care about packed16 FlashAttention prefill performance;
+- you are comfortable building `llama.cpp` from source.
+
+Use upstream `llama.cpp` if:
+
+- you need broad hardware or model support;
+- you are not on RDNA3;
+- you want stable daily-driver behavior;
+- you do not need packed16 KV-cache experiments.
+
+**Packed16 is a runtime K-cache layout, not a new GGUF model format.** The
+branch stores K as I32 payload rows, with each 32-bit word carrying four packed
+8-bit K values, and keeps f16 scales separately.
+
+---
+
+## Headline results
+
+RX 7900 XTX / gfx1100, ROCm 6.4, `amdclang++`, `llama-bench -fa 1 -ngl 99`.
+
+### Prefill (`nq > 1`)
+
+| Model | Route | pp512 | pp1024 | pp2048 | pp4096 |
+|---|---|---:|---:|---:|---:|
+| 35B | DOT4-MMQ GQA1, default | 2628 | 2541 | 2320 | 2050 |
+| 35B | DOT4-MMQ KSHARED, opt-in | 2649 | 2533 | — | — |
+| 35B | PWMMA BM32 reg-out direct-V | **2707** | **2633** | — | 2569* |
+| 35B | PWMMA BM16 | 2590 | 2394 | — | — |
+| 35B | PWMMA BM64 512t | 2612 | 2578 | — | — |
+| 27B | DOT4-MMQ GQA1, default | 894 | — | — | — |
+| 27B | DOT4-MMQ KSHARED, opt-in | 905 | — | — | — |
+| 27B | PWMMA BM32 reg-out direct-V | **929** | — | — | — |
+| 27B | PWMMA BM64 512t | 922 | — | — | — |
+
+\* pp1024+ configuration.
+
+### Decode (`nq = 1`)
+
+Decode uses DOT4 decode kernels, not the prefill WMMA kernels.
+
+| Model | tg128, packed16 + DOT4 decode |
+|---|---:|
 | 35B | 92.8 tok/s |
 | 27B | 28.7 tok/s |
 
-Decode uses DOT4 decode kernels (BN64/split-K), not the prefill WMMA kernels.
+### What these numbers show
 
-### Speedup summary
-
-On 35B pp512, BM32_regout_directv is **+3% faster than DOT4-MMQ** (2707 vs
-2628) and **substantially faster than standard q8_0 VEC FA** (the packed16
-format alone eliminates per-tile dequant overhead).
-
-On 27B, BM32_regout_directv is **+3.9% faster than DOT4-MMQ** (929 vs 894).
+- DOT4-MMQ is the production default packed16 prefill route.
+- PWMMA BM32 reg-out direct-V is the fastest measured prefill route on the
+  listed workloads: +3.0% over DOT4-MMQ on 35B pp512 and +3.9% on 27B pp512.
+- A clean upstream q8_0 VEC FA baseline table is still TODO; current tables
+  compare the packed16 route family and measured variants.
 
 ---
 
-## Architecture
+## Quick start
 
-### Packed16 K cache
+Build the branch, run a model, and let the branch pick the right packed16 route
+automatically. **No route-forcing env vars are needed for normal use.**
 
-The K cache persists as I32 rows. Each q8_0 group (32 dimensions, 1 scale)
-is stored as eight 32-bit integers, each holding 4 packed bytes. Scales are
-f16. Layout:
-
-```
-Row j, dimensions [0..255]:
-  int payload[j * 64 + 0]  → bytes for dims  0,1,2,3
-  int payload[j * 64 + 1]  → bytes for dims  4,5,6,7
-  ...
-  int payload[j * 64 + 63] → bytes for dims 252,253,254,255
-  half scales[j * 8 + 0]   → scale for dims 0..31
-  ...
-  half scales[j * 8 + 7]   → scale for dims 224..255
-```
-
-Total per row: 64 ints (256B) + 8 halfs (16B) = 272 bytes. Same as q8_0
-(256B data + 16B scales), but 32-bit aligned.
-
-### Consumer-driven V layout
-
-V is stored contiguously in KV cache (sequence-first). Each consumer kernel
-declares its preferred layout:
-
-```cpp
-enum { PWMMA_V_LAYOUT_FA = 0, ... };
-cgraph_local_set_v_layout(tensor, PWMMA_V_LAYOUT_FA);
-```
-
-FA kernels request D-contiguous layout (stride=2 for f16 V). VEC kernels
-request transposed layout. Zero copies — the scheduler assigns the correct
-view per consumer.
-
----
-
-## DOT4-MMQ (production default)
-
-DOT4-MMQ is the default packed16 FlashAttention kernel. It uses:
-
-- **M16N64 tile** for QK: 16 Q rows × 64 K columns per CTA
-- **DOT4 I4 acceleration**: 4-way dot-product per thread on packed I4 values
-- **Online softmax** with shared-memory probs buffer
-- **Staged V tile** in LDS (32 KiB for M16N64, 0 for M4N64)
-- **GQA1 only** in auto-route (GQA2 is slower beyond pp512)
-
-```
-GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE=1    # enable packed16 K cache
-# DOT4-MMQ auto-loaded when packed16 K is active
-GGML_CUDA_ROCM_PACKED16_DOT4_MMQ=0             # disable DOT4-MMQ (escape hatch)
-```
-
-Experimental DOT4-MMQ variants:
+You need a compatible GGUF model. The tested model families and example
+Hugging Face sources are listed below under [Tested models](#tested-models).
 
 ```bash
-GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_IMPL=kshared    # K in LDS, +1.5% 35B, +15% 27B
-GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_IMPL=kshared_stagev
-GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_IMPL=kshared_directv   # no V staging, slower
+git clone https://github.com/DrBearJew/llama.cpp
+cd llama.cpp
+git checkout tbq4-rdna3-experiment
+
+bash scripts/configure-rocm-gfx1100-wmma.sh
+cmake --build build-rocm-fixed --target llama-server llama-bench -j$(nproc)
 ```
 
-KSHARED caches K payload+scales in LDS once per tile for cooperative QK matmul.
-On 27B (gqa=6, K reused 6× per Q head), this gives +15%. On 35B (gqa=8), +1.5%.
+Run a server:
+
+```bash
+./build-rocm-fixed/bin/llama-server \
+  --device ROCm0 \
+  --model /path/to/Qwen3.6-35B-A3B-IQ4_XS-00001-of-00002.gguf \
+  --flash-attn on \
+  --cache-type-v q4_0 \
+  --ctx-size 40960 --parallel 1
+```
+
+Benchmark prefill:
+
+```bash
+./build-rocm-fixed/bin/llama-bench \
+  -m /path/to/Qwen3.6-35B-A3B-IQ4_XS.gguf \
+  -fa 1 -ngl 99 -p 512 -n 1
+```
+
+Expected on RX 7900 XTX / ROCm 6.4: approximately **2628 tok/s** for 35B
+pp512 on the default packed16 route.
+
+Optional: add route logging when benchmarking or debugging:
+
+```bash
+GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE=1 \
+./build-rocm-fixed/bin/llama-bench \
+  -m /path/to/Qwen3.6-35B-A3B-IQ4_XS.gguf \
+  -fa 1 -ngl 99 -p 512 -n 1
+```
+
+Expected route log shape:
+
+```text
+PACKED16 FA ROUTE ... selected=dot4_mmq_gqa1 ...
+```
+
+If the verbose route log does not show a packed16 route, the benchmark is not
+measuring the new kernels in this branch.
+
+| Task | Use |
+|---|---|
+| Run inference | plain `llama-server` command above |
+| Benchmark default path | plain `llama-bench` command above |
+| Confirm route | add `GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE=1` |
+| Compare kernels | [Advanced route-forcing section](#advanced-route-forcing-and-ab-tests) |
+| Disable packed16 | [Runtime flags](#runtime-flags) |
 
 ---
 
-## PWMMA kernel family
+## Supported hardware
 
-PWMMA kernels use raw RDNA3 WMMA builtins (`__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`)
-for QK matmul. All variants read from the same packed16 K cache.
+| Hardware | Status | Notes |
+|---|---|---|
+| RX 7900 XTX / gfx1100 | Tested | Primary development and benchmark target |
+| RX 7900 XT / gfx1100 | Expected | Same architecture class; not separately reported here |
+| Other RDNA3 | Unknown | May need target-specific validation |
+| RDNA2 / gfx1030 | Not targeted | This branch focuses on RDNA3 packed16/WMMA work |
+| RDNA4 / gfx12xx | Untested | Needs separate route/compiler validation |
+| CDNA / MI300X | Not targeted | Different architecture assumptions |
+| NVIDIA/CUDA | Not targeted | Branch is ROCm/RDNA3-specific |
 
-### Available variants
+## Tested models
 
-| Variant | Impl | BM | Waves | CTA threads | out[] | LDS | Notes |
-|---------|------|----|-------|-------------|-------|-----|-------|
-| BM16 smem | 0 | 16 | 1 | 256 | smem | ~60K | Original, stable |
-| BM32 regout stagev | 1 | 32 | 2 | 256 | 32 | ~60K | Staged V |
-| **BM32 regout directv** | **2** | **32** | **2** | **256** | **32** | **~20K** | **Champion** |
-| BM64 regout directv 512t | 5 | 64 | 4 | 512 | 32 | ~9K | Stable, slower |
-| BM16 GQA2 | — | 16 | 1 | 256 | smem | ~60K | V-tile reuse |
+| Model / family | Status | Notes |
+|---|---|---|
+| Qwen3.6 35B-A3B MoE GGUF | Tested | Main 35B benchmark target |
+| Qwen3.6 27B MTP GGUF | Tested | MTP + packed16 route target |
+| Other Qwen GGUFs | Unknown | May work if shapes and cache assumptions match |
+| Llama-family GGUFs | Untested | Not the target of this branch |
+| Other MoE families | Untested | GQA/MoE assumptions may differ |
 
-### Selection
-
-```bash
-GGML_CUDA_ROCM_PACKED16_WMMA_TILE=1              # enable PWMMA
-GGML_CUDA_FA_ROUTE_REQUIRE=rocm_packed16_wmma_tile  # force PWMMA
-GGML_CUDA_ROCM_PACKED16_WMMA_BM=32               # 16, 32 (default), or 64
-GGML_CUDA_ROCM_PACKED16_WMMA_IMPL=bm32_regout_directv  # 0-5
-```
-
-BM32 regout directv is the recommended PWMMA variant:
-- Float32 accumulator in registers (no half-precision compromise)
-- Direct V load (no V tile staging in LDS)
-- Beats DOT4-MMQ at pp1024+ on 35B and all lengths on 27B
-- 20 KiB LDS vs 60 KiB for smem variants
+Model sources used during development include GGUF releases from
+[llmfan46](https://huggingface.co/llmfan46),
+[HauhauCS](https://huggingface.co/HauhauCS),
+[havenoammo](https://huggingface.co/havenoammo), and
+[Radamanthys11](https://huggingface.co/Radamanthys11).
 
 ---
 
-## Route policy
+## How it works
 
-The route selector (`get_best_fattn_kernel()`) auto-selects based on K type:
+Standard q8_0 KV-cache attention spends work inside the attention kernel
+unpacking K tiles from 8-bit values to f16 and applying per-group scales. On
+large prefill batches, that dequantization competes with the actual Q·K^T
+matrix multiply for bandwidth and ALU time.
 
-```
-K type → I32 (packed16) ?
-  ├─ nq > 1 → DOT4-MMQ GQA1 (default)
-  │   └─ DOT4-MMQ unavailable? → PWMMA BM32 (fallback)
-  │       └─ PWMMA unavailable? → DOT4-KQ (safety net)
-  └─ nq = 1 → DOT4 decode BN64 / split-K
-```
+This branch changes the K-cache representation and route policy:
 
-**Never auto-selected**: DOT4-MMQ GQA2, PWMMA BM64, PWMMA GQA2, CPU FA,
-old BM16 smem variant, or KSHARED.
+1. **Packed16 K cache** stores K rows as 32-bit words. Each word carries four
+   packed 8-bit values; f16 scales remain separate.
+2. **DOT4-MMQ and PWMMA kernels** read the packed words directly. They extract
+   bytes, apply scales, and feed RDNA3 matrix-multiply paths without creating
+   an intermediate dequant buffer.
+3. **Direct-V layout** lets FlashAttention consumers request D-contiguous V
+   while VEC consumers can request transposed V. The scheduler assigns the
+   right view instead of forcing a V transposition copy.
+4. **Route selection** detects packed16 K by I32 K-cache type and dispatches to
+   packed16-specific prefill/decode kernels.
 
-The route contract is strict: if `GGML_CUDA_FA_ROUTE_REQUIRE=rocm_packed16_wmma_tile`
-is set and PWMMA cannot run, the kernel **aborts** — no silent DOT4 fallback.
-
-```bash
-GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE=1    # log route decisions
-```
+| Metric | Standard q8_0 VEC FA | Packed16 route |
+|---|---|---|
+| K dequant per tile | Full 8→f16 + scale multiply | Byte extract + f16 scale |
+| K memory per D=256 row | 256 bytes + 8 scales | 64 ints / 256 bytes + 8 scales |
+| K alignment | 8-bit payload | 32-bit aligned payload |
+| V transposition | copy or indirect indexing | consumer-selected layout |
 
 ---
 
 ## Build
 
-WMMA-only build for gfx1100:
+WMMA-focused gfx1100 build:
 
 ```bash
 bash scripts/configure-rocm-gfx1100-wmma.sh
@@ -239,14 +247,19 @@ cd build-rocm-fixed
 cmake --build . --target llama-bench llama-server -j$(nproc)
 ```
 
-Requires: ROCm 6.2+, `amdclang++`, gfx1100 (RX 7900 XTX/XT).
+Requirements:
 
-Key CMake flags:
+- ROCm 6.2+; ROCm 6.4 used for headline measurements
+- `/opt/rocm/bin/amdclang++`
+- gfx1100-class RDNA3 GPU; RX 7900 XTX is the measured target
+
+Key CMake settings used by the helper script:
+
 - `CMAKE_HIP_COMPILER=/opt/rocm/bin/amdclang++`
 - `GPU_TARGETS=gfx1100`
-- `-Wno-gpu-maybe-exceed-local-memory` (suppress LDS-size warnings for WMMA kernels)
+- `-Wno-gpu-maybe-exceed-local-memory` for WMMA LDS-size warnings
 
-Multi-backend build (ROCm + Vulkan):
+Optional ROCm + Vulkan build:
 
 ```bash
 cmake -S . -B build-rocm-vulkan \
@@ -259,59 +272,19 @@ cmake --build build-rocm-vulkan --target llama-server llama-bench -j
 
 ---
 
-## Run recipes
+## Run notes
 
-### 35B MoE with packed16 FA (auto-route)
+Normal use should not require route forcing. The branch allocates packed16 K
+cache by default on HIP and auto-selects the packed16 FlashAttention route for
+the supported shapes.
 
-```bash
-GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE=1 \
-GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE=1 \
-./build-rocm-fixed/bin/llama-server \
-  --device ROCm0 \
-  --model /path/to/Qwen3.6-35B-A3B-IQ4_XS-00001-of-00002.gguf \
-  --flash-attn on \
-  --cache-type-v q4_0 \
-  --ctx-size 40960 --parallel 1
-```
+For ordinary testing, use the simple `llama-server` and `llama-bench` commands
+from the quick start. Use the advanced route-forcing commands near the end only
+when comparing kernels or debugging dispatch.
 
-### Force PWMMA champion
+### MTP settings
 
-```bash
-GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE=1 \
-GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE=1 \
-GGML_CUDA_FA_ROUTE_REQUIRE=rocm_packed16_wmma_tile \
-GGML_CUDA_ROCM_PACKED16_WMMA_IMPL=bm32_regout_directv \
-./build-rocm-fixed/bin/llama-bench -m model.gguf -fa 1 -ngl 99 -p 512 -n 1
-```
-
-### A/B benchmark sweep
-
-```bash
-# Baseline: DOT4-MMQ (auto)
-GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE=1 \
-GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE=1 \
-./build-rocm-fixed/bin/llama-bench -m model.gguf -fa 1 -ngl 99 -p 512,1024,2048 -n 1
-
-# PWMMA BM32 regout
-GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE=1 \
-GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE=1 \
-GGML_CUDA_FA_ROUTE_REQUIRE=rocm_packed16_wmma_tile \
-GGML_CUDA_ROCM_PACKED16_WMMA_IMPL=bm32_regout_directv \
-./build-rocm-fixed/bin/llama-bench -m model.gguf -fa 1 -ngl 99 -p 512,1024,2048 -n 1
-
-# KSHARED
-GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE=1 \
-GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE=1 \
-GGML_CUDA_FA_ROUTE_REQUIRE=rocm_packed16_dot4_mmq \
-GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_IMPL=kshared \
-./build-rocm-fixed/bin/llama-bench -m model.gguf -fa 1 -ngl 99 -p 512,1024 -n 1
-```
-
----
-
-## MTP (Multi-Token Prediction)
-
-MTP is supported for both 27B and 35B. Key settings:
+MTP is supported for the tested 27B and 35B targets.
 
 ```bash
 --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0
@@ -319,15 +292,102 @@ MTP is supported for both 27B and 35B. Key settings:
 LLAMA_MTP_PREFILL_CHUNK=1024  # match --ubatch-size
 ```
 
-MTP impact on FA routing:
-- **MTP_DRAFT** (nq=1): routes to DOT4 decode kernel — unchanged
-- **MTP_VERIFY** (nq≥2): auto-routes to DOT4-MMQ GQA1 when packed16 is active
+Routing impact:
 
-Disable DOT4-MMQ for MTP verify if needed:
+- `MTP_DRAFT` (`nq = 1`) routes to DOT4 decode.
+- `MTP_VERIFY` (`nq >= 2`) routes to DOT4-MMQ GQA1 when packed16 is active.
+
+Disable DOT4-MMQ for MTP verify/oracle comparison:
 
 ```bash
-GGML_CUDA_ROCM_PACKED16_DOT4_MMQ=0  # reverts to DOT4-KQ oracle
+GGML_CUDA_ROCM_PACKED16_DOT4_MMQ=0
 ```
+
+---
+
+## Validation checklist
+
+Before trusting a benchmark, verify route attribution and basic correctness.
+
+| Check | Why |
+|---|---|
+| Enable `GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE=1` | Confirms the intended packed16 route is active |
+| Force `GGML_CUDA_FA_ROUTE_REQUIRE=...` | Prevents silent fallback when testing a route |
+| Compare against DOT4-KQ with `GGML_CUDA_ROCM_PACKED16_DOT4_MMQ=0` | Provides oracle/safety-net comparison |
+| Repeat pp512/pp1024 runs | Catches unstable route or clock variance |
+| Watch for NaNs/divergence | Required for custom attention kernels |
+| Run a `llama-server` smoke test | Confirms the non-benchmark path works |
+
+A clean upstream q8_0 VEC FA baseline table is still TODO and should be added
+before using this README as a broad speedup claim against upstream.
+
+---
+
+## Architecture notes
+
+### Packed16 K-cache layout
+
+K persists as I32 rows. For a D=256 row, each q8_0 group of 32 dimensions is
+stored as eight 32-bit integers, each holding four packed bytes. Scales are f16.
+
+```text
+Row j, dimensions [0..255]:
+  int payload[j * 64 + 0]  -> bytes for dims   0,  1,  2,  3
+  int payload[j * 64 + 1]  -> bytes for dims   4,  5,  6,  7
+  ...
+  int payload[j * 64 + 63] -> bytes for dims 252,253,254,255
+  half scales[j * 8 + 0]   -> scale for dims   0..31
+  ...
+  half scales[j * 8 + 7]   -> scale for dims 224..255
+```
+
+Total per D=256 row: 64 ints / 256 bytes + 8 halfs / 16 bytes = 272 bytes.
+That matches q8_0 payload+scale size while giving 32-bit-aligned K payloads.
+
+### Direct-V layout
+
+V is stored contiguously in KV cache. Consumers declare their preferred layout:
+
+```cpp
+enum { PWMMA_V_LAYOUT_FA = 0, ... };
+cgraph_local_set_v_layout(tensor, PWMMA_V_LAYOUT_FA);
+```
+
+FlashAttention kernels request D-contiguous V. VEC kernels request transposed V.
+The scheduler assigns the correct view per consumer instead of requiring a
+separate V transpose copy.
+
+### DOT4-MMQ
+
+DOT4-MMQ is the default packed16 prefill kernel:
+
+- M16N64 QK tile: 16 Q rows × 64 K columns per CTA
+- DOT4 I4 acceleration on packed values
+- online softmax
+- shared-memory probability buffer
+- staged V tile in LDS for the default path
+- GQA1 only in auto-route
+
+KSHARED caches K payload+scales in LDS once per tile for cooperative QK matmul.
+It is opt-in because it is workload-dependent.
+
+### PWMMA
+
+PWMMA kernels use raw RDNA3 WMMA builtins:
+
+```cpp
+__builtin_amdgcn_wmma_f32_16x16x16_f16_w32
+```
+
+Available variants:
+
+| Variant | Impl | BM | Waves | CTA threads | Output | LDS | Notes |
+|---|---:|---:|---:|---:|---|---:|---|
+| BM16 smem | 0 | 16 | 1 | 256 | smem | ~60K | original, stable |
+| BM32 regout stagev | 1 | 32 | 2 | 256 | registers | ~60K | staged V |
+| BM32 regout direct-V | 2 | 32 | 2 | 256 | registers | ~20K | champion route |
+| BM64 regout direct-V 512t | 5 | 64 | 4 | 512 | registers | ~9K | stable, slower |
+| BM16 GQA2 | — | 16 | 1 | 256 | smem | ~60K | V-tile reuse experiment |
 
 ---
 
@@ -336,12 +396,108 @@ GGML_CUDA_ROCM_PACKED16_DOT4_MMQ=0  # reverts to DOT4-KQ oracle
 | File | Purpose |
 |---|---|
 | `ggml/src/ggml-cuda/fattn.cu` | Route selection, dispatch, scheduler |
-| `ggml/src/ggml-cuda/fattn-common.cuh` | Route policies, auto-selection logic |
-| `ggml/src/ggml-cuda/fattn-packed16-dot4-mmq.cuh` | DOT4-MMQ kernel (GQA1/GQA2/KSHARED) |
-| `ggml/src/ggml-cuda/fattn-packed16-wmma-tile.cuh` | PWMMA kernels (BM16/32/64, regout variants) |
-| `ggml/src/ggml-cuda/fattn-packed16-wmma-builtin.cuh` | Raw WMMA builtins, I8 extraction |
-| `ggml/src/ggml-cuda/fattn-dot4-q8k-kq.cuh` | DOT4-KQ oracle (safety net) |
-| `ggml/src/ggml-cuda/fattn-dot4-q8k-decode.cuh` | DOT4 decode kernel (nq=1) |
+| `ggml/src/ggml-cuda/fattn-common.cuh` | Route policies and auto-selection logic |
+| `ggml/src/ggml-cuda/fattn-packed16-dot4-mmq.cuh` | DOT4-MMQ kernel family |
+| `ggml/src/ggml-cuda/fattn-packed16-wmma-tile.cuh` | PWMMA BM16/BM32/BM64 kernels |
+| `ggml/src/ggml-cuda/fattn-packed16-wmma-builtin.cuh` | Raw WMMA builtins and I8 extraction |
+| `ggml/src/ggml-cuda/fattn-dot4-q8k-kq.cuh` | DOT4-KQ oracle/safety-net route |
+| `ggml/src/ggml-cuda/fattn-dot4-q8k-decode.cuh` | DOT4 decode kernel for `nq = 1` |
+
+---
+
+## Kernel routes
+
+| Route | Auto-selected? | Use case | Notes |
+|---|---:|---|---|
+| DOT4-MMQ GQA1 | Yes | packed16 prefill | production default |
+| PWMMA BM32 reg-out direct-V | Fallback / forced | fastest measured prefill route | route can be required explicitly |
+| DOT4 decode BN64 / split-K | Yes for `nq = 1` | decode | used by MTP draft/decode |
+| DOT4-KQ | Fallback/oracle | validation and safety net | used when DOT4-MMQ is disabled |
+| DOT4-MMQ KSHARED | No | experimental K-in-LDS variant | opt-in only |
+| PWMMA BM64 / GQA2 / old BM16 smem | No | experiments | not selected by default |
+
+Route policy:
+
+```text
+K type -> I32 packed16?
+  ├─ nq > 1 -> DOT4-MMQ GQA1
+  │   └─ if unavailable -> PWMMA BM32
+  │       └─ if unavailable -> DOT4-KQ safety net
+  └─ nq = 1 -> DOT4 decode BN64 / split-K
+```
+
+If `GGML_CUDA_FA_ROUTE_REQUIRE=...` is set and the required route cannot run,
+the kernel aborts instead of silently falling back.
+
+---
+
+## Advanced: route forcing and A/B tests
+
+Most users can skip this section. These flags are for kernel comparisons, route
+contract tests, and debugging.
+
+### Force PWMMA BM32 reg-out direct-V
+
+```bash
+GGML_CUDA_FA_ROUTE_REQUIRE=rocm_packed16_wmma_tile \
+GGML_CUDA_ROCM_PACKED16_WMMA_IMPL=bm32_regout_directv \
+GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE=1 \
+./build-rocm-fixed/bin/llama-bench \
+  -m /path/to/Qwen3.6-35B-A3B-IQ4_XS.gguf \
+  -fa 1 -ngl 99 -p 512,1024,2048 -n 1
+```
+
+### Force DOT4-MMQ
+
+```bash
+GGML_CUDA_FA_ROUTE_REQUIRE=rocm_packed16_dot4_mmq \
+GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE=1 \
+./build-rocm-fixed/bin/llama-bench \
+  -m /path/to/Qwen3.6-35B-A3B-IQ4_XS.gguf \
+  -fa 1 -ngl 99 -p 512,1024,2048 -n 1
+```
+
+### Test KSHARED
+
+```bash
+GGML_CUDA_FA_ROUTE_REQUIRE=rocm_packed16_dot4_mmq \
+GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_IMPL=kshared \
+GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE=1 \
+./build-rocm-fixed/bin/llama-bench \
+  -m /path/to/Qwen3.6-35B-A3B-IQ4_XS.gguf \
+  -fa 1 -ngl 99 -p 512,1024 -n 1
+```
+
+## Runtime flags
+
+| Flag | Purpose |
+|---|---|
+| `GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE=1` | Explicitly enable packed16 K cache; currently default-on for HIP |
+| `GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE=0` | Disable packed16 K cache for A/B testing |
+| `GGML_CUDA_ROCM_PACKED16_DISABLE=1` | Disable all packed16 K-cache allocation |
+| `GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE=1` | Log route decisions; recommended for benchmarks |
+| `GGML_CUDA_ROCM_PACKED16_DOT4_MMQ=0` | Disable DOT4-MMQ and fall back to DOT4-KQ oracle path |
+| `GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_IMPL=kshared` | Opt into KSHARED DOT4-MMQ variant |
+| `GGML_CUDA_ROCM_PACKED16_WMMA_TILE=0` | Disable PWMMA route family |
+| `GGML_CUDA_FA_ROUTE_REQUIRE=rocm_packed16_wmma_tile` | Require PWMMA route; abort if unavailable |
+| `GGML_CUDA_FA_ROUTE_REQUIRE=rocm_packed16_dot4_mmq` | Require DOT4-MMQ route; abort if unavailable |
+| `GGML_CUDA_ROCM_PACKED16_WMMA_BM=32` | Select PWMMA block-M size, e.g. 16/32/64 |
+| `GGML_CUDA_ROCM_PACKED16_WMMA_IMPL=bm32_regout_directv` | Select champion PWMMA implementation |
+
+---
+
+## Known limitations
+
+- Primary target is RX 7900 XTX / gfx1100.
+- Packed16 K cache is default-on for HIP in this branch. Set
+  `GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE=1` only to make the benchmark
+  contract explicit.
+- Disable packed16 with `GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE=0` or `GGML_CUDA_ROCM_PACKED16_DISABLE=1`.
+- PWMMA requires ROCm compiler support for RDNA3 WMMA builtins.
+- DOT4-MMQ GQA2, PWMMA BM64, BM16 smem, and KSHARED are not auto-selected.
+- Decode uses DOT4 decode kernels, not the prefill WMMA kernels.
+- `GGML_CUDA_FA_ROUTE_REQUIRE=...` intentionally aborts if the route cannot run.
+- Non-Qwen3.6 models and non-RDNA3 hardware need separate validation.
 
 ---
 
@@ -350,26 +506,22 @@ GGML_CUDA_ROCM_PACKED16_DOT4_MMQ=0  # reverts to DOT4-KQ oracle
 This branch builds on:
 
 - [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) — base runtime,
-  ggml backends, FlashAttention, MTP/TBQ upstream.
+  ggml backends, FlashAttention, and upstream infrastructure.
 - [Indras-Mirror/llama.cpp-mtp](https://github.com/Indras-Mirror/llama.cpp-mtp)
   — MTP/TurboQuant fork foundation, tensor sharing, CUDA TBQ4 FA.
-- [adelj88/rocm_wmma_gemm](https://github.com/adelj88/rocm_wmma_gemm) —
-  RDNA3 rocWMMA GEMM reference (autotuner, config lookup, LDS buffering).
-- [ROCm/amd_matrix_instruction_calculator](https://github.com/ROCm/amd_matrix_instruction_calculator) —
-  official AMD matrix instruction calculator (WMMA shapes, throughput).
+- [adelj88/rocm_wmma_gemm](https://github.com/adelj88/rocm_wmma_gemm) — RDNA3
+  rocWMMA GEMM reference, autotuner, config lookup, LDS buffering.
+- [ROCm/amd_matrix_instruction_calculator](https://github.com/ROCm/amd_matrix_instruction_calculator)
+  — official AMD matrix-instruction calculator for WMMA shapes and throughput.
 - [Kaden-Schutt/hipfire](https://github.com/Kaden-Schutt/hipfire) —
   dispatch-screening and WMMA references.
-- [Stormrage34/llama.cpp-turboquant-hip](https://github.com/Stormrage34/llama.cpp-turboquant-hip) —
-  first AMD VEC TurboQuant-style path.
-- [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant) —
-  original TurboQuant block-format reference.
-- Model sources: [llmfan46](https://huggingface.co/llmfan46),
-  [HauhauCS](https://huggingface.co/HauhauCS),
-  [havenoammo](https://huggingface.co/havenoammo),
-  [Radamanthys11](https://huggingface.co/Radamanthys11) — Qwen3.6/MTP GGUF releases.
+- [Stormrage34/llama.cpp-turboquant-hip](https://github.com/Stormrage34/llama.cpp-turboquant-hip)
+  — AMD VEC TurboQuant-style path.
+- [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant)
+  — original TurboQuant block-format reference.
 
 ---
 
 ## License
 
-Follows upstream llama.cpp licensing terms.
+Follows upstream `llama.cpp` licensing terms.
