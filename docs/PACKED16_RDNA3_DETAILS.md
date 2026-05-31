@@ -257,6 +257,34 @@ LLAMA_MTP_PREFILL_CHUNK=1024  # match --ubatch-size
 ---
 
 
+## Experiment journey
+
+This branch is the second-stage result of the DOT4 FlashAttention work. The
+earlier prototype asked a narrower question: can RDNA3 `sudot4` make quantized
+KV-cache attention fast enough to recover f16-V-like decode speed while keeping
+q4_0-style VRAM savings? That work produced the first packed16 K-cache, DOT4
+QK kernels, BN64 decode, split-K decode, and route-contract experiments.
+
+The main lessons from that prototype were:
+
+- **Attention was not just math-bound.** K layout, V layout, routing, and cache
+  representation mattered as much as the DOT4 instruction.
+- **Packed16 was the useful abstraction.** Storing K as I32 payload rows plus
+  f16 scales gave the kernels aligned, DOT4-ready data without a per-tile
+  dequant buffer.
+- **Route contracts mattered.** Forced routes and verbose dispatch logs were
+  necessary to avoid benchmarking the wrong fallback path.
+- **Decode and prefill wanted different kernels.** BN64/split-K decode solved
+  one side of the problem; this branch focuses on the packed16 prefill route
+  family with DOT4-MMQ and PWMMA variants.
+
+The older prototype notes live at
+[DrBearJew/dot4-flash-attention](https://github.com/DrBearJew/dot4-flash-attention).
+They are useful background, but this branch is the cleaner llama.cpp integration
+for the current packed16 FA path.
+
+---
+
 ## Credits and related work
 
 This branch builds on:

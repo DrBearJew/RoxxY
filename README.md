@@ -167,22 +167,53 @@ Most users can stop here. For internals and debugging, see
 
 ---
 
+## Experiment notes
+
+This branch came out of a longer AMD/RDNA attention experiment, not a one-shot
+kernel drop.
+
+- The first prototype work focused on DOT4 FlashAttention for llama.cpp HIP on
+  RDNA3: pack K into DOT4-friendly rows, use `sudot4` for QK, and make
+  quantized KV cache attention fast enough that attention stops dominating
+  decode.
+- That prototype proved the important lesson: the K layout matters as much as
+  the math instruction. Packed16 made K reads aligned and DOT4-ready without a
+  separate dequant buffer.
+- The current branch carries that lesson into a cleaner packed16 K-cache
+  FlashAttention path for Qwen3.6-style workloads, with DOT4-MMQ as the default
+  prefill path and PWMMA as the WMMA-family comparison/fallback route.
+- If you want the longer prototype history, including the earlier DOT4 decode,
+  split-K, and packed16 cache experiments, read
+  [DrBearJew/dot4-flash-attention](https://github.com/DrBearJew/dot4-flash-attention).
+
+---
+
 ## Credits and further reading
 
-This branch builds on upstream `llama.cpp`, the MTP/TurboQuant fork work, and
-community AMD/RDNA experiments. Special thanks to the authors of:
+This branch builds on a lot of prior work. Special thanks to:
 
-- [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
+- [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) — base runtime,
+  ggml backends, FlashAttention infrastructure, and the upstream project this
+  branch extends.
 - [Indras-Mirror/llama.cpp-mtp](https://github.com/Indras-Mirror/llama.cpp-mtp)
+  — MTP/TurboQuant fork foundation, tensor sharing, and CUDA TBQ4 FA work that
+  provided the branch foundation.
 - [DrBearJew/dot4-flash-attention](https://github.com/DrBearJew/dot4-flash-attention)
-  — earlier DOT4 FlashAttention prototype notes and experiment history
-- [adelj88/rocm_wmma_gemm](https://github.com/adelj88/rocm_wmma_gemm)
+  — earlier DOT4 FlashAttention prototype notes, packed16 K-cache experiments,
+  split-K decode work, and the experiment trail that led here.
+- [adelj88/rocm_wmma_gemm](https://github.com/adelj88/rocm_wmma_gemm) — RDNA3
+  rocWMMA GEMM reference, autotuner, config lookup, and LDS buffering ideas.
 - [ROCm/amd_matrix_instruction_calculator](https://github.com/ROCm/amd_matrix_instruction_calculator)
-- [Kaden-Schutt/hipfire](https://github.com/Kaden-Schutt/hipfire)
+  — AMD matrix-instruction details for WMMA shapes, lane layout, and throughput
+  sanity checks.
+- [Kaden-Schutt/hipfire](https://github.com/Kaden-Schutt/hipfire) — AMD/RDNA
+  dispatch-screening and WMMA references.
 - [Stormrage34/llama.cpp-turboquant-hip](https://github.com/Stormrage34/llama.cpp-turboquant-hip)
+  — AMD VEC TurboQuant-style path and practical ROCm fork lessons.
 - [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant)
+  — original TurboQuant block-format reference.
 
-For the longer lineage and technical references, see
+For deeper internals, see
 [Packed16 RDNA3 technical notes](docs/PACKED16_RDNA3_DETAILS.md).
 
 ---
