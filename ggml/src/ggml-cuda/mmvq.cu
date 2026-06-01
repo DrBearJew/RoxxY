@@ -1,9 +1,15 @@
 #include "mmvq.cuh"
+#include "mmvq-rdna3-dot4.cuh"
+#include "dot4-packed16/mmvq/dp16-mmvq-q8-gemv.cuh"
+#include "dot4-packed16/mmvq/dp16-mmvq-packed16-gemv.cuh"
+#include "dot4-packed16/dp16-trace.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <mutex>
+#include <unordered_map>
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
@@ -269,6 +275,797 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
         }
     }
     return MMVQ_MAX_BATCH_SIZE;
+}
+
+struct ggml_cuda_dp16_packed16_weight_cache_key {
+    const ggml_tensor * tensor;
+    const void * data;
+    ggml_backend_buffer_t buffer;
+    int device;
+    int64_t cols;
+    int64_t rows;
+    int64_t channels;
+    int64_t samples;
+    size_t nb0;
+    size_t nb1;
+    size_t nb2;
+    size_t nb3;
+    ggml_type source_type;
+    dp16_layout layout;
+    dp16_correction_policy correction;
+    uint32_t flags;
+
+    bool operator==(const ggml_cuda_dp16_packed16_weight_cache_key & other) const {
+        return tensor == other.tensor && data == other.data && buffer == other.buffer && device == other.device &&
+            cols == other.cols && rows == other.rows && channels == other.channels && samples == other.samples &&
+            nb0 == other.nb0 && nb1 == other.nb1 && nb2 == other.nb2 && nb3 == other.nb3 &&
+            source_type == other.source_type && layout == other.layout && correction == other.correction && flags == other.flags;
+    }
+};
+
+struct ggml_cuda_dp16_packed16_weight_cache_key_hash {
+    size_t operator()(const ggml_cuda_dp16_packed16_weight_cache_key & key) const {
+        size_t h = std::hash<const void *>{}(key.tensor);
+        const auto mix = [&](const size_t v) {
+            h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        };
+        mix(std::hash<const void *>{}(key.data));
+        mix(std::hash<const void *>{}(key.buffer));
+        mix(std::hash<int>{}(key.device));
+        mix(std::hash<int64_t>{}(key.cols));
+        mix(std::hash<int64_t>{}(key.rows));
+        mix(std::hash<int64_t>{}(key.channels));
+        mix(std::hash<int64_t>{}(key.samples));
+        mix(std::hash<size_t>{}(key.nb0));
+        mix(std::hash<size_t>{}(key.nb1));
+        mix(std::hash<size_t>{}(key.nb2));
+        mix(std::hash<size_t>{}(key.nb3));
+        mix(std::hash<int>{}((int) key.source_type));
+        mix(std::hash<int>{}((int) key.layout));
+        mix(std::hash<int>{}((int) key.correction));
+        mix(std::hash<uint32_t>{}(key.flags));
+        return h;
+    }
+};
+
+struct ggml_cuda_dp16_packed16_weight_cache_entry {
+    int32_t * payload = nullptr;
+    half    * scales  = nullptr;
+    dp16_packed16_weight_view view = {};
+    cudaEvent_t ready = nullptr;
+    bool ready_recorded = false;
+    size_t packed_bytes_payload = 0;
+    size_t packed_bytes_scales = 0;
+};
+
+static std::mutex & ggml_cuda_dp16_packed16_weight_cache_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+static inline void ggml_cuda_dp16_packed16_weight_cache_entry_free(
+        const ggml_cuda_dp16_packed16_weight_cache_key & key,
+        ggml_cuda_dp16_packed16_weight_cache_entry & entry) {
+    if (entry.payload || entry.scales || entry.ready) {
+        ggml_cuda_set_device(key.device);
+    }
+    if (entry.payload) {
+        (void) cudaFree(entry.payload);
+        entry.payload = nullptr;
+    }
+    if (entry.scales) {
+        (void) cudaFree(entry.scales);
+        entry.scales = nullptr;
+    }
+    if (entry.ready) {
+        (void) cudaEventDestroy(entry.ready);
+        entry.ready = nullptr;
+    }
+    entry.ready_recorded = false;
+    entry.packed_bytes_payload = 0;
+    entry.packed_bytes_scales = 0;
+    entry.view = {};
+}
+
+struct ggml_cuda_dp16_packed16_weight_cache_state {
+    std::unordered_map<
+        ggml_cuda_dp16_packed16_weight_cache_key,
+        ggml_cuda_dp16_packed16_weight_cache_entry,
+        ggml_cuda_dp16_packed16_weight_cache_key_hash> entries;
+
+    ~ggml_cuda_dp16_packed16_weight_cache_state() {
+        for (auto & kv : entries) {
+            ggml_cuda_dp16_packed16_weight_cache_entry_free(kv.first, kv.second);
+        }
+    }
+};
+
+static ggml_cuda_dp16_packed16_weight_cache_state & ggml_cuda_dp16_packed16_weight_cache_state_get() {
+    static ggml_cuda_dp16_packed16_weight_cache_state state;
+    return state;
+}
+
+static std::unordered_map<
+        ggml_cuda_dp16_packed16_weight_cache_key,
+        ggml_cuda_dp16_packed16_weight_cache_entry,
+        ggml_cuda_dp16_packed16_weight_cache_key_hash> & ggml_cuda_dp16_packed16_weight_cache() {
+    return ggml_cuda_dp16_packed16_weight_cache_state_get().entries;
+}
+
+void ggml_cuda_dp16_packed16_weight_cache_invalidate_buffer(ggml_backend_buffer_t buffer) {
+    if (!buffer) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(ggml_cuda_dp16_packed16_weight_cache_mutex());
+    auto & cache = ggml_cuda_dp16_packed16_weight_cache();
+    for (auto it = cache.begin(); it != cache.end(); ) {
+        if (it->first.buffer == buffer) {
+            ggml_cuda_dp16_packed16_weight_cache_entry_free(it->first, it->second);
+            it = cache.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void ggml_cuda_dp16_packed16_weight_cache_invalidate_tensor(const ggml_tensor * tensor) {
+    if (!tensor) {
+        return;
+    }
+
+    const ggml_tensor * storage_tensor = tensor->view_src ? tensor->view_src : tensor;
+    const void * data = storage_tensor->data;
+    ggml_backend_buffer_t buffer = storage_tensor->buffer;
+
+    std::lock_guard<std::mutex> lock(ggml_cuda_dp16_packed16_weight_cache_mutex());
+    auto & cache = ggml_cuda_dp16_packed16_weight_cache();
+    for (auto it = cache.begin(); it != cache.end(); ) {
+        const auto & k = it->first;
+        const bool same_tensor = k.tensor == tensor || k.tensor == storage_tensor;
+        const bool same_data = data != nullptr && k.data == data;
+        const bool same_buffer = buffer != nullptr && k.buffer == buffer;
+        if (same_tensor || same_data || same_buffer) {
+            ggml_cuda_dp16_packed16_weight_cache_entry_free(it->first, it->second);
+            it = cache.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void ggml_cuda_dp16_packed16_weight_cache_remove_buffer(ggml_backend_buffer_t buffer) {
+    ggml_cuda_dp16_packed16_weight_cache_invalidate_buffer(buffer);
+}
+
+static inline bool ggml_cuda_dp16_make_packed16_weight_cache_key(
+        const ggml_tensor * src0,
+        ggml_cuda_dp16_packed16_weight_cache_key * out) {
+    if (!src0 || !out || src0->data == nullptr || src0->view_src != nullptr) {
+        return false;
+    }
+    if (src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_Q4_0) {
+        return false;
+    }
+    if (src0->ne[0] <= 0 || src0->ne[1] <= 0 || src0->ne[2] <= 0 || src0->ne[3] <= 0) {
+        return false;
+    }
+    if (src0->ne[0] % QK8_0 != 0) {
+        return false;
+    }
+    if (src0->nb[0] != ggml_type_size(src0->type)) {
+        return false;
+    }
+
+    *out = {};
+    out->tensor = src0;
+    out->data = src0->data;
+    out->buffer = src0->buffer;
+    out->device = ggml_cuda_get_device();
+    out->cols = src0->ne[0];
+    out->rows = src0->ne[1];
+    out->channels = src0->ne[2];
+    out->samples = src0->ne[3];
+    out->nb0 = src0->nb[0];
+    out->nb1 = src0->nb[1];
+    out->nb2 = src0->nb[2];
+    out->nb3 = src0->nb[3];
+    out->source_type = src0->type;
+    out->layout = DP16_LAYOUT_PACKED16_I32_SCALED;
+    out->correction = src0->type == GGML_TYPE_Q4_0 ? DP16_CORR_PREPACK_SIGNED_I8 : DP16_CORR_NONE;
+    out->flags = 0;
+    return true;
+}
+
+static __device__ __forceinline__ int8_t ggml_cuda_dp16_q4_0_signed_value(const block_q4_0 & b, const int e) {
+    const uint8_t byte = b.qs[e & 15];
+    const int q = e < 16 ? (byte & 0x0f) : (byte >> 4);
+    return (int8_t) (q - 8);
+}
+
+static __device__ __forceinline__ int32_t ggml_cuda_dp16_pack4_i8(
+        const int8_t v0, const int8_t v1, const int8_t v2, const int8_t v3) {
+    uint32_t p = 0;
+    p |= (uint32_t) (uint8_t) v0;
+    p |= (uint32_t) (uint8_t) v1 << 8;
+    p |= (uint32_t) (uint8_t) v2 << 16;
+    p |= (uint32_t) (uint8_t) v3 << 24;
+    return (int32_t) p;
+}
+
+static __global__ void ggml_cuda_dp16_pack_q8_0_to_packed16_i32_scaled_kernel(
+        const block_q8_0 * __restrict__ src,
+        int32_t * __restrict__ payload,
+        half * __restrict__ scales,
+        const uint32_t blocks_per_row,
+        const uint32_t rows,
+        const uint32_t channels,
+        const uint32_t samples,
+        const uint32_t src_stride_row_blocks,
+        const uint32_t src_stride_channel_blocks,
+        const uint32_t src_stride_sample_blocks,
+        const uint32_t payload_stride_row_i32,
+        const uint32_t payload_stride_channel_i32,
+        const uint32_t payload_stride_sample_i32,
+        const uint32_t scale_stride_row_half,
+        const uint32_t scale_stride_channel_half,
+        const uint32_t scale_stride_sample_half) {
+    const uint64_t total_blocks = (uint64_t) samples*channels*rows*blocks_per_row;
+    for (uint64_t idx = (uint64_t) blockIdx.x*blockDim.x + threadIdx.x; idx < total_blocks; idx += (uint64_t) gridDim.x*blockDim.x) {
+        uint64_t t = idx;
+        const uint32_t qb = t % blocks_per_row; t /= blocks_per_row;
+        const uint32_t row = t % rows;           t /= rows;
+        const uint32_t channel = t % channels;   t /= channels;
+        const uint32_t sample = t;
+
+        const block_q8_0 & bx = src[
+            sample*src_stride_sample_blocks +
+            channel*src_stride_channel_blocks +
+            row*src_stride_row_blocks + qb];
+
+        const int32_t * qx = (const int32_t *) bx.qs;
+        int32_t * dst_payload = payload +
+            sample*payload_stride_sample_i32 +
+            channel*payload_stride_channel_i32 +
+            row*payload_stride_row_i32 + qb*(QK8_0/4);
+#pragma unroll
+        for (int i = 0; i < QK8_0/4; ++i) {
+            dst_payload[i] = qx[i];
+        }
+
+        scales[
+            sample*scale_stride_sample_half +
+            channel*scale_stride_channel_half +
+            row*scale_stride_row_half + qb] = bx.d;
+    }
+}
+
+static __global__ void ggml_cuda_dp16_pack_q4_0_to_packed16_i32_scaled_kernel(
+        const block_q4_0 * __restrict__ src,
+        int32_t * __restrict__ payload,
+        half * __restrict__ scales,
+        const uint32_t blocks_per_row,
+        const uint32_t rows,
+        const uint32_t channels,
+        const uint32_t samples,
+        const uint32_t src_stride_row_blocks,
+        const uint32_t src_stride_channel_blocks,
+        const uint32_t src_stride_sample_blocks,
+        const uint32_t payload_stride_row_i32,
+        const uint32_t payload_stride_channel_i32,
+        const uint32_t payload_stride_sample_i32,
+        const uint32_t scale_stride_row_half,
+        const uint32_t scale_stride_channel_half,
+        const uint32_t scale_stride_sample_half) {
+    const uint64_t total_blocks = (uint64_t) samples*channels*rows*blocks_per_row;
+    for (uint64_t idx = (uint64_t) blockIdx.x*blockDim.x + threadIdx.x; idx < total_blocks; idx += (uint64_t) gridDim.x*blockDim.x) {
+        uint64_t t = idx;
+        const uint32_t qb = t % blocks_per_row; t /= blocks_per_row;
+        const uint32_t row = t % rows;           t /= rows;
+        const uint32_t channel = t % channels;   t /= channels;
+        const uint32_t sample = t;
+
+        const block_q4_0 & bx = src[
+            sample*src_stride_sample_blocks +
+            channel*src_stride_channel_blocks +
+            row*src_stride_row_blocks + qb];
+
+        int32_t * dst_payload = payload +
+            sample*payload_stride_sample_i32 +
+            channel*payload_stride_channel_i32 +
+            row*payload_stride_row_i32 + qb*(QK8_0/4);
+#pragma unroll
+        for (int qi4 = 0; qi4 < QK8_0/4; ++qi4) {
+            const int e = qi4*4;
+            dst_payload[qi4] = ggml_cuda_dp16_pack4_i8(
+                    ggml_cuda_dp16_q4_0_signed_value(bx, e + 0),
+                    ggml_cuda_dp16_q4_0_signed_value(bx, e + 1),
+                    ggml_cuda_dp16_q4_0_signed_value(bx, e + 2),
+                    ggml_cuda_dp16_q4_0_signed_value(bx, e + 3));
+        }
+
+        scales[
+            sample*scale_stride_sample_half +
+            channel*scale_stride_channel_half +
+            row*scale_stride_row_half + qb] = bx.d;
+    }
+}
+
+static inline bool ggml_cuda_dp16_get_packed16_weight(
+        const ggml_tensor * src0,
+        dp16_packed16_weight_view * out) {
+    if (out) {
+        *out = {};
+    }
+    if (!src0 || !out) {
+        return false;
+    }
+
+    ggml_cuda_dp16_packed16_weight_cache_key key = {};
+    if (!ggml_cuda_dp16_make_packed16_weight_cache_key(src0, &key)) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(ggml_cuda_dp16_packed16_weight_cache_mutex());
+    auto & cache = ggml_cuda_dp16_packed16_weight_cache();
+    auto it = cache.find(key);
+    if (it == cache.end()) {
+        return false;
+    }
+    *out = it->second.view;
+    return true;
+}
+
+static inline bool ggml_cuda_dp16_ensure_packed16_weight(
+        const ggml_tensor * src0,
+        cudaStream_t stream) {
+    ggml_cuda_dp16_packed16_weight_cache_key key = {};
+    if (!ggml_cuda_dp16_make_packed16_weight_cache_key(src0, &key)) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(ggml_cuda_dp16_packed16_weight_cache_mutex());
+    auto & cache = ggml_cuda_dp16_packed16_weight_cache();
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        if (it->second.ready_recorded && it->second.ready) {
+#if defined(GGML_USE_HIP)
+            hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+            CUDA_CHECK(hipStreamIsCapturing(stream, &capture_status));
+            if (capture_status == hipStreamCaptureStatusNone) {
+                CUDA_CHECK(cudaStreamWaitEvent(stream, it->second.ready, 0));
+            }
+#else
+            cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+            CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+            if (capture_status == cudaStreamCaptureStatusNone) {
+                CUDA_CHECK(cudaStreamWaitEvent(stream, it->second.ready, 0));
+            }
+#endif
+        }
+        dp16_trace_emit_sidecar(src0->type == GGML_TYPE_Q4_0 ? DP16_ROUTE_MMVQ_Q4_0_PACKED16_DOT4 : DP16_ROUTE_MMVQ_PACKED16_DOT4,
+                src0->type, DP16_LAYOUT_PACKED16_I32_SCALED,
+                src0->type == GGML_TYPE_Q4_0 ? DP16_CORR_PREPACK_SIGNED_I8 : DP16_CORR_NONE, "hit", false,
+                it->second.packed_bytes_payload, it->second.packed_bytes_scales);
+        return true;
+    }
+
+    const int64_t blocks_per_row = src0->ne[0] / QK8_0;
+    const int64_t rows = src0->ne[1];
+    const int64_t channels = src0->ne[2];
+    const int64_t samples = src0->ne[3];
+
+    const int64_t payload_stride_row_i32 = src0->ne[0] / 4;
+    const int64_t scale_stride_row_half = blocks_per_row;
+    const int64_t payload_stride_channel_i32 = rows*payload_stride_row_i32;
+    const int64_t scale_stride_channel_half = rows*scale_stride_row_half;
+    const int64_t payload_stride_sample_i32 = channels*payload_stride_channel_i32;
+    const int64_t scale_stride_sample_half = channels*scale_stride_channel_half;
+
+    const size_t payload_count = (size_t) samples*payload_stride_sample_i32;
+    const size_t scale_count = (size_t) samples*scale_stride_sample_half;
+
+    ggml_cuda_dp16_packed16_weight_cache_entry * entry = nullptr;
+    if (it == cache.end()) {
+        ggml_cuda_dp16_packed16_weight_cache_entry new_entry = {};
+        CUDA_CHECK(cudaMalloc((void **) &new_entry.payload, payload_count*sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc((void **) &new_entry.scales, scale_count*sizeof(half)));
+        CUDA_CHECK(cudaEventCreateWithFlags(&new_entry.ready, cudaEventDisableTiming));
+        new_entry.packed_bytes_payload = payload_count*sizeof(int32_t);
+        new_entry.packed_bytes_scales = scale_count*sizeof(half);
+
+        new_entry.view.payload = new_entry.payload;
+        new_entry.view.scales = new_entry.scales;
+        new_entry.view.rows = rows;
+        new_entry.view.cols = src0->ne[0];
+        new_entry.view.payload_stride_row_i32 = payload_stride_row_i32;
+        new_entry.view.scale_stride_row_half = scale_stride_row_half;
+        new_entry.view.payload_stride_channel_i32 = payload_stride_channel_i32;
+        new_entry.view.scale_stride_channel_half = scale_stride_channel_half;
+        new_entry.view.payload_stride_sample_i32 = payload_stride_sample_i32;
+        new_entry.view.scale_stride_sample_half = scale_stride_sample_half;
+        new_entry.view.source_type = src0->type;
+        new_entry.view.flags = 0;
+
+        auto inserted = cache.emplace(key, new_entry);
+        entry = &inserted.first->second;
+    } else {
+        entry = &it->second;
+    }
+
+    const uint32_t src_stride_row_blocks = (uint32_t) (src0->nb[1] / ggml_type_size(src0->type));
+    const uint32_t src_stride_channel_blocks = (uint32_t) (src0->nb[2] / ggml_type_size(src0->type));
+    const uint32_t src_stride_sample_blocks = (uint32_t) (src0->nb[3] / ggml_type_size(src0->type));
+
+    const uint64_t total_blocks = (uint64_t) samples*channels*rows*blocks_per_row;
+    const int threads = 256;
+    const int blocks = (int) std::min<uint64_t>((total_blocks + threads - 1) / threads, 65535);
+    if (src0->type == GGML_TYPE_Q4_0) {
+        ggml_cuda_dp16_pack_q4_0_to_packed16_i32_scaled_kernel<<<blocks, threads, 0, stream>>>(
+                (const block_q4_0 *) src0->data,
+                entry->payload,
+                entry->scales,
+                (uint32_t) blocks_per_row,
+                (uint32_t) rows,
+                (uint32_t) channels,
+                (uint32_t) samples,
+                src_stride_row_blocks,
+                src_stride_channel_blocks,
+                src_stride_sample_blocks,
+                (uint32_t) payload_stride_row_i32,
+                (uint32_t) payload_stride_channel_i32,
+                (uint32_t) payload_stride_sample_i32,
+                (uint32_t) scale_stride_row_half,
+                (uint32_t) scale_stride_channel_half,
+                (uint32_t) scale_stride_sample_half);
+    } else {
+        ggml_cuda_dp16_pack_q8_0_to_packed16_i32_scaled_kernel<<<blocks, threads, 0, stream>>>(
+                (const block_q8_0 *) src0->data,
+                entry->payload,
+                entry->scales,
+                (uint32_t) blocks_per_row,
+                (uint32_t) rows,
+                (uint32_t) channels,
+                (uint32_t) samples,
+                src_stride_row_blocks,
+                src_stride_channel_blocks,
+                src_stride_sample_blocks,
+                (uint32_t) payload_stride_row_i32,
+                (uint32_t) payload_stride_channel_i32,
+                (uint32_t) payload_stride_sample_i32,
+                (uint32_t) scale_stride_row_half,
+                (uint32_t) scale_stride_channel_half,
+                (uint32_t) scale_stride_sample_half);
+    }
+    CUDA_CHECK(cudaEventRecord(entry->ready, stream));
+    entry->ready_recorded = true;
+    dp16_trace_emit_sidecar(src0->type == GGML_TYPE_Q4_0 ? DP16_ROUTE_MMVQ_Q4_0_PACKED16_DOT4 : DP16_ROUTE_MMVQ_PACKED16_DOT4,
+            src0->type, DP16_LAYOUT_PACKED16_I32_SCALED,
+            src0->type == GGML_TYPE_Q4_0 ? DP16_CORR_PREPACK_SIGNED_I8 : DP16_CORR_NONE, "miss", true,
+            entry->packed_bytes_payload, entry->packed_bytes_scales);
+
+    return true;
+}
+
+static inline dp16_problem ggml_cuda_dp16_mmvq_problem_init(
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * dst,
+        const int64_t ncols_x,
+        const int64_t nrows_x,
+        const int64_t ncols_dst,
+        const int cc,
+        const bool has_fusion,
+        const bool has_ids) {
+    dp16_problem problem = dp16_problem_init(DP16_OP_DECODE_PROJ_GEMV);
+    problem.m = nrows_x;
+    problem.n = ncols_dst;
+    problem.k = ncols_x;
+    problem.batch = dst ? (int) dst->ne[3] : 1;
+    problem.heads_q = dst ? (int) dst->ne[2] : 1;
+    problem.heads_kv = src0 ? (int) src0->ne[2] : 1;
+    problem.head_dim = (int) ncols_x;
+    problem.src0_type = src0 ? src0->type : GGML_TYPE_COUNT;
+    // MMVQ quantizes the activation side to q8_1 before the matvec kernel.
+    problem.src1_type = GGML_TYPE_Q8_1;
+    problem.src2_type = GGML_TYPE_COUNT;
+    problem.dst_type = dst ? dst->type : GGML_TYPE_COUNT;
+    problem.is_decode = ncols_dst <= 4;
+    problem.has_fusion = has_fusion;
+    problem.has_ids = has_ids;
+    problem.cc = cc;
+
+    problem.a = dp16_operand_desc_make(DP16_OPERAND_ACTIVATION, DP16_STORAGE_TRANSIENT_TILE,
+            DP16_LAYOUT_Q8_BLOCK32, GGML_TYPE_Q8_1, ncols_dst, ncols_x,
+            src1 ? src1->nb[1] : 0, src1 ? src1->nb[0] : 0);
+
+    dp16_packed16_weight_view w16 = {};
+    if (ggml_cuda_dp16_get_packed16_weight(src0, &w16)) {
+        problem.has_packed16_b = true;
+        problem.b_packed16 = w16;
+        problem.b = dp16_operand_desc_make(DP16_OPERAND_WEIGHT, DP16_STORAGE_PERSISTENT_WEIGHT,
+                DP16_LAYOUT_PACKED16_I32_SCALED, problem.src0_type, nrows_x, ncols_x,
+                w16.payload_stride_row_i32, 1);
+    } else {
+        problem.has_packed16_b = false;
+        problem.b = dp16_operand_desc_from_type(DP16_OPERAND_WEIGHT, DP16_STORAGE_PERSISTENT_WEIGHT,
+                problem.src0_type, nrows_x, ncols_x,
+                src0 ? src0->nb[1] : 0, src0 ? src0->nb[0] : 0);
+    }
+
+    problem.dst = dp16_operand_desc_from_type(DP16_OPERAND_OUTPUT, DP16_STORAGE_OUTPUT,
+            problem.dst_type, nrows_x, ncols_dst,
+            dst ? dst->nb[0] : 0, dst ? dst->nb[1] : 0);
+    return problem;
+}
+
+static inline bool ggml_cuda_dp16_route_require_q8_mmvq() {
+    return dp16_route_name_is_mmvq_q8_dot4(dp16_route_require_env());
+}
+
+static inline bool ggml_cuda_dp16_route_require_packed16_mmvq() {
+    return dp16_route_name_is_mmvq_packed16_dot4(dp16_route_require_env());
+}
+
+static inline bool ggml_cuda_dp16_route_require_q4_0_packed16_mmvq() {
+    return dp16_route_name_is_mmvq_q4_0_packed16_dot4(dp16_route_require_env());
+}
+
+static inline bool ggml_cuda_dp16_route_require_any_mmvq() {
+    return ggml_cuda_dp16_route_require_q8_mmvq() ||
+        ggml_cuda_dp16_route_require_packed16_mmvq() ||
+        ggml_cuda_dp16_route_require_q4_0_packed16_mmvq();
+}
+
+static inline bool ggml_cuda_dp16_mmvq_q8_dot4_enabled() {
+    const char * enabled = getenv("GGML_CUDA_ROCM_Q8_DOT4_MMVQ");
+    return ggml_cuda_dp16_route_require_q8_mmvq() || (enabled && atoi(enabled) != 0);
+}
+
+static inline bool ggml_cuda_dp16_mmvq_packed16_dot4_env_enabled() {
+    const char * enabled = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMVQ");
+    return enabled && atoi(enabled) != 0;
+}
+
+static inline bool ggml_cuda_dp16_mmvq_q4_0_packed16_dot4_env_enabled() {
+    const char * enabled = getenv("GGML_CUDA_ROCM_Q4_0_PACKED16_DOT4_MMVQ");
+    return enabled && atoi(enabled) != 0;
+}
+
+static inline bool ggml_cuda_dp16_mmvq_packed16_dot4_enabled() {
+    return ggml_cuda_dp16_route_require_packed16_mmvq() ||
+        ggml_cuda_dp16_route_require_q4_0_packed16_mmvq() ||
+        ggml_cuda_dp16_mmvq_packed16_dot4_env_enabled() ||
+        ggml_cuda_dp16_mmvq_q4_0_packed16_dot4_env_enabled();
+}
+
+static inline bool ggml_cuda_dp16_mmvq_q8_dot4_supported(
+        const ggml_type type,
+        const int cc,
+        const int warp_size,
+        const int ncols_dst,
+        const bool has_fusion,
+        const bool has_ids,
+        const int ncols_x,
+        const int nrows_x) {
+#if defined(GGML_USE_HIP)
+    return ggml_cuda_dp16_mmvq_q8_dot4_enabled() &&
+        GGML_CUDA_CC_IS_RDNA3(cc) &&
+        warp_size == DP16_MMVQ_Q8_DOT4_WARP_SIZE &&
+        type == GGML_TYPE_Q8_0 &&
+        ncols_dst >= 1 && ncols_dst <= 4 &&
+        (!has_fusion || ncols_dst == 1) && !has_ids &&
+        ncols_x % 256 == 0 &&
+        nrows_x > 0;
+#else
+    GGML_UNUSED_VARS(type, cc, warp_size, ncols_dst, has_fusion, has_ids, ncols_x, nrows_x);
+    return false;
+#endif
+}
+
+static inline bool ggml_cuda_dp16_mmvq_packed16_dot4_supported(
+        const int cc,
+        const int warp_size,
+        const int ncols_dst,
+        const bool has_fusion,
+        const bool has_ids,
+        const int ncols_x,
+        const int nrows_x) {
+#if defined(GGML_USE_HIP)
+    return ggml_cuda_dp16_mmvq_packed16_dot4_enabled() &&
+        GGML_CUDA_CC_IS_RDNA3(cc) &&
+        warp_size == DP16_MMVQ_PACKED16_DOT4_WARP_SIZE &&
+        ncols_dst >= 1 && ncols_dst <= 4 &&
+        !has_fusion && !has_ids &&
+        ncols_x % 256 == 0 &&
+        nrows_x > 0;
+#else
+    GGML_UNUSED_VARS(cc, warp_size, ncols_dst, has_fusion, has_ids, ncols_x, nrows_x);
+    return false;
+#endif
+}
+
+static inline void ggml_cuda_dp16_mmvq_route_require_fail(
+        const dp16_problem & problem,
+        const dp16_plan & plan,
+        const dp16_reject_reason reject) {
+    GGML_ABORT(
+        "DP16 route require failed: required=%s op=%s route=%s kernel=%s reject=%s "
+        "fallback_disallowed=1 m=%lld n=%lld k=%lld A.role=%s A.storage=%s A.layout=%s "
+        "B.role=%s B.storage=%s B.layout=%s dst.layout=%s",
+        dp16_route_require_env(),
+        dp16_op_name(problem.op),
+        dp16_cstr_or_none(plan.route_name),
+        dp16_cstr_or_none(plan.kernel_name),
+        dp16_reject_name(reject),
+        (long long) problem.m,
+        (long long) problem.n,
+        (long long) problem.k,
+        dp16_operand_role_name(plan.a.role != DP16_OPERAND_UNKNOWN ? plan.a.role : problem.a.role),
+        dp16_storage_name(plan.a.role != DP16_OPERAND_UNKNOWN ? plan.a.storage : problem.a.storage),
+        dp16_layout_name(plan.a.role != DP16_OPERAND_UNKNOWN ? plan.a.layout : problem.a.layout),
+        dp16_operand_role_name(plan.b.role != DP16_OPERAND_UNKNOWN ? plan.b.role : problem.b.role),
+        dp16_storage_name(plan.b.role != DP16_OPERAND_UNKNOWN ? plan.b.storage : problem.b.storage),
+        dp16_layout_name(plan.b.role != DP16_OPERAND_UNKNOWN ? plan.b.layout : problem.b.layout),
+        dp16_layout_name(plan.dst.role != DP16_OPERAND_UNKNOWN ? plan.dst.layout : problem.dst.layout));
+}
+
+static inline void ggml_cuda_dp16_trace_mmvq_decode_plan(
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * dst,
+        const int64_t ncols_x,
+        const int64_t nrows_x,
+        const int64_t ncols_dst,
+        const int cc,
+        const int warp_size,
+        const bool has_fusion,
+        const bool has_ids) {
+    const bool trace = dp16_trace_enabled();
+    const bool require_mmvq = ggml_cuda_dp16_route_require_any_mmvq();
+    if (!trace && !require_mmvq) {
+        return;
+    }
+
+    const dp16_problem problem = ggml_cuda_dp16_mmvq_problem_init(
+            src0, src1, dst, ncols_x, nrows_x, ncols_dst, cc, has_fusion, has_ids);
+    dp16_plan plan = dp16_plan_decode_proj_mmvq(problem, dp16_route_require_env());
+    if (plan.backend == DP16_BACKEND_MMVQ_PACKED16_I32_DOT4) {
+        plan.kernel_name = dp16_mmvq_packed16_kernel_name();
+    }
+    dp16_trace_emit_plan(problem, plan);
+
+    if (!dp16_plan_accepted(plan)) {
+        if (require_mmvq) {
+            ggml_cuda_dp16_mmvq_route_require_fail(problem, plan, plan.reject);
+        }
+        return;
+    }
+
+    bool runtime_supported = false;
+    if (plan.backend == DP16_BACKEND_MMVQ_Q8_DOT4) {
+        runtime_supported = ggml_cuda_dp16_mmvq_q8_dot4_supported(
+                problem.src0_type, cc, warp_size, (int) ncols_dst, has_fusion, has_ids, (int) ncols_x, (int) nrows_x);
+    } else if (plan.backend == DP16_BACKEND_MMVQ_PACKED16_I32_DOT4 ||
+            plan.backend == DP16_BACKEND_MMVQ_Q4_0_PACKED16_I32_DOT4) {
+        runtime_supported = ggml_cuda_dp16_mmvq_packed16_dot4_supported(
+                cc, warp_size, (int) ncols_dst, has_fusion, has_ids, (int) ncols_x, (int) nrows_x);
+    }
+    if (runtime_supported) {
+        return;
+    }
+
+    // Keep existing MMVQ dispatch when the DP16 route is optional, but reject
+    // silent fallback when explicitly required.
+    dp16_plan fallback = plan;
+    fallback.reject = DP16_REJECT_RUNTIME_DISABLED;
+    fallback.kernel_name = "existing_mmvq_fallback";
+    dp16_trace_emit_plan(problem, fallback);
+
+    if (require_mmvq) {
+        ggml_cuda_dp16_mmvq_route_require_fail(problem, fallback, DP16_REJECT_RUNTIME_DISABLED);
+    }
+}
+
+static inline bool ggml_cuda_dp16_try_launch_packed16_mmvq(
+        const ggml_tensor * src0,
+        const void * src1_q8_1,
+        float * dst,
+        const int ncols_x,
+        const int nrows_x,
+        const int ncols_dst,
+        const uint3 channel_ratio,
+        const uint3 sample_ratio,
+        const int stride_col_y,
+        const int stride_col_dst,
+        const int nchannels_dst,
+        const int stride_channel_y,
+        const int stride_channel_dst,
+        const int nsamples_dst,
+        const int stride_sample_y,
+        const int stride_sample_dst,
+        const int cc,
+        const int warp_size,
+        const bool has_fusion,
+        const bool has_ids,
+        cudaStream_t stream) {
+    dp16_packed16_weight_view w16 = {};
+    if (!ggml_cuda_dp16_get_packed16_weight(src0, &w16)) {
+        return false;
+    }
+    if (!ggml_cuda_dp16_mmvq_packed16_dot4_supported(
+            cc, warp_size, ncols_dst, has_fusion, has_ids, ncols_x, nrows_x)) {
+        return false;
+    }
+    if (w16.cols != ncols_x || w16.rows < nrows_x) {
+        return false;
+    }
+
+    const bool use_i32_lane = dp16_mmvq_packed16_use_i32_lane_kernel();
+    switch (ncols_dst) {
+        case 1:
+            if (use_i32_lane) {
+                dp16_mmvq_packed16_i32_n1_4_k256_launch<1>(w16, src1_q8_1, dst,
+                        ncols_x, nrows_x, channel_ratio, sample_ratio,
+                        stride_col_y, stride_col_dst, nchannels_dst,
+                        stride_channel_y, stride_channel_dst,
+                        nsamples_dst, stride_sample_y, stride_sample_dst, stream);
+            } else {
+                dp16_mmvq_packed16_i32_b32_n1_4_k256_launch<1>(w16, src1_q8_1, dst,
+                        ncols_x, nrows_x, channel_ratio, sample_ratio,
+                        stride_col_y, stride_col_dst, nchannels_dst,
+                        stride_channel_y, stride_channel_dst,
+                        nsamples_dst, stride_sample_y, stride_sample_dst, stream);
+            }
+            return true;
+        case 2:
+            if (use_i32_lane) {
+                dp16_mmvq_packed16_i32_n1_4_k256_launch<2>(w16, src1_q8_1, dst,
+                        ncols_x, nrows_x, channel_ratio, sample_ratio,
+                        stride_col_y, stride_col_dst, nchannels_dst,
+                        stride_channel_y, stride_channel_dst,
+                        nsamples_dst, stride_sample_y, stride_sample_dst, stream);
+            } else {
+                dp16_mmvq_packed16_i32_b32_n1_4_k256_launch<2>(w16, src1_q8_1, dst,
+                        ncols_x, nrows_x, channel_ratio, sample_ratio,
+                        stride_col_y, stride_col_dst, nchannels_dst,
+                        stride_channel_y, stride_channel_dst,
+                        nsamples_dst, stride_sample_y, stride_sample_dst, stream);
+            }
+            return true;
+        case 3:
+            if (use_i32_lane) {
+                dp16_mmvq_packed16_i32_n1_4_k256_launch<3>(w16, src1_q8_1, dst,
+                        ncols_x, nrows_x, channel_ratio, sample_ratio,
+                        stride_col_y, stride_col_dst, nchannels_dst,
+                        stride_channel_y, stride_channel_dst,
+                        nsamples_dst, stride_sample_y, stride_sample_dst, stream);
+            } else {
+                dp16_mmvq_packed16_i32_b32_n1_4_k256_launch<3>(w16, src1_q8_1, dst,
+                        ncols_x, nrows_x, channel_ratio, sample_ratio,
+                        stride_col_y, stride_col_dst, nchannels_dst,
+                        stride_channel_y, stride_channel_dst,
+                        nsamples_dst, stride_sample_y, stride_sample_dst, stream);
+            }
+            return true;
+        case 4:
+            if (use_i32_lane) {
+                dp16_mmvq_packed16_i32_n1_4_k256_launch<4>(w16, src1_q8_1, dst,
+                        ncols_x, nrows_x, channel_ratio, sample_ratio,
+                        stride_col_y, stride_col_dst, nchannels_dst,
+                        stride_channel_y, stride_channel_dst,
+                        nsamples_dst, stride_sample_y, stride_sample_dst, stream);
+            } else {
+                dp16_mmvq_packed16_i32_b32_n1_4_k256_launch<4>(w16, src1_q8_1, dst,
+                        ncols_x, nrows_x, channel_ratio, sample_ratio,
+                        stride_col_y, stride_col_dst, nchannels_dst,
+                        stride_channel_y, stride_channel_dst,
+                        nsamples_dst, stride_sample_y, stride_sample_dst, stream);
+            }
+            return true;
+        default:
+            return false;
+    }
 }
 
 // Device constexpr: returns the max batch size for the current arch+type at compile time.
@@ -726,7 +1523,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int nchannels_x, const int nchannels_y, const int nchannels_dst,
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int ids_stride, cudaStream_t stream) {
+        const int32_t * y_q8sum4, const int ids_stride, cudaStream_t stream) {
 
     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
     GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
@@ -799,6 +1596,34 @@ static void mul_mat_vec_q_switch_ncols_dst(
         case 1: {
             constexpr int c_ncols_dst = 1;
 
+            if (ggml_cuda_dp16_mmvq_q8_dot4_supported(
+                    type, cc, warp_size, c_ncols_dst, has_fusion, has_ids, ncols_x, nrows_x)) {
+                if (has_fusion) {
+                    dp16_mmvq_q8_dot4_fusion_n1_k256_launch<c_ncols_dst>(
+                        vx, vy, fusion, dst, ncols_x, nrows_x, channel_ratio_fd, sample_ratio_fd,
+                        stride_row_x, stride_col_y, stride_col_dst, nchannels_dst,
+                        stride_channel_x, stride_channel_y, stride_channel_dst,
+                        nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream);
+                } else {
+                    dp16_mmvq_q8_dot4_n1_4_k256_launch<c_ncols_dst>(
+                        vx, vy, dst, ncols_x, nrows_x, channel_ratio_fd, sample_ratio_fd,
+                        stride_row_x, stride_col_y, stride_col_dst, nchannels_dst,
+                        stride_channel_x, stride_channel_y, stride_channel_dst,
+                        nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream);
+                }
+                return;
+            }
+
+            if (ggml_cuda_rdna3_mmvq_dot4_supported(
+                    type, cc, warp_size, c_ncols_dst, has_fusion, has_ids, ncols_x, nrows_x, y_q8sum4)) {
+                ggml_cuda_rdna3_mmvq_dot4_launch<type>(
+                    vx, vy, y_q8sum4, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd,
+                    channel_ratio_fd, sample_ratio_fd, stride_row_x, stride_col_y, stride_col_dst,
+                    nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                return;
+            }
+
             bool use_small_k = should_use_small_k(c_ncols_dst);
 
             if (use_small_k) {
@@ -821,6 +1646,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
         } break;
         case 2: {
             constexpr int c_ncols_dst = 2;
+            if (ggml_cuda_dp16_mmvq_q8_dot4_supported(
+                    type, cc, warp_size, c_ncols_dst, has_fusion, has_ids, ncols_x, nrows_x)) {
+                dp16_mmvq_q8_dot4_n1_4_k256_launch<c_ncols_dst>(
+                    vx, vy, dst, ncols_x, nrows_x, channel_ratio_fd, sample_ratio_fd,
+                    stride_row_x, stride_col_y, stride_col_dst, nchannels_dst,
+                    stride_channel_x, stride_channel_y, stride_channel_dst,
+                    nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream);
+                return;
+            }
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -829,6 +1663,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
         } break;
         case 3: {
             constexpr int c_ncols_dst = 3;
+            if (ggml_cuda_dp16_mmvq_q8_dot4_supported(
+                    type, cc, warp_size, c_ncols_dst, has_fusion, has_ids, ncols_x, nrows_x)) {
+                dp16_mmvq_q8_dot4_n1_4_k256_launch<c_ncols_dst>(
+                    vx, vy, dst, ncols_x, nrows_x, channel_ratio_fd, sample_ratio_fd,
+                    stride_row_x, stride_col_y, stride_col_dst, nchannels_dst,
+                    stride_channel_x, stride_channel_y, stride_channel_dst,
+                    nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream);
+                return;
+            }
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -837,6 +1680,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
         } break;
         case 4: {
             constexpr int c_ncols_dst = 4;
+            if (ggml_cuda_dp16_mmvq_q8_dot4_supported(
+                    type, cc, warp_size, c_ncols_dst, has_fusion, has_ids, ncols_x, nrows_x)) {
+                dp16_mmvq_q8_dot4_n1_4_k256_launch<c_ncols_dst>(
+                    vx, vy, dst, ncols_x, nrows_x, channel_ratio_fd, sample_ratio_fd,
+                    stride_row_x, stride_col_y, stride_col_dst, nchannels_dst,
+                    stride_channel_x, stride_channel_y, stride_channel_dst,
+                    nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream);
+                return;
+            }
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -889,139 +1741,139 @@ static void mul_mat_vec_q_switch_type(
         const int nchannels_x, const int nchannels_y, const int nchannels_dst,
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int ids_stride, cudaStream_t stream) {
+        const int32_t * y_q8sum4, const int ids_stride, cudaStream_t stream) {
     switch (type_x) {
         case GGML_TYPE_Q1_0:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q1_0>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, y_q8sum4, ids_stride, stream);
             break;
         case GGML_TYPE_Q4_0:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q4_0>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, y_q8sum4, ids_stride, stream);
             break;
         case GGML_TYPE_Q4_1:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q4_1>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, y_q8sum4, ids_stride, stream);
             break;
         case GGML_TYPE_Q5_0:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q5_0>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, y_q8sum4, ids_stride, stream);
             break;
         case GGML_TYPE_Q5_1:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q5_1>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, y_q8sum4, ids_stride, stream);
             break;
         case GGML_TYPE_Q8_0:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q8_0>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, y_q8sum4, ids_stride, stream);
             break;
         case GGML_TYPE_MXFP4:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_MXFP4>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, y_q8sum4, ids_stride, stream);
             break;
         case GGML_TYPE_NVFP4:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_NVFP4>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, y_q8sum4, ids_stride, stream);
             break;
         case GGML_TYPE_Q2_K:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q2_K>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, y_q8sum4, ids_stride, stream);
             break;
         case GGML_TYPE_Q3_K:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q3_K>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, y_q8sum4, ids_stride, stream);
             break;
         case GGML_TYPE_Q4_K:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q4_K>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, y_q8sum4, ids_stride, stream);
             break;
         case GGML_TYPE_Q5_K:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q5_K>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, y_q8sum4, ids_stride, stream);
             break;
         case GGML_TYPE_Q6_K:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q6_K>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, y_q8sum4, ids_stride, stream);
             break;
         case GGML_TYPE_IQ2_XXS:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ2_XXS>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, y_q8sum4, ids_stride, stream);
             break;
         case GGML_TYPE_IQ2_XS:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ2_XS>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, y_q8sum4, ids_stride, stream);
             break;
         case GGML_TYPE_IQ2_S:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ2_S>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, y_q8sum4, ids_stride, stream);
             break;
         case GGML_TYPE_IQ3_XXS:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ3_XXS>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, y_q8sum4, ids_stride, stream);
             break;
         case GGML_TYPE_IQ1_S:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ1_S>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, y_q8sum4, ids_stride, stream);
             break;
         case GGML_TYPE_IQ1_M:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ1_M>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, y_q8sum4, ids_stride, stream);
             break;
         case GGML_TYPE_IQ4_NL:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ4_NL>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, y_q8sum4, ids_stride, stream);
             break;
         case GGML_TYPE_IQ4_XS:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ4_XS>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, y_q8sum4, ids_stride, stream);
             break;
         case GGML_TYPE_IQ3_S:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ3_S>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, y_q8sum4, ids_stride, stream);
             break;
         default:
             GGML_ABORT("fatal error");
@@ -1122,11 +1974,56 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
+    {
+        const int device = ggml_cuda_get_device();
+        const int cc = ggml_cuda_info().devices[device].cc;
+        const int warp_size = ggml_cuda_info().devices[device].warp_size;
+        const bool has_fusion = fusion_local.gate != nullptr || fusion_local.x_bias != nullptr || fusion_local.gate_bias != nullptr;
+        const bool has_ids = ids_d != nullptr;
+        const bool should_prepare_packed16 = ggml_cuda_dp16_mmvq_packed16_dot4_env_enabled() ||
+            ggml_cuda_dp16_mmvq_q4_0_packed16_dot4_env_enabled() ||
+            ggml_cuda_dp16_route_require_q4_0_packed16_mmvq();
+        if (should_prepare_packed16 &&
+                !has_fusion && !has_ids &&
+                ncols_dst >= 1 && ncols_dst <= 4 &&
+                ne00 % 256 == 0) {
+            ggml_cuda_dp16_ensure_packed16_weight(src0, stream);
+        }
+        ggml_cuda_dp16_trace_mmvq_decode_plan(src0, src1, dst, ne00, ne01, ncols_dst, cc, warp_size, has_fusion, has_ids);
+
+        if (!has_ids) {
+            const uint3 channel_ratio_fd = init_fastdiv_values(nchannels_dst / ne02);
+            const uint3 sample_ratio_fd  = init_fastdiv_values(ne3 / ne03);
+            if (ggml_cuda_dp16_try_launch_packed16_mmvq(
+                    src0, src1_q8_1.get(), dst_d, ne00, ne01, ncols_dst,
+                    channel_ratio_fd, sample_ratio_fd,
+                    stride_col_y, stride_col_dst, nchannels_dst,
+                    stride_channel_y, stride_channel_dst,
+                    ne3, s13, s3,
+                    cc, warp_size, has_fusion, has_ids, stream)) {
+                return;
+            }
+        }
+    }
+
+    ggml_cuda_pool_alloc<int32_t> src1_q8sum4(ctx.pool());
+    const int32_t * src1_q8sum4_d = nullptr;
+    {
+        const int device = ggml_cuda_get_device();
+        const int cc = ggml_cuda_info().devices[device].cc;
+        const int warp_size = ggml_cuda_info().devices[device].warp_size;
+        if (ggml_cuda_rdna3_mmvq_dot4_wants_q8sum4(src0->type, cc, warp_size, ncols_dst, ids_d != nullptr, ne00, ne01)) {
+            const int64_t n_q8_blocks_total = ne13*ne12 * ne11*(ne10_padded / QK8_1);
+            src1_q8sum4_d = src1_q8sum4.alloc(4*n_q8_blocks_total);
+            ggml_cuda_rdna3_q8_1_sum4_precompute(src1_q8_1.get(), src1_q8sum4.get(), n_q8_blocks_total, stream);
+        }
+    }
+
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
-        ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+        ne03,              ne3,           s03, s13,              s3,               src1_q8sum4_d, ids_stride, stream);
 }
 
 void ggml_cuda_op_mul_mat_vec_q(
@@ -1152,10 +2049,14 @@ void ggml_cuda_op_mul_mat_vec_q(
     const int stride_row_x = ne00 / ggml_blck_size(src0->type);
     const int stride_col_y = src1_padded_row_size / QK8_1;
 
+    const int cc = ggml_cuda_info().devices[id].cc;
+    const int warp_size = ggml_cuda_info().devices[id].warp_size;
+    ggml_cuda_dp16_trace_mmvq_decode_plan(src0, src1, dst, ne00, row_diff, src1_ncols, cc, warp_size, false, false);
+
     ggml_cuda_mm_fusion_args_device fusion_local{};
     mul_mat_vec_q_switch_type(
         src0_dd_i, src0->type, src1_ddq_i, nullptr, fusion_local, dst_dd_i, ne00, row_diff, src1_ncols, stride_row_x, stride_col_y, nrows_dst,
-        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, stream);
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, nullptr, 0, stream);
 
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
 }

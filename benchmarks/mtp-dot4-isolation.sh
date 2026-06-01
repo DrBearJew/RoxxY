@@ -8,6 +8,7 @@ OUT_DIR=${OUT_DIR:-/tmp/mtp-dot4-isolation}
 PROMPT=${PROMPT:-The capital of France is}
 N_PREDICT=${N_PREDICT:-8}
 BASE_PORT=${BASE_PORT:-18400}
+MTP_KV_ARGS=${MTP_KV_ARGS:---cache-type-v q4_0 --spec-draft-type-v q4_0}
 
 mkdir -p "$OUT_DIR"
 cd "$ROOT"
@@ -28,7 +29,7 @@ run_case() {
   env LLAMA_MTP_VALIDATE_INPUTS=1 LLAMA_MTP_TEACHER_PROBE=1 LLAMA_MTP_FA_ROUTE=1 COMPRESSED_KV_FATTN_LOG=1 $extra_env "$BIN" \
     --device ROCm0 \
     -m "$MODEL" \
-    --flash-attn on --cache-type-k f16 --cache-type-v f16 \
+    --flash-attn on $MTP_KV_ARGS \
     --ctx-size 1024 --batch-size 128 --ubatch-size 128 \
     --spec-type draft-mtp --spec-draft-n-max 1 --spec-draft-p-min 0 \
     --parallel 1 --no-warmup --port "$port" > "$log" 2>&1 &
@@ -102,8 +103,8 @@ if [[ "${STRICT_ROUTES:-0}" == 1 ]]; then
   require_route mtp-verify-dot4-recthist 'fa_instruction=mtp_verify_qk.*selected=rocm_q8k_dot4_kq|fa_final_select: inst=mtp_verify_qk selected=rocm_q8k_dot4_kq'
   require_route mtp-draft-decode-dot4 'fa_instruction=mtp_draft_decode_qk.*selected=rocm_q8k_dot4_kq|fa_final_select: inst=mtp_draft_decode_qk selected=rocm_q8k_dot4_kq'
   if [[ "${RUN_MTP_PACKED16_MMQ:-0}" == 1 ]]; then
-    require_route mtp-verify-packed16-mmq 'fa_final_select: inst=mtp_verify_qk selected=rocm_packed16_dot4_mmq .*K=i32 V=f16'
-    require_route mtp-verify-packed16-mmq 'PDMQ QK probe PASSED'
+    require_route mtp-verify-packed16-mmq 'fa_final_select: inst=mtp_verify_qk selected=rocm_packed16_dot4_mmq .*K=i32 V=q4_0'
+    require_route mtp-verify-packed16-mmq 'PDMQ2 route=rocm_packed16_dot4_mmq .*K=i32 V=q4_0'
   fi
   exit "$status"
 fi

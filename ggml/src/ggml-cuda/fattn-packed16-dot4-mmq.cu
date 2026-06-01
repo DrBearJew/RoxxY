@@ -38,6 +38,10 @@
 #include <float.h>
 #include <math.h>
 
+// Heavy ggml FlashAttention route implementation. This is intentionally kept in
+// this .cu so fattn.cu only includes the small declaration header.
+#include "fattn-packed16-dot4-mmq-impl.cuh"
+
 #if defined(__HIP_PLATFORM_AMD__) || defined(GGML_USE_HIP)
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -352,7 +356,7 @@ static __device__ __forceinline__ int dot4_mmq_dot4_i8_i8(
         acc,
         false);
 
-#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 610)
+#elif !defined(__HIP_PLATFORM_AMD__) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 610)
 
     return __dp4a(q_word, k_word, acc);
 

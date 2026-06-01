@@ -14,6 +14,7 @@ SPEC_DRAFT_N_MAX=${SPEC_DRAFT_N_MAX:-3}
 SPEC_DRAFT_P_MIN=${SPEC_DRAFT_P_MIN:-0}
 BASE_PORT=${BASE_PORT:-18820}
 ROUTES=${ROUTES:-"source-dot4 packed16-mmq"}
+MTP_KV_ARGS=${MTP_KV_ARGS:---cache-type-v q4_0 --spec-draft-type-v q4_0}
 
 mkdir -p "$OUT_DIR"
 cd "$ROOT"
@@ -40,7 +41,7 @@ run_case() {
     "$BIN" \
       --device ROCm0 \
       -m "$MODEL" \
-      --flash-attn on --cache-type-k f16 --cache-type-v f16 \
+      --flash-attn on $MTP_KV_ARGS \
       --ctx-size "$CTX_SIZE" --batch-size "$BATCH_SIZE" --ubatch-size "$UBATCH_SIZE" \
       --spec-type draft-mtp --spec-draft-n-max "$SPEC_DRAFT_N_MAX" --spec-draft-p-min "$SPEC_DRAFT_P_MIN" \
       --parallel 1 --no-warmup --port "$port" > "$log" 2>&1 &

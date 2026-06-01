@@ -241,6 +241,7 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
 endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
+llama_build(test-dp16-packed16-mmvq.cpp)
 
 # DOT4 correctness harness
 add_executable(test-dot4-harness test-dot4-harness.cpp)

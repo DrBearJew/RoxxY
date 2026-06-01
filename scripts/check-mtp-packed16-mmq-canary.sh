@@ -11,6 +11,7 @@ cd "$ROOT"
 
 STRICT_ROUTES=1 \
 RUN_MTP_PACKED16_MMQ=1 \
+MTP_KV_ARGS="--cache-type-v q4_0 --spec-draft-type-v q4_0" \
 OUT_DIR="$OUT_DIR" \
 BASE_PORT="$BASE_PORT" \
 N_PREDICT="$N_PREDICT" \
@@ -50,9 +51,12 @@ if d1.get("generated", 0) <= 0 or d1.get("accepted", 0) <= 0:
     failures.append(f"d1={d1_s}")
 
 log = log_path.read_text(errors="replace")
-mtp_mmq = re.findall(r"fa_final_select: inst=mtp_verify_qk selected=rocm_packed16_dot4_mmq nq=(\d+) nk=(\d+) d=(\d+) K=i32 V=f16", log)
+mtp_mmq = re.findall(r"fa_final_select: inst=mtp_verify_qk selected=rocm_packed16_dot4_mmq nq=(\d+) nk=(\d+) d=(\d+) K=i32 V=q4_0", log)
+pdmq2_mmq = re.findall(r"PDMQ2 route=rocm_packed16_dot4_mmq .*K=i32 V=q4_0", log)
 if not mtp_mmq:
-    failures.append("missing mtp_verify_qk rocm_packed16_dot4_mmq K=i32 V=f16 selection")
+    failures.append("missing mtp_verify_qk rocm_packed16_dot4_mmq K=i32 V=q4_0 selection")
+if not pdmq2_mmq:
+    failures.append("missing PDMQ2 rocm_packed16_dot4_mmq K=i32 V=q4_0 evidence")
 else:
     nqs = {int(m[0]) for m in mtp_mmq}
     if not (nqs & {2, 4}):

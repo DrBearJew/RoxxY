@@ -2652,6 +2652,33 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
         if (!(Q->type == GGML_TYPE_F32 && ggml_cuda_packed16_dot4_mmq_v_supported(V->type) && dst->type == GGML_TYPE_F32 &&
               k_shape_ok && v_shape_ok && K->ne[1] > 0 && head_ok)) {
+            if (dp16_trace_enabled()) {
+                dp16_problem dp_problem = dp16_problem_init(DP16_OP_FA_QKPV);
+                dp_problem.m = Q->ne[1];
+                dp_problem.n = K->ne[1];
+                dp_problem.k = Q->ne[0];
+                dp_problem.batch = Q->ne[3];
+                dp_problem.heads_q = Q->ne[2];
+                dp_problem.heads_kv = K->ne[2];
+                dp_problem.head_dim = Q->ne[0];
+                dp_problem.src0_type = Q->type;
+                dp_problem.src1_type = K->type;
+                dp_problem.src2_type = V->type;
+                dp_problem.dst_type = dst->type;
+                dp_problem.is_decode = Q->ne[1] == 1;
+                dp_problem.cc = cc;
+                dp_problem.a = dp16_operand_desc_from_type(DP16_OPERAND_ACTIVATION, DP16_STORAGE_TRANSIENT_TILE,
+                        Q->type, Q->ne[1], Q->ne[0], Q->nb[1], Q->nb[0]);
+                dp_problem.b = dp16_operand_desc_from_type(DP16_OPERAND_K_CACHE, DP16_STORAGE_PERSISTENT_CACHE,
+                        K->type, K->ne[1], Q->ne[0], K->nb[1], K->nb[0]);
+                dp_problem.v = dp16_operand_desc_from_type(DP16_OPERAND_V_CACHE, DP16_STORAGE_PERSISTENT_CACHE,
+                        V->type, V->ne[1], V->ne[0], V->nb[1], V->nb[0]);
+                dp_problem.dst = dp16_operand_desc_from_type(DP16_OPERAND_OUTPUT, DP16_STORAGE_OUTPUT,
+                        dst->type, dst->ne[1], dst->ne[0], dst->nb[1], dst->nb[0]);
+                const dp16_reject_reason dp16_reason = (!k_shape_ok || !v_shape_ok || Q->ne[0] != 256) ?
+                    DP16_REJECT_K_NOT_ALIGNED : DP16_REJECT_TYPE_UNSUPPORTED;
+                dp16_trace_emit_reject(dp_problem, dp16_reason, "rocm_packed16_dot4_mmq");
+            }
             // Log why I32 K was rejected so we can debug shape mismatches.
             static bool i32_reject_printed = false;
             if (!i32_reject_printed) {
