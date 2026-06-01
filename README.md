@@ -10,7 +10,7 @@ values, while f16 scales remain separate.
 
 ---
 
-## PROPER STARTING OPTIONS — I32/DOT4 FlashAttention
+## PROPER STARTING OPTIONS — I32 packed16 FlashAttention
 
 For this branch's RDNA3 FlashAttention work, **K is the packed16/I32 route**.
 Do **not** pass a K cache-type flag for this path. In particular, do not use
@@ -61,13 +61,14 @@ packed16-K + q8-V is about 17 bits per K+V pair.
 `tbq4_0` is no longer a proper starting option. Treat it, plus `planar3_0` and
 `iso3_0`, as legacy/experimental V-format research only.
 
-Expected route evidence:
+Expected route evidence for normal long prefill is the packed16/I32 family, usually the production auto PWMMA prefill route on target Qwen shapes:
 
 ```text
-selected=rocm_packed16_dot4_mmq K=i32 V=<value-type>
+selected=pwmma_bm32_regout_directv ... K=I32 V=<value-type>
+FATTN COMPUTE SELECT selected=... name=rocm_packed16_wmma_tile
 ```
 
-If the log says K is q8_0 for FlashAttention, you are not validating this path.
+`rocm_packed16_dot4_mmq`/`PDMQ2 ... K=i32 V=<value-type>` remains the DOT4-MMQ/PDMQ route for small-Q/MTP validation, experimental V formats, and CI/canary route assertions. If the log says K is q8_0 for FlashAttention, you are not validating this packed16/I32 path.
 
 ### Fast WikiText quality smoke
 
@@ -149,8 +150,7 @@ Benchmark prefill:
   -fa 1 -ngl 99 -p 512 -n 1
 ```
 
-On the benchmark system used for the results below, this was approximately
-**2628 tok/s** for 35B pp512 on the default packed16 route.
+On the benchmark system used for the results below, this is expected to use the automatic PWMMA BM32 reg-out direct-V packed16 route for target Qwen shapes; historical 35B pp512 measurements were around **2700 tok/s** on that route.
 
 ---
 
@@ -163,14 +163,14 @@ and compiler versions when rerunning these numbers.
 
 | Model | Route | pp512 | pp1024 | pp2048 | pp4096 |
 |---|---|---:|---:|---:|---:|
-| 35B | DOT4-MMQ GQA1, default | 2628 | 2541 | 2320 | 2050 |
+| 35B | DOT4-MMQ GQA1, historical/pinned | 2628 | 2541 | 2320 | 2050 |
 | 35B | DOT4-MMQ KSHARED, opt-in | 2649 | 2533 | — | — |
-| 35B | PWMMA BM32 reg-out direct-V | **2707** | **2633** | — | 2569* |
+| 35B | PWMMA BM32 reg-out direct-V, production auto | **2707** | **2633** | — | 2569* |
 | 35B | PWMMA BM16 | 2590 | 2394 | — | — |
 | 35B | PWMMA BM64 512t | 2612 | 2578 | — | — |
-| 27B | DOT4-MMQ GQA1, default | 894 | — | — | — |
+| 27B | DOT4-MMQ GQA1, historical/pinned | 894 | — | — | — |
 | 27B | DOT4-MMQ KSHARED, opt-in | 905 | — | — | — |
-| 27B | PWMMA BM32 reg-out direct-V | **929** | — | — | — |
+| 27B | PWMMA BM32 reg-out direct-V, production auto | **929** | — | — | — |
 | 27B | PWMMA BM64 512t | 922 | — | — | — |
 
 \* pp1024+ configuration.
@@ -186,9 +186,9 @@ Decode uses DOT4 decode kernels, not the prefill WMMA kernels.
 
 ### What these numbers show
 
-- DOT4-MMQ is the production default packed16 prefill route.
-- PWMMA BM32 reg-out direct-V is the fastest measured prefill route on the
-  listed workloads: +3.0% over DOT4-MMQ on 35B pp512 and +3.9% on 27B pp512.
+- PWMMA BM32 reg-out direct-V is the production auto packed16 prefill route for the listed target Qwen shapes once `pp/nk >= 512`.
+- DOT4-MMQ/PDMQ remains available for route-pinned validation, small-Q/MTP roles, and experimental V formats.
+- PWMMA BM32 reg-out direct-V is the fastest measured prefill route on the listed workloads: +3.0% over DOT4-MMQ on 35B pp512 and +3.9% on 27B pp512.
 - A clean upstream q8_0 VEC FA baseline table is still TODO; current tables
   compare the packed16 route family and measured variants.
 

@@ -547,6 +547,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     idx, (int) id, (int) top_id[0], p_top1, margin, top_val[0], (int) top_id[1], top_val[1]);
         }
 
+        if (getenv("LLAMA_MTP_TOPK_TRACE")) {
+            fprintf(stderr, "MTP_TOPK_TRACE: idx=%d sampled=%d", idx, (int) id);
+            for (int k = 0; k < k_conf && top_id[k] != LLAMA_TOKEN_NULL; ++k) {
+                fprintf(stderr, " %d:%.8g", (int) top_id[k], top_val[k]);
+            }
+            fprintf(stderr, "\n");
+        }
+
         return id == top_id[0] ? p_top1 : 0.0f;
     }
 

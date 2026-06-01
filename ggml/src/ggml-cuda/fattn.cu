@@ -401,18 +401,26 @@ static int32_t ggml_cuda_fattn_get_instruction(const ggml_tensor * dst) {
 }
 
 // PR3: f16-source K op-local materialization.
-// When enabled, MTP_VERIFY_QK + source K=f16 will quantize K into a
-// temporary packed16 representation inside the DOT4 launch path, without
-// altering the persistent MTP KV cache.
-//
-// Legal K representations for DOT4 recthist:
-//   - persistent packed16 I32
-//   - q8_0/q4_0
-//   - source f16 materialized op-locally into packed16
+// This route quantizes source K=f16 into a temporary packed16 representation
+// inside the DOT4 launch path. It preserves the persistent MTP KV cache, but
+// MTP draft-logit A/B showed it changes top-1 badly enough to cause zero
+// draft acceptance. Keep it behind an explicit unsafe lab gate until a quality-safe
+// MTP attention fastpath exists.
+static bool ggml_cuda_mtp_source_f16_dot4_unsafe_enabled() {
+#ifdef GGML_USE_HIP
+    const char * env = getenv("GGML_CUDA_ROCM_MTP_SOURCE_F16_DOT4_UNSAFE");
+    return env && atoi(env) != 0;
+#else
+    return false;
+#endif
+}
+
+// When enabled with the unsafe gate, MTP_VERIFY_QK + source K=f16 will quantize
+// K into a temporary packed16 representation inside the DOT4 launch path.
 static bool ggml_cuda_mtp_verify_f16k_dot4_adapter_enabled() {
 #ifdef GGML_USE_HIP
     const char * env = getenv("GGML_CUDA_ROCM_MTP_VERIFY_F16K_DOT4_ADAPTER");
-    return env && atoi(env) != 0;
+    return env && atoi(env) != 0 && ggml_cuda_mtp_source_f16_dot4_unsafe_enabled();
 #else
     return false;
 #endif
@@ -2334,6 +2342,14 @@ static bool ggml_cuda_mtp_draft_dot4_decode_supported(
         V->type == GGML_TYPE_Q4_0 &&
         K->ne[0] == Q->ne[0];
 
+    // The source-f16 -> op-local packed16 DOT4 adapter is intentionally unsafe
+    // for MTP draft decode: it was measured to change top-1 logits and produce
+    // zero acceptance. Keep it lab-only instead of silently selecting it when the
+    // generic DOT4 env knobs are set.
+    if (source_f16_k && !ggml_cuda_mtp_source_f16_dot4_unsafe_enabled()) {
+        return false;
+    }
+
     return Q->ne[0] == 256 &&
            V->ne[0] == Q->ne[0] &&
            v_ok &&
@@ -2432,13 +2448,16 @@ static best_fattn_kernel ggml_cuda_select_mtp_draft_decode_fattn(
     {
         const bool dot4_env = ggml_cuda_q8k_dot4_kq_enabled();
         const bool decode_env = ggml_cuda_mtp_draft_dot4_decode_enabled();
+        const bool source_f16_k_candidate = K->type == GGML_TYPE_F16 && K->ne[0] == Q->ne[0];
+        const bool source_f16_unsafe = ggml_cuda_mtp_source_f16_dot4_unsafe_enabled();
         const bool shapes_ok = (Q->ne[0] == 256 && V->ne[0] == Q->ne[0] &&
                                  K->ne[0] == Q->ne[0]);
 
-        const char * status = !dot4_env            ? "env_disabled"
-                            : !decode_env         ? "decode_env_disabled"
-                            : !shapes_ok          ? "shape_or_device_reject"
-                            :                        "missing_legal_k_representation";
+        const char * status = !dot4_env                                      ? "env_disabled"
+                            : !decode_env                                   ? "decode_env_disabled"
+                            : source_f16_k_candidate && !source_f16_unsafe  ? "source_f16_dot4_unsafe_disabled"
+                            : !shapes_ok                                    ? "shape_or_device_reject"
+                            :                                                  "missing_legal_k_representation";
         log_decode(status, BEST_FATTN_KERNEL_NONE, "none");
     }
 
@@ -2766,7 +2785,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         const bool mtp_packed16_experiment = mtp_disable_p16_env && atoi(mtp_disable_p16_env) == 0;
         const bool prefill_or_verify =
             Q->ne[1] > 1 &&
-            (inst == GGML_FATTN_INST_PREFILL_QK ||
+            (inst == GGML_FATTN_INST_NONE ||
+             inst == GGML_FATTN_INST_PREFILL_QK ||
              inst == GGML_FATTN_INST_SPEC_VERIFY_QK ||
              inst == GGML_FATTN_INST_BATCH_VERIFY_QK ||
              (mtp_packed16_experiment && inst == GGML_FATTN_INST_MTP_VERIFY_QK));
@@ -2783,8 +2803,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_Q8K_DOT4_KQ;
         }
 
-        // nq > 1 prefill/verify: DOT4-MMQ is first priority (fastest packed16 path).
-        // PWMMA BM32 is preferred fallback. DOT4_KQ is last resort.
+        // nq > 1 prefill/verify:
+        // - PDMQ/DOT4-MMQ remains the small-Q, forced-route, and experimental-V path.
+        // - PWMMA BM32 reg-out direct-V is the production prefill path once the
+        //   prompt is large enough to amortize its setup work.
+        // - DOT4_KQ is the last resort.
         const bool auto_verbose =
             (getenv("GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE") && atoi(getenv("GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE"))) ||
             (getenv("COMPRESSED_KV_FATTN_LOG") && atoi(getenv("COMPRESSED_KV_FATTN_LOG")));
@@ -2804,12 +2827,17 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                     strcmp(explicit_impl, "bm64_regout_directv") == 0 ||
                     strcmp(explicit_impl, "bm64_regout_stagev") == 0);
             const bool impl_auto = (!explicit_impl || !*explicit_impl || strcmp(explicit_impl, "smem") == 0);
-            // 27B-like shape: gqa_ratio=6, heads_q=24, heads_k=4
-            const bool is_27b_like = (gqa_ratio == 6 && K->ne[1] >= 1024);
-            // 35B-like or general: nk >= 1024 (context length, not query chunk size)
+            // Qwen 27B-like shape: gqa_ratio=6, heads_q=24, heads_k=4.
+            // Qwen 35B-like shape: gqa_ratio=8, heads_q=16, heads_k=2.
+            // A/B showed BM32 reg-out direct-V already wins at pp512 for these
+            // target shapes; do not leave pp512 on the underfilled PDMQ prefill path.
+            const bool is_27b_like = (gqa_ratio == 6 && K->ne[1] >= 512);
+            const bool is_35b_like = (gqa_ratio == 8 && K->ne[1] >= 512);
+            // General/unknown shapes keep the more conservative threshold at
+            // nk >= 1024 (context length, not query chunk size).
             const bool is_long_context = (K->ne[1] >= 1024);
             const bool wmma_available = wmma_sup;
-            const bool use_bm32_regout = !v_requires_dot4_mmq && impl_auto && wmma_available && (is_27b_like || is_long_context);
+            const bool use_bm32_regout = !v_requires_dot4_mmq && impl_auto && wmma_available && (is_27b_like || is_35b_like || is_long_context);
 
             // Once we auto-select WMMA for long context, keep using it for
             // subsequent calls (IMPL is already set to bm32_regout_directv).
