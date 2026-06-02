@@ -242,6 +242,14 @@ endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
 llama_build(test-dp16-packed16-mmvq.cpp)
+add_custom_target(test-fattn-mtp-graph-race
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test-fattn-mtp-graph-race.py
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    VERBATIM)
+add_custom_target(test-fattn-mtp-hip-replay
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test-fattn-mtp-hip-replay.py --mode dry-run
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    VERBATIM)
 
 # DOT4 correctness harness
 add_executable(test-dot4-harness test-dot4-harness.cpp)

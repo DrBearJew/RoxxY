@@ -8,6 +8,9 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <unordered_map>
 
@@ -747,6 +750,46 @@ static inline bool ggml_cuda_dp16_ensure_packed16_weight(
     return true;
 }
 
+static inline bool ggml_cuda_dp16_get_packed16_weight_if_ready(
+        const ggml_tensor * src0,
+        dp16_packed16_weight_view * out) {
+    if (out) {
+        *out = {};
+    }
+    if (!src0 || !out) {
+        return false;
+    }
+
+    ggml_cuda_dp16_packed16_weight_cache_key key = {};
+    if (!ggml_cuda_dp16_make_packed16_weight_cache_key(src0, &key)) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(ggml_cuda_dp16_packed16_weight_cache_mutex());
+    auto & cache = ggml_cuda_dp16_packed16_weight_cache();
+    auto it = cache.find(key);
+    if (it == cache.end() || !it->second.ready_recorded || !it->second.ready) {
+        return false;
+    }
+
+#if defined(GGML_USE_HIP)
+    const hipError_t err = hipEventQuery(it->second.ready);
+    if (err == hipErrorNotReady) {
+        return false;
+    }
+    CUDA_CHECK(err);
+#else
+    const cudaError_t err = cudaEventQuery(it->second.ready);
+    if (err == cudaErrorNotReady) {
+        return false;
+    }
+    CUDA_CHECK(err);
+#endif
+
+    *out = it->second.view;
+    return true;
+}
+
 static inline dp16_problem ggml_cuda_dp16_mmvq_problem_init(
         const ggml_tensor * src0,
         const ggml_tensor * src1,
@@ -756,6 +799,7 @@ static inline dp16_problem ggml_cuda_dp16_mmvq_problem_init(
         const int64_t ncols_dst,
         const int cc,
         const bool has_fusion,
+        const bool fusion_x_bias_only,
         const bool has_ids) {
     dp16_problem problem = dp16_problem_init(DP16_OP_DECODE_PROJ_GEMV);
     problem.m = nrows_x;
@@ -770,8 +814,9 @@ static inline dp16_problem ggml_cuda_dp16_mmvq_problem_init(
     problem.src1_type = GGML_TYPE_Q8_1;
     problem.src2_type = GGML_TYPE_COUNT;
     problem.dst_type = dst ? dst->type : GGML_TYPE_COUNT;
-    problem.is_decode = ncols_dst <= 4;
+    problem.is_decode = ncols_dst <= dp16_mmvq_packed16_runtime_max_n();
     problem.has_fusion = has_fusion;
+    problem.fusion_x_bias_only = fusion_x_bias_only;
     problem.has_ids = has_ids;
     problem.cc = cc;
 
@@ -817,9 +862,499 @@ static inline bool ggml_cuda_dp16_route_require_any_mmvq() {
         ggml_cuda_dp16_route_require_q4_0_packed16_mmvq();
 }
 
+static thread_local bool g_ggml_cuda_dp16_mmvq_mtp_q8_dot4_scope = false;
+static thread_local const char * g_ggml_cuda_dp16_mmvq_mtp_q8_dot4_tensor_name = nullptr;
+
+struct ggml_cuda_dp16_mmvq_mtp_q8_dot4_scope_guard {
+    bool old;
+    const char * old_tensor_name;
+    ggml_cuda_dp16_mmvq_mtp_q8_dot4_scope_guard(const bool enabled, const char * tensor_name)
+        : old(g_ggml_cuda_dp16_mmvq_mtp_q8_dot4_scope),
+          old_tensor_name(g_ggml_cuda_dp16_mmvq_mtp_q8_dot4_tensor_name) {
+        g_ggml_cuda_dp16_mmvq_mtp_q8_dot4_scope = enabled;
+        g_ggml_cuda_dp16_mmvq_mtp_q8_dot4_tensor_name = enabled ? tensor_name : nullptr;
+    }
+    ~ggml_cuda_dp16_mmvq_mtp_q8_dot4_scope_guard() {
+        g_ggml_cuda_dp16_mmvq_mtp_q8_dot4_scope = old;
+        g_ggml_cuda_dp16_mmvq_mtp_q8_dot4_tensor_name = old_tensor_name;
+    }
+};
+
+static inline bool ggml_cuda_mtp_q8_dot4_mmvq_env_enabled() {
+    const char * enabled = getenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ");
+    return enabled && atoi(enabled) != 0;
+}
+
+static inline bool ggml_cuda_mtp_q8_dot4_mmvq_log_enabled() {
+    const char * enabled = getenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_LOG");
+    return (enabled && atoi(enabled) != 0) || dp16_trace_enabled();
+}
+
+static inline void ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(
+        const char * func,
+        const char * route,
+        const ggml_tensor * tensor,
+        const char * reject,
+        const int ncols_x,
+        const int nrows_x,
+        const int ncols_dst,
+        const bool has_fusion,
+        const bool has_ids) {
+    if (!ggml_cuda_mtp_q8_dot4_mmvq_log_enabled()) {
+        return;
+    }
+    GGML_LOG_INFO("%s: mtp_weight_route route=%s tensor=%s status=reject reject=%s ncols_x=%d nrows_x=%d ncols_dst=%d fusion=%d ids=%d\n",
+            func, route, tensor ? tensor->name : "-", reject,
+            ncols_x, nrows_x, ncols_dst, has_fusion ? 1 : 0, has_ids ? 1 : 0);
+}
+
+static inline void ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject_capture(
+        const char * func,
+        const char * route,
+        const ggml_tensor * tensor,
+        const char * reject,
+        const int ncols_x,
+        const int nrows_x,
+        const int ncols_dst,
+        const bool has_fusion,
+        const bool has_ids) {
+    if (!ggml_cuda_mtp_q8_dot4_mmvq_log_enabled()) {
+        return;
+    }
+    GGML_LOG_INFO("%s: mtp_weight_route route=%s tensor=%s status=reject reject=%s capture=1 ncols_x=%d nrows_x=%d ncols_dst=%d fusion=%d ids=%d\n",
+            func, route, tensor ? tensor->name : "-", reject,
+            ncols_x, nrows_x, ncols_dst, has_fusion ? 1 : 0, has_ids ? 1 : 0);
+}
+
+static inline bool ggml_cuda_mtp_q8_dot4_mmvq_packed_glu_enabled() {
+    const char * enabled = getenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_PACKED_GLU");
+    return ggml_cuda_mtp_q8_dot4_mmvq_env_enabled() && enabled && atoi(enabled) != 0;
+}
+
+static inline bool ggml_cuda_mtp_q8_dot4_mmvq_packed_eh_enabled() {
+    const char * enabled = getenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_PACKED_EH");
+    return ggml_cuda_mtp_q8_dot4_mmvq_env_enabled() && enabled && atoi(enabled) != 0;
+}
+
+static inline bool ggml_cuda_mtp_q8_dot4_mmvq_packed_down_enabled() {
+    const char * enabled = getenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_PACKED_DOWN");
+    return ggml_cuda_mtp_q8_dot4_mmvq_env_enabled() && enabled && atoi(enabled) != 0;
+}
+
+static inline bool ggml_cuda_mtp_q8_dot4_mmvq_packed_qkv_enabled() {
+    const char * enabled = getenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_PACKED_QKV");
+    return ggml_cuda_mtp_q8_dot4_mmvq_env_enabled() && enabled && atoi(enabled) != 0;
+}
+
+static inline bool ggml_cuda_mtp_q8_dot4_mmvq_packed_attn_out_enabled() {
+    const char * enabled = getenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_PACKED_ATTN_OUT");
+    return ggml_cuda_mtp_q8_dot4_mmvq_env_enabled() && enabled && atoi(enabled) != 0;
+}
+
+static inline bool ggml_cuda_mtp_q8_dot4_mmvq_stream_is_capturing(cudaStream_t stream) {
+#if defined(GGML_USE_HIP)
+    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+    CUDA_CHECK(hipStreamIsCapturing(stream, &capture_status));
+    return capture_status != hipStreamCaptureStatusNone;
+#else
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+    return capture_status != cudaStreamCaptureStatusNone;
+#endif
+}
+
+enum ggml_cuda_mtp_q8_dot4_mmvq_profile_route_id {
+    GGML_CUDA_MTP_Q8_DOT4_MMVQ_PROFILE_GLU = 0,
+    GGML_CUDA_MTP_Q8_DOT4_MMVQ_PROFILE_EH,
+    GGML_CUDA_MTP_Q8_DOT4_MMVQ_PROFILE_QKV,
+    GGML_CUDA_MTP_Q8_DOT4_MMVQ_PROFILE_ATTN_OUT,
+    GGML_CUDA_MTP_Q8_DOT4_MMVQ_PROFILE_DOWN,
+    GGML_CUDA_MTP_Q8_DOT4_MMVQ_PROFILE_COUNT,
+};
+
+struct ggml_cuda_mtp_q8_dot4_mmvq_profile_stat {
+    uint64_t count = 0;
+    double total_ms = 0.0;
+    float max_ms = 0.0f;
+};
+
+static std::mutex & ggml_cuda_mtp_q8_dot4_mmvq_profile_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+static ggml_cuda_mtp_q8_dot4_mmvq_profile_stat * ggml_cuda_mtp_q8_dot4_mmvq_profile_stats() {
+    static ggml_cuda_mtp_q8_dot4_mmvq_profile_stat stats[GGML_CUDA_MTP_Q8_DOT4_MMVQ_PROFILE_COUNT];
+    return stats;
+}
+
+static inline bool ggml_cuda_mtp_q8_dot4_mmvq_profile_enabled() {
+    const char * enabled = getenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_PROFILE");
+    return enabled && atoi(enabled) != 0;
+}
+
+static inline int ggml_cuda_mtp_q8_dot4_mmvq_profile_every() {
+    const char * every = getenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_PROFILE_EVERY");
+    if (!every || every[0] == '\0') {
+        return 1;
+    }
+    const int value = atoi(every);
+    return value > 0 ? value : 1;
+}
+
+static inline void ggml_cuda_mtp_q8_dot4_mmvq_profile_record(
+        const ggml_cuda_mtp_q8_dot4_mmvq_profile_route_id route_id,
+        const char * route,
+        const char * tensor,
+        const int64_t ncols_x,
+        const int64_t nrows_x,
+        const int64_t ncols_dst,
+        const bool has_fusion,
+        const float elapsed_ms) {
+    uint64_t count = 0;
+    double total_ms = 0.0;
+    float max_ms = 0.0f;
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_mtp_q8_dot4_mmvq_profile_mutex());
+        ggml_cuda_mtp_q8_dot4_mmvq_profile_stat & stat = ggml_cuda_mtp_q8_dot4_mmvq_profile_stats()[route_id];
+        stat.count++;
+        stat.total_ms += (double) elapsed_ms;
+        if (elapsed_ms > stat.max_ms) {
+            stat.max_ms = elapsed_ms;
+        }
+        count = stat.count;
+        total_ms = stat.total_ms;
+        max_ms = stat.max_ms;
+    }
+
+    const int every = ggml_cuda_mtp_q8_dot4_mmvq_profile_every();
+    if (count <= 4 || (every > 0 && (count % (uint64_t) every) == 0)) {
+        const double avg_ms = count > 0 ? total_ms / (double) count : 0.0;
+        GGML_LOG_INFO("%s: mtp_weight_timing route=%s tensor=%s status=measured count=%llu last_ms=%.6f avg_ms=%.6f total_ms=%.6f max_ms=%.6f ncols_x=%lld nrows_x=%lld ncols_dst=%lld fusion=%d\n",
+                __func__, route ? route : "-", tensor ? tensor : "-",
+                (unsigned long long) count, (double) elapsed_ms, avg_ms, total_ms, (double) max_ms,
+                (long long) ncols_x, (long long) nrows_x, (long long) ncols_dst, has_fusion ? 1 : 0);
+    }
+}
+
+template <typename TryLaunch>
+static inline bool ggml_cuda_mtp_q8_dot4_mmvq_profiled_try_launch(
+        const bool profile_candidate,
+        const ggml_cuda_mtp_q8_dot4_mmvq_profile_route_id route_id,
+        const char * route,
+        const char * tensor,
+        const int64_t ncols_x,
+        const int64_t nrows_x,
+        const int64_t ncols_dst,
+        const bool has_fusion,
+        cudaStream_t stream,
+        const TryLaunch & try_launch) {
+    if (!profile_candidate || !ggml_cuda_mtp_q8_dot4_mmvq_profile_enabled() ||
+            ggml_cuda_mtp_q8_dot4_mmvq_stream_is_capturing(stream)) {
+        return try_launch();
+    }
+
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop = nullptr;
+#if defined(GGML_USE_HIP)
+    CUDA_CHECK(hipEventCreate(&start));
+    CUDA_CHECK(hipEventCreate(&stop));
+#else
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+#endif
+    CUDA_CHECK(cudaEventRecord(start, stream));
+    const bool launched = try_launch();
+    if (!launched) {
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+        return false;
+    }
+    CUDA_CHECK(cudaEventRecord(stop, stream));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    float elapsed_ms = 0.0f;
+#if defined(GGML_USE_HIP)
+    CUDA_CHECK(hipEventElapsedTime(&elapsed_ms, start, stop));
+#else
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+#endif
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+
+    ggml_cuda_mtp_q8_dot4_mmvq_profile_record(route_id, route, tensor, ncols_x, nrows_x, ncols_dst, has_fusion, elapsed_ms);
+    return true;
+}
+
+static inline bool ggml_cuda_mtp_q8_dot4_mmvq_name_allowed(const char * name) {
+    if (!name || name[0] == '\0') {
+        return false;
+    }
+
+    if (const char * filter = getenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_FILTER")) {
+        if (filter[0] != '\0') {
+            return strstr(name, filter) != nullptr;
+        }
+    }
+
+    // Qwen3.5/3.6 MTP convention: the one NextN block is stored as the final
+    // block index.  Keep this opt-in path MTP-scoped by default instead of
+    // enabling q8 DOT4 MMVQ for every q8_0 trunk/expert weight.
+    const char * layer = getenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_LAYER");
+    char prefix[32];
+    snprintf(prefix, sizeof(prefix), "blk.%s.", (layer && layer[0] != '\0') ? layer : "64");
+    return strstr(name, prefix) == name && strstr(name, ".weight") != nullptr;
+}
+
+static inline bool ggml_cuda_mtp_q8_dot4_mmvq_tensor_allowed(const ggml_tensor * src0) {
+    return ggml_cuda_mtp_q8_dot4_mmvq_env_enabled() &&
+        src0 && src0->type == GGML_TYPE_Q8_0 &&
+        ggml_cuda_mtp_q8_dot4_mmvq_name_allowed(src0->name);
+}
+
+static inline bool ggml_cuda_mtp_q8_dot4_mmvq_packed_eh_tensor_allowed(const ggml_tensor * src0) {
+    return ggml_cuda_mtp_q8_dot4_mmvq_packed_eh_enabled() &&
+        src0 && src0->type == GGML_TYPE_Q8_0 && src0->name[0] != '\0' &&
+        strstr(src0->name, ".nextn.eh_proj.weight") != nullptr &&
+        ggml_cuda_mtp_q8_dot4_mmvq_name_allowed(src0->name);
+}
+
+static inline bool ggml_cuda_mtp_q8_dot4_mmvq_packed_down_tensor_allowed(const ggml_tensor * src0) {
+    return ggml_cuda_mtp_q8_dot4_mmvq_packed_down_enabled() &&
+        src0 && src0->type == GGML_TYPE_Q8_0 && src0->name[0] != '\0' &&
+        strstr(src0->name, ".ffn_down.weight") != nullptr &&
+        ggml_cuda_mtp_q8_dot4_mmvq_name_allowed(src0->name);
+}
+
+static inline bool ggml_cuda_mtp_q8_dot4_mmvq_packed_qkv_tensor_allowed(const ggml_tensor * src0) {
+    return ggml_cuda_mtp_q8_dot4_mmvq_packed_qkv_enabled() &&
+        src0 && src0->type == GGML_TYPE_Q8_0 && src0->name[0] != '\0' &&
+        (strstr(src0->name, ".attn_q.weight") != nullptr ||
+         strstr(src0->name, ".attn_k.weight") != nullptr ||
+         strstr(src0->name, ".attn_v.weight") != nullptr) &&
+        ggml_cuda_mtp_q8_dot4_mmvq_name_allowed(src0->name);
+}
+
+static inline bool ggml_cuda_mtp_q8_dot4_mmvq_packed_attn_out_tensor_allowed(const ggml_tensor * src0) {
+    return ggml_cuda_mtp_q8_dot4_mmvq_packed_attn_out_enabled() &&
+        src0 && src0->type == GGML_TYPE_Q8_0 && src0->name[0] != '\0' &&
+        strstr(src0->name, ".attn_output.weight") != nullptr &&
+        ggml_cuda_mtp_q8_dot4_mmvq_name_allowed(src0->name);
+}
+
+static inline bool ggml_cuda_mtp_q8_dot4_mmvq_packed_glu_tensors_allowed(
+        const ggml_tensor * up,
+        const ggml_tensor * gate) {
+    return ggml_cuda_mtp_q8_dot4_mmvq_packed_glu_enabled() &&
+        up && gate &&
+        up->type == GGML_TYPE_Q8_0 && gate->type == GGML_TYPE_Q8_0 &&
+        ggml_are_same_shape(up, gate) && ggml_are_same_stride(up, gate) &&
+        up->name[0] != '\0' && gate->name[0] != '\0' &&
+        strstr(up->name, ".ffn_up.weight") != nullptr &&
+        strstr(gate->name, ".ffn_gate.weight") != nullptr &&
+        ggml_cuda_mtp_q8_dot4_mmvq_name_allowed(up->name) &&
+        ggml_cuda_mtp_q8_dot4_mmvq_name_allowed(gate->name);
+}
+
+static inline bool ggml_cuda_mtp_q8_dot4_mmvq_qkv_reuse_act_enabled() {
+    const char * enabled = getenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_QKV_REUSE_ACT");
+    return ggml_cuda_mtp_q8_dot4_mmvq_packed_qkv_enabled() && enabled && atoi(enabled) != 0;
+}
+
+struct ggml_cuda_mtp_q8_dot4_mmvq_act_cache_key {
+    const void * data = nullptr;
+    int device = -1;
+    ggml_type type = GGML_TYPE_COUNT;
+    int64_t ne[4] = { 0, 0, 0, 0 };
+    size_t nb[4] = { 0, 0, 0, 0 };
+    int64_t ne0_padded = 0;
+
+    bool operator==(const ggml_cuda_mtp_q8_dot4_mmvq_act_cache_key & other) const {
+        return data == other.data && device == other.device && type == other.type && ne0_padded == other.ne0_padded &&
+            memcmp(ne, other.ne, sizeof(ne)) == 0 && memcmp(nb, other.nb, sizeof(nb)) == 0;
+    }
+};
+
+struct ggml_cuda_mtp_q8_dot4_mmvq_act_cache_state {
+    char * data = nullptr;
+    size_t bytes = 0;
+    bool has_key = false;
+    bool valid = false;
+    cudaStream_t writer_stream = nullptr;
+    ggml_cuda_mtp_q8_dot4_mmvq_act_cache_key key = {};
+
+    ~ggml_cuda_mtp_q8_dot4_mmvq_act_cache_state() {
+        if (data) {
+            if (key.device >= 0) {
+                ggml_cuda_set_device(key.device);
+            }
+            (void) cudaFree(data);
+            data = nullptr;
+        }
+    }
+};
+
+static thread_local ggml_cuda_mtp_q8_dot4_mmvq_act_cache_state g_ggml_cuda_mtp_q8_dot4_mmvq_act_cache;
+
+void ggml_cuda_mtp_q8_dot4_mmvq_act_cache_reset() {
+    g_ggml_cuda_mtp_q8_dot4_mmvq_act_cache.valid = false;
+    g_ggml_cuda_mtp_q8_dot4_mmvq_act_cache.writer_stream = nullptr;
+}
+
+static inline bool ggml_cuda_mtp_q8_dot4_mmvq_act_cache_make_key(
+        const ggml_tensor * src1,
+        const int64_t ne0_padded,
+        ggml_cuda_mtp_q8_dot4_mmvq_act_cache_key * out) {
+    if (!src1 || !out || src1->data == nullptr || ne0_padded <= 0) {
+        return false;
+    }
+
+    *out = {};
+    out->data = src1->data;
+    out->device = ggml_cuda_get_device();
+    out->type = src1->type;
+    out->ne0_padded = ne0_padded;
+    for (int i = 0; i < 4; ++i) {
+        out->ne[i] = src1->ne[i];
+        out->nb[i] = src1->nb[i];
+    }
+    return true;
+}
+
+static inline bool ggml_cuda_mtp_q8_dot4_mmvq_act_cache_try_get(
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const bool has_ids,
+        const int64_t ne0_padded,
+        const size_t bytes,
+        cudaStream_t stream,
+        char ** out,
+        bool * needs_quantize) {
+#if defined(GGML_USE_HIP)
+    if (out) {
+        *out = nullptr;
+    }
+    if (needs_quantize) {
+        *needs_quantize = false;
+    }
+    if (!out || !needs_quantize || has_ids || bytes == 0 ||
+            !ggml_cuda_mtp_q8_dot4_mmvq_qkv_reuse_act_enabled() ||
+            !ggml_cuda_mtp_q8_dot4_mmvq_packed_qkv_tensor_allowed(src0)) {
+        return false;
+    }
+
+    ggml_cuda_mtp_q8_dot4_mmvq_act_cache_key key = {};
+    if (!ggml_cuda_mtp_q8_dot4_mmvq_act_cache_make_key(src1, ne0_padded, &key)) {
+        return false;
+    }
+
+    ggml_cuda_mtp_q8_dot4_mmvq_act_cache_state & cache = g_ggml_cuda_mtp_q8_dot4_mmvq_act_cache;
+    const bool key_match = cache.has_key && cache.key == key;
+    const bool stream_is_capturing = ggml_cuda_mtp_q8_dot4_mmvq_stream_is_capturing(stream);
+    // Do not capture the TLS cache pointer into hipGraph: graph update tracking does
+    // not know about this internal allocation, so a later grow/free could leave an
+    // old graph exec with a stale pointer. Fall back to the existing per-node pool
+    // quantization path while capturing.
+    if (stream_is_capturing) {
+        if (ggml_cuda_mtp_q8_dot4_mmvq_log_enabled()) {
+            GGML_LOG_INFO("%s: mtp_weight_route route=rocm_mtp_i8_qkv_act_reuse tensor=%s status=reject reject=capture_cache_pointer_unstable bytes=%zu\n",
+                    __func__, src0 ? src0->name : "-", bytes);
+        }
+        return false;
+    }
+    if (!key_match) {
+        cache.valid = false;
+        cache.writer_stream = nullptr;
+        cache.has_key = true;
+        cache.key = key;
+    }
+
+    if (cache.valid && cache.writer_stream != stream) {
+        if (ggml_cuda_mtp_q8_dot4_mmvq_log_enabled()) {
+            GGML_LOG_INFO("%s: mtp_weight_route route=rocm_mtp_i8_qkv_act_reuse tensor=%s status=reject reject=cross_stream_unordered bytes=%zu\n",
+                    __func__, src0 ? src0->name : "-", bytes);
+        }
+        return false;
+    }
+
+    if (cache.bytes < bytes) {
+        if (cache.data) {
+            CUDA_CHECK(cudaFree(cache.data));
+            cache.data = nullptr;
+            cache.bytes = 0;
+        }
+        CUDA_CHECK(cudaMalloc((void **) &cache.data, bytes));
+        cache.bytes = bytes;
+        cache.valid = false;
+    }
+
+    if (!cache.data) {
+        return false;
+    }
+
+    *out = cache.data;
+    *needs_quantize = !cache.valid;
+    if (*needs_quantize) {
+        cache.writer_stream = stream;
+    }
+    if (ggml_cuda_mtp_q8_dot4_mmvq_log_enabled()) {
+        GGML_LOG_INFO("%s: mtp_weight_route route=rocm_mtp_i8_qkv_act_reuse tensor=%s status=%s capture=%d bytes=%zu\n",
+                __func__, src0 ? src0->name : "-", cache.valid ? "reuse" : "quantize", stream_is_capturing ? 1 : 0, bytes);
+    }
+    return true;
+#else
+    GGML_UNUSED_VARS(src0, src1, has_ids, ne0_padded, bytes, stream, out, needs_quantize);
+    return false;
+#endif
+}
+
+static inline void ggml_cuda_mtp_q8_dot4_mmvq_act_cache_mark_valid(const char * tensor_name) {
+#if defined(GGML_USE_HIP)
+    g_ggml_cuda_mtp_q8_dot4_mmvq_act_cache.valid = true;
+    if (ggml_cuda_mtp_q8_dot4_mmvq_log_enabled()) {
+        GGML_LOG_INFO("%s: mtp_weight_route route=rocm_mtp_i8_qkv_act_reuse tensor=%s status=ready\n",
+                __func__, tensor_name ? tensor_name : "-");
+    }
+#else
+    GGML_UNUSED(tensor_name);
+#endif
+}
+
+static inline void ggml_cuda_mtp_q8_dot4_mmvq_log_selected(
+        const int64_t ncols_x, const int64_t nrows_x, const int64_t ncols_dst,
+        const bool has_fusion, const bool has_ids) {
+    if (!g_ggml_cuda_dp16_mmvq_mtp_q8_dot4_scope || !ggml_cuda_mtp_q8_dot4_mmvq_log_enabled()) {
+        return;
+    }
+    GGML_LOG_INFO("%s: mtp_weight_route route=rocm_q8_dot4_mmvq tensor=%s status=selected "
+            "ncols_x=%lld nrows_x=%lld ncols_dst=%lld fusion=%d ids=%d\n",
+            __func__, g_ggml_cuda_dp16_mmvq_mtp_q8_dot4_tensor_name ? g_ggml_cuda_dp16_mmvq_mtp_q8_dot4_tensor_name : "-",
+            (long long) ncols_x, (long long) nrows_x, (long long) ncols_dst,
+            has_fusion ? 1 : 0, has_ids ? 1 : 0);
+}
+
+static inline void ggml_cuda_mtp_q8_dot4_mmvq_log_tensor(
+        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst,
+        const int64_t ncols_x, const int64_t nrows_x, const int64_t ncols_dst,
+        const bool has_fusion, const bool has_ids) {
+    if (!ggml_cuda_mtp_q8_dot4_mmvq_log_enabled()) {
+        return;
+    }
+    GGML_LOG_INFO("%s: mtp_weight_route route=rocm_q8_dot4_mmvq tensor=%s status=%s "
+            "ncols_x=%lld nrows_x=%lld ncols_dst=%lld src0=%s src1=%s dst=%s fusion=%d ids=%d\n",
+            __func__, src0 ? src0->name : "-",
+            (ncols_dst >= 1 && ncols_dst <= dp16_mmvq_packed16_runtime_max_n() && (ncols_x % 256) == 0 && !has_ids) ? "candidate" : "not_applicable",
+            (long long) ncols_x, (long long) nrows_x, (long long) ncols_dst,
+            src0 ? ggml_type_name(src0->type) : "-",
+            src1 ? ggml_type_name(src1->type) : "-",
+            dst ? ggml_type_name(dst->type) : "-",
+            has_fusion ? 1 : 0, has_ids ? 1 : 0);
+}
+
 static inline bool ggml_cuda_dp16_mmvq_q8_dot4_enabled() {
     const char * enabled = getenv("GGML_CUDA_ROCM_Q8_DOT4_MMVQ");
-    return ggml_cuda_dp16_route_require_q8_mmvq() || (enabled && atoi(enabled) != 0);
+    return ggml_cuda_dp16_route_require_q8_mmvq() ||
+        g_ggml_cuda_dp16_mmvq_mtp_q8_dot4_scope ||
+        (enabled && atoi(enabled) != 0);
 }
 
 static inline bool ggml_cuda_dp16_mmvq_packed16_dot4_env_enabled() {
@@ -854,7 +1389,7 @@ static inline bool ggml_cuda_dp16_mmvq_q8_dot4_supported(
         warp_size == DP16_MMVQ_Q8_DOT4_WARP_SIZE &&
         type == GGML_TYPE_Q8_0 &&
         ncols_dst >= 1 && ncols_dst <= 4 &&
-        (!has_fusion || ncols_dst == 1) && !has_ids &&
+        !has_ids &&
         ncols_x % 256 == 0 &&
         nrows_x > 0;
 #else
@@ -875,7 +1410,7 @@ static inline bool ggml_cuda_dp16_mmvq_packed16_dot4_supported(
     return ggml_cuda_dp16_mmvq_packed16_dot4_enabled() &&
         GGML_CUDA_CC_IS_RDNA3(cc) &&
         warp_size == DP16_MMVQ_PACKED16_DOT4_WARP_SIZE &&
-        ncols_dst >= 1 && ncols_dst <= 4 &&
+        ncols_dst >= 1 && ncols_dst <= dp16_mmvq_packed16_runtime_max_n() &&
         !has_fusion && !has_ids &&
         ncols_x % 256 == 0 &&
         nrows_x > 0;
@@ -910,6 +1445,188 @@ static inline void ggml_cuda_dp16_mmvq_route_require_fail(
         dp16_layout_name(plan.dst.role != DP16_OPERAND_UNKNOWN ? plan.dst.layout : problem.dst.layout));
 }
 
+#define GGML_CUDA_DP16_DISPATCH_NCOLS_1_16(LAUNCH_EXPR) \
+    switch (ncols_dst) { \
+        case 1:  { constexpr int c_ncols_dst = 1;  LAUNCH_EXPR; return true; } \
+        case 2:  { constexpr int c_ncols_dst = 2;  LAUNCH_EXPR; return true; } \
+        case 3:  { constexpr int c_ncols_dst = 3;  LAUNCH_EXPR; return true; } \
+        case 4:  { constexpr int c_ncols_dst = 4;  LAUNCH_EXPR; return true; } \
+        case 5:  { constexpr int c_ncols_dst = 5;  LAUNCH_EXPR; return true; } \
+        case 6:  { constexpr int c_ncols_dst = 6;  LAUNCH_EXPR; return true; } \
+        case 7:  { constexpr int c_ncols_dst = 7;  LAUNCH_EXPR; return true; } \
+        case 8:  { constexpr int c_ncols_dst = 8;  LAUNCH_EXPR; return true; } \
+        case 9:  { constexpr int c_ncols_dst = 9;  LAUNCH_EXPR; return true; } \
+        case 10: { constexpr int c_ncols_dst = 10; LAUNCH_EXPR; return true; } \
+        case 11: { constexpr int c_ncols_dst = 11; LAUNCH_EXPR; return true; } \
+        case 12: { constexpr int c_ncols_dst = 12; LAUNCH_EXPR; return true; } \
+        case 13: { constexpr int c_ncols_dst = 13; LAUNCH_EXPR; return true; } \
+        case 14: { constexpr int c_ncols_dst = 14; LAUNCH_EXPR; return true; } \
+        case 15: { constexpr int c_ncols_dst = 15; LAUNCH_EXPR; return true; } \
+        case 16: { constexpr int c_ncols_dst = 16; LAUNCH_EXPR; return true; } \
+        default: return false; \
+    }
+
+#define GGML_CUDA_DP16_DISPATCH_NCOLS_1_8(...) \
+    switch (ncols_dst) { \
+        case 1:  { constexpr int c_ncols_dst = 1;  __VA_ARGS__; return true; } \
+        case 2:  { constexpr int c_ncols_dst = 2;  __VA_ARGS__; return true; } \
+        case 3:  { constexpr int c_ncols_dst = 3;  __VA_ARGS__; return true; } \
+        case 4:  { constexpr int c_ncols_dst = 4;  __VA_ARGS__; return true; } \
+        case 5:  { constexpr int c_ncols_dst = 5;  __VA_ARGS__; return true; } \
+        case 6:  { constexpr int c_ncols_dst = 6;  __VA_ARGS__; return true; } \
+        case 7:  { constexpr int c_ncols_dst = 7;  __VA_ARGS__; return true; } \
+        case 8:  { constexpr int c_ncols_dst = 8;  __VA_ARGS__; return true; } \
+        default: return false; \
+    }
+
+#define GGML_CUDA_DP16_DISPATCH_NCOLS_2_5(...) \
+    switch (ncols_dst) { \
+        case 2:  { constexpr int c_ncols_dst = 2;  __VA_ARGS__; return true; } \
+        case 3:  { constexpr int c_ncols_dst = 3;  __VA_ARGS__; return true; } \
+        case 4:  { constexpr int c_ncols_dst = 4;  __VA_ARGS__; return true; } \
+        case 5:  { constexpr int c_ncols_dst = 5;  __VA_ARGS__; return true; } \
+        default: return false; \
+    }
+
+template<int NCOLS_DST>
+static inline void ggml_cuda_dp16_launch_packed16_dot4(
+        const dp16_packed16_weight_view & w16,
+        const void * src1_q8_1,
+        float * dst,
+        const int ncols_x,
+        const int nrows_x,
+        const uint3 channel_ratio,
+        const uint3 sample_ratio,
+        const int stride_col_y,
+        const int stride_col_dst,
+        const int nchannels_dst,
+        const int stride_channel_y,
+        const int stride_channel_dst,
+        const int nsamples_dst,
+        const int stride_sample_y,
+        const int stride_sample_dst,
+        cudaStream_t stream,
+        const bool use_i32_lane) {
+    if (use_i32_lane) {
+        dp16_mmvq_packed16_i32_n1_16_k256_launch<NCOLS_DST>(w16, src1_q8_1, dst,
+                ncols_x, nrows_x, channel_ratio, sample_ratio,
+                stride_col_y, stride_col_dst, nchannels_dst,
+                stride_channel_y, stride_channel_dst,
+                nsamples_dst, stride_sample_y, stride_sample_dst, stream);
+    } else {
+        dp16_mmvq_packed16_i32_b32_n1_16_k256_launch<NCOLS_DST>(w16, src1_q8_1, dst,
+                ncols_x, nrows_x, channel_ratio, sample_ratio,
+                stride_col_y, stride_col_dst, nchannels_dst,
+                stride_channel_y, stride_channel_dst,
+                nsamples_dst, stride_sample_y, stride_sample_dst, stream);
+    }
+}
+
+template<int NCOLS_DST>
+static inline void ggml_cuda_dp16_launch_packed16_fusion_dot4(
+        const dp16_packed16_weight_view & w16,
+        const void * src1_q8_1,
+        const ggml_cuda_mm_fusion_args_device fusion_dev,
+        float * dst,
+        const int ncols_x,
+        const int nrows_x,
+        const uint3 channel_ratio,
+        const uint3 sample_ratio,
+        const int stride_col_y,
+        const int stride_col_dst,
+        const int nchannels_dst,
+        const int stride_channel_y,
+        const int stride_channel_dst,
+        const int nsamples_dst,
+        const int stride_sample_y,
+        const int stride_sample_dst,
+        cudaStream_t stream) {
+    dp16_mmvq_packed16_i32_b32_fusion_n1_16_k256_launch<NCOLS_DST>(w16, src1_q8_1, fusion_dev, dst,
+            ncols_x, nrows_x, channel_ratio, sample_ratio,
+            stride_col_y, stride_col_dst, nchannels_dst,
+            stride_channel_y, stride_channel_dst,
+            nsamples_dst, stride_sample_y, stride_sample_dst, stream);
+}
+
+template<int NCOLS_DST, bool HAS_XBIAS>
+static inline void ggml_cuda_dp16_launch_packed16_lds_m2n_dot4(
+        const dp16_packed16_weight_view & w16,
+        const void * src1_q8_1,
+        const ggml_cuda_mm_fusion_args_device fusion_dev,
+        float * dst,
+        const int ncols_x,
+        const int nrows_x,
+        const uint3 channel_ratio,
+        const uint3 sample_ratio,
+        const int stride_col_y,
+        const int stride_col_dst,
+        const int nchannels_dst,
+        const int stride_channel_y,
+        const int stride_channel_dst,
+        const int nsamples_dst,
+        const int stride_sample_y,
+        const int stride_sample_dst,
+        cudaStream_t stream) {
+    dp16_mmvq_packed16_i32_b32_lds_m2n_k256_launch<NCOLS_DST, HAS_XBIAS>(w16, src1_q8_1, fusion_dev, dst,
+            ncols_x, nrows_x, channel_ratio, sample_ratio,
+            stride_col_y, stride_col_dst, nchannels_dst,
+            stride_channel_y, stride_channel_dst,
+            nsamples_dst, stride_sample_y, stride_sample_dst, stream);
+}
+
+template<int NCOLS_DST, bool HAS_XBIAS>
+static inline void ggml_cuda_dp16_launch_packed16_reuse_n_dot4(
+        const dp16_packed16_weight_view & w16,
+        const void * src1_q8_1,
+        const ggml_cuda_mm_fusion_args_device fusion_dev,
+        float * dst,
+        const int ncols_x,
+        const int nrows_x,
+        const uint3 channel_ratio,
+        const uint3 sample_ratio,
+        const int stride_col_y,
+        const int stride_col_dst,
+        const int nchannels_dst,
+        const int stride_channel_y,
+        const int stride_channel_dst,
+        const int nsamples_dst,
+        const int stride_sample_y,
+        const int stride_sample_dst,
+        cudaStream_t stream) {
+    dp16_mmvq_packed16_i32_b32_reuse_n_k256_launch<NCOLS_DST, HAS_XBIAS>(w16, src1_q8_1, fusion_dev, dst,
+            ncols_x, nrows_x, channel_ratio, sample_ratio,
+            stride_col_y, stride_col_dst, nchannels_dst,
+            stride_channel_y, stride_channel_dst,
+            nsamples_dst, stride_sample_y, stride_sample_dst, stream);
+}
+
+template<int NCOLS_DST>
+static inline void ggml_cuda_dp16_launch_packed16_fused_glu_dot4(
+        const dp16_packed16_weight_view & up16,
+        const dp16_packed16_weight_view & gate16,
+        const void * src1_q8_1,
+        const ggml_cuda_mm_fusion_args_device fusion_dev,
+        float * dst,
+        const int ncols_x,
+        const int nrows_x,
+        const uint3 channel_ratio,
+        const uint3 sample_ratio,
+        const int stride_col_y,
+        const int stride_col_dst,
+        const int nchannels_dst,
+        const int stride_channel_y,
+        const int stride_channel_dst,
+        const int nsamples_dst,
+        const int stride_sample_y,
+        const int stride_sample_dst,
+        cudaStream_t stream) {
+    dp16_mmvq_packed16_i32_b32_fused_glu_n1_16_k256_launch<NCOLS_DST>(up16, gate16, src1_q8_1, fusion_dev, dst,
+            ncols_x, nrows_x, channel_ratio, sample_ratio,
+            stride_col_y, stride_col_dst, nchannels_dst,
+            stride_channel_y, stride_channel_dst,
+            nsamples_dst, stride_sample_y, stride_sample_dst, stream);
+}
+
 static inline void ggml_cuda_dp16_trace_mmvq_decode_plan(
         const ggml_tensor * src0,
         const ggml_tensor * src1,
@@ -920,6 +1637,7 @@ static inline void ggml_cuda_dp16_trace_mmvq_decode_plan(
         const int cc,
         const int warp_size,
         const bool has_fusion,
+        const bool fusion_x_bias_only,
         const bool has_ids) {
     const bool trace = dp16_trace_enabled();
     const bool require_mmvq = ggml_cuda_dp16_route_require_any_mmvq();
@@ -928,7 +1646,7 @@ static inline void ggml_cuda_dp16_trace_mmvq_decode_plan(
     }
 
     const dp16_problem problem = ggml_cuda_dp16_mmvq_problem_init(
-            src0, src1, dst, ncols_x, nrows_x, ncols_dst, cc, has_fusion, has_ids);
+            src0, src1, dst, ncols_x, nrows_x, ncols_dst, cc, has_fusion, fusion_x_bias_only, has_ids);
     dp16_plan plan = dp16_plan_decode_proj_mmvq(problem, dp16_route_require_env());
     if (plan.backend == DP16_BACKEND_MMVQ_PACKED16_I32_DOT4) {
         plan.kernel_name = dp16_mmvq_packed16_kernel_name();
@@ -950,6 +1668,14 @@ static inline void ggml_cuda_dp16_trace_mmvq_decode_plan(
             plan.backend == DP16_BACKEND_MMVQ_Q4_0_PACKED16_I32_DOT4) {
         runtime_supported = ggml_cuda_dp16_mmvq_packed16_dot4_supported(
                 cc, warp_size, (int) ncols_dst, has_fusion, has_ids, (int) ncols_x, (int) nrows_x);
+        if (!runtime_supported && fusion_x_bias_only && !has_ids &&
+                (ggml_cuda_mtp_q8_dot4_mmvq_packed_qkv_tensor_allowed(src0) ||
+                 ggml_cuda_mtp_q8_dot4_mmvq_packed_down_tensor_allowed(src0) ||
+                 ggml_cuda_mtp_q8_dot4_mmvq_packed_attn_out_tensor_allowed(src0))) {
+            // Generic packed16 dispatch has no fusion arguments, but the
+            // MTP-specialized packed routes below do support x_bias-only fusion.
+            runtime_supported = true;
+        }
     }
     if (runtime_supported) {
         return;
@@ -998,74 +1724,545 @@ static inline bool ggml_cuda_dp16_try_launch_packed16_mmvq(
         return false;
     }
     if (w16.cols != ncols_x || w16.rows < nrows_x) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, DP16_ROUTE_MMVQ_PACKED16_DOT4, src0, "packed_weight_shape_mismatch", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
         return false;
     }
 
-    const bool use_i32_lane = dp16_mmvq_packed16_use_i32_lane_kernel();
-    switch (ncols_dst) {
-        case 1:
-            if (use_i32_lane) {
-                dp16_mmvq_packed16_i32_n1_4_k256_launch<1>(w16, src1_q8_1, dst,
-                        ncols_x, nrows_x, channel_ratio, sample_ratio,
-                        stride_col_y, stride_col_dst, nchannels_dst,
-                        stride_channel_y, stride_channel_dst,
-                        nsamples_dst, stride_sample_y, stride_sample_dst, stream);
-            } else {
-                dp16_mmvq_packed16_i32_b32_n1_4_k256_launch<1>(w16, src1_q8_1, dst,
-                        ncols_x, nrows_x, channel_ratio, sample_ratio,
-                        stride_col_y, stride_col_dst, nchannels_dst,
-                        stride_channel_y, stride_channel_dst,
-                        nsamples_dst, stride_sample_y, stride_sample_dst, stream);
-            }
-            return true;
-        case 2:
-            if (use_i32_lane) {
-                dp16_mmvq_packed16_i32_n1_4_k256_launch<2>(w16, src1_q8_1, dst,
-                        ncols_x, nrows_x, channel_ratio, sample_ratio,
-                        stride_col_y, stride_col_dst, nchannels_dst,
-                        stride_channel_y, stride_channel_dst,
-                        nsamples_dst, stride_sample_y, stride_sample_dst, stream);
-            } else {
-                dp16_mmvq_packed16_i32_b32_n1_4_k256_launch<2>(w16, src1_q8_1, dst,
-                        ncols_x, nrows_x, channel_ratio, sample_ratio,
-                        stride_col_y, stride_col_dst, nchannels_dst,
-                        stride_channel_y, stride_channel_dst,
-                        nsamples_dst, stride_sample_y, stride_sample_dst, stream);
-            }
-            return true;
-        case 3:
-            if (use_i32_lane) {
-                dp16_mmvq_packed16_i32_n1_4_k256_launch<3>(w16, src1_q8_1, dst,
-                        ncols_x, nrows_x, channel_ratio, sample_ratio,
-                        stride_col_y, stride_col_dst, nchannels_dst,
-                        stride_channel_y, stride_channel_dst,
-                        nsamples_dst, stride_sample_y, stride_sample_dst, stream);
-            } else {
-                dp16_mmvq_packed16_i32_b32_n1_4_k256_launch<3>(w16, src1_q8_1, dst,
-                        ncols_x, nrows_x, channel_ratio, sample_ratio,
-                        stride_col_y, stride_col_dst, nchannels_dst,
-                        stride_channel_y, stride_channel_dst,
-                        nsamples_dst, stride_sample_y, stride_sample_dst, stream);
-            }
-            return true;
-        case 4:
-            if (use_i32_lane) {
-                dp16_mmvq_packed16_i32_n1_4_k256_launch<4>(w16, src1_q8_1, dst,
-                        ncols_x, nrows_x, channel_ratio, sample_ratio,
-                        stride_col_y, stride_col_dst, nchannels_dst,
-                        stride_channel_y, stride_channel_dst,
-                        nsamples_dst, stride_sample_y, stride_sample_dst, stream);
-            } else {
-                dp16_mmvq_packed16_i32_b32_n1_4_k256_launch<4>(w16, src1_q8_1, dst,
-                        ncols_x, nrows_x, channel_ratio, sample_ratio,
-                        stride_col_y, stride_col_dst, nchannels_dst,
-                        stride_channel_y, stride_channel_dst,
-                        nsamples_dst, stride_sample_y, stride_sample_dst, stream);
-            }
-            return true;
-        default:
-            return false;
+    if (src0->type == GGML_TYPE_Q8_0 && dp16_mmvq_packed16_generic_reuse_n_enabled() &&
+            dp16_mmvq_packed16_reuse_n_supported_n(ncols_dst)) {
+        const ggml_cuda_mm_fusion_args_device no_fusion = {};
+        GGML_CUDA_DP16_DISPATCH_NCOLS_1_8(
+                ggml_cuda_dp16_launch_packed16_reuse_n_dot4<c_ncols_dst, false>(w16, src1_q8_1, no_fusion, dst,
+                    ncols_x, nrows_x, channel_ratio, sample_ratio,
+                    stride_col_y, stride_col_dst, nchannels_dst,
+                    stride_channel_y, stride_channel_dst,
+                    nsamples_dst, stride_sample_y, stride_sample_dst, stream)
+        )
     }
+
+    const bool use_i32_lane = dp16_mmvq_packed16_use_i32_lane_kernel();
+    GGML_CUDA_DP16_DISPATCH_NCOLS_1_16(
+            ggml_cuda_dp16_launch_packed16_dot4<c_ncols_dst>(w16, src1_q8_1, dst,
+                ncols_x, nrows_x, channel_ratio, sample_ratio,
+                stride_col_y, stride_col_dst, nchannels_dst,
+                stride_channel_y, stride_channel_dst,
+                nsamples_dst, stride_sample_y, stride_sample_dst, stream, use_i32_lane)
+    )
+}
+
+static inline bool ggml_cuda_dp16_try_launch_mtp_packed_q8_eh_proj(
+        const ggml_tensor * src0,
+        const void * src1_q8_1,
+        float * dst,
+        const int ncols_x,
+        const int nrows_x,
+        const int ncols_dst,
+        const uint3 channel_ratio,
+        const uint3 sample_ratio,
+        const int stride_col_y,
+        const int stride_col_dst,
+        const int nchannels_dst,
+        const int stride_channel_y,
+        const int stride_channel_dst,
+        const int nsamples_dst,
+        const int stride_sample_y,
+        const int stride_sample_dst,
+        const int cc,
+        const int warp_size,
+        const bool has_fusion,
+        const bool has_ids,
+        cudaStream_t stream) {
+#if defined(GGML_USE_HIP)
+    constexpr const char * route = "rocm_mtp_i8_eh_proj_dot4";
+    if (!ggml_cuda_mtp_q8_dot4_mmvq_packed_eh_tensor_allowed(src0)) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "tensor_not_allowed", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+    if (has_ids) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "ids_unsupported", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+    if (has_fusion) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "fusion_unsupported", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+    if (!GGML_CUDA_CC_IS_RDNA3(cc) || warp_size != DP16_MMVQ_PACKED16_DOT4_WARP_SIZE) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "arch_unsupported", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+    if (ncols_dst < 1 || ncols_dst > dp16_mmvq_packed16_runtime_max_n() || ncols_x % 256 != 0 || nrows_x <= 0) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "shape_unsupported", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+
+    dp16_packed16_weight_view w16 = {};
+    const bool stream_is_capturing = ggml_cuda_mtp_q8_dot4_mmvq_stream_is_capturing(stream);
+    if (stream_is_capturing) {
+        if (!ggml_cuda_dp16_get_packed16_weight_if_ready(src0, &w16)) {
+            ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject_capture(__func__, route, src0, "capture_packed_weight_unverified", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+            return false;
+        }
+    } else {
+        if (!ggml_cuda_dp16_ensure_packed16_weight(src0, stream)) {
+            ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "packed_weight_prepare_failed", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+            return false;
+        }
+        if (!ggml_cuda_dp16_get_packed16_weight(src0, &w16)) {
+            ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "packed_weight_missing", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+            return false;
+        }
+    }
+    if (w16.cols != ncols_x || w16.rows < nrows_x) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "packed_weight_shape_mismatch", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+
+    if (ggml_cuda_mtp_q8_dot4_mmvq_log_enabled()) {
+        GGML_LOG_INFO("%s: mtp_weight_route route=rocm_mtp_i8_eh_proj_dot4 tensor=%s status=selected capture=%d ncols_x=%d nrows_x=%d ncols_dst=%d packed_payload_bytes=%zu packed_scale_bytes=%zu\n",
+                __func__, src0->name, stream_is_capturing ? 1 : 0, ncols_x, nrows_x, ncols_dst,
+                (size_t) (w16.payload_stride_sample_i32 ? w16.payload_stride_sample_i32 : w16.rows*w16.payload_stride_row_i32) * sizeof(int32_t),
+                (size_t) (w16.scale_stride_sample_half ? w16.scale_stride_sample_half : w16.rows*w16.scale_stride_row_half) * sizeof(half));
+    }
+
+    GGML_CUDA_DP16_DISPATCH_NCOLS_1_16(
+            ggml_cuda_dp16_launch_packed16_dot4<c_ncols_dst>(w16, src1_q8_1, dst,
+                ncols_x, nrows_x, channel_ratio, sample_ratio,
+                stride_col_y, stride_col_dst, nchannels_dst,
+                stride_channel_y, stride_channel_dst,
+                nsamples_dst, stride_sample_y, stride_sample_dst, stream, false)
+    )
+#else
+    GGML_UNUSED_VARS(src0, src1_q8_1, dst, ncols_x, nrows_x, ncols_dst,
+            channel_ratio, sample_ratio, stride_col_y, stride_col_dst, nchannels_dst, stride_channel_y,
+            stride_channel_dst, nsamples_dst, stride_sample_y, stride_sample_dst, cc, warp_size,
+            has_fusion, has_ids, stream);
+    return false;
+#endif
+}
+
+static inline bool ggml_cuda_dp16_try_launch_mtp_packed_q8_ffn_down(
+        const ggml_tensor * src0,
+        const ggml_cuda_mm_fusion_args_host * fusion_host,
+        const ggml_cuda_mm_fusion_args_device fusion_dev,
+        const void * src1_q8_1,
+        float * dst,
+        const int ncols_x,
+        const int nrows_x,
+        const int ncols_dst,
+        const uint3 channel_ratio,
+        const uint3 sample_ratio,
+        const int stride_col_y,
+        const int stride_col_dst,
+        const int nchannels_dst,
+        const int stride_channel_y,
+        const int stride_channel_dst,
+        const int nsamples_dst,
+        const int stride_sample_y,
+        const int stride_sample_dst,
+        const int cc,
+        const int warp_size,
+        const bool has_fusion,
+        const bool has_ids,
+        cudaStream_t stream) {
+#if defined(GGML_USE_HIP)
+    constexpr const char * route = "rocm_mtp_i8_ffn_down_dot4";
+    if (has_ids) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "ids_unsupported", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+    if (!ggml_cuda_mtp_q8_dot4_mmvq_packed_down_tensor_allowed(src0)) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "tensor_not_allowed", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+    if (has_fusion && !fusion_host) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "fusion_host_missing", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+    if (has_fusion && (fusion_host->gate || fusion_host->gate_bias)) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "fusion_gate_or_gate_bias", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+    if (!GGML_CUDA_CC_IS_RDNA3(cc) || warp_size != DP16_MMVQ_PACKED16_DOT4_WARP_SIZE) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "arch_unsupported", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+    if (ncols_dst < 1 || ncols_dst > dp16_mmvq_packed16_runtime_max_n() || ncols_x % 256 != 0 || nrows_x <= 0) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "shape_unsupported", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+
+    dp16_packed16_weight_view w16 = {};
+    const bool stream_is_capturing = ggml_cuda_mtp_q8_dot4_mmvq_stream_is_capturing(stream);
+    if (stream_is_capturing) {
+        if (!ggml_cuda_dp16_get_packed16_weight_if_ready(src0, &w16)) {
+            ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject_capture(__func__, route, src0, "capture_packed_weight_unverified", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+            return false;
+        }
+    } else {
+        if (!ggml_cuda_dp16_ensure_packed16_weight(src0, stream)) {
+            ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "packed_weight_prepare_failed", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+            return false;
+        }
+        if (!ggml_cuda_dp16_get_packed16_weight(src0, &w16)) {
+            ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "packed_weight_missing", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+            return false;
+        }
+    }
+    if (w16.cols != ncols_x || w16.rows < nrows_x) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "packed_weight_shape_mismatch", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+
+    // Across-N MMVQ prototypes (no-LDS acc[N] reuse-N and LDS M2xN) are
+    // retained as historical force experiments only; real-MTP profiling made
+    // both production no-go. Do not route them for MTP ffn_down/attn_out.
+    if (ggml_cuda_mtp_q8_dot4_mmvq_log_enabled()) {
+        GGML_LOG_INFO("%s: mtp_weight_route route=%s tensor=%s status=selected capture=%d ncols_x=%d nrows_x=%d ncols_dst=%d fusion=%d reuse_n=0 lds_m2n=0 rows_per_block=0 qblocks_tile=0 lds_bytes=0 packed_payload_bytes=%zu packed_scale_bytes=%zu\n",
+                __func__, route, src0->name, stream_is_capturing ? 1 : 0, ncols_x, nrows_x, ncols_dst, has_fusion ? 1 : 0,
+                (size_t) (w16.payload_stride_sample_i32 ? w16.payload_stride_sample_i32 : w16.rows*w16.payload_stride_row_i32) * sizeof(int32_t),
+                (size_t) (w16.scale_stride_sample_half ? w16.scale_stride_sample_half : w16.rows*w16.scale_stride_row_half) * sizeof(half));
+    }
+
+    GGML_CUDA_DP16_DISPATCH_NCOLS_1_16(
+            if (has_fusion) {
+                ggml_cuda_dp16_launch_packed16_fusion_dot4<c_ncols_dst>(w16, src1_q8_1, fusion_dev, dst,
+                        ncols_x, nrows_x, channel_ratio, sample_ratio,
+                        stride_col_y, stride_col_dst, nchannels_dst,
+                        stride_channel_y, stride_channel_dst,
+                        nsamples_dst, stride_sample_y, stride_sample_dst, stream);
+            } else {
+                ggml_cuda_dp16_launch_packed16_dot4<c_ncols_dst>(w16, src1_q8_1, dst,
+                        ncols_x, nrows_x, channel_ratio, sample_ratio,
+                        stride_col_y, stride_col_dst, nchannels_dst,
+                        stride_channel_y, stride_channel_dst,
+                        nsamples_dst, stride_sample_y, stride_sample_dst, stream, false);
+            }
+    )
+#else
+    GGML_UNUSED_VARS(src0, fusion_host, fusion_dev, src1_q8_1, dst, ncols_x, nrows_x, ncols_dst,
+            channel_ratio, sample_ratio, stride_col_y, stride_col_dst, nchannels_dst, stride_channel_y,
+            stride_channel_dst, nsamples_dst, stride_sample_y, stride_sample_dst, cc, warp_size,
+            has_fusion, has_ids, stream);
+    return false;
+#endif
+}
+
+static inline bool ggml_cuda_dp16_try_launch_mtp_packed_q8_qkv_proj(
+        const ggml_tensor * src0,
+        const ggml_cuda_mm_fusion_args_host * fusion_host,
+        const ggml_cuda_mm_fusion_args_device fusion_dev,
+        const void * src1_q8_1,
+        float * dst,
+        const int ncols_x,
+        const int nrows_x,
+        const int ncols_dst,
+        const uint3 channel_ratio,
+        const uint3 sample_ratio,
+        const int stride_col_y,
+        const int stride_col_dst,
+        const int nchannels_dst,
+        const int stride_channel_y,
+        const int stride_channel_dst,
+        const int nsamples_dst,
+        const int stride_sample_y,
+        const int stride_sample_dst,
+        const int cc,
+        const int warp_size,
+        const bool has_fusion,
+        const bool has_ids,
+        cudaStream_t stream) {
+#if defined(GGML_USE_HIP)
+    constexpr const char * route = "rocm_mtp_i8_qkv_proj_dot4";
+    if (has_ids) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "ids_unsupported", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+    if (!ggml_cuda_mtp_q8_dot4_mmvq_packed_qkv_tensor_allowed(src0)) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "tensor_not_allowed", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+    if (has_fusion && !fusion_host) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "fusion_host_missing", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+    if (has_fusion && (fusion_host->gate || fusion_host->gate_bias)) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "fusion_gate_or_gate_bias", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+    if (!GGML_CUDA_CC_IS_RDNA3(cc) || warp_size != DP16_MMVQ_PACKED16_DOT4_WARP_SIZE) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "arch_unsupported", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+    if (ncols_dst < 1 || ncols_dst > dp16_mmvq_packed16_runtime_max_n() || ncols_x % 256 != 0 || nrows_x <= 0) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "shape_unsupported", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+
+    dp16_packed16_weight_view w16 = {};
+    const bool stream_is_capturing = ggml_cuda_mtp_q8_dot4_mmvq_stream_is_capturing(stream);
+    if (stream_is_capturing) {
+        if (!ggml_cuda_dp16_get_packed16_weight_if_ready(src0, &w16)) {
+            ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject_capture(__func__, route, src0, "capture_packed_weight_unverified", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+            return false;
+        }
+    } else {
+        if (!ggml_cuda_dp16_ensure_packed16_weight(src0, stream)) {
+            ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "packed_weight_prepare_failed", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+            return false;
+        }
+        if (!ggml_cuda_dp16_get_packed16_weight(src0, &w16)) {
+            ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "packed_weight_missing", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+            return false;
+        }
+    }
+    if (w16.cols != ncols_x || w16.rows < nrows_x) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "packed_weight_shape_mismatch", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+
+    if (ggml_cuda_mtp_q8_dot4_mmvq_log_enabled()) {
+        GGML_LOG_INFO("%s: mtp_weight_route route=rocm_mtp_i8_qkv_proj_dot4 tensor=%s status=selected capture=%d ncols_x=%d nrows_x=%d ncols_dst=%d fusion=%d packed_payload_bytes=%zu packed_scale_bytes=%zu\n",
+                __func__, src0->name, stream_is_capturing ? 1 : 0, ncols_x, nrows_x, ncols_dst, has_fusion ? 1 : 0,
+                (size_t) (w16.payload_stride_sample_i32 ? w16.payload_stride_sample_i32 : w16.rows*w16.payload_stride_row_i32) * sizeof(int32_t),
+                (size_t) (w16.scale_stride_sample_half ? w16.scale_stride_sample_half : w16.rows*w16.scale_stride_row_half) * sizeof(half));
+    }
+
+    GGML_CUDA_DP16_DISPATCH_NCOLS_1_16(
+            if (has_fusion) {
+                ggml_cuda_dp16_launch_packed16_fusion_dot4<c_ncols_dst>(w16, src1_q8_1, fusion_dev, dst,
+                        ncols_x, nrows_x, channel_ratio, sample_ratio,
+                        stride_col_y, stride_col_dst, nchannels_dst,
+                        stride_channel_y, stride_channel_dst,
+                        nsamples_dst, stride_sample_y, stride_sample_dst, stream);
+            } else {
+                ggml_cuda_dp16_launch_packed16_dot4<c_ncols_dst>(w16, src1_q8_1, dst,
+                        ncols_x, nrows_x, channel_ratio, sample_ratio,
+                        stride_col_y, stride_col_dst, nchannels_dst,
+                        stride_channel_y, stride_channel_dst,
+                        nsamples_dst, stride_sample_y, stride_sample_dst, stream, false);
+            }
+    )
+#else
+    GGML_UNUSED_VARS(src0, fusion_host, fusion_dev, src1_q8_1, dst, ncols_x, nrows_x, ncols_dst,
+            channel_ratio, sample_ratio, stride_col_y, stride_col_dst, nchannels_dst, stride_channel_y,
+            stride_channel_dst, nsamples_dst, stride_sample_y, stride_sample_dst, cc, warp_size,
+            has_fusion, has_ids, stream);
+    return false;
+#endif
+}
+
+static inline bool ggml_cuda_dp16_try_launch_mtp_packed_q8_attn_out(
+        const ggml_tensor * src0,
+        const ggml_cuda_mm_fusion_args_host * fusion_host,
+        const ggml_cuda_mm_fusion_args_device fusion_dev,
+        const void * src1_q8_1,
+        float * dst,
+        const int ncols_x,
+        const int nrows_x,
+        const int ncols_dst,
+        const uint3 channel_ratio,
+        const uint3 sample_ratio,
+        const int stride_col_y,
+        const int stride_col_dst,
+        const int nchannels_dst,
+        const int stride_channel_y,
+        const int stride_channel_dst,
+        const int nsamples_dst,
+        const int stride_sample_y,
+        const int stride_sample_dst,
+        const int cc,
+        const int warp_size,
+        const bool has_fusion,
+        const bool has_ids,
+        cudaStream_t stream) {
+#if defined(GGML_USE_HIP)
+    constexpr const char * route = "rocm_mtp_i8_attn_out_dot4";
+    if (has_ids) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "ids_unsupported", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+    if (!ggml_cuda_mtp_q8_dot4_mmvq_packed_attn_out_tensor_allowed(src0)) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "tensor_not_allowed", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+    if (has_fusion && !fusion_host) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "fusion_host_missing", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+    if (has_fusion && (fusion_host->gate || fusion_host->gate_bias)) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "fusion_gate_or_gate_bias", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+    if (!GGML_CUDA_CC_IS_RDNA3(cc) || warp_size != DP16_MMVQ_PACKED16_DOT4_WARP_SIZE) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "arch_unsupported", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+    if (ncols_dst < 1 || ncols_dst > dp16_mmvq_packed16_runtime_max_n() || ncols_x % 256 != 0 || nrows_x <= 0) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "shape_unsupported", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+
+    dp16_packed16_weight_view w16 = {};
+    const bool stream_is_capturing = ggml_cuda_mtp_q8_dot4_mmvq_stream_is_capturing(stream);
+    if (stream_is_capturing) {
+        if (!ggml_cuda_dp16_get_packed16_weight_if_ready(src0, &w16)) {
+            ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject_capture(__func__, route, src0, "capture_packed_weight_unverified", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+            return false;
+        }
+    } else {
+        if (!ggml_cuda_dp16_ensure_packed16_weight(src0, stream)) {
+            ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "packed_weight_prepare_failed", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+            return false;
+        }
+        if (!ggml_cuda_dp16_get_packed16_weight(src0, &w16)) {
+            ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "packed_weight_missing", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+            return false;
+        }
+    }
+    if (w16.cols != ncols_x || w16.rows < nrows_x) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "packed_weight_shape_mismatch", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+
+    // Across-N MMVQ prototypes (no-LDS acc[N] reuse-N and LDS M2xN) are
+    // retained as historical force experiments only; real-MTP profiling made
+    // both production no-go. Do not route them for MTP ffn_down/attn_out.
+    if (ggml_cuda_mtp_q8_dot4_mmvq_log_enabled()) {
+        GGML_LOG_INFO("%s: mtp_weight_route route=%s tensor=%s status=selected capture=%d ncols_x=%d nrows_x=%d ncols_dst=%d fusion=%d reuse_n=0 lds_m2n=0 rows_per_block=0 qblocks_tile=0 lds_bytes=0 packed_payload_bytes=%zu packed_scale_bytes=%zu\n",
+                __func__, route, src0->name, stream_is_capturing ? 1 : 0, ncols_x, nrows_x, ncols_dst, has_fusion ? 1 : 0,
+                (size_t) (w16.payload_stride_sample_i32 ? w16.payload_stride_sample_i32 : w16.rows*w16.payload_stride_row_i32) * sizeof(int32_t),
+                (size_t) (w16.scale_stride_sample_half ? w16.scale_stride_sample_half : w16.rows*w16.scale_stride_row_half) * sizeof(half));
+    }
+
+    GGML_CUDA_DP16_DISPATCH_NCOLS_1_16(
+            if (has_fusion) {
+                ggml_cuda_dp16_launch_packed16_fusion_dot4<c_ncols_dst>(w16, src1_q8_1, fusion_dev, dst,
+                        ncols_x, nrows_x, channel_ratio, sample_ratio,
+                        stride_col_y, stride_col_dst, nchannels_dst,
+                        stride_channel_y, stride_channel_dst,
+                        nsamples_dst, stride_sample_y, stride_sample_dst, stream);
+            } else {
+                ggml_cuda_dp16_launch_packed16_dot4<c_ncols_dst>(w16, src1_q8_1, dst,
+                ncols_x, nrows_x, channel_ratio, sample_ratio,
+                stride_col_y, stride_col_dst, nchannels_dst,
+                stride_channel_y, stride_channel_dst,
+                nsamples_dst, stride_sample_y, stride_sample_dst, stream, false);
+            }
+    )
+#else
+    GGML_UNUSED_VARS(src0, fusion_host, fusion_dev, src1_q8_1, dst, ncols_x, nrows_x, ncols_dst,
+            channel_ratio, sample_ratio, stride_col_y, stride_col_dst, nchannels_dst, stride_channel_y,
+            stride_channel_dst, nsamples_dst, stride_sample_y, stride_sample_dst, cc, warp_size,
+            has_fusion, has_ids, stream);
+    return false;
+#endif
+}
+
+static inline bool ggml_cuda_dp16_try_launch_mtp_packed_q8_fused_glu(
+        const ggml_tensor * src0,
+        const ggml_cuda_mm_fusion_args_host * fusion_host,
+        const ggml_cuda_mm_fusion_args_device fusion_dev,
+        const void * src1_q8_1,
+        float * dst,
+        const int ncols_x,
+        const int nrows_x,
+        const int ncols_dst,
+        const uint3 channel_ratio,
+        const uint3 sample_ratio,
+        const int stride_col_y,
+        const int stride_col_dst,
+        const int nchannels_dst,
+        const int stride_channel_y,
+        const int stride_channel_dst,
+        const int nsamples_dst,
+        const int stride_sample_y,
+        const int stride_sample_dst,
+        const int cc,
+        const int warp_size,
+        const bool has_fusion,
+        const bool has_ids,
+        cudaStream_t stream) {
+#if defined(GGML_USE_HIP)
+    constexpr const char * route = "rocm_mtp_i8_ffn_gate_up_dot4";
+    if (!has_fusion) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "no_fusion", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+    if (has_ids) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "ids_unsupported", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+    if (!fusion_host) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "fusion_host_missing", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+    if (!fusion_host->gate) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "fusion_gate_missing", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+    if (!ggml_cuda_mtp_q8_dot4_mmvq_packed_glu_tensors_allowed(src0, fusion_host->gate)) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "tensor_not_allowed", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+    if (!GGML_CUDA_CC_IS_RDNA3(cc) || warp_size != DP16_MMVQ_PACKED16_DOT4_WARP_SIZE) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "arch_unsupported", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+    if (ncols_dst < 1 || ncols_dst > dp16_mmvq_packed16_runtime_max_n() || ncols_x % 256 != 0 || nrows_x <= 0) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "shape_unsupported", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+
+    dp16_packed16_weight_view up16 = {};
+    dp16_packed16_weight_view gate16 = {};
+    const bool stream_is_capturing = ggml_cuda_mtp_q8_dot4_mmvq_stream_is_capturing(stream);
+    if (stream_is_capturing) {
+        if (!ggml_cuda_dp16_get_packed16_weight_if_ready(src0, &up16) ||
+                !ggml_cuda_dp16_get_packed16_weight_if_ready(fusion_host->gate, &gate16)) {
+            ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject_capture(__func__, route, src0, "capture_packed_weight_unverified", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+            return false;
+        }
+    } else {
+        if (!ggml_cuda_dp16_ensure_packed16_weight(src0, stream)) {
+            ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "packed_weight_prepare_failed", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+            return false;
+        }
+        if (!ggml_cuda_dp16_ensure_packed16_weight(fusion_host->gate, stream)) {
+            ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "gate_packed_weight_prepare_failed", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+            return false;
+        }
+        if (!ggml_cuda_dp16_get_packed16_weight(src0, &up16) ||
+                !ggml_cuda_dp16_get_packed16_weight(fusion_host->gate, &gate16)) {
+            ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "packed_weight_missing", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+            return false;
+        }
+    }
+    if (up16.cols != ncols_x || gate16.cols != ncols_x || up16.rows < nrows_x || gate16.rows < nrows_x) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject(__func__, route, src0, "packed_weight_shape_mismatch", ncols_x, nrows_x, ncols_dst, has_fusion, has_ids);
+        return false;
+    }
+
+    if (ggml_cuda_mtp_q8_dot4_mmvq_log_enabled()) {
+        GGML_LOG_INFO("%s: mtp_weight_route route=rocm_mtp_i8_ffn_gate_up_dot4 tensor=%s gate=%s status=selected capture=%d ncols_x=%d nrows_x=%d ncols_dst=%d packed_payload_bytes=%zu packed_scale_bytes=%zu\n",
+                __func__, src0->name, fusion_host->gate->name, stream_is_capturing ? 1 : 0, ncols_x, nrows_x, ncols_dst,
+                (size_t) (up16.payload_stride_sample_i32 ? up16.payload_stride_sample_i32 : up16.rows*up16.payload_stride_row_i32) * sizeof(int32_t),
+                (size_t) (up16.scale_stride_sample_half ? up16.scale_stride_sample_half : up16.rows*up16.scale_stride_row_half) * sizeof(half));
+    }
+
+    GGML_CUDA_DP16_DISPATCH_NCOLS_1_16(
+            ggml_cuda_dp16_launch_packed16_fused_glu_dot4<c_ncols_dst>(up16, gate16, src1_q8_1, fusion_dev, dst,
+                    ncols_x, nrows_x, channel_ratio, sample_ratio,
+                    stride_col_y, stride_col_dst, nchannels_dst,
+                    stride_channel_y, stride_channel_dst,
+                    nsamples_dst, stride_sample_y, stride_sample_dst, stream)
+    )
+#else
+    GGML_UNUSED_VARS(src0, fusion_host, fusion_dev, src1_q8_1, dst, ncols_x, nrows_x, ncols_dst,
+            channel_ratio, sample_ratio, stride_col_y, stride_col_dst, nchannels_dst, stride_channel_y,
+            stride_channel_dst, nsamples_dst, stride_sample_y, stride_sample_dst, cc, warp_size,
+            has_fusion, has_ids, stream);
+    return false;
+#endif
 }
 
 // Device constexpr: returns the max batch size for the current arch+type at compile time.
@@ -1598,6 +2795,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
             if (ggml_cuda_dp16_mmvq_q8_dot4_supported(
                     type, cc, warp_size, c_ncols_dst, has_fusion, has_ids, ncols_x, nrows_x)) {
+                ggml_cuda_mtp_q8_dot4_mmvq_log_selected(ncols_x, nrows_x, c_ncols_dst, has_fusion, has_ids);
                 if (has_fusion) {
                     dp16_mmvq_q8_dot4_fusion_n1_k256_launch<c_ncols_dst>(
                         vx, vy, fusion, dst, ncols_x, nrows_x, channel_ratio_fd, sample_ratio_fd,
@@ -1648,11 +2846,20 @@ static void mul_mat_vec_q_switch_ncols_dst(
             constexpr int c_ncols_dst = 2;
             if (ggml_cuda_dp16_mmvq_q8_dot4_supported(
                     type, cc, warp_size, c_ncols_dst, has_fusion, has_ids, ncols_x, nrows_x)) {
-                dp16_mmvq_q8_dot4_n1_4_k256_launch<c_ncols_dst>(
-                    vx, vy, dst, ncols_x, nrows_x, channel_ratio_fd, sample_ratio_fd,
-                    stride_row_x, stride_col_y, stride_col_dst, nchannels_dst,
-                    stride_channel_x, stride_channel_y, stride_channel_dst,
-                    nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream);
+                ggml_cuda_mtp_q8_dot4_mmvq_log_selected(ncols_x, nrows_x, c_ncols_dst, has_fusion, has_ids);
+                if (has_fusion) {
+                    dp16_mmvq_q8_dot4_fusion_n1_k256_launch<c_ncols_dst>(
+                        vx, vy, fusion, dst, ncols_x, nrows_x, channel_ratio_fd, sample_ratio_fd,
+                        stride_row_x, stride_col_y, stride_col_dst, nchannels_dst,
+                        stride_channel_x, stride_channel_y, stride_channel_dst,
+                        nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream);
+                } else {
+                    dp16_mmvq_q8_dot4_n1_4_k256_launch<c_ncols_dst>(
+                        vx, vy, dst, ncols_x, nrows_x, channel_ratio_fd, sample_ratio_fd,
+                        stride_row_x, stride_col_y, stride_col_dst, nchannels_dst,
+                        stride_channel_x, stride_channel_y, stride_channel_dst,
+                        nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream);
+                }
                 return;
             }
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
@@ -1665,11 +2872,20 @@ static void mul_mat_vec_q_switch_ncols_dst(
             constexpr int c_ncols_dst = 3;
             if (ggml_cuda_dp16_mmvq_q8_dot4_supported(
                     type, cc, warp_size, c_ncols_dst, has_fusion, has_ids, ncols_x, nrows_x)) {
-                dp16_mmvq_q8_dot4_n1_4_k256_launch<c_ncols_dst>(
-                    vx, vy, dst, ncols_x, nrows_x, channel_ratio_fd, sample_ratio_fd,
-                    stride_row_x, stride_col_y, stride_col_dst, nchannels_dst,
-                    stride_channel_x, stride_channel_y, stride_channel_dst,
-                    nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream);
+                ggml_cuda_mtp_q8_dot4_mmvq_log_selected(ncols_x, nrows_x, c_ncols_dst, has_fusion, has_ids);
+                if (has_fusion) {
+                    dp16_mmvq_q8_dot4_fusion_n1_k256_launch<c_ncols_dst>(
+                        vx, vy, fusion, dst, ncols_x, nrows_x, channel_ratio_fd, sample_ratio_fd,
+                        stride_row_x, stride_col_y, stride_col_dst, nchannels_dst,
+                        stride_channel_x, stride_channel_y, stride_channel_dst,
+                        nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream);
+                } else {
+                    dp16_mmvq_q8_dot4_n1_4_k256_launch<c_ncols_dst>(
+                        vx, vy, dst, ncols_x, nrows_x, channel_ratio_fd, sample_ratio_fd,
+                        stride_row_x, stride_col_y, stride_col_dst, nchannels_dst,
+                        stride_channel_x, stride_channel_y, stride_channel_dst,
+                        nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream);
+                }
                 return;
             }
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
@@ -1682,11 +2898,20 @@ static void mul_mat_vec_q_switch_ncols_dst(
             constexpr int c_ncols_dst = 4;
             if (ggml_cuda_dp16_mmvq_q8_dot4_supported(
                     type, cc, warp_size, c_ncols_dst, has_fusion, has_ids, ncols_x, nrows_x)) {
-                dp16_mmvq_q8_dot4_n1_4_k256_launch<c_ncols_dst>(
-                    vx, vy, dst, ncols_x, nrows_x, channel_ratio_fd, sample_ratio_fd,
-                    stride_row_x, stride_col_y, stride_col_dst, nchannels_dst,
-                    stride_channel_x, stride_channel_y, stride_channel_dst,
-                    nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream);
+                ggml_cuda_mtp_q8_dot4_mmvq_log_selected(ncols_x, nrows_x, c_ncols_dst, has_fusion, has_ids);
+                if (has_fusion) {
+                    dp16_mmvq_q8_dot4_fusion_n1_k256_launch<c_ncols_dst>(
+                        vx, vy, fusion, dst, ncols_x, nrows_x, channel_ratio_fd, sample_ratio_fd,
+                        stride_row_x, stride_col_y, stride_col_dst, nchannels_dst,
+                        stride_channel_x, stride_channel_y, stride_channel_dst,
+                        nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream);
+                } else {
+                    dp16_mmvq_q8_dot4_n1_4_k256_launch<c_ncols_dst>(
+                        vx, vy, dst, ncols_x, nrows_x, channel_ratio_fd, sample_ratio_fd,
+                        stride_row_x, stride_col_y, stride_col_dst, nchannels_dst,
+                        stride_channel_x, stride_channel_y, stride_channel_dst,
+                        nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream);
+                }
                 return;
             }
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
@@ -1910,8 +3135,14 @@ void ggml_cuda_mul_mat_vec_q(
     ggml_cuda_mm_fusion_args_device fusion_local{};
 
     if (fusion) {
+        const char * mtp_fuse_glu = getenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_FUSE_GLU");
+        const char * mtp_packed_glu = getenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_PACKED_GLU");
+        const bool allow_mtp_fused_n1_4 = !ids && dst->ne[1] >= 1 && dst->ne[1] <= 4 &&
+            ((mtp_fuse_glu && atoi(mtp_fuse_glu) != 0) || (mtp_packed_glu && atoi(mtp_packed_glu) != 0)) &&
+            ggml_cuda_mtp_q8_dot4_mmvq_tensor_allowed(src0);
+        const bool allow_mtp_reuse_n_xbias = false;
         GGML_ASSERT( !ids || dst->ne[2] == 1);
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        GGML_ASSERT(  ids || dst->ne[1] == 1 || allow_mtp_fused_n1_4 || allow_mtp_reuse_n_xbias);
 
         if (fusion->x_bias) {
             GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
@@ -1944,12 +3175,25 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+    const size_t src1_q8_1_bytes = (size_t) (ne13*ne12 * ne11*ne10_padded) * sizeof(block_q8_1)/QK8_1;
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    char * src1_q8_1_d = nullptr;
+    bool src1_q8_1_needs_quantize = true;
+    const bool src1_q8_1_act_cache_used = ggml_cuda_mtp_q8_dot4_mmvq_act_cache_try_get(
+            src0, src1, ids_d != nullptr, ne10_padded, src1_q8_1_bytes, stream,
+            &src1_q8_1_d, &src1_q8_1_needs_quantize);
+    if (!src1_q8_1_act_cache_used) {
+        src1_q8_1_d = src1_q8_1.alloc(src1_q8_1_bytes);
+        src1_q8_1_needs_quantize = true;
+    }
+    if (src1_q8_1_needs_quantize) {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1_d, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        if (src1_q8_1_act_cache_used) {
+            ggml_cuda_mtp_q8_dot4_mmvq_act_cache_mark_valid(src0->name);
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1974,28 +3218,131 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
+    const bool mtp_q8_dot4_mmvq_scope_enabled = ggml_cuda_mtp_q8_dot4_mmvq_tensor_allowed(src0);
+    ggml_cuda_dp16_mmvq_mtp_q8_dot4_scope_guard mtp_q8_dot4_mmvq_scope(mtp_q8_dot4_mmvq_scope_enabled, src0->name);
+
     {
         const int device = ggml_cuda_get_device();
         const int cc = ggml_cuda_info().devices[device].cc;
         const int warp_size = ggml_cuda_info().devices[device].warp_size;
         const bool has_fusion = fusion_local.gate != nullptr || fusion_local.x_bias != nullptr || fusion_local.gate_bias != nullptr;
+        const bool fusion_x_bias_only = fusion_local.x_bias != nullptr && fusion_local.gate == nullptr && fusion_local.gate_bias == nullptr;
         const bool has_ids = ids_d != nullptr;
+        if (mtp_q8_dot4_mmvq_scope_enabled) {
+            ggml_cuda_mtp_q8_dot4_mmvq_log_tensor(src0, src1, dst, ne00, ne01, ncols_dst, has_fusion, has_ids);
+        }
+        const bool should_prepare_mtp_x_bias_packed16 = fusion_x_bias_only &&
+            (ggml_cuda_mtp_q8_dot4_mmvq_packed_qkv_tensor_allowed(src0) ||
+             ggml_cuda_mtp_q8_dot4_mmvq_packed_down_tensor_allowed(src0) ||
+             ggml_cuda_mtp_q8_dot4_mmvq_packed_attn_out_tensor_allowed(src0));
         const bool should_prepare_packed16 = ggml_cuda_dp16_mmvq_packed16_dot4_env_enabled() ||
             ggml_cuda_dp16_mmvq_q4_0_packed16_dot4_env_enabled() ||
-            ggml_cuda_dp16_route_require_q4_0_packed16_mmvq();
+            ggml_cuda_dp16_route_require_q4_0_packed16_mmvq() ||
+            should_prepare_mtp_x_bias_packed16;
         if (should_prepare_packed16 &&
-                !has_fusion && !has_ids &&
-                ncols_dst >= 1 && ncols_dst <= 4 &&
+                (!has_fusion || should_prepare_mtp_x_bias_packed16) && !has_ids &&
+                ncols_dst >= 1 && ncols_dst <= dp16_mmvq_packed16_runtime_max_n() &&
                 ne00 % 256 == 0) {
             ggml_cuda_dp16_ensure_packed16_weight(src0, stream);
         }
-        ggml_cuda_dp16_trace_mmvq_decode_plan(src0, src1, dst, ne00, ne01, ncols_dst, cc, warp_size, has_fusion, has_ids);
+        ggml_cuda_dp16_trace_mmvq_decode_plan(src0, src1, dst, ne00, ne01, ncols_dst, cc, warp_size, has_fusion, fusion_x_bias_only, has_ids);
 
         if (!has_ids) {
             const uint3 channel_ratio_fd = init_fastdiv_values(nchannels_dst / ne02);
             const uint3 sample_ratio_fd  = init_fastdiv_values(ne3 / ne03);
+
+            const bool profile_glu_candidate = has_fusion && fusion && fusion->gate &&
+                ggml_cuda_mtp_q8_dot4_mmvq_packed_glu_tensors_allowed(src0, fusion->gate);
+            if (ggml_cuda_mtp_q8_dot4_mmvq_profiled_try_launch(
+                    profile_glu_candidate,
+                    GGML_CUDA_MTP_Q8_DOT4_MMVQ_PROFILE_GLU,
+                    "rocm_mtp_i8_ffn_gate_up_dot4", src0->name,
+                    ne00, ne01, ncols_dst, has_fusion, stream,
+                    [&]() {
+                        return ggml_cuda_dp16_try_launch_mtp_packed_q8_fused_glu(
+                                src0, fusion, fusion_local, src1_q8_1_d, dst_d, ne00, ne01, ncols_dst,
+                                channel_ratio_fd, sample_ratio_fd,
+                                stride_col_y, stride_col_dst, nchannels_dst,
+                                stride_channel_y, stride_channel_dst,
+                                ne3, s13, s3,
+                                cc, warp_size, has_fusion, has_ids, stream);
+                    })) {
+                return;
+            }
+
+            const bool profile_eh_candidate = !has_fusion && ggml_cuda_mtp_q8_dot4_mmvq_packed_eh_tensor_allowed(src0);
+            if (ggml_cuda_mtp_q8_dot4_mmvq_profiled_try_launch(
+                    profile_eh_candidate,
+                    GGML_CUDA_MTP_Q8_DOT4_MMVQ_PROFILE_EH,
+                    "rocm_mtp_i8_eh_proj_dot4", src0->name,
+                    ne00, ne01, ncols_dst, has_fusion, stream,
+                    [&]() {
+                        return ggml_cuda_dp16_try_launch_mtp_packed_q8_eh_proj(
+                                src0, src1_q8_1_d, dst_d, ne00, ne01, ncols_dst,
+                                channel_ratio_fd, sample_ratio_fd,
+                                stride_col_y, stride_col_dst, nchannels_dst,
+                                stride_channel_y, stride_channel_dst,
+                                ne3, s13, s3,
+                                cc, warp_size, has_fusion, has_ids, stream);
+                    })) {
+                return;
+            }
+
+            const bool profile_qkv_candidate = ggml_cuda_mtp_q8_dot4_mmvq_packed_qkv_tensor_allowed(src0);
+            if (ggml_cuda_mtp_q8_dot4_mmvq_profiled_try_launch(
+                    profile_qkv_candidate,
+                    GGML_CUDA_MTP_Q8_DOT4_MMVQ_PROFILE_QKV,
+                    "rocm_mtp_i8_qkv_proj_dot4", src0->name,
+                    ne00, ne01, ncols_dst, has_fusion, stream,
+                    [&]() {
+                        return ggml_cuda_dp16_try_launch_mtp_packed_q8_qkv_proj(
+                                src0, fusion, fusion_local, src1_q8_1_d, dst_d, ne00, ne01, ncols_dst,
+                                channel_ratio_fd, sample_ratio_fd,
+                                stride_col_y, stride_col_dst, nchannels_dst,
+                                stride_channel_y, stride_channel_dst,
+                                ne3, s13, s3,
+                                cc, warp_size, has_fusion, has_ids, stream);
+                    })) {
+                return;
+            }
+
+            const bool profile_attn_out_candidate = ggml_cuda_mtp_q8_dot4_mmvq_packed_attn_out_tensor_allowed(src0);
+            if (ggml_cuda_mtp_q8_dot4_mmvq_profiled_try_launch(
+                    profile_attn_out_candidate,
+                    GGML_CUDA_MTP_Q8_DOT4_MMVQ_PROFILE_ATTN_OUT,
+                    "rocm_mtp_i8_attn_out_dot4", src0->name,
+                    ne00, ne01, ncols_dst, has_fusion, stream,
+                    [&]() {
+                        return ggml_cuda_dp16_try_launch_mtp_packed_q8_attn_out(
+                                src0, fusion, fusion_local, src1_q8_1_d, dst_d, ne00, ne01, ncols_dst,
+                                channel_ratio_fd, sample_ratio_fd,
+                                stride_col_y, stride_col_dst, nchannels_dst,
+                                stride_channel_y, stride_channel_dst,
+                                ne3, s13, s3,
+                                cc, warp_size, has_fusion, has_ids, stream);
+                    })) {
+                return;
+            }
+
+            const bool profile_down_candidate = ggml_cuda_mtp_q8_dot4_mmvq_packed_down_tensor_allowed(src0);
+            if (ggml_cuda_mtp_q8_dot4_mmvq_profiled_try_launch(
+                    profile_down_candidate,
+                    GGML_CUDA_MTP_Q8_DOT4_MMVQ_PROFILE_DOWN,
+                    "rocm_mtp_i8_ffn_down_dot4", src0->name,
+                    ne00, ne01, ncols_dst, has_fusion, stream,
+                    [&]() {
+                        return ggml_cuda_dp16_try_launch_mtp_packed_q8_ffn_down(
+                                src0, fusion, fusion_local, src1_q8_1_d, dst_d, ne00, ne01, ncols_dst,
+                                channel_ratio_fd, sample_ratio_fd,
+                                stride_col_y, stride_col_dst, nchannels_dst,
+                                stride_channel_y, stride_channel_dst,
+                                ne3, s13, s3,
+                                cc, warp_size, has_fusion, has_ids, stream);
+                    })) {
+                return;
+            }
             if (ggml_cuda_dp16_try_launch_packed16_mmvq(
-                    src0, src1_q8_1.get(), dst_d, ne00, ne01, ncols_dst,
+                    src0, src1_q8_1_d, dst_d, ne00, ne01, ncols_dst,
                     channel_ratio_fd, sample_ratio_fd,
                     stride_col_y, stride_col_dst, nchannels_dst,
                     stride_channel_y, stride_channel_dst,
@@ -2015,12 +3362,12 @@ void ggml_cuda_mul_mat_vec_q(
         if (ggml_cuda_rdna3_mmvq_dot4_wants_q8sum4(src0->type, cc, warp_size, ncols_dst, ids_d != nullptr, ne00, ne01)) {
             const int64_t n_q8_blocks_total = ne13*ne12 * ne11*(ne10_padded / QK8_1);
             src1_q8sum4_d = src1_q8sum4.alloc(4*n_q8_blocks_total);
-            ggml_cuda_rdna3_q8_1_sum4_precompute(src1_q8_1.get(), src1_q8sum4.get(), n_q8_blocks_total, stream);
+            ggml_cuda_rdna3_q8_1_sum4_precompute(src1_q8_1_d, src1_q8sum4.get(), n_q8_blocks_total, stream);
         }
     }
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1_d, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               src1_q8sum4_d, ids_stride, stream);
@@ -2051,7 +3398,12 @@ void ggml_cuda_op_mul_mat_vec_q(
 
     const int cc = ggml_cuda_info().devices[id].cc;
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
-    ggml_cuda_dp16_trace_mmvq_decode_plan(src0, src1, dst, ne00, row_diff, src1_ncols, cc, warp_size, false, false);
+    const bool mtp_q8_dot4_mmvq_scope_enabled = ggml_cuda_mtp_q8_dot4_mmvq_tensor_allowed(src0);
+    ggml_cuda_dp16_mmvq_mtp_q8_dot4_scope_guard mtp_q8_dot4_mmvq_scope(mtp_q8_dot4_mmvq_scope_enabled, src0->name);
+    if (mtp_q8_dot4_mmvq_scope_enabled) {
+        ggml_cuda_mtp_q8_dot4_mmvq_log_tensor(src0, src1, dst, ne00, row_diff, src1_ncols, false, false);
+    }
+    ggml_cuda_dp16_trace_mmvq_decode_plan(src0, src1, dst, ne00, row_diff, src1_ncols, cc, warp_size, false, false, false);
 
     ggml_cuda_mm_fusion_args_device fusion_local{};
     mul_mat_vec_q_switch_type(

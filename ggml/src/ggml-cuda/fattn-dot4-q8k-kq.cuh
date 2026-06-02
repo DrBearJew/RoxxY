@@ -50,6 +50,24 @@ static inline bool ggml_cuda_q8k_dot4_kq_enabled() {
     return ggml_cuda_q8k_dot4_kq_route_required();
 }
 
+static inline bool ggml_cuda_q8k_dot4_kq_route_is_decode_contract(const char * required) {
+    return required && (
+        strcmp(required, "rocm_mtp_draft_dot4_decode") == 0 ||
+        strcmp(required, "rocm_mtp_draft_dot4_decode_bn64") == 0 ||
+        strcmp(required, "rocm_mtp_draft_dot4_decode_splitk") == 0 ||
+        strcmp(required, "rocm_q8k_dot4_decode_mtp_draft") == 0 ||
+        strcmp(required, "rocm_q8k_dot4_decode_bn64_mtp_draft") == 0 ||
+        strcmp(required, "rocm_q8k_dot4_decode_splitk_mtp_draft") == 0 ||
+        strcmp(required, "dot4_decode") == 0);
+}
+
+static inline bool ggml_cuda_q8k_dot4_kq_route_is_verify_contract(const char * required) {
+    return required && (
+        strcmp(required, "rocm_mtp_verify_dot4_recthist") == 0 ||
+        strcmp(required, "rocm_q8k_dot4_recthist_mtp_verify") == 0 ||
+        strcmp(required, "dot4_recthist") == 0);
+}
+
 static inline bool ggml_cuda_q8k_dot4_kq_supported(const int cc, const ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
@@ -57,45 +75,30 @@ static inline bool ggml_cuda_q8k_dot4_kq_supported(const int cc, const ggml_tens
     if (!ggml_cuda_q8k_dot4_kq_enabled()) {
         return false;
     }
-    const bool k_is_packed16_i32 = (K->type == GGML_TYPE_I32);
-
-    // Defense-in-depth: MTP context must never use packed16 I32 K.
-    // The primary gate is in llama_kv_cache (is_mtp_draft), but if an MTP
-    // FA op somehow sees I32 K, reject here with a log.
-    {
-        const int32_t fa_inst = ((const int32_t *)dst->op_params)[4];
-        const bool is_mtp = (fa_inst == GGML_FATTN_INST_MTP_DRAFT ||
-                             fa_inst == GGML_FATTN_INST_MTP_VERIFY_QK);
-        if (is_mtp && k_is_packed16_i32) {
-            if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
-                if (log_env && atoi(log_env) != 0) {
-                    GGML_LOG_INFO("%s: q8k_dot4_kq reject=mtp_packed16_k inst=%s Q=[%lld,%lld,%lld,%lld]\n",
-                            __func__,
-                            fa_inst == GGML_FATTN_INST_MTP_DRAFT ? "mtp_draft" : "mtp_verify_qk",
-                            (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3]);
-                }
-            }
-            return false;
-        }
+    const int32_t fa_inst = ((const int32_t *)dst->op_params)[4];
+    const char * required_route = getenv("GGML_CUDA_FA_ROUTE_REQUIRE");
+    if (ggml_cuda_q8k_dot4_kq_route_is_decode_contract(required_route) &&
+            !(fa_inst == GGML_FATTN_INST_MTP_DRAFT_DECODE_QK && Q->ne[1] == 1)) {
+        return false;
     }
+    if (ggml_cuda_q8k_dot4_kq_route_is_verify_contract(required_route) &&
+            !(fa_inst == GGML_FATTN_INST_MTP_VERIFY_QK && Q->ne[1] > 1)) {
+        return false;
+    }
+
     if (!GGML_CUDA_CC_IS_RDNA3(cc) || Q->type != GGML_TYPE_F32 ||
             dst->type != GGML_TYPE_F32) {
         return false;
     }
-    // Accept: q8_0 K (original path) or I32 packed16 K (packed16-only path)
-    if (!k_is_packed16_i32 && (K->type != GGML_TYPE_Q8_0 || V->type != GGML_TYPE_Q4_0)) {
+    // rocm_q8k_dot4_kq is the true GGML_TYPE_Q8_0/block32 K reader.
+    // Packed16-q8 side-channel K is physical I32 payload + F16 scales and
+    // must enter through packed16-specific route contracts.
+    if (K->type != GGML_TYPE_Q8_0 || V->type != GGML_TYPE_Q4_0) {
         return false;
     }
-    if (k_is_packed16_i32 && V->type != GGML_TYPE_F16 && V->type != GGML_TYPE_Q8_0 && V->type != GGML_TYPE_Q4_0) {
-        return false;  // packed16 path requires f16 V
+    if (K->ne[0] != Q->ne[0] || K->ne[0] != 256 || V->ne[0] != 256 || dst->ne[0] != 256) {
+        return false;
     }
-    // Packed16 I32 K has ne[0] = D_per_head/4 vs Q's ne[0] = D_per_head
-    const bool k_shape_ok = k_is_packed16_i32
-        ? (K->ne[0] * 4 == Q->ne[0])
-        : (K->ne[0] == Q->ne[0] && K->ne[0] == 256);
-    if (!k_shape_ok) return false;
-    if (!k_is_packed16_i32 && (V->ne[0] != 256 || dst->ne[0] != 256)) return false;
-    if (k_is_packed16_i32 && (dst->ne[0] != Q->ne[0])) return false;
     if (Q->ne[1] <= 2) {
         return false;
     }
@@ -143,16 +146,12 @@ static inline bool ggml_cuda_q8k_dot4_kq_route_for_instruction_ok(
     if (strcmp(required, "rocm_q8k_dot4_kq") == 0) {
         return true;
     }
-    if (strcmp(required, "dot4_recthist") == 0 &&
-        (inst == GGML_FATTN_INST_MTP_VERIFY_QK ||
-         inst == GGML_FATTN_INST_PREFILL_QK ||
-         inst == GGML_FATTN_INST_SPEC_VERIFY_QK ||
-         inst == GGML_FATTN_INST_BATCH_VERIFY_QK)) {
+    if (ggml_cuda_q8k_dot4_kq_route_is_verify_contract(required) &&
+        inst == GGML_FATTN_INST_MTP_VERIFY_QK) {
         return true;
     }
-    if (strcmp(required, "dot4_decode") == 0 &&
-        (inst == GGML_FATTN_INST_MTP_DRAFT_DECODE_QK ||
-         inst == GGML_FATTN_INST_DECODE_QK)) {
+    if (ggml_cuda_q8k_dot4_kq_route_is_decode_contract(required) &&
+        inst == GGML_FATTN_INST_MTP_DRAFT_DECODE_QK) {
         return true;
     }
 

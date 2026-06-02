@@ -1997,6 +1997,16 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     } \
 } while (0)
 
+#define PDMQ_LAUNCH_GQA2_NO_RAW(VT, CAUSAL, kshared_var, directv_var) do { \
+    if (shape == PDMQ_SHAPE_M16N16) { \
+        PDMQ_LAUNCH_GQA2_IMPL(VT, PDMQ_BM_PREFILL, PDMQ_BN_PREFILL, CAUSAL, kshared_var, directv_var, false); \
+    } else if (shape == PDMQ_SHAPE_M8N32) { \
+        PDMQ_LAUNCH_GQA2_IMPL(VT, PDMQ_BM_SMALL, PDMQ_BN_SMALL, CAUSAL, kshared_var, directv_var, false); \
+    } else { \
+        GGML_ABORT("PDMQ GQA2 launch requested for unsupported shape=%s", pdmq_shape_name(shape)); \
+    } \
+} while (0)
+
 #define PDMQ_LAUNCH_TYPED_IMPL(VT, CAUSAL, kshared_val, stagev_val, raw_lds_q4_val) do { \
     if (shape == PDMQ_SHAPE_M1N32) { \
         PDMQ_LAUNCH_SHAPE(VT, PDMQ_BM_DECODE32, PDMQ_BN_DECODE32, CAUSAL, stagev_val, raw_lds_q4_val, kshared_val); \
@@ -2033,25 +2043,37 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     } \
 } while (0)
 
+#define PDMQ_LAUNCH_TYPED_NO_RAW(VT, CAUSAL, kshared_var, directv_var) do { \
+    if (kshared_var && directv_var) { \
+        PDMQ_LAUNCH_TYPED_IMPL(VT, CAUSAL, true, false, false); \
+    } else if (kshared_var) { \
+        PDMQ_LAUNCH_TYPED_IMPL(VT, CAUSAL, true, true, false); \
+    } else if (directv_var) { \
+        PDMQ_LAUNCH_TYPED_IMPL(VT, CAUSAL, false, false, false); \
+    } else { \
+        PDMQ_LAUNCH_TYPED_IMPL(VT, CAUSAL, false, true, false); \
+    } \
+} while (0)
+
 if (is_gqa2) {
     if (assume_causal) {
         switch (V->type) {
             case GGML_TYPE_Q4_0:      PDMQ_LAUNCH_GQA2(PACKED16_DOT4_MMQ_V_Q4_0,      true, kshared, directv, raw_lds_q4); break;
-            case GGML_TYPE_Q8_0:      PDMQ_LAUNCH_GQA2(PACKED16_DOT4_MMQ_V_Q8_0,      true, kshared, directv, false); break;
-            case GGML_TYPE_F16:       PDMQ_LAUNCH_GQA2(PACKED16_DOT4_MMQ_V_F16,       true, kshared, directv, false); break;
-            case GGML_TYPE_TBQ4_0:    PDMQ_LAUNCH_GQA2(PACKED16_DOT4_MMQ_V_TBQ4_0,    true, kshared, directv, false); break;
-            case GGML_TYPE_PLANAR3_0: PDMQ_LAUNCH_GQA2(PACKED16_DOT4_MMQ_V_PLANAR3_0, true, kshared, directv, false); break;
-            case GGML_TYPE_ISO3_0:    PDMQ_LAUNCH_GQA2(PACKED16_DOT4_MMQ_V_ISO3_0,    true, kshared, directv, false); break;
+            case GGML_TYPE_Q8_0:      PDMQ_LAUNCH_GQA2_NO_RAW(PACKED16_DOT4_MMQ_V_Q8_0,      true, kshared, directv); break;
+            case GGML_TYPE_F16:       PDMQ_LAUNCH_GQA2_NO_RAW(PACKED16_DOT4_MMQ_V_F16,       true, kshared, directv); break;
+            case GGML_TYPE_TBQ4_0:    PDMQ_LAUNCH_GQA2_NO_RAW(PACKED16_DOT4_MMQ_V_TBQ4_0,    true, kshared, directv); break;
+            case GGML_TYPE_PLANAR3_0: PDMQ_LAUNCH_GQA2_NO_RAW(PACKED16_DOT4_MMQ_V_PLANAR3_0, true, kshared, directv); break;
+            case GGML_TYPE_ISO3_0:    PDMQ_LAUNCH_GQA2_NO_RAW(PACKED16_DOT4_MMQ_V_ISO3_0,    true, kshared, directv); break;
             default: GGML_ABORT("packed16_dot4_mmq gqa2: unsupported V type");
         }
     } else {
         switch (V->type) {
             case GGML_TYPE_Q4_0:      PDMQ_LAUNCH_GQA2(PACKED16_DOT4_MMQ_V_Q4_0,      false, kshared, directv, raw_lds_q4); break;
-            case GGML_TYPE_Q8_0:      PDMQ_LAUNCH_GQA2(PACKED16_DOT4_MMQ_V_Q8_0,      false, kshared, directv, false); break;
-            case GGML_TYPE_F16:       PDMQ_LAUNCH_GQA2(PACKED16_DOT4_MMQ_V_F16,       false, kshared, directv, false); break;
-            case GGML_TYPE_TBQ4_0:    PDMQ_LAUNCH_GQA2(PACKED16_DOT4_MMQ_V_TBQ4_0,    false, kshared, directv, false); break;
-            case GGML_TYPE_PLANAR3_0: PDMQ_LAUNCH_GQA2(PACKED16_DOT4_MMQ_V_PLANAR3_0, false, kshared, directv, false); break;
-            case GGML_TYPE_ISO3_0:    PDMQ_LAUNCH_GQA2(PACKED16_DOT4_MMQ_V_ISO3_0,    false, kshared, directv, false); break;
+            case GGML_TYPE_Q8_0:      PDMQ_LAUNCH_GQA2_NO_RAW(PACKED16_DOT4_MMQ_V_Q8_0,      false, kshared, directv); break;
+            case GGML_TYPE_F16:       PDMQ_LAUNCH_GQA2_NO_RAW(PACKED16_DOT4_MMQ_V_F16,       false, kshared, directv); break;
+            case GGML_TYPE_TBQ4_0:    PDMQ_LAUNCH_GQA2_NO_RAW(PACKED16_DOT4_MMQ_V_TBQ4_0,    false, kshared, directv); break;
+            case GGML_TYPE_PLANAR3_0: PDMQ_LAUNCH_GQA2_NO_RAW(PACKED16_DOT4_MMQ_V_PLANAR3_0, false, kshared, directv); break;
+            case GGML_TYPE_ISO3_0:    PDMQ_LAUNCH_GQA2_NO_RAW(PACKED16_DOT4_MMQ_V_ISO3_0,    false, kshared, directv); break;
             default: GGML_ABORT("packed16_dot4_mmq gqa2: unsupported V type");
         }
     }
@@ -2059,11 +2081,11 @@ if (is_gqa2) {
 #define PDMQ_SWITCH_V(CAUSAL) \
     switch (V->type) { \
         case GGML_TYPE_Q4_0:      PDMQ_LAUNCH_TYPED(PACKED16_DOT4_MMQ_V_Q4_0,      CAUSAL, kshared, directv, raw_lds_q4); break; \
-        case GGML_TYPE_Q8_0:      PDMQ_LAUNCH_TYPED(PACKED16_DOT4_MMQ_V_Q8_0,      CAUSAL, kshared, directv, false); break; \
-        case GGML_TYPE_F16:       PDMQ_LAUNCH_TYPED(PACKED16_DOT4_MMQ_V_F16,       CAUSAL, kshared, directv, false); break; \
-        case GGML_TYPE_TBQ4_0:    PDMQ_LAUNCH_TYPED(PACKED16_DOT4_MMQ_V_TBQ4_0,    CAUSAL, kshared, directv, false); break; \
-        case GGML_TYPE_PLANAR3_0: PDMQ_LAUNCH_TYPED(PACKED16_DOT4_MMQ_V_PLANAR3_0, CAUSAL, kshared, directv, false); break; \
-        case GGML_TYPE_ISO3_0:    PDMQ_LAUNCH_TYPED(PACKED16_DOT4_MMQ_V_ISO3_0,    CAUSAL, kshared, directv, false); break; \
+        case GGML_TYPE_Q8_0:      PDMQ_LAUNCH_TYPED_NO_RAW(PACKED16_DOT4_MMQ_V_Q8_0,      CAUSAL, kshared, directv); break; \
+        case GGML_TYPE_F16:       PDMQ_LAUNCH_TYPED_NO_RAW(PACKED16_DOT4_MMQ_V_F16,       CAUSAL, kshared, directv); break; \
+        case GGML_TYPE_TBQ4_0:    PDMQ_LAUNCH_TYPED_NO_RAW(PACKED16_DOT4_MMQ_V_TBQ4_0,    CAUSAL, kshared, directv); break; \
+        case GGML_TYPE_PLANAR3_0: PDMQ_LAUNCH_TYPED_NO_RAW(PACKED16_DOT4_MMQ_V_PLANAR3_0, CAUSAL, kshared, directv); break; \
+        case GGML_TYPE_ISO3_0:    PDMQ_LAUNCH_TYPED_NO_RAW(PACKED16_DOT4_MMQ_V_ISO3_0,    CAUSAL, kshared, directv); break; \
         default: GGML_ABORT("packed16_dot4_mmq: unsupported V type"); \
     }
 
@@ -2075,7 +2097,9 @@ if (is_gqa2) {
 
 #undef PDMQ_SWITCH_V
 }
+#undef PDMQ_LAUNCH_TYPED_NO_RAW
 #undef PDMQ_LAUNCH_TYPED
+#undef PDMQ_LAUNCH_GQA2_NO_RAW
 #undef PDMQ_LAUNCH_GQA2
 #undef PDMQ_LAUNCH_GQA2_IMPL
 #undef PDMQ_LAUNCH_GQA2_SHAPE

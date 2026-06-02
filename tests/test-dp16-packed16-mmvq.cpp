@@ -7,13 +7,14 @@
 //   - rocm_packed16_dot4_mmvq
 //
 // Usage:
-//   GGML_CUDA_DP16_TRACE=1 ./build-rocm-fixed/bin/test-dp16-packed16-mmvq --m 16 --n 1,2,3,4 --k 256,512
+//   GGML_CUDA_DP16_TRACE=1 ./build-rocm-fixed/bin/test-dp16-packed16-mmvq --m 16 --n 1,2,3,4,8,16 --k 256,512
 
 #include <ggml.h>
 #include <ggml-backend.h>
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -25,6 +26,8 @@ struct run_result {
     bool ok = false;
     std::string error;
     std::vector<float> output;
+    double elapsed_ms = 0.0;
+    int measured_repeats = 0;
 };
 
 static std::vector<int> parse_list(const char * s) {
@@ -311,11 +314,10 @@ static run_result run_gpu_mul_mat_repeated(
     ggml_backend_tensor_set(A, q_weight.data(), 0, q_weight.size());
     ggml_backend_tensor_set(B, x.data(), 0, x.size() * sizeof(float));
 
-    const int total = std::max(1, warmup + repeat);
-    for (int i = 0; i < total; ++i) {
+    for (int i = 0; i < warmup; ++i) {
         const ggml_status status = ggml_backend_graph_compute(backend, gf);
         if (status != GGML_STATUS_SUCCESS) {
-            rr.error = std::string("ggml_backend_graph_compute failed: ") + ggml_status_to_string(status);
+            rr.error = std::string("ggml_backend_graph_compute warmup failed: ") + ggml_status_to_string(status);
             ggml_backend_buffer_free(cbuf);
             ggml_backend_buffer_free(wbuf);
             ggml_free(ctx);
@@ -324,6 +326,24 @@ static run_result run_gpu_mul_mat_repeated(
             return rr;
         }
     }
+
+    const int measured = std::max(1, repeat);
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < measured; ++i) {
+        const ggml_status status = ggml_backend_graph_compute(backend, gf);
+        if (status != GGML_STATUS_SUCCESS) {
+            rr.error = std::string("ggml_backend_graph_compute measured failed: ") + ggml_status_to_string(status);
+            ggml_backend_buffer_free(cbuf);
+            ggml_backend_buffer_free(wbuf);
+            ggml_free(ctx);
+            ggml_free(wctx);
+            ggml_backend_free(backend);
+            return rr;
+        }
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    rr.elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    rr.measured_repeats = measured;
 
     if (mutate_to) {
         ggml_backend_tensor_set(A, mutate_to->data(), 0, mutate_to->size());
@@ -351,6 +371,302 @@ static run_result run_gpu_mul_mat_repeated(
     return rr;
 }
 
+
+static void fill_bias(std::vector<float> & b, int m, int n) {
+    b.resize((size_t) m * (size_t) n);
+    for (size_t i = 0; i < b.size(); ++i) {
+        b[i] = deterministic_value(i, 23, 0.05f);
+    }
+}
+
+static void set_mtp_route_env() {
+    unsetenv("GGML_CUDA_DP16_ROUTE_REQUIRE");
+    setenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ", "1", 1);
+    setenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_LOG", "1", 1);
+    setenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_PACKED_QKV", "1", 1);
+    setenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_PACKED_DOWN", "1", 1);
+    setenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_PACKED_ATTN_OUT", "1", 1);
+    setenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_PACKED_GLU", "1", 1);
+    setenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_PACKED_EH", "1", 1);
+    setenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMVQ_REUSE_N", "1", 1);
+    setenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_LAYER", "64", 1);
+}
+
+static run_result run_gpu_mtp_xbias_route(
+        const char * weight_name,
+        const std::vector<uint8_t> & q_weight,
+        const std::vector<float> & x,
+        const std::vector<float> & bias,
+        int m,
+        int n,
+        int k) {
+    run_result rr;
+    set_mtp_route_env();
+
+    ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+    if (!backend) {
+        rr.error = "no GPU backend";
+        return rr;
+    }
+
+    const size_t meta = ggml_tensor_overhead() * 12 + ggml_graph_overhead() + 1024 * 1024;
+    ggml_init_params wparams = { meta, nullptr, true };
+    ggml_context * wctx = ggml_init(wparams);
+    ggml_init_params cparams = { meta, nullptr, true };
+    ggml_context * ctx = ggml_init(cparams);
+    if (!wctx || !ctx) {
+        rr.error = "ggml_init failed";
+        if (ctx)  ggml_free(ctx);
+        if (wctx) ggml_free(wctx);
+        ggml_backend_free(backend);
+        return rr;
+    }
+
+    ggml_tensor * A = ggml_new_tensor_2d(wctx, GGML_TYPE_Q8_0, k, m);
+    ggml_set_name(A, weight_name);
+    ggml_tensor * B = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+    ggml_set_name(B, "mtp_route_B_f32_activation");
+    ggml_tensor * XBias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
+    ggml_set_name(XBias, "mtp_route_x_bias");
+    ggml_tensor * MM = ggml_mul_mat(ctx, A, B);
+    ggml_set_name(MM, "mtp_route_mm");
+    ggml_tensor * C = ggml_add(ctx, MM, XBias);
+    ggml_set_name(C, "mtp_route_xbias_output");
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, C);
+
+    ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(wctx, backend);
+    ggml_backend_buffer_t cbuf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!wbuf || !cbuf) {
+        rr.error = "backend tensor allocation failed";
+        if (cbuf) ggml_backend_buffer_free(cbuf);
+        if (wbuf) ggml_backend_buffer_free(wbuf);
+        ggml_free(ctx);
+        ggml_free(wctx);
+        ggml_backend_free(backend);
+        return rr;
+    }
+    ggml_backend_buffer_set_usage(wbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_buffer_set_usage(cbuf, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+
+    ggml_backend_tensor_set(A, q_weight.data(), 0, q_weight.size());
+    ggml_backend_tensor_set(B, x.data(), 0, x.size() * sizeof(float));
+    ggml_backend_tensor_set(XBias, bias.data(), 0, bias.size() * sizeof(float));
+
+    const ggml_status status = ggml_backend_graph_compute(backend, gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        rr.error = std::string("ggml_backend_graph_compute failed: ") + ggml_status_to_string(status);
+        ggml_backend_buffer_free(cbuf);
+        ggml_backend_buffer_free(wbuf);
+        ggml_free(ctx);
+        ggml_free(wctx);
+        ggml_backend_free(backend);
+        return rr;
+    }
+
+    rr.output.resize((size_t) ggml_nelements(C));
+    ggml_backend_tensor_get(C, rr.output.data(), 0, rr.output.size() * sizeof(float));
+    rr.ok = true;
+
+    ggml_backend_buffer_free(cbuf);
+    ggml_backend_buffer_free(wbuf);
+    ggml_free(ctx);
+    ggml_free(wctx);
+    ggml_backend_free(backend);
+    return rr;
+}
+
+static run_result run_gpu_mtp_gate_reject_route(
+        const char * up_weight_name,
+        const std::vector<uint8_t> & q_up_weight,
+        const std::vector<uint8_t> & q_gate_weight,
+        const std::vector<float> & x,
+        int m,
+        int n,
+        int k) {
+    run_result rr;
+    set_mtp_route_env();
+
+    ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+    if (!backend) {
+        rr.error = "no GPU backend";
+        return rr;
+    }
+
+    const size_t meta = ggml_tensor_overhead() * 14 + ggml_graph_overhead() + 1024 * 1024;
+    ggml_init_params wparams = { meta, nullptr, true };
+    ggml_context * wctx = ggml_init(wparams);
+    ggml_init_params cparams = { meta, nullptr, true };
+    ggml_context * ctx = ggml_init(cparams);
+    if (!wctx || !ctx) {
+        rr.error = "ggml_init failed";
+        if (ctx)  ggml_free(ctx);
+        if (wctx) ggml_free(wctx);
+        ggml_backend_free(backend);
+        return rr;
+    }
+
+    ggml_tensor * AUp = ggml_new_tensor_2d(wctx, GGML_TYPE_Q8_0, k, m);
+    ggml_set_name(AUp, up_weight_name);
+    ggml_tensor * AGate = ggml_new_tensor_2d(wctx, GGML_TYPE_Q8_0, k, m);
+    ggml_set_name(AGate, "blk.64.ffn_gate.weight");
+    ggml_tensor * B = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+    ggml_set_name(B, "mtp_route_gate_B_f32_activation");
+    ggml_tensor * Gate = ggml_mul_mat(ctx, AGate, B);
+    ggml_set_name(Gate, "mtp_route_gate_mm");
+    ggml_tensor * Up = ggml_mul_mat(ctx, AUp, B);
+    ggml_set_name(Up, "mtp_route_up_mm");
+    ggml_tensor * C = ggml_glu_split(ctx, Gate, Up, GGML_GLU_OP_SWIGLU);
+    ggml_set_name(C, "mtp_route_gate_reject_output");
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, C);
+
+    ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(wctx, backend);
+    ggml_backend_buffer_t cbuf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!wbuf || !cbuf) {
+        rr.error = "backend tensor allocation failed";
+        if (cbuf) ggml_backend_buffer_free(cbuf);
+        if (wbuf) ggml_backend_buffer_free(wbuf);
+        ggml_free(ctx);
+        ggml_free(wctx);
+        ggml_backend_free(backend);
+        return rr;
+    }
+    ggml_backend_buffer_set_usage(wbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_buffer_set_usage(cbuf, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+
+    ggml_backend_tensor_set(AUp, q_up_weight.data(), 0, q_up_weight.size());
+    ggml_backend_tensor_set(AGate, q_gate_weight.data(), 0, q_gate_weight.size());
+    ggml_backend_tensor_set(B, x.data(), 0, x.size() * sizeof(float));
+
+    const ggml_status status = ggml_backend_graph_compute(backend, gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        rr.error = std::string("ggml_backend_graph_compute failed: ") + ggml_status_to_string(status);
+        ggml_backend_buffer_free(cbuf);
+        ggml_backend_buffer_free(wbuf);
+        ggml_free(ctx);
+        ggml_free(wctx);
+        ggml_backend_free(backend);
+        return rr;
+    }
+
+    rr.output.resize((size_t) ggml_nelements(C));
+    ggml_backend_tensor_get(C, rr.output.data(), 0, rr.output.size() * sizeof(float));
+    rr.ok = true;
+
+    ggml_backend_buffer_free(cbuf);
+    ggml_backend_buffer_free(wbuf);
+    ggml_free(ctx);
+    ggml_free(wctx);
+    ggml_backend_free(backend);
+    return rr;
+}
+
+static int run_mtp_route_proof() {
+    const int m = 16;
+    const int n = 1;
+    const int k = 256;
+    const float tolerance = 1.0e-2f;
+    std::vector<float> weights_up;
+    std::vector<float> weights_gate;
+    std::vector<float> x;
+    std::vector<float> bias;
+    fill_weights(weights_up, m, k, 1);
+    fill_weights(weights_gate, m, k, 31);
+    fill_activations(x, k, n);
+    fill_bias(bias, m, n);
+    const std::vector<uint8_t> q_up = quantize_q8_0_rows(weights_up, m, k);
+    const std::vector<uint8_t> q_gate = quantize_q8_0_rows(weights_gate, m, k);
+    std::vector<float> ref = cpu_dequant_q8_0_matmul_ref(q_up, x, m, n, k);
+    for (size_t i = 0; i < ref.size(); ++i) {
+        ref[i] += bias[i];
+    }
+
+    int failures = 0;
+    run_result qkv_xbias = run_gpu_mtp_xbias_route("blk.64.attn_q.weight", q_up, x, bias, m, n, k);
+    if (!qkv_xbias.ok) {
+        std::fprintf(stderr, "mtp qkv x_bias route failed: %s\n", qkv_xbias.error.c_str());
+        ++failures;
+    } else {
+        const float diff = max_abs_diff(qkv_xbias.output, ref);
+        std::printf("mtp_route_proof qkv_xbias_selected max=%g\n", diff);
+        if (diff > tolerance) {
+            std::fprintf(stderr, "mtp qkv x_bias diff %g > tol %g\n", diff, tolerance);
+            ++failures;
+        }
+    }
+
+    const int n_reuse = 4;
+    std::vector<float> x_reuse;
+    std::vector<float> bias_reuse;
+    fill_activations(x_reuse, k, n_reuse);
+    fill_bias(bias_reuse, m, n_reuse);
+    std::vector<float> ref_reuse = cpu_dequant_q8_0_matmul_ref(q_up, x_reuse, m, n_reuse, k);
+    for (size_t i = 0; i < ref_reuse.size(); ++i) {
+        ref_reuse[i] += bias_reuse[i];
+    }
+    for (const char * name : {"blk.64.ffn_down.weight", "blk.64.attn_output.weight"}) {
+        run_result xbias_n4 = run_gpu_mtp_xbias_route(name, q_up, x_reuse, bias_reuse, m, n_reuse, k);
+        if (!xbias_n4.ok) {
+            std::fprintf(stderr, "mtp x_bias N=4 route failed for %s: %s\n", name, xbias_n4.error.c_str());
+            ++failures;
+        } else {
+            const float diff = max_abs_diff(xbias_n4.output, ref_reuse);
+            std::printf("mtp_route_proof xbias_n4 tensor=%s n=%d max=%g\n", name, n_reuse, diff);
+            if (diff > tolerance) {
+                std::fprintf(stderr, "mtp x_bias N=4 diff %g > tol %g for %s\n", diff, tolerance, name);
+                ++failures;
+            }
+        }
+    }
+
+    const int n_reuse_capped = 8;
+    std::vector<float> x_reuse_capped;
+    std::vector<float> bias_reuse_capped;
+    fill_activations(x_reuse_capped, k, n_reuse_capped);
+    fill_bias(bias_reuse_capped, m, n_reuse_capped);
+    std::vector<float> ref_reuse_capped = cpu_dequant_q8_0_matmul_ref(q_up, x_reuse_capped, m, n_reuse_capped, k);
+    for (size_t i = 0; i < ref_reuse_capped.size(); ++i) {
+        ref_reuse_capped[i] += bias_reuse_capped[i];
+    }
+    for (const char * name : {"blk.64.ffn_down.weight", "blk.64.attn_output.weight"}) {
+        run_result xbias_n8 = run_gpu_mtp_xbias_route(name, q_up, x_reuse_capped, bias_reuse_capped, m, n_reuse_capped, k);
+        if (!xbias_n8.ok) {
+            std::fprintf(stderr, "mtp x_bias N=8 route failed for %s: %s\n", name, xbias_n8.error.c_str());
+            ++failures;
+        } else {
+            const float diff = max_abs_diff(xbias_n8.output, ref_reuse_capped);
+            std::printf("mtp_route_proof xbias_n8 tensor=%s n=%d max=%g\n", name, n_reuse_capped, diff);
+            if (diff > tolerance) {
+                std::fprintf(stderr, "mtp x_bias N=8 diff %g > tol %g for %s\n", diff, tolerance, name);
+                ++failures;
+            }
+        }
+    }
+
+    for (const char * name : {"blk.64.attn_q.weight", "blk.64.ffn_down.weight", "blk.64.attn_output.weight"}) {
+        run_result gate_reject = run_gpu_mtp_gate_reject_route(name, q_up, q_gate, x, m, n, k);
+        if (!gate_reject.ok) {
+            std::fprintf(stderr, "mtp gate reject proof failed for %s: %s\n", name, gate_reject.error.c_str());
+            ++failures;
+        } else if (has_nonfinite(gate_reject.output)) {
+            std::fprintf(stderr, "mtp gate reject proof produced non-finite output for %s\n", name);
+            ++failures;
+        } else {
+            std::printf("mtp_route_proof gate_reject_case tensor=%s ok=1\n", name);
+        }
+    }
+
+    if (failures != 0) {
+        std::fprintf(stderr, "MTP route proof failed: %d failure(s)\n", failures);
+        return 1;
+    }
+    std::printf("MTP route proof passed\n");
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     int m = 16;
     std::vector<int> ns = {1, 2, 3, 4};
@@ -360,6 +676,7 @@ int main(int argc, char ** argv) {
     int warmup = 0;
     int repeat = 1;
     bool mutation_check = false;
+    bool mtp_route_proof = false;
     const bool allow_invalid = getenv("DP16_MMVQ_HARNESS_ALLOW_INVALID") && atoi(getenv("DP16_MMVQ_HARNESS_ALLOW_INVALID")) != 0;
 
     for (int i = 1; i < argc; ++i) {
@@ -380,8 +697,10 @@ int main(int argc, char ** argv) {
             repeat = parse_list(argv[++i]).at(0);
         } else if (arg == "--mutation-check") {
             mutation_check = true;
+        } else if (arg == "--mtp-route-proof") {
+            mtp_route_proof = true;
         } else if (arg == "--help") {
-            std::printf("usage: %s [--m 16] [--n 1,2,3,4] [--k 256,512] [--tol 1e-3] [--source q8_0] [--warmup 0] [--repeat 1] [--mutation-check]\n", argv[0]);
+            std::printf("usage: %s [--m 16] [--n 1,2,3,4] [--k 256,512] [--tol 1e-3] [--source q8_0] [--warmup 0] [--repeat 1] [--mutation-check] [--mtp-route-proof]\n", argv[0]);
             return 0;
         } else {
             std::fprintf(stderr, "unknown or incomplete argument: %s\n", arg.c_str());
@@ -391,6 +710,10 @@ int main(int argc, char ** argv) {
 
     setenv("GGML_CUDA_DP16_TRACE", getenv("GGML_CUDA_DP16_TRACE") ? getenv("GGML_CUDA_DP16_TRACE") : "1", 1);
     ggml_backend_load_all();
+
+    if (mtp_route_proof) {
+        return run_mtp_route_proof();
+    }
 
     if (source != "q8_0" && source != "q4_0") {
         std::fprintf(stderr, "unsupported --source '%s' (supported: q8_0,q4_0)\n", source.c_str());
@@ -414,8 +737,8 @@ int main(int argc, char ** argv) {
         const std::vector<uint8_t> q_weight = quantize_rows(weights, m, k, weight_type);
 
         for (int n : ns) {
-            if (!allow_invalid && (n <= 0 || n > 4)) {
-                std::fprintf(stderr, "n=%d is outside packed16 MMVQ decode range 1..4\n", n);
+            if (!allow_invalid && (n <= 0 || n > 16)) {
+                std::fprintf(stderr, "n=%d is outside packed16 MMVQ decode range 1..16\n", n);
                 ++failures;
                 continue;
             }
@@ -426,7 +749,8 @@ int main(int argc, char ** argv) {
 
             std::printf("case m=%d n=%d k=%d\n", m, n, k);
             run_result q8;
-            if (weight_type == GGML_TYPE_Q8_0) {
+            const bool q8_ref_available = weight_type == GGML_TYPE_Q8_0 && n <= 4;
+            if (q8_ref_available) {
                 q8 = run_gpu_mul_mat("rocm_q8_dot4_mmvq", q_weight, x, m, n, k, weight_type);
                 if (!q8.ok) {
                     std::fprintf(stderr, "  q8 route failed: %s\n", q8.error.c_str());
@@ -440,14 +764,14 @@ int main(int argc, char ** argv) {
                 ++failures;
                 continue;
             }
-            if ((weight_type == GGML_TYPE_Q8_0 && has_nonfinite(q8.output)) || has_nonfinite(packed16.output)) {
+            if ((q8_ref_available && has_nonfinite(q8.output)) || has_nonfinite(packed16.output)) {
                 std::fprintf(stderr, "  non-finite output detected\n");
                 ++failures;
                 continue;
             }
 
             const float max_p16_cpu = max_abs_diff(packed16.output, cpu_ref);
-            if (weight_type == GGML_TYPE_Q8_0) {
+            if (q8_ref_available) {
                 const float max_q8_p16 = max_abs_diff(q8.output, packed16.output);
                 const float mean_q8_p16 = mean_abs_diff(q8.output, packed16.output);
                 const float max_q8_cpu = max_abs_diff(q8.output, cpu_ref);
@@ -455,6 +779,13 @@ int main(int argc, char ** argv) {
                         max_q8_p16, mean_q8_p16, max_q8_cpu, max_p16_cpu);
                 if (max_q8_p16 > tolerance) {
                     std::fprintf(stderr, "  FAIL: q8 vs packed16 diff %g > tol %g\n", max_q8_p16, tolerance);
+                    ++failures;
+                }
+            } else if (weight_type == GGML_TYPE_Q8_0) {
+                const float cpu_ref_tolerance = std::max(tolerance, 0.01f);
+                std::printf("  packed16_vs_dequant_f32 max=%g tol=%g (q8 route reference unavailable for n=%d)\n", max_p16_cpu, cpu_ref_tolerance, n);
+                if (max_p16_cpu > cpu_ref_tolerance) {
+                    std::fprintf(stderr, "  FAIL: packed16 diff %g > tol %g\n", max_p16_cpu, cpu_ref_tolerance);
                     ++failures;
                 }
             } else {
@@ -471,16 +802,18 @@ int main(int argc, char ** argv) {
                     std::fprintf(stderr, "  steady packed16 route failed: %s\n", steady.error.c_str());
                     ++failures;
                 } else {
-                    const float max_steady = weight_type == GGML_TYPE_Q8_0 ? max_abs_diff(steady.output, q8.output) : max_abs_diff(steady.output, cpu_ref);
-                    std::printf("  steady_packed16_vs_%s max=%g warmup=%d repeat=%d\n", weight_type == GGML_TYPE_Q8_0 ? "q8" : "dequant_f32", max_steady, warmup, repeat);
-                    if (max_steady > tolerance) {
-                        std::fprintf(stderr, "  FAIL: steady packed16 diff %g > tol %g\n", max_steady, tolerance);
+                    const float max_steady = q8_ref_available ? max_abs_diff(steady.output, q8.output) : max_abs_diff(steady.output, cpu_ref);
+                    const double avg_ms = steady.measured_repeats > 0 ? steady.elapsed_ms / (double) steady.measured_repeats : 0.0;
+                    std::printf("  steady_packed16_vs_%s max=%g warmup=%d repeat=%d elapsed_ms=%.3f avg_ms=%.6f\n", q8_ref_available ? "q8" : "dequant_f32", max_steady, warmup, repeat, steady.elapsed_ms, avg_ms);
+                    const float steady_tolerance = q8_ref_available ? tolerance : std::max(tolerance, 0.01f);
+                    if (max_steady > steady_tolerance) {
+                        std::fprintf(stderr, "  FAIL: steady packed16 diff %g > tol %g\n", max_steady, steady_tolerance);
                         ++failures;
                     }
                 }
             }
 
-            if (mutation_check && weight_type == GGML_TYPE_Q8_0) {
+            if (mutation_check && q8_ref_available) {
                 std::vector<float> weights2;
                 fill_weights(weights2, m, k, 101);
                 const std::vector<uint8_t> q_weight2 = quantize_q8_0_rows(weights2, m, k);

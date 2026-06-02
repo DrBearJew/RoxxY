@@ -8,7 +8,7 @@
 //   A/activation: transient q8_1 blocks produced by the existing MMVQ quantizer
 //   N: 1..4 columns/tokens
 //   K: multiple of 256 (enforced by the host planner)
-//   Fusion: supported for N=1 decode FFN/GEMV (bias/gate/GLU)
+//   Fusion: supported for N=1..4 decode FFN/GEMV (bias/gate/GLU)
 //   IDs: not supported in this first lane
 
 static constexpr int DP16_MMVQ_Q8_DOT4_WARP_SIZE = 32;
@@ -90,7 +90,7 @@ static __global__ void dp16_mmvq_q8_dot4_n1_4_k256_kernel(
 }
 
 template<int NCOLS_DST>
-__launch_bounds__(DP16_MMVQ_Q8_DOT4_WARP_SIZE, 1)
+__launch_bounds__(NCOLS_DST*DP16_MMVQ_Q8_DOT4_WARP_SIZE, 1)
 static __global__ void dp16_mmvq_q8_dot4_fusion_n1_k256_kernel(
         const void * __restrict__ vx,
         const void * __restrict__ vy,
@@ -109,9 +109,13 @@ static __global__ void dp16_mmvq_q8_dot4_fusion_n1_k256_kernel(
         const uint32_t stride_sample_x,
         const uint32_t stride_sample_y,
         const uint32_t stride_sample_dst) {
-    static_assert(NCOLS_DST == 1, "DP16 MMVQ q8 DOT4 fusion is N=1 only");
+    static_assert(NCOLS_DST >= 1 && NCOLS_DST <= 4, "DP16 MMVQ q8 DOT4 fusion is N=1..4 only");
 
     const int lane = threadIdx.x;
+    const int col  = threadIdx.y;
+    if (col >= NCOLS_DST) {
+        return;
+    }
 
     const uint32_t row = blockIdx.x;
     if (row >= nrows_x) {
@@ -128,7 +132,7 @@ static __global__ void dp16_mmvq_q8_dot4_fusion_n1_k256_kernel(
     const block_q8_0 * x = ((const block_q8_0 *) vx) +
         sample_x*stride_sample_x + channel_x*stride_channel_x + row*stride_row_x;
     const block_q8_1 * y = ((const block_q8_1 *) vy) +
-        sample_y*stride_sample_y + channel_y*stride_channel_y;
+        sample_y*stride_sample_y + channel_y*stride_channel_y + col*stride_col_y;
 
     float acc = dp16_mmvq_q8_dot4_accumulate_row(x, y, ncols_x, lane);
 
@@ -150,7 +154,7 @@ static __global__ void dp16_mmvq_q8_dot4_fusion_n1_k256_kernel(
 
     if (lane == 0) {
         float result = acc;
-        const uint32_t out_offset = sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row;
+        const uint32_t out_offset = sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + col*stride_col_dst + row;
         if (use_bias) {
             result += ((const float *) fusion.x_bias)[out_offset];
         }
@@ -200,10 +204,8 @@ static inline void dp16_mmvq_q8_dot4_fusion_n1_k256_launch(
         const int stride_sample_y,
         const int stride_sample_dst,
         cudaStream_t stream) {
-    static_assert(NCOLS_DST == 1, "DP16 MMVQ q8 DOT4 fusion is N=1 only");
-    GGML_UNUSED(stride_col_dst);
-    GGML_UNUSED(stride_col_y);
-    const dim3 block(DP16_MMVQ_Q8_DOT4_WARP_SIZE, 1, 1);
+    static_assert(NCOLS_DST >= 1 && NCOLS_DST <= 4, "DP16 MMVQ q8 DOT4 fusion is N=1..4 only");
+    const dim3 block(DP16_MMVQ_Q8_DOT4_WARP_SIZE, NCOLS_DST, 1);
     const dim3 grid(nrows_x, nchannels_dst, nsamples_dst);
     dp16_mmvq_q8_dot4_fusion_n1_k256_kernel<NCOLS_DST><<<grid, block, 0, stream>>>(
         vx, vy, fusion, dst, ncols_x, nrows_x, channel_ratio, sample_ratio,

@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/dot4-packed16/dp16-common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -81,12 +82,14 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
 void ggml_cuda_dp16_packed16_weight_cache_remove_buffer(ggml_backend_buffer_t buffer);
 void ggml_cuda_dp16_packed16_weight_cache_invalidate_buffer(ggml_backend_buffer_t buffer);
 void ggml_cuda_dp16_packed16_weight_cache_invalidate_tensor(const ggml_tensor * tensor);
+void ggml_cuda_mtp_q8_dot4_mmvq_act_cache_reset();
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
@@ -121,6 +124,60 @@ static bool ggml_cuda_copy_sync_trace_enabled() {
         return env && atoi(env) != 0;
     }();
     return enabled;
+}
+
+static bool ggml_cuda_graph_trace_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_CUDA_GRAPH_TRACE");
+        return env && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static int ggml_cuda_graph_trace_every() {
+    static const int every = []() {
+        const char * env = getenv("GGML_CUDA_GRAPH_TRACE_EVERY");
+        if (!env || env[0] == '\0') {
+            return 16;
+        }
+        const int value = atoi(env);
+        return value > 0 ? value : 16;
+    }();
+    return every;
+}
+
+static std::mutex & ggml_cuda_graph_trace_mutex() {
+    static std::mutex * mutex = new std::mutex();
+    return *mutex;
+}
+
+static uint64_t & ggml_cuda_graph_trace_record_count() {
+    static uint64_t * count = new uint64_t(0);
+    return *count;
+}
+
+static void ggml_cuda_graph_trace_emit(
+        const char * site,
+        const char * mode,
+        const bool update,
+        const int n_nodes,
+        const int64_t host_us) {
+    if (!ggml_cuda_graph_trace_enabled()) {
+        return;
+    }
+
+    uint64_t count = 0;
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_graph_trace_mutex());
+        count = ++ggml_cuda_graph_trace_record_count();
+    }
+
+    const int every = ggml_cuda_graph_trace_every();
+    if (count <= 8 || (every > 0 && (count % (uint64_t) every) == 0)) {
+        GGML_LOG_INFO("%s: cuda_graph_trace mode=%s update=%d nodes=%d host_us=%lld count=%llu\n",
+                site ? site : "-", mode ? mode : "-", update ? 1 : 0, n_nodes,
+                (long long) host_us, (unsigned long long) count);
+    }
 }
 
 static std::string ggml_cuda_copy_sync_trace_raw_name(const ggml_tensor * tensor) {
@@ -2495,6 +2552,43 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     return true;
 }
 
+static bool ggml_cuda_mtp_q8_dot4_mmvq_fuse_glu_enabled() {
+    const char * mtp_q8 = getenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ");
+    const char * fuse   = getenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_FUSE_GLU");
+    const char * packed = getenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_PACKED_GLU");
+    return mtp_q8 && atoi(mtp_q8) != 0 && ((fuse && atoi(fuse) != 0) || (packed && atoi(packed) != 0));
+}
+
+static bool ggml_cuda_mtp_q8_dot4_mmvq_fuse_glu_log_enabled() {
+    const char * enabled = getenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_LOG");
+    return enabled && atoi(enabled) != 0;
+}
+
+static bool ggml_cuda_mtp_q8_dot4_mmvq_fuse_glu_name_allowed(const char * name) {
+    if (!name || name[0] == '\0' || strstr(name, ".ffn_up.weight") == nullptr) {
+        return false;
+    }
+
+    if (const char * filter = getenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_FILTER")) {
+        if (filter[0] != '\0') {
+            return strstr(name, filter) != nullptr;
+        }
+    }
+
+    const char * layer = getenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_LAYER");
+    char prefix[32];
+    snprintf(prefix, sizeof(prefix), "blk.%s.", (layer && layer[0] != '\0') ? layer : "64");
+    return strstr(name, prefix) == name;
+}
+
+static bool ggml_cuda_mtp_q8_dot4_mmvq_should_fuse_glu(const ggml_tensor * tensor) {
+    if (!ggml_cuda_mtp_q8_dot4_mmvq_fuse_glu_enabled() || !tensor || tensor->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+    const ggml_tensor * src0 = tensor->src[0];
+    return src0 && src0->type == GGML_TYPE_Q8_0 && ggml_cuda_mtp_q8_dot4_mmvq_fuse_glu_name_allowed(src0->name);
+}
+
 static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
@@ -2547,9 +2641,13 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
-    //we only support fusion for ncols_dst = 1
+
+    const bool mtp_fuse_glu_n1_4 = ggml_cuda_mtp_q8_dot4_mmvq_should_fuse_glu(tensor);
     if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
-        return false;
+        const bool allow_glu = mtp_fuse_glu_n1_4 && dst->ne[1] >= 2 && dst->ne[1] <= 4;
+        if (!allow_glu) {
+            return false;
+        }
     }
 
     if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] != 1) {
@@ -2565,6 +2663,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
         return false;
     }
 
+    if (mtp_fuse_glu_n1_4 && dst->ne[1] > 1 && ggml_cuda_mtp_q8_dot4_mmvq_fuse_glu_log_enabled()) {
+        GGML_LOG_INFO("%s: mtp_weight_route route=rocm_q8_dot4_mmvq_fused_glu tensor=%s status=fuse_candidate ncols_dst=%lld\n",
+                __func__, src0->name, (long long) dst->ne[1]);
+    }
     return use_mul_mat_vec_q;
 }
 
@@ -4230,6 +4332,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
+    const bool graph_trace = ggml_cuda_graph_trace_enabled();
+    const int64_t eval_start_us = graph_trace ? ggml_time_us() : 0;
+    ggml_cuda_mtp_q8_dot4_mmvq_act_cache_reset();
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
@@ -4415,6 +4520,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
             graph_evaluated_or_captured = true; // CUDA graph has been captured
+            if (graph_trace) {
+                ggml_cuda_graph_trace_emit(__func__, "capture", true, cgraph->n_nodes, ggml_time_us() - eval_start_us);
+            }
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
             if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
@@ -4422,6 +4530,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
         } else {
             graph_evaluated_or_captured = true; // ggml graph has been directly evaluated
+            if (graph_trace && !use_cuda_graph) {
+                ggml_cuda_graph_trace_emit(__func__, "direct", false, cgraph->n_nodes, ggml_time_us() - eval_start_us);
+            }
         }
     }
 
@@ -4434,7 +4545,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
         // Launch graph
+        const int64_t launch_start_us = graph_trace ? ggml_time_us() : 0;
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        if (graph_trace) {
+            ggml_cuda_graph_trace_emit(__func__, cuda_graph_update_required ? "graph_launch_after_capture" : "graph_launch", cuda_graph_update_required, cgraph->n_nodes, ggml_time_us() - launch_start_us);
+        }
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;

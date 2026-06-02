@@ -14,6 +14,7 @@
 
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -2216,6 +2217,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
             ggml_fattn_instruction inst = GGML_FATTN_INST_NONE;
             const char * inst_reason = "upstream_like_none";
+
+            if (const char * mtp_f16k_q4v_vec = getenv("GGML_CUDA_ROCM_MTP_F16K_Q4V_VEC")) {
+                if (atoi(mtp_f16k_q4v_vec) != 0 && ubatch.n_tokens == 1 && n_outputs > 0) {
+                    inst = GGML_FATTN_INST_MTP_DRAFT_DECODE_QK;
+                    inst_reason = "auto_mtp_f16k_q4v_decode";
+                }
+            }
 
             if (const char * force = getenv("LLAMA_MTP_FA_INST")) {
                 if (strcmp(force, "draft_decode") == 0 && ubatch.n_tokens == 1 && n_outputs > 0) {

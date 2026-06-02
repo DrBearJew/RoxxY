@@ -1,5 +1,6 @@
 #include "fattn-dot4-q8k-kq.cuh"
 
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <unordered_map>
@@ -45,6 +46,78 @@ static inline bool ggml_cuda_q8k_dot4_kq_env_enabled(const char * name) {
 static inline int ggml_cuda_q8k_dot4_kq_env_int(const char * name, int fallback) {
     const char * env = getenv(name);
     return env ? atoi(env) : fallback;
+}
+
+static inline const char * ggml_cuda_q8k_dot4_k_physical_name(const ggml_tensor * K) {
+    if (!K) {
+        return "unknown";
+    }
+    if (K->type == GGML_TYPE_Q8_0) {
+        return "q8_0_block32";
+    }
+    if (K->type == GGML_TYPE_I32) {
+        return "packed16_q8_sidechannel_i32_f16scales";
+    }
+    if (K->type == GGML_TYPE_F16) {
+        return "f16_source_op_local_packed16";
+    }
+    return "unknown";
+}
+
+static bool ggml_cuda_q8k_dot4_packed16_sidecar_valid(
+        const ggml_tensor * K,
+        const ggml_tensor * payload,
+        const ggml_tensor * scales,
+        const bool verbose,
+        const char * context) {
+    const char * reject = nullptr;
+    int64_t head_stride_payload = 0;
+    int64_t head_stride_scales = 0;
+
+    if (!K || K->type != GGML_TYPE_I32) {
+        reject = "not_i32_packed16_k";
+    } else if (!payload || !scales) {
+        reject = "missing_packed16_k_sidecar";
+    } else if (payload->type != GGML_TYPE_I32 || scales->type != GGML_TYPE_F16) {
+        reject = "bad_packed16_k_sidecar_type";
+    } else if (K->ne[2] <= 0 || payload->ne[1] % K->ne[2] != 0 || scales->ne[1] % K->ne[2] != 0) {
+        reject = "bad_packed16_k_head_stride";
+    } else {
+        head_stride_payload = payload->ne[1] / K->ne[2];
+        head_stride_scales = scales->ne[1] / K->ne[2];
+        if (payload->ne[0] != GGML_CUDA_Q8K_DOT4_KQ_D / 4 ||
+                scales->ne[0] != GGML_CUDA_Q8K_DOT4_KQ_D / QK8_0 ||
+                head_stride_payload < K->ne[1] || head_stride_scales < K->ne[1] ||
+                payload->ne[1] < K->ne[1] * K->ne[2] ||
+                scales->ne[1] < K->ne[1] * K->ne[2] ||
+                payload->nb[0] != (int64_t) sizeof(int) ||
+                scales->nb[0] != (int64_t) sizeof(half) ||
+                payload->nb[1] != (GGML_CUDA_Q8K_DOT4_KQ_D / 4) * (int64_t) sizeof(int) ||
+                scales->nb[1] != (GGML_CUDA_Q8K_DOT4_KQ_D / QK8_0) * (int64_t) sizeof(half) ||
+                payload->nb[2] != payload->ne[1] * payload->nb[1] ||
+                scales->nb[2] != scales->ne[1] * scales->nb[1] ||
+                payload->nb[3] != payload->ne[2] * payload->nb[2] ||
+                scales->nb[3] != scales->ne[2] * scales->nb[2]) {
+            reject = "bad_packed16_k_sidecar_shape";
+        }
+    }
+
+    if (!reject) {
+        return true;
+    }
+
+    if (verbose) {
+        fprintf(stderr,
+            "q8k_dot4_kq reject route=rocm_fa2_packed16_dot4_decode "
+            "reject=%s context=%s K_data=%p K=[%lld,%lld,%lld,%lld] "
+            "payload=%p scales=%p head_stride_payload=%lld head_stride_scales=%lld\n",
+            reject, context ? context : "unknown", K ? K->data : nullptr,
+            K ? (long long) K->ne[0] : 0, K ? (long long) K->ne[1] : 0,
+            K ? (long long) K->ne[2] : 0, K ? (long long) K->ne[3] : 0,
+            (const void *) payload, (const void *) scales,
+            (long long) head_stride_payload, (long long) head_stride_scales);
+    }
+    return false;
 }
 
 static inline void ggml_cuda_q8k_dot4_kq_event_create(hipEvent_t * event) {
@@ -3151,12 +3224,13 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
     if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
         if (log_env && atoi(log_env) != 0) {
             GGML_LOG_INFO(
-                "fa_dot4_launch: fa_inst=%d nq=%lld nk=%lld d=%lld K=%s V=%s\n",
+                "fa_dot4_launch: fa_inst=%d nq=%lld nk=%lld d=%lld K=%s k_phys=%s V=%s\n",
                 fa_inst_i32,
                 (long long) Q->ne[1],
                 (long long) K->ne[1],
                 (long long) Q->ne[0],
                 ggml_type_name(K->type),
+                ggml_cuda_q8k_dot4_k_physical_name(K),
                 ggml_type_name(V->type));
         }
     }
@@ -3235,7 +3309,18 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
     const bool blockfa_hybrid_bm8_any = blockfa_hybrid_bm8 || blockfa_hybrid_bm8_packed16_scalar || blockfa_hybrid_bm8_vreuse || blockfa_hybrid_bm8_hgroup;
     const bool blockfa_runtime_any_explicit = blockfa_hybrid_bm8_any || blockfa_recthist_any_explicit;
     const bool fused_variant_explicit = fused_online || fused_tile8_parallel || grouped_gqa_online || grouped_gqa_qtile2_tile8 || grouped_gqa_qtile4_tile8 || grouped_gqa6_qtile4_tile8 || grouped_gqa6_qtile4_vshared || blockfa_runtime_any_explicit;
-    const bool full_fa = ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_KQ_FULL_FA");
+    const bool full_fa_env = ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_KQ_FULL_FA");
+    // FA2 packed16 MTP draft-decode is a real attention lane, not the legacy
+    // KQ-only probe. When the selector routes persistent packed16/I32 MTP draft
+    // decode through rocm_q8k_dot4_kq, auto-enable FULL_FA so the launcher
+    // executes the native FA output path instead of zero/probe behavior.
+    const bool auto_full_fa_mtp_packed16_draft =
+        !full_fa_env &&
+        fa_inst_i32 == GGML_FATTN_INST_MTP_DRAFT_DECODE_QK &&
+        Q->ne[1] == 1 &&
+        K->type == GGML_TYPE_I32 &&
+        V->type == GGML_TYPE_Q4_0;
+    const bool full_fa = full_fa_env || auto_full_fa_mtp_packed16_draft;
 
     // Auto-select blockfa_recthist_v4_single for f16/q8_0/q4_0 V when FULL_FA=1
     // and no explicit variant is set. The default packed16 path for f16/q8_0 would
@@ -3354,15 +3439,21 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
     static std::unordered_map<const void *, std::pair<int *, half *>> s_cache;
     static std::unordered_map<const void *, size_t> s_cache_rows;  // k_rows at last repack
     const bool use_packed16 = ggml_cuda_q8k_dot4_packed16_k_cache_enabled();
+    if (k_is_i32_packed16 && !use_packed16) {
+        GGML_ABORT("q8k_dot4_kq packed16-q8 side-channel K requires packed16 K cache sidecars; K=%s physical=%s",
+                ggml_type_name(K->type), ggml_cuda_q8k_dot4_k_physical_name(K));
+    }
     bool skip_k_repack = false;
     if (use_packed16) {
         // Prefer GGML tensors from registry (allocated by KV cache). Fall back to hipMalloc.
         ggml_tensor * payload_tensor = nullptr;
         ggml_tensor * scales_tensor  = nullptr;
         llama_kv_cache_get_packed16_tensors(K->data, &payload_tensor, &scales_tensor);
-        // Packed16 I32 K MUST have registry entries (pre-quantized in cache).
-        if (K->type == GGML_TYPE_I32) {
-            GGML_ASSERT(payload_tensor && scales_tensor && "I32 K requires packed16 registry (populated in kv_cache init)");
+        // Packed16 I32 K MUST have registry entries (pre-quantized in cache)
+        // with flat physical rows: row = hk * head_stride + k.
+        if (k_is_i32_packed16 && !ggml_cuda_q8k_dot4_packed16_sidecar_valid(
+                    K, payload_tensor, scales_tensor, true, "launch")) {
+            GGML_ABORT("q8k_dot4_kq packed16 sidecar contract failed for physical I32+F16-scale K");
         }
         if (payload_tensor && scales_tensor) {
             // Use GGML tensors directly — no hipMalloc needed.
@@ -3372,13 +3463,16 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
             static bool dot4_registry_printed = false;
             if (!dot4_registry_printed) {
                 dot4_registry_printed = true;
+                const int64_t head_stride = (payload_tensor->ne[1] > 0 && K->ne[2] > 0) ? payload_tensor->ne[1] / K->ne[2] : 0;
                 fprintf(stderr, "DOT4 packed16 registry: payload=%p scales=%p "
-                        "payload_ne=(%lld,%lld,%lld,%lld) scales_ne=(%lld,%lld,%lld,%lld)\n",
+                        "payload_ne=(%lld,%lld,%lld,%lld) scales_ne=(%lld,%lld,%lld,%lld) "
+                        "physical=packed16_q8_sidechannel_i32_f16scales head_stride=%lld row=hk*head_stride+k\n",
                         (void*)payload_tensor->data, (void*)scales_tensor->data,
                         (long long)payload_tensor->ne[0], (long long)payload_tensor->ne[1],
                         (long long)payload_tensor->ne[2], (long long)payload_tensor->ne[3],
                         (long long)scales_tensor->ne[0], (long long)scales_tensor->ne[1],
-                        (long long)scales_tensor->ne[2], (long long)scales_tensor->ne[3]);
+                        (long long)scales_tensor->ne[2], (long long)scales_tensor->ne[3],
+                        (long long)head_stride);
             }
             // Check if cache unchanged since last repack.
             std::lock_guard<std::mutex> lock(s_cache_mutex);

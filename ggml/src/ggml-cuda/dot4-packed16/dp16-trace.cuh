@@ -91,6 +91,59 @@ static inline void dp16_trace_emit_plan(const dp16_problem & problem, const dp16
     }
 }
 
+static inline void dp16_trace_emit_fa_plan(const dp16_fa_problem & problem, const dp16_fa_plan & plan) {
+    if (!dp16_trace_enabled()) {
+        return;
+    }
+
+    const dp16_fa_graph_key key = dp16_make_fa_graph_key(problem, plan);
+    const uint64_t graph_hash = dp16_hash_fa_graph_key(key);
+    fprintf(stderr,
+        "dp16_fa_plan status=%s op=FA_QKPV inst=%s plane=%s backend=%s route=%s reason=%s "
+        "nq=%d nk_bucket=%d d=%d heads_q=%d heads_kv=%d gqa=%d batch=%d "
+        "q_type=%s k_type=%s v_type=%s q_layout=%s k_layout=%s v_layout=%s k_repr=%s "
+        "shape=%s vpath=%s qtok_tile=%d gqa_tile=%d logical_q=%d k_tile=%d "
+        "experimental=%d fallback=%d capture=%d capture_safe=%d default_allowed=%d route_required=%d "
+        "causal=%d mask=%d sliding_window=%d sink=%d graph_key=0x%llx\n",
+        plan.selected ? "selected" : "reject",
+        dp16_fa_inst_name(problem.inst),
+        dp16_fa_plane_name(plan.plane),
+        dp16_backend_name(plan.backend),
+        dp16_cstr_or_none(plan.route),
+        dp16_cstr_or_none(plan.reason),
+        problem.nq,
+        problem.nk_bucket,
+        problem.d_head,
+        problem.n_heads_q,
+        problem.n_heads_kv,
+        problem.gqa_ratio,
+        problem.batch,
+        dp16_ggml_type_name_safe(problem.q_type),
+        dp16_ggml_type_name_safe(problem.k_type),
+        dp16_ggml_type_name_safe(problem.v_type),
+        dp16_layout_name(problem.q_layout),
+        dp16_layout_name(problem.k_layout),
+        dp16_layout_name(problem.v_layout),
+        dp16_k_repr_name(plan.k_repr),
+        dp16_fa_shape_name(plan.shape),
+        dp16_fa_vpath_name(plan.vpath),
+        plan.qtok_tile,
+        plan.gqa_tile,
+        plan.logical_q,
+        plan.k_tile,
+        plan.experimental ? 1 : 0,
+        plan.fallback ? 1 : 0,
+        problem.capture ? 1 : 0,
+        plan.capture_safe ? 1 : 0,
+        plan.default_allowed ? 1 : 0,
+        problem.route_required ? 1 : 0,
+        problem.causal ? 1 : 0,
+        problem.has_mask ? 1 : 0,
+        problem.has_sliding_window ? 1 : 0,
+        problem.has_sink ? 1 : 0,
+        (unsigned long long) graph_hash);
+}
+
 static inline void dp16_trace_emit_reject(const dp16_problem & problem, const dp16_reject_reason reason, const char * route_name) {
     if (!dp16_trace_enabled()) {
         return;
