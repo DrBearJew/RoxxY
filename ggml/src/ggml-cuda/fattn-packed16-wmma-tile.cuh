@@ -2375,7 +2375,461 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_512t_wavegate_stagev_kernel(
     }
 }
 
+// ── BM64_I8QK PV-WMMA DBV: dedicated scaffold for V double-buffer route ──
 template<packed16_wmma_v_type V_TYPE>
+static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev_kernel(
+        const float * __restrict__ Q, const char * __restrict__ V, float * __restrict__ dst,
+        int64_t q_nb01, int64_t q_nb02, int64_t q_nb03,
+        int64_t v_nb10, int64_t v_nb11, int64_t v_nb12, int64_t v_nb13, int64_t v_ne13,
+        int v_layout,
+        const char * __restrict__ mask,
+        int64_t mask_ne00, int64_t mask_ne01, int64_t mask_ne03,
+        int64_t mask_nb00, int64_t mask_nb01, int64_t mask_nb03,
+        const int  * __restrict__ k_payload, const half * __restrict__ k_scales,
+        int nq, int nk, int n_heads_q, int n_heads_k, int gqa_ratio,
+        int packed_rows,
+        float attention_scale,
+        unsigned long long * __restrict__ skip_counter,
+        bool causal_skip_enabled,
+        pwmma_debug_error * __restrict__ bounds_err,
+        pwmma_kernel_profile * __restrict__ profile) {
+
+    GGML_UNUSED(causal_skip_enabled);
+    const int q_tile = blockIdx.x, hq = blockIdx.y, b = blockIdx.z, hk = hq / gqa_ratio;
+    const int head_stride = packed_rows / n_heads_k;
+    const size_t k_head_base = size_t(hk) * size_t(head_stride);
+    const int q0 = q_tile * PWMMA_BM64;
+    constexpr bool PROBS_F16 = true;
+    constexpr bool K32_ACC = false;
+    constexpr bool K_SHARED = false;
+    constexpr bool PV_WMMA = true;
+    constexpr bool BN32 = false;
+    constexpr int Q_SCALE_BLOCK = 32;
+    constexpr int Q_SCALE_BLOCKS = PWMMA_D / Q_SCALE_BLOCK;
+    constexpr int BN_TILE = PWMMA_BN;
+
+    using prob_t = typename pwmma_prob_storage_type<PROBS_F16>::type;
+    __shared__ int q_i32[PWMMA_BM64][PWMMA_D/4];
+    __shared__ float  q_s [PWMMA_BM64][Q_SCALE_BLOCKS];
+    __shared__ half   v_tile_f16_db[2][BN_TILE][PWMMA_D];
+    __shared__ float logits_f32[PWMMA_BM64][BN_TILE];
+    __shared__ prob_t probs [PWMMA_BM64][BN_TILE];
+    __shared__ float row_m_smem[PWMMA_BM64], row_l_smem[PWMMA_BM64], alpha_smem[PWMMA_BM64];
+    __shared__ bool  wave_active[4];
+    __shared__ unsigned long long profile_t0;
+    extern __shared__ int pbwmma_i8_kshared_i32[];
+    int  * const k_i32_smem = pbwmma_i8_kshared_i32;
+    half * const k_s_smem   = reinterpret_cast<half *>(k_i32_smem + PWMMA_I8_KSHARED_I32_COUNT);
+
+    if (threadIdx.x < PWMMA_BM64) { row_m_smem[threadIdx.x] = -FLT_MAX/2.0f; row_l_smem[threadIdx.x] = 0.0f; }
+
+    // Quantize Q once for this BM64 tile with 32-dim scales matching K scale granularity.
+    for (int idx = threadIdx.x; idx < PWMMA_BM64 * Q_SCALE_BLOCKS; idx += blockDim.x) {
+        const int r = idx / Q_SCALE_BLOCKS;
+        const int sb = idx % Q_SCALE_BLOCKS;
+        const int qq = q0 + r;
+        const int d_base = sb * Q_SCALE_BLOCK;
+        float amax = 0.0f;
+        float vals[Q_SCALE_BLOCK];
+        #pragma unroll
+        for (int i = 0; i < Q_SCALE_BLOCK; ++i) {
+            const int dd = d_base + i;
+            const float x = (qq < nq)
+                ? Q[qq * (int)(q_nb01 / sizeof(float)) + hq * (int)(q_nb02 / sizeof(float)) + b * (int)(q_nb03 / sizeof(float)) + dd]
+                : 0.0f;
+            vals[i] = x;
+            amax = fmaxf(amax, fabsf(x));
+        }
+        const float s = amax > 0.0f ? amax / 127.0f : 1.0f;
+        q_s[r][sb] = s;
+        #pragma unroll
+        for (int g = 0; g < Q_SCALE_BLOCK/4; ++g) {
+            q_i32[r][d_base/4 + g] = pwmma_pack_i8x4(
+                pwmma_i8_clamp_round(vals[4*g + 0] / s),
+                pwmma_i8_clamp_round(vals[4*g + 1] / s),
+                pwmma_i8_clamp_round(vals[4*g + 2] / s),
+                pwmma_i8_clamp_round(vals[4*g + 3] / s));
+        }
+    }
+    __syncthreads();
+
+    const int pv_group = threadIdx.x >> 8;
+    const int d        = threadIdx.x & 255;
+    const int row_base = pv_group * 32;
+    float out[32];
+    if (d < PWMMA_D) { for (int r = 0; r < 32; ++r) out[r] = 0.0f; }
+    float out_pv[4][8];
+    if constexpr (PV_WMMA) {
+        #pragma unroll
+        for (int rb = 0; rb < 4; ++rb) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) out_pv[rb][i] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    const int num_k_tiles = CEIL_DIV(nk, BN_TILE);
+    for (int kt = 0; kt < num_k_tiles; ++kt) {
+        const int k0 = kt * BN_TILE, valid_k = min(BN_TILE, nk - k0);
+        const int q_offset = nk - nq;
+
+        if (threadIdx.x < 4) {
+            const int w = threadIdx.x;
+            const int wg_first = q0 + w * 16;
+            const int wg_last  = min(nq - 1, wg_first + 15);
+            wave_active[w] = (wg_first < nq) && (k0 <= q_offset + wg_last);
+        }
+        __syncthreads();
+        if (!wave_active[0] && !wave_active[1] && !wave_active[2] && !wave_active[3]) {
+            if (skip_counter && threadIdx.x == 0) atomicAdd(skip_counter, 1ULL);
+            continue;
+        }
+
+        for (int idx = threadIdx.x; idx < BN_TILE * PWMMA_D; idx += blockDim.x) {
+            const int c = idx / PWMMA_D, dd = idx % PWMMA_D;
+            v_tile_f16_db[kt & 1][c][dd] = (_Float16)pwmma_v_element<V_TYPE>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, v_layout, k0 + c, hk, b, dd);
+        }
+        if constexpr (K_SHARED) {
+            for (int idx = threadIdx.x; idx < PWMMA_I8_KSHARED_I32_COUNT; idx += blockDim.x) {
+                const int c = idx / (PWMMA_D/4);
+                const int g = idx - c * (PWMMA_D/4);
+                if (c < valid_k) {
+                    const size_t row = k_head_base + size_t(k0) + size_t(c);
+                    k_i32_smem[idx] = k_payload[row * (PWMMA_D/4) + g];
+                } else {
+                    k_i32_smem[idx] = 0;
+                }
+            }
+            for (int idx = threadIdx.x; idx < PWMMA_I8_KSHARED_SCALE_COUNT; idx += blockDim.x) {
+                const int c = idx / (PWMMA_D/QK8_0);
+                const int s = idx - c * (PWMMA_D/QK8_0);
+                if (c < valid_k) {
+                    const size_t row = k_head_base + size_t(k0) + size_t(c);
+                    k_s_smem[idx] = k_scales[row * (PWMMA_D/QK8_0) + s];
+                } else {
+                    k_s_smem[idx] = __float2half(0.0f);
+                }
+            }
+        }
+        for (int idx = threadIdx.x; idx < PWMMA_BM64 * BN_TILE; idx += blockDim.x) logits_f32[idx / BN_TILE][idx % BN_TILE] = 0.0f;
+        __syncthreads();
+
+        PWMMA_PROFILE_PHASE_BEGIN();
+        if (threadIdx.x < 128) {
+            const int wave_id = threadIdx.x >> 5;
+            if (wave_active[wave_id]) {
+                const int lane    = threadIdx.x & 31;
+                const int lane_lo = lane & 15;
+                const int lane_hi = lane >> 4;
+                const int r_base  = wave_id * 16;
+                #pragma unroll
+                for (int kc_base = 0; kc_base < BN_TILE; kc_base += 16) {
+                const int k_col   = kc_base + lane_lo;
+                const bool k_col_valid = k_col < valid_k;
+                float acc_f[8];
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) acc_f[i] = 0.0f;
+
+                constexpr int QK_WMMA_STEP = K32_ACC ? Q_SCALE_BLOCK : 16;
+                for (int d0 = 0; d0 < PWMMA_D; d0 += QK_WMMA_STEP) {
+                    if constexpr (K32_ACC) {
+                        pbwmma_v8i32 acc_i = {0,0,0,0,0,0,0,0};
+                        int ref_i[8];
+                        #pragma unroll
+                        for (int i = 0; i < 8; ++i) ref_i[i] = 0;
+
+                        #pragma unroll
+                        for (int sub = 0; sub < 2; ++sub) {
+                            const int sd0 = d0 + sub * 16;
+                            pbwmma_v4i32 a_frag;
+                            pbwmma_v4i32 b_frag;
+                            #pragma unroll
+                            for (int g = 0; g < PBWMMA_I8_WORDS_PER_K16; ++g) {
+                                const int qr = r_base + pbwmma_i8_a_row_from_lane_lo(lane_lo);
+                                a_frag[g] = q_i32[qr][(sd0/4) + g];
+                                if constexpr (K_SHARED) {
+                                    b_frag[g] = k_i32_smem[k_col * (PWMMA_D/4) + (sd0/4) + g];
+                                } else if (k_col_valid) {
+                                    const size_t row = k_head_base + size_t(k0) + size_t(k_col);
+                                    b_frag[g] = k_payload[row * (PWMMA_D/4) + (sd0/4) + g];
+                                } else {
+                                    b_frag[g] = 0;
+                                }
+                            }
+                            acc_i = pbwmma_mma_i8(a_frag, b_frag, acc_i);
+                            if (bounds_err && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && kt == 0) {
+                                #pragma unroll
+                                for (int i = 0; i < 8; ++i) {
+                                    const int rr = r_base + pbwmma_i8_d_row_from_acc(i, lane_hi);
+                                    ref_i[i] += pbwmma_i8_dot4_k16_ref_frag(&q_i32[rr][sd0/4], b_frag);
+                                    if (acc_i[i] != ref_i[i] && atomicCAS(&bounds_err->flag, 0, 1) == 0) {
+                                        bounds_err->code = 9001;
+                                        bounds_err->variant = K_SHARED ? 13 : 11;
+                                        bounds_err->block_x = blockIdx.x;
+                                        bounds_err->block_y = blockIdx.y;
+                                        bounds_err->block_z = blockIdx.z;
+                                        bounds_err->thread_x = threadIdx.x;
+                                        bounds_err->nq = nq;
+                                        bounds_err->nk = nk;
+                                        bounds_err->n_heads_q = n_heads_q;
+                                        bounds_err->n_heads_k = n_heads_k;
+                                        bounds_err->gqa_ratio = gqa_ratio;
+                                        bounds_err->q_tile = q_tile;
+                                        bounds_err->hq = hq;
+                                        bounds_err->hk = hk;
+                                        bounds_err->k0 = k0;
+                                        bounds_err->valid_k = valid_k;
+                                        bounds_err->k = k_col;
+                                        bounds_err->d = sd0 + i;
+                                        bounds_err->head_stride = head_stride;
+                                        bounds_err->packed_rows = packed_rows;
+                                        bounds_err->k_row = int(k_head_base + size_t(k0) + size_t(k_col));
+                                    }
+                                }
+                            }
+                        }
+                        float ks = 0.0f;
+                        if constexpr (K_SHARED) {
+                            ks = __half2float(k_s_smem[k_col * (PWMMA_D/QK8_0) + (d0 / QK8_0)]);
+                        } else if (k_col_valid) {
+                            ks = __half2float(k_scales[(k_head_base + size_t(k0) + size_t(k_col)) * (PWMMA_D/QK8_0) + (d0 / QK8_0)]);
+                        }
+                        #pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            const int rr = r_base + pbwmma_i8_d_row_from_acc(i, lane_hi);
+                            acc_f[i] += float(acc_i[i]) * q_s[rr][d0 / Q_SCALE_BLOCK] * ks * attention_scale;
+                        }
+                    } else {
+                        pbwmma_v4i32 a_frag;
+                        pbwmma_v4i32 b_frag;
+                        #pragma unroll
+                        for (int g = 0; g < PBWMMA_I8_WORDS_PER_K16; ++g) {
+                            const int qr = r_base + pbwmma_i8_a_row_from_lane_lo(lane_lo);
+                            a_frag[g] = q_i32[qr][(d0/4) + g];
+                            if constexpr (K_SHARED) {
+                                b_frag[g] = k_i32_smem[k_col * (PWMMA_D/4) + (d0/4) + g];
+                            } else if (k_col_valid) {
+                                const size_t row = k_head_base + size_t(k0) + size_t(k_col);
+                                b_frag[g] = k_payload[row * (PWMMA_D/4) + (d0/4) + g];
+                            } else {
+                                b_frag[g] = 0;
+                            }
+                        }
+                        pbwmma_v8i32 acc_i = {0,0,0,0,0,0,0,0};
+                        acc_i = pbwmma_mma_i8(a_frag, b_frag, acc_i);
+                        if (bounds_err && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && kt == 0) {
+                            #pragma unroll
+                            for (int i = 0; i < 8; ++i) {
+                                const int rr = r_base + pbwmma_i8_d_row_from_acc(i, lane_hi);
+                                const int ref = pbwmma_i8_dot4_k16_ref_frag(&q_i32[rr][d0/4], b_frag);
+                                if (acc_i[i] != ref && atomicCAS(&bounds_err->flag, 0, 1) == 0) {
+                                    bounds_err->code = 9001;
+                                    bounds_err->variant = BN32 ? 15 : (K_SHARED ? 12 : (PROBS_F16 ? 10 : 9));
+                                    bounds_err->block_x = blockIdx.x;
+                                    bounds_err->block_y = blockIdx.y;
+                                    bounds_err->block_z = blockIdx.z;
+                                    bounds_err->thread_x = threadIdx.x;
+                                    bounds_err->nq = nq;
+                                    bounds_err->nk = nk;
+                                    bounds_err->n_heads_q = n_heads_q;
+                                    bounds_err->n_heads_k = n_heads_k;
+                                    bounds_err->gqa_ratio = gqa_ratio;
+                                    bounds_err->q_tile = q_tile;
+                                    bounds_err->hq = hq;
+                                    bounds_err->hk = hk;
+                                    bounds_err->k0 = k0;
+                                    bounds_err->valid_k = valid_k;
+                                    bounds_err->k = k_col;
+                                    bounds_err->d = d0 + i;
+                                    bounds_err->head_stride = head_stride;
+                                    bounds_err->packed_rows = packed_rows;
+                                    bounds_err->k_row = int(k_head_base + size_t(k0) + size_t(k_col));
+                                }
+                            }
+                        }
+                        float ks = 0.0f;
+                        if constexpr (K_SHARED) {
+                            ks = __half2float(k_s_smem[k_col * (PWMMA_D/QK8_0) + (d0 / QK8_0)]);
+                        } else if (k_col_valid) {
+                            ks = __half2float(k_scales[(k_head_base + size_t(k0) + size_t(k_col)) * (PWMMA_D/QK8_0) + (d0 / QK8_0)]);
+                        }
+                        #pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            const int rr = r_base + pbwmma_i8_d_row_from_acc(i, lane_hi);
+                            acc_f[i] += float(acc_i[i]) * q_s[rr][d0 / Q_SCALE_BLOCK] * ks * attention_scale;
+                        }
+                    }
+                }
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    logits_f32[r_base + pbwmma_i8_d_row_from_acc(i, lane_hi)][kc_base + pbwmma_i8_d_col_from_lane_lo(lane_lo)] = acc_f[i];
+                }
+                }
+            }
+        }
+        __syncthreads();
+        PWMMA_PROFILE_PHASE_END(qk_cycles);
+        PWMMA_PROFILE_PHASE_BEGIN();
+
+        for (int idx = threadIdx.x; idx < PWMMA_BM64 * BN_TILE; idx += blockDim.x) {
+            const int r = idx / BN_TILE, c = idx % BN_TILE, qq = q0 + r;
+            float v = logits_f32[r][c];
+            if (qq >= nq || c >= valid_k || !wave_active[r >> 4]) v = -FLT_MAX/2.0f;
+            else if (mask) v += pwmma_mask_val(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, qq, k0+c, b);
+            logits_f32[r][c] = v;
+        }
+        __syncthreads();
+
+        for (int r = threadIdx.x; r < PWMMA_BM64; r += blockDim.x) {
+            const int wave_id = r >> 4, qq = q0 + r;
+            if (qq >= nq || !wave_active[wave_id]) { alpha_smem[r] = 0.0f; continue; }
+            float tile_max = -FLT_MAX;
+            #pragma unroll
+            for (int c = 0; c < valid_k; ++c) tile_max = fmaxf(tile_max, logits_f32[r][c]);
+            const float new_m = fmaxf(row_m_smem[r], tile_max);
+            const float alpha = (row_l_smem[r] > 0.0f) ? expf(row_m_smem[r] - new_m) : 0.0f;
+            float p_sum = 0.0f;
+            #pragma unroll
+            for (int c = 0; c < valid_k; ++c) {
+                const float p = expf(logits_f32[r][c] - new_m);
+                if constexpr (PROBS_F16) probs[r][c] = __float2half(p);
+                else probs[r][c] = p;
+                p_sum += p;
+            }
+            alpha_smem[r] = alpha; row_m_smem[r] = new_m; row_l_smem[r] = row_l_smem[r] * alpha + p_sum;
+        }
+        __syncthreads();
+        PWMMA_PROFILE_PHASE_END(softmax_cycles);
+        PWMMA_PROFILE_PHASE_BEGIN();
+
+        if constexpr (PV_WMMA) {
+            const int lane    = threadIdx.x & 31;
+            const int lane_lo = lane & 15;
+            const int lane_hi = lane >> 4;
+            const int d_tile  = (threadIdx.x >> 5) & 15;
+            #pragma unroll
+            for (int rb = 0; rb < 4; ++rb) {
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int global_r = rb * 16 + pbwmma_f16_d_row_from_acc(i, lane_hi);
+                    out_pv[rb][i] *= alpha_smem[global_r];
+                }
+                #pragma unroll
+                for (int kc_base = 0; kc_base < BN_TILE; kc_base += 16) {
+                    pbwmma_v16fp16 a_frag;
+                    pbwmma_v16fp16 b_frag;
+                    if (wave_active[rb]) {
+                        #pragma unroll
+                        for (int kk = 0; kk < 16; ++kk) {
+                            const int kc = kc_base + kk;
+                            if (kc < valid_k) {
+                                if constexpr (PROBS_F16) a_frag[kk] = probs[rb * 16 + pbwmma_f16_a_row_from_lane_lo(lane_lo)][kc];
+                                else a_frag[kk] = __float2half(probs[rb * 16 + pbwmma_f16_a_row_from_lane_lo(lane_lo)][kc]);
+                                b_frag[kk] = v_tile_f16_db[kt & 1][kc][d_tile * 16 + pbwmma_f16_b_col_from_lane_lo(lane_lo)];
+                            } else {
+                                a_frag[kk] = __float2half(0.0f);
+                                b_frag[kk] = __float2half(0.0f);
+                            }
+                        }
+                    } else {
+                        #pragma unroll
+                        for (int kk = 0; kk < 16; ++kk) {
+                            a_frag[kk] = __float2half(0.0f);
+                            b_frag[kk] = __float2half(0.0f);
+                        }
+                    }
+                    pbwmma_v8fp32 pv_acc = {0,0,0,0,0,0,0,0};
+                    pv_acc = pbwmma_mma(a_frag, b_frag, pv_acc);
+                    #pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const int global_r = rb * 16 + pbwmma_f16_d_row_from_acc(i, lane_hi);
+                        if (bounds_err && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && kt == 0 && d_tile == 0) {
+                            float ref = 0.0f;
+                            #pragma unroll
+                            for (int c = 0; c < 16; ++c) {
+                                const int kc = kc_base + c;
+                                if (kc < valid_k) ref += __half2float(probs[global_r][kc]) * __half2float(v_tile_f16_db[kt & 1][kc][lane_lo]);
+                            }
+                            const float tol = 2.5e-2f * fmaxf(1.0f, fabsf(ref));
+                            if (fabsf(pv_acc[i] - ref) > tol && atomicCAS(&bounds_err->flag, 0, 1) == 0) {
+                                bounds_err->code = 9101;
+                                bounds_err->variant = BN32 ? 15 : 14;
+                                bounds_err->block_x = blockIdx.x;
+                                bounds_err->block_y = blockIdx.y;
+                                bounds_err->block_z = blockIdx.z;
+                                bounds_err->thread_x = threadIdx.x;
+                                bounds_err->nq = nq;
+                                bounds_err->nk = nk;
+                                bounds_err->n_heads_q = n_heads_q;
+                                bounds_err->n_heads_k = n_heads_k;
+                                bounds_err->gqa_ratio = gqa_ratio;
+                                bounds_err->q_tile = q_tile;
+                                bounds_err->hq = hq;
+                                bounds_err->hk = hk;
+                                bounds_err->k0 = k0;
+                                bounds_err->valid_k = valid_k;
+                                bounds_err->k = rb;
+                                bounds_err->d = d_tile * 16 + lane_lo;
+                                bounds_err->head_stride = head_stride;
+                                bounds_err->packed_rows = packed_rows;
+                                bounds_err->k_row = global_r;
+                            }
+                        }
+                        out_pv[rb][i] += pv_acc[i];
+                    }
+                }
+            }
+        } else if (d < PWMMA_D) {
+            const int w0 = row_base >> 4, w1 = w0 + 1;
+            if (wave_active[w0] || wave_active[w1]) {
+                for (int r = 0; r < 32; ++r) if (wave_active[(row_base + r) >> 4]) out[r] *= alpha_smem[row_base + r];
+                for (int c = 0; c < valid_k; ++c) {
+                    #pragma unroll
+                    for (int r = 0; r < 32; ++r) {
+                        if (wave_active[(row_base + r) >> 4]) {
+                            float p;
+                            if constexpr (PROBS_F16) p = __half2float(probs[row_base + r][c]);
+                            else p = probs[row_base + r][c];
+                            out[r] += p * __half2float(v_tile_f16_db[kt & 1][c][d]);
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        PWMMA_PROFILE_PHASE_END(pv_cycles);
+    }
+
+    if constexpr (PV_WMMA) {
+        const int lane    = threadIdx.x & 31;
+        const int lane_lo = lane & 15;
+        const int lane_hi = lane >> 4;
+        const int d_tile  = (threadIdx.x >> 5) & 15;
+        const int dd      = d_tile * 16 + lane_lo;
+        #pragma unroll
+        for (int rb = 0; rb < 4; ++rb) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int rr = pbwmma_f16_d_row_from_acc(i, lane_hi);
+                const int qq = q0 + rb * 16 + rr;
+                if (qq >= nq) continue;
+                const float l = row_l_smem[rb * 16 + rr]; if (l <= 0.0f) continue;
+                dst[((size_t(b)*nq + qq)*n_heads_q + hq)*PWMMA_D + dd] = out_pv[rb][i] / l;
+            }
+        }
+    } else if (d < PWMMA_D) {
+        for (int r = 0; r < 32; ++r) {
+            const int qq = q0 + row_base + r;
+            if (qq >= nq) continue;
+            const float l = row_l_smem[row_base + r]; if (l <= 0.0f) continue;
+            dst[((size_t(b)*nq + qq)*n_heads_q + hq)*PWMMA_D + d] = out[r] / l;
+        }
+    }
+}
+
+template<packed16_wmma_v_type V_TYPE>
+
+
 static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_bn32_512t_wavegate_stagev_kernel(
         const float * __restrict__ Q, const char * __restrict__ V, float * __restrict__ dst,
         int64_t q_nb01, int64_t q_nb02, int64_t q_nb03,
@@ -3646,6 +4100,24 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
                 default: GGML_ABORT("pwmma bm64 i8qk pvwmma bn32: unsupported V type");
             }
 #undef LAUNCH_BM64_I8QK_PV_BN32
+        } else if (impl == 16) {
+            dim3 block512(512);
+#define LAUNCH_BM64_I8QK_DBV(VT) \
+    packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev_kernel<VT><<<grid, block512, 0, stream>>>( \
+        (const float*)Q->data, (const char*)V->data, (float*)dst->data, \
+        Q->nb[1], Q->nb[2], Q->nb[3], V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
+        v_layout, \
+        mask ? (const char*)mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+        k_payload, k_scales, \
+        nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_kv_size, attention_scale, \
+        d_skip_counter, causal_skip_active, d_live_shadow_err, profile_dev)
+            switch (V->type) {
+                case GGML_TYPE_Q4_0: LAUNCH_BM64_I8QK_DBV(PACKED16_WMMA_V_Q4_0); break;
+                case GGML_TYPE_Q8_0: LAUNCH_BM64_I8QK_DBV(PACKED16_WMMA_V_Q8_0); break;
+                case GGML_TYPE_F16:  LAUNCH_BM64_I8QK_DBV(PACKED16_WMMA_V_F16);  break;
+                default: GGML_ABORT("pwmma bm64 i8qk pvwmma dbv: unsupported V type");
+            }
+#undef LAUNCH_BM64_I8QK_DBV
         } else if (impl_i8qk) {
             dim3 block512(512);
 #define LAUNCH_BM64_I8QK_WG_SV(VT, P16, K32, KSHARED, PVWMMA, BN32V) \
@@ -3663,7 +4135,6 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
     else if (impl == 12) { LAUNCH_BM64_I8QK_WG_SV(VT, false, false, true, false, false); } \
     else if (impl == 13) { LAUNCH_BM64_I8QK_WG_SV(VT, false, true, true, false, false); } \
     else if (impl == 14) { LAUNCH_BM64_I8QK_WG_SV(VT, true, false, false, true, false); } \
-    else if (impl == 16) { LAUNCH_BM64_I8QK_WG_SV(VT, true, false, false, true, false); } \
     else { LAUNCH_BM64_I8QK_WG_SV(VT, false, false, false, false, false); } \
 } while (0)
             switch (V->type) {

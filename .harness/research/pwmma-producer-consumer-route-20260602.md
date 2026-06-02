@@ -171,6 +171,6 @@ Initial opt-in impl ID 16 was added:
 16 = bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev
 ```
 
-The first attempted 3D shared V-buffer template (`v_tile_f16_db[2][BN][D]`) built through semantic checking but crashed ROCm clang 22 during backend codegen, similar to earlier BN32 template-pressure failures. The committed impl-16 selector therefore currently maps to the proven BN16 PV-WMMA body as a safe scaffold/route knob while the dedicated DBV kernel is split out in a future patch to avoid extra template instantiations.
+The first attempted 3D shared V-buffer inside the generic template (`v_tile_f16_db[2][BN][D]`) built through semantic checking but crashed ROCm clang 22 during backend codegen, similar to earlier BN32 template-pressure failures. The next patch split impl 16 into a dedicated DBV kernel with fewer template parameters and a real alternating V buffer.
 
-Smoke artifact: `dbv-alias-smoke-20260602-215340` selects `IMPL=bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev`, passes QK/i8/PV probes, and emits `PWMMA PROFILE` lines.
+Smoke artifact: `dbv-dedicated-smoke-20260602-220035` selects `IMPL=bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev`, passes QK/i8/PV probes, emits `PWMMA PROFILE` lines, and runs pp1024 at `915.04 tok/s` in a one-rep smoke.
