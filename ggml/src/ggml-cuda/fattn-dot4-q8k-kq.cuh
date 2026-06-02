@@ -24,9 +24,8 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, struct ggml_t
 static inline bool ggml_cuda_q8k_dot4_kq_route_required() {
     const char * required = getenv("GGML_CUDA_FA_ROUTE_REQUIRE");
     if (!required || required[0] == '\0' || strcmp(required, "any") == 0) {
-        // DOT4 recthist is a lab route. Only auto-select with explicit opt-in.
-        const char * auto_env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_KQ_AUTO");
-        return auto_env && atoi(auto_env) != 0;
+        const char * disable_env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_KQ_AUTO_DISABLE");
+        return !(disable_env && atoi(disable_env) != 0);
     }
     // Broad contract plus all precise family names.
     return strcmp(required, "rocm_q8k_dot4_kq") == 0

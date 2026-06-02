@@ -449,15 +449,8 @@ static bool ggml_cuda_env_enabled_name(const char * name) {
 
 static bool ggml_cuda_mtp_attention_env_active() {
 #ifdef GGML_USE_HIP
-    return ggml_cuda_env_enabled_name("LLAMA_MTP_ENABLE_FA") ||
-           ggml_cuda_env_enabled_name("LLAMA_MTP_FORCE_FA1_VEC") ||
-           ggml_cuda_env_enabled_name("LLAMA_MTP_FORCE_VEC_FALLBACK") ||
-           ggml_cuda_env_enabled_name("LLAMA_MTP_ENABLE_DOT4_FA2") ||
-           ggml_cuda_env_enabled_name("LLAMA_MTP_ENABLE_PACKED16_FA") ||
-           ggml_cuda_env_enabled_name("LLAMA_MTP_ENABLE_F16K_ADAPT_DOT4_FA2") ||
-           ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_MTP_DRAFT_DOT4_DECODE") ||
-           ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_MTP_VERIFY_F16K_DOT4_ADAPTER") ||
-           ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_MTP_F16K_Q4V_VEC");
+    return !ggml_cuda_env_enabled_name("LLAMA_MTP_DISABLE_FA") &&
+           !ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_MTP_DISABLE_FA");
 #else
     return false;
 #endif
@@ -465,9 +458,8 @@ static bool ggml_cuda_mtp_attention_env_active() {
 
 static bool ggml_cuda_mtp_hidden_producer_dot4_enabled() {
 #ifdef GGML_USE_HIP
-    return ggml_cuda_env_enabled_name("LLAMA_MTP_ENABLE_PRODUCER_DOT4_FA2") ||
-           ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_MTP_PRODUCER_DOT4") ||
-           ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_MTP_HIDDEN_PRODUCER_DOT4");
+    return !ggml_cuda_env_enabled_name("LLAMA_MTP_DISABLE_PRODUCER_DOT4_FA2") &&
+           !ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_MTP_DISABLE_PRODUCER_DOT4");
 #else
     return false;
 #endif
@@ -2739,8 +2731,8 @@ static int64_t ggml_cuda_q8k_dot4_decode_splitk_threshold() {
 
 static bool ggml_cuda_mtp_draft_dot4_decode_enabled() {
 #ifdef GGML_USE_HIP
-    const char * env = getenv("GGML_CUDA_ROCM_MTP_DRAFT_DOT4_DECODE");
-    return env && atoi(env) != 0;
+    return !ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_MTP_DRAFT_DOT4_DECODE_DISABLE") &&
+           !ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_DISABLE_DOT4_FA2");
 #else
     return false;
 #endif
@@ -3388,20 +3380,19 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_NONE;
         }
 
-        // Debug policy: keep MTP off persistent packed16 I32-K routes by
-        // default. MTP DOT4 route experiments use instruction-specific
-        // f16-source materialization/decoding; set LLAMA_MTP_DISABLE_PACKED16_FA=0
-        // only for focused packed16 MTP experiments.
+        // Production policy: persistent packed16 I32-K MTP routes are enabled
+        // by default after route/replay validation. Keep an explicit disable
+        // knob for A/B and emergency fallback.
         {
             const int32_t fi = ((const int32_t *)dst->op_params)[4];
             if (fi == GGML_FATTN_INST_MTP_VERIFY_QK ||
                 fi == GGML_FATTN_INST_MTP_DRAFT ||
                 fi == GGML_FATTN_INST_MTP_DRAFT_DECODE_QK) {
                 const char * mtp_disable_p16 = getenv("LLAMA_MTP_DISABLE_PACKED16_FA");
-                const bool disable_p16_mtp = mtp_disable_p16 == nullptr || atoi(mtp_disable_p16) != 0;
+                const bool disable_p16_mtp = mtp_disable_p16 && atoi(mtp_disable_p16) != 0;
                 if (disable_p16_mtp) {
                     if (getenv("LLAMA_MTP_FA_ROUTE")) {
-                        fprintf(stderr, "MTP_FA_ROUTE: inst=%d k_type=%d selected=none reason=packed16_mtp_disabled_by_default\n",
+                        fprintf(stderr, "MTP_FA_ROUTE: inst=%d k_type=%d selected=none reason=packed16_mtp_disabled\n",
                             fi, K->type);
                     }
                     return BEST_FATTN_KERNEL_NONE;
@@ -3483,19 +3474,17 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_PACKED16_WMMA_TILE;
         }
 
-        // MTP_VERIFY_QK must NOT use packed16 I32 K — the MTP draft head is
-        // trained on exact f16 K, and even small differences from lossy 4-bit
-        // packed16 K cause 100%% draft rejection.  Route MTP verify through the
-        // instruction fastpath (q8k_dot4_kq / VEC / WMMA_F16) instead.
+        // Packed16 MTP verify is now a validated FA2/PDMQ lane for persistent
+        // packed16 I32 K + q4_0 V. Keep an explicit disable knob for fallback.
         const char * mtp_disable_p16_env = getenv("LLAMA_MTP_DISABLE_PACKED16_FA");
-        const bool mtp_packed16_experiment = mtp_disable_p16_env && atoi(mtp_disable_p16_env) == 0;
+        const bool mtp_packed16_enabled = !(mtp_disable_p16_env && atoi(mtp_disable_p16_env) != 0);
         const bool prefill_or_verify =
             Q->ne[1] > 1 &&
             (inst == GGML_FATTN_INST_NONE ||
              inst == GGML_FATTN_INST_PREFILL_QK ||
              inst == GGML_FATTN_INST_SPEC_VERIFY_QK ||
              inst == GGML_FATTN_INST_BATCH_VERIFY_QK ||
-             (mtp_packed16_experiment && inst == GGML_FATTN_INST_MTP_VERIFY_QK));
+             (mtp_packed16_enabled && inst == GGML_FATTN_INST_MTP_VERIFY_QK));
         const bool v_requires_dot4_mmq = V->type == GGML_TYPE_TBQ4_0 || V->type == GGML_TYPE_PLANAR3_0 || V->type == GGML_TYPE_ISO3_0;
 
         // nq == 1 decode: always route to DOT4 (BN64/split-K).
@@ -3524,15 +3513,26 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         const char * packed16_route_name = "none";
 
         if ((prefill_or_verify || v_requires_dot4_mmq) && dot4_sup) {
-            // ── BM32_regout_directv auto-selection ──────────
-            // Wins on 27B at all pp ≥512 and on 35B at pp ≥1024.
+            // ── Packed16 PWMMA auto-selection ──────────
+            // Use PV-WMMA for long-context prefill; keep BM32 direct-V for shorter chunks.
             const char * explicit_impl = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL");
             const bool impl_is_wmma =
                 explicit_impl && (
                     strcmp(explicit_impl, "bm32_regout_directv") == 0 ||
                     strcmp(explicit_impl, "bm32_regout_stagev") == 0 ||
                     strcmp(explicit_impl, "bm64_regout_directv") == 0 ||
-                    strcmp(explicit_impl, "bm64_regout_stagev") == 0);
+                    strcmp(explicit_impl, "bm64_regout_stagev") == 0 ||
+                    strcmp(explicit_impl, "bm64_regout_directv_512t") == 0 ||
+                    strcmp(explicit_impl, "bm64_512t_wavegate_directv") == 0 ||
+                    strcmp(explicit_impl, "bm64_512t_wavegate_stagev") == 0 ||
+                    strcmp(explicit_impl, "bm64_512t_wavegate_stagev_kshared") == 0 ||
+                    strcmp(explicit_impl, "bm64_i8qk_512t_wavegate_stagev") == 0 ||
+                    strcmp(explicit_impl, "bm64_i8qk_p16_512t_wavegate_stagev") == 0 ||
+                    strcmp(explicit_impl, "bm64_i8qk_k32acc_512t_wavegate_stagev") == 0 ||
+                    strcmp(explicit_impl, "bm64_i8qk_kshared_512t_wavegate_stagev") == 0 ||
+                    strcmp(explicit_impl, "bm64_i8qk_k32acc_kshared_512t_wavegate_stagev") == 0 ||
+                    strcmp(explicit_impl, "bm64_i8qk_pvwmma_512t_wavegate_stagev") == 0 ||
+                    strcmp(explicit_impl, "bm64_i8qk_pvwmma_bn32_512t_wavegate_stagev") == 0);
             const bool impl_auto = (!explicit_impl || !*explicit_impl || strcmp(explicit_impl, "smem") == 0);
             // Qwen 27B-like shape: gqa_ratio=6, heads_q=24, heads_k=4.
             // Qwen 35B-like shape: gqa_ratio=8, heads_q=16, heads_k=2.
@@ -3543,19 +3543,33 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             // General/unknown shapes keep the more conservative threshold at
             // nk >= 1024 (context length, not query chunk size).
             const bool is_long_context = (K->ne[1] >= 1024);
+            const bool is_pvwmma_context = (K->ne[1] >= 1024);
             const bool wmma_available = wmma_sup;
-            const bool use_bm32_regout = !v_requires_dot4_mmq && impl_auto && wmma_available && (is_27b_like || is_35b_like || is_long_context);
+            const bool use_pvwmma = !v_requires_dot4_mmq && impl_auto && wmma_available && is_pvwmma_context;
+            const bool use_bm32_regout = !use_pvwmma && !v_requires_dot4_mmq && impl_auto && wmma_available && (is_27b_like || is_35b_like || is_long_context);
+            const bool use_auto_wmma = use_pvwmma || use_bm32_regout;
 
             // Once we auto-select WMMA for long context, keep using it for
-            // subsequent calls (IMPL is already set to bm32_regout_directv).
-            if (!v_requires_dot4_mmq && (use_bm32_regout || (impl_is_wmma && wmma_available))) {
-                if (use_bm32_regout) {
+            // subsequent calls (IMPL is already set).
+            if (!v_requires_dot4_mmq && (use_auto_wmma || (impl_is_wmma && wmma_available))) {
+                if (use_pvwmma) {
+                    setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL", "bm64_i8qk_pvwmma_512t_wavegate_stagev", 1);
+                    setenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM", "64", 1);
+                    setenv("GGML_CUDA_ROCM_PACKED16_WMMA_CAUSAL_SKIP", "1", 1);
+                } else if (use_bm32_regout) {
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL", "bm32_regout_directv", 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM", "32", 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_CAUSAL_SKIP", "1", 1);
                 }
                 packed16_kernel = BEST_FATTN_KERNEL_PACKED16_WMMA_TILE;
-                packed16_route_name = "pwmma_bm32_regout_directv";
+                if (use_pvwmma) {
+                    packed16_route_name = "pwmma_bm64_i8qk_pvwmma";
+                } else if (use_bm32_regout) {
+                    packed16_route_name = "pwmma_bm32_regout_directv";
+                } else {
+                    const int bm = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM") ? atoi(getenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM")) : 32;
+                    packed16_route_name = (bm == 16) ? "pwmma_bm16" : (bm == 32 ? "pwmma_bm32" : "pwmma_bm64");
+                }
             } else {
                 packed16_kernel = BEST_FATTN_KERNEL_PACKED16_DOT4_MMQ;
                 packed16_route_name =
@@ -3569,10 +3583,17 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             const char * explicit_impl = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL");
             const bool impl_auto = (!explicit_impl || !*explicit_impl || strcmp(explicit_impl, "smem") == 0);
             if (impl_auto) {
-                setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL", "bm32_regout_directv", 1);
-                setenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM", "32", 1);
-                setenv("GGML_CUDA_ROCM_PACKED16_WMMA_CAUSAL_SKIP", "1", 1);
-                packed16_route_name = "pwmma_bm32_regout_directv";
+                if (K->ne[1] >= 1024) {
+                    setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL", "bm64_i8qk_pvwmma_512t_wavegate_stagev", 1);
+                    setenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM", "64", 1);
+                    setenv("GGML_CUDA_ROCM_PACKED16_WMMA_CAUSAL_SKIP", "1", 1);
+                    packed16_route_name = "pwmma_bm64_i8qk_pvwmma";
+                } else {
+                    setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL", "bm32_regout_directv", 1);
+                    setenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM", "32", 1);
+                    setenv("GGML_CUDA_ROCM_PACKED16_WMMA_CAUSAL_SKIP", "1", 1);
+                    packed16_route_name = "pwmma_bm32_regout_directv";
+                }
             } else {
                 const int bm = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM") ? atoi(getenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM")) : 32;
                 packed16_route_name = (bm == 16) ? "pwmma_bm16" : (bm == 32 ? "pwmma_bm32" : "pwmma_bm64");

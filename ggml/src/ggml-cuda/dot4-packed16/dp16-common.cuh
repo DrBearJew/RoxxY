@@ -314,9 +314,9 @@ static inline bool dp16_mtp_force_vec_fallback() {
 }
 
 static inline bool dp16_mtp_enable_dot4_fa2() {
-    return dp16_env_enabled("LLAMA_MTP_ENABLE_DOT4_FA2") ||
-           dp16_env_enabled("LLAMA_MTP_ENABLE_PACKED16_FA") ||
-           dp16_env_enabled("GGML_CUDA_FA_ROUTE_REQUIRE_DOT4");
+    return !dp16_env_enabled("LLAMA_MTP_DISABLE_DOT4_FA2") &&
+           !dp16_env_enabled("LLAMA_MTP_DISABLE_PACKED16_FA") &&
+           !dp16_env_enabled("GGML_CUDA_ROCM_DISABLE_DOT4_FA2");
 }
 
 static inline bool dp16_mtp_enable_f16_adapt_dot4() {

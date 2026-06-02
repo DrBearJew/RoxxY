@@ -28,10 +28,118 @@ static constexpr int PBWMMA_BN = 16;
 
 using pbwmma_v16fp16 = _Float16 __attribute__((ext_vector_type(16)));
 using pbwmma_v8fp32  = float    __attribute__((ext_vector_type(8)));
+using pbwmma_v4i32   = int      __attribute__((ext_vector_type(4)));
+using pbwmma_v8i32   = int      __attribute__((ext_vector_type(8)));
 
 static __device__ __forceinline__ pbwmma_v8fp32 pbwmma_mma(
         pbwmma_v16fp16 a, pbwmma_v16fp16 b, pbwmma_v8fp32 c) {
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+}
+
+static __device__ __forceinline__ pbwmma_v8i32 pbwmma_mma_i8(
+        pbwmma_v4i32 a, pbwmma_v4i32 b, pbwmma_v8i32 c) {
+    return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, c, false);
+}
+
+static __device__ __forceinline__ int pbwmma_extract_s8(
+        const int word, const int lane) {
+    const uint32_t u = static_cast<uint32_t>(word);
+    const uint32_t b = (u >> (lane * 8)) & 0xffu;
+    return static_cast<int>(static_cast<int8_t>(b));
+}
+
+static __device__ __forceinline__ int pbwmma_dot4_i8_i8(
+        const int a, const int b, int acc) {
+#if defined(__HIP_PLATFORM_AMD__) && ( \
+        defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || \
+        defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__))
+    return __builtin_amdgcn_sudot4(true, a, true, b, acc, false);
+#else
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        acc += pbwmma_extract_s8(a, i) * pbwmma_extract_s8(b, i);
+    }
+    return acc;
+#endif
+}
+
+// ── RDNA3 i8 WMMA layout contract ───────────────────────────────
+// Keep these formulas in sync with scripts/hip/pbwmma-i8-calculator.py.
+// DOT4 shadow probes validate this contract against the actual WMMA builtin.
+static constexpr int PBWMMA_I8_WORDS_PER_K16 = 4;
+static constexpr int PBWMMA_I8_BYTES_PER_WORD = 4;
+
+static __device__ __forceinline__ int pbwmma_i8_k_word(const int k) {
+    return k >> 2;
+}
+
+static __device__ __forceinline__ int pbwmma_i8_k_byte(const int k) {
+    return k & 3;
+}
+
+static __device__ __forceinline__ int pbwmma_i8_a_row_from_lane_lo(const int lane_lo) {
+    return lane_lo;
+}
+
+static __device__ __forceinline__ int pbwmma_i8_b_col_from_lane_lo(const int lane_lo) {
+    return lane_lo;
+}
+
+static __device__ __forceinline__ int pbwmma_i8_d_row_from_acc(const int acc_reg, const int lane_hi) {
+    return 2 * acc_reg + lane_hi;
+}
+
+static __device__ __forceinline__ int pbwmma_i8_d_col_from_lane_lo(const int lane_lo) {
+    return lane_lo;
+}
+
+static __device__ __forceinline__ int pbwmma_i8_d_acc_from_row(const int row) {
+    return row >> 1;
+}
+
+static __device__ __forceinline__ int pbwmma_i8_d_lane_from_mn(const int m, const int n) {
+    return n + 16 * (m & 1);
+}
+
+static __device__ __forceinline__ int pbwmma_i8_dot4_k16_ref_words(
+        const int * __restrict__ q_words,
+        const int * __restrict__ k_words) {
+    int ref = 0;
+#pragma unroll
+    for (int g = 0; g < PBWMMA_I8_WORDS_PER_K16; ++g) {
+        ref = pbwmma_dot4_i8_i8(q_words[g], k_words[g], ref);
+    }
+    return ref;
+}
+
+static __device__ __forceinline__ int pbwmma_i8_dot4_k16_ref_frag(
+        const int * __restrict__ q_words,
+        const pbwmma_v4i32 k_frag) {
+    int ref = 0;
+#pragma unroll
+    for (int g = 0; g < PBWMMA_I8_WORDS_PER_K16; ++g) {
+        ref = pbwmma_dot4_i8_i8(q_words[g], k_frag[g], ref);
+    }
+    return ref;
+}
+
+// ── RDNA3 f16 WMMA layout contract ──────────────────────────────
+// Used by QK f16 probes and by PV-WMMA: A rows and B columns are lane_lo,
+// accumulator register i maps to D row 2*i+lane_hi, D column lane_lo.
+static __device__ __forceinline__ int pbwmma_f16_a_row_from_lane_lo(const int lane_lo) {
+    return lane_lo;
+}
+
+static __device__ __forceinline__ int pbwmma_f16_b_col_from_lane_lo(const int lane_lo) {
+    return lane_lo;
+}
+
+static __device__ __forceinline__ int pbwmma_f16_d_row_from_acc(const int acc_reg, const int lane_hi) {
+    return 2 * acc_reg + lane_hi;
+}
+
+static __device__ __forceinline__ int pbwmma_f16_d_col_from_lane_lo(const int lane_lo) {
+    return lane_lo;
 }
 
 // ── QK probe: one wave (32 threads), one 16×16 tile ────────────
@@ -139,6 +247,286 @@ static bool pbwmma_qk_probe_pass(hipStream_t stream) {
         return false;
     }
     fprintf(stderr, "PBWMMA QK probe PASSED: max_err=%f\n", max_err);
+    return true;
+}
+
+// ── PV probe: one wave computes P[16x16] * V[16x16] ─────────────
+static __global__ void pbwmma_pv_probe_kernel(
+        const half  * __restrict__ p_probe,
+        const half  * __restrict__ v_probe,
+        float       * __restrict__ out) {
+
+    const int lane    = threadIdx.x;
+    const int lane_lo = lane & 15;
+    const int lane_hi = lane >> 4;
+
+    pbwmma_v16fp16 a;
+    pbwmma_v16fp16 b;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        a[i] = p_probe[pbwmma_f16_a_row_from_lane_lo(lane_lo) * PBWMMA_BN + i];
+        b[i] = v_probe[i * PBWMMA_BN + pbwmma_f16_b_col_from_lane_lo(lane_lo)];
+    }
+
+    pbwmma_v8fp32 acc = {0,0,0,0,0,0,0,0};
+    acc = pbwmma_mma(a, b, acc);
+
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int r = pbwmma_f16_d_row_from_acc(i, lane_hi);
+        const int c = pbwmma_f16_d_col_from_lane_lo(lane_lo);
+        out[r * PBWMMA_BN + c] = acc[i];
+    }
+}
+
+static bool pbwmma_pv_probe_pass(hipStream_t stream) {
+    constexpr int NR = PBWMMA_BM;
+    constexpr int NK = PBWMMA_BN;
+    constexpr int ND = PBWMMA_BN;
+    constexpr size_t p_bytes   = NR * NK * sizeof(half);
+    constexpr size_t v_bytes   = NK * ND * sizeof(half);
+    constexpr size_t out_bytes = NR * ND * sizeof(float);
+
+    half  * h_p   = (half  *) malloc(p_bytes);
+    half  * h_v   = (half  *) malloc(v_bytes);
+    float * h_ref = (float *) malloc(out_bytes);
+    float * h_gpu = (float *) malloc(out_bytes);
+
+    srand(314159);
+    for (int i = 0; i < NR * NK; ++i) {
+        const float v = ((float)rand() / RAND_MAX * 2.0f - 1.0f);
+        h_p[i] = __float2half(v);
+    }
+    for (int i = 0; i < NK * ND; ++i) {
+        const float v = ((float)rand() / RAND_MAX * 2.0f - 1.0f) * 2.0f;
+        h_v[i] = __float2half(v);
+    }
+
+    for (int r = 0; r < NR; ++r) {
+        for (int d = 0; d < ND; ++d) {
+            float sum = 0.0f;
+            for (int k = 0; k < NK; ++k) {
+                sum += __half2float(h_p[r * NK + k]) * __half2float(h_v[k * ND + d]);
+            }
+            h_ref[r * ND + d] = sum;
+        }
+    }
+
+    half  * d_p = nullptr;
+    half  * d_v = nullptr;
+    float * d_out = nullptr;
+    CUDA_CHECK(hipMalloc(&d_p, p_bytes));
+    CUDA_CHECK(hipMalloc(&d_v, v_bytes));
+    CUDA_CHECK(hipMalloc(&d_out, out_bytes));
+    CUDA_CHECK(hipMemcpyAsync(d_p, h_p, p_bytes, hipMemcpyHostToDevice, stream));
+    CUDA_CHECK(hipMemcpyAsync(d_v, h_v, v_bytes, hipMemcpyHostToDevice, stream));
+    CUDA_CHECK(hipMemsetAsync(d_out, 0, out_bytes, stream));
+
+    pbwmma_pv_probe_kernel<<<1, 32, 0, stream>>>(d_p, d_v, d_out);
+    CUDA_CHECK(hipGetLastError());
+    CUDA_CHECK(hipMemcpyAsync(h_gpu, d_out, out_bytes, hipMemcpyDeviceToHost, stream));
+    CUDA_CHECK(hipStreamSynchronize(stream));
+
+    float max_err = 0.0f;
+    for (int i = 0; i < NR * ND; ++i) max_err = fmaxf(max_err, fabsf(h_gpu[i] - h_ref[i]));
+
+    CUDA_CHECK(hipFree(d_p));
+    CUDA_CHECK(hipFree(d_v));
+    CUDA_CHECK(hipFree(d_out));
+    free(h_p); free(h_v); free(h_ref); free(h_gpu);
+
+    if (max_err > 1e-2f) {
+        fprintf(stderr, "PBWMMA PV WMMA probe FAILED: max_err=%f\n", max_err);
+        return false;
+    }
+    fprintf(stderr, "PBWMMA PV WMMA probe PASSED: max_err=%f\n", max_err);
+    return true;
+}
+
+static __global__ void pbwmma_i8_qk_probe_kernel(
+        const int8_t * __restrict__ q_probe,
+        const int8_t * __restrict__ k_probe,
+        int          * __restrict__ out) {
+    const int lane    = threadIdx.x;
+    const int lane_lo = lane & 15;
+    const int lane_hi = lane >> 4;
+
+    pbwmma_v4i32 a;
+    pbwmma_v4i32 b;
+    const int a_row = pbwmma_i8_a_row_from_lane_lo(lane_lo);
+    const int b_col = pbwmma_i8_b_col_from_lane_lo(lane_lo);
+    #pragma unroll
+    for (int g = 0; g < PBWMMA_I8_WORDS_PER_K16; ++g) {
+        uint32_t av = 0, bv = 0;
+        #pragma unroll
+        for (int j = 0; j < PBWMMA_I8_BYTES_PER_WORD; ++j) {
+            av |= uint32_t(uint8_t(q_probe[a_row * 16 + PBWMMA_I8_BYTES_PER_WORD*g + j])) << (8*j);
+            bv |= uint32_t(uint8_t(k_probe[b_col * 16 + PBWMMA_I8_BYTES_PER_WORD*g + j])) << (8*j);
+        }
+        a[g] = int(av);
+        b[g] = int(bv);
+    }
+
+    pbwmma_v8i32 acc = {0,0,0,0,0,0,0,0};
+    acc = pbwmma_mma_i8(a, b, acc);
+
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int r = pbwmma_i8_d_row_from_acc(i, lane_hi);
+        const int c = pbwmma_i8_d_col_from_lane_lo(lane_lo);
+        out[r * 16 + c] = acc[i];
+    }
+}
+
+static bool pbwmma_i8_qk_probe_pass(hipStream_t stream) {
+    constexpr int N = 16;
+    constexpr size_t in_bytes = N * N * sizeof(int8_t);
+    constexpr size_t out_bytes = N * N * sizeof(int);
+    int8_t * h_q = (int8_t *) malloc(in_bytes);
+    int8_t * h_k = (int8_t *) malloc(in_bytes);
+    int * h_ref = (int *) malloc(out_bytes);
+    int * h_gpu = (int *) malloc(out_bytes);
+
+    srand(1337);
+    for (int i = 0; i < N*N; ++i) {
+        h_q[i] = int8_t((rand() % 255) - 127);
+        h_k[i] = int8_t((rand() % 255) - 127);
+    }
+    for (int r = 0; r < N; ++r) {
+        for (int c = 0; c < N; ++c) {
+            int sum = 0;
+            for (int d = 0; d < N; ++d) sum += int(h_q[r*N + d]) * int(h_k[c*N + d]);
+            h_ref[r*N + c] = sum;
+        }
+    }
+
+    int8_t * d_q = nullptr;
+    int8_t * d_k = nullptr;
+    int * d_out = nullptr;
+    CUDA_CHECK(hipMalloc(&d_q, in_bytes));
+    CUDA_CHECK(hipMalloc(&d_k, in_bytes));
+    CUDA_CHECK(hipMalloc(&d_out, out_bytes));
+    CUDA_CHECK(hipMemcpyAsync(d_q, h_q, in_bytes, hipMemcpyHostToDevice, stream));
+    CUDA_CHECK(hipMemcpyAsync(d_k, h_k, in_bytes, hipMemcpyHostToDevice, stream));
+    CUDA_CHECK(hipMemsetAsync(d_out, 0, out_bytes, stream));
+    pbwmma_i8_qk_probe_kernel<<<1, 32, 0, stream>>>(d_q, d_k, d_out);
+    CUDA_CHECK(hipGetLastError());
+    CUDA_CHECK(hipMemcpyAsync(h_gpu, d_out, out_bytes, hipMemcpyDeviceToHost, stream));
+    CUDA_CHECK(hipStreamSynchronize(stream));
+
+    int max_err = 0;
+    for (int i = 0; i < N*N; ++i) max_err = max(max_err, abs(h_gpu[i] - h_ref[i]));
+    CUDA_CHECK(hipFree(d_q));
+    CUDA_CHECK(hipFree(d_k));
+    CUDA_CHECK(hipFree(d_out));
+    free(h_q); free(h_k); free(h_ref); free(h_gpu);
+    if (max_err != 0) {
+        fprintf(stderr, "PBWMMA I8 QK probe FAILED: max_err=%d\n", max_err);
+        return false;
+    }
+    fprintf(stderr, "PBWMMA I8 QK probe PASSED: max_err=%d\n", max_err);
+    return true;
+}
+
+// ── I8 DOT4 shadow probe: use packed scalar DOT4 as a WMMA oracle ─────
+// This is a layout/signedness instrument, not a performance path.  It feeds
+// the same packed i8 fragments to RDNA3 WMMA and to a DOT4 chain, then checks
+// that every WMMA output lane maps to the DOT4 scalar reference.
+static __global__ void pbwmma_i8_dot4_shadow_probe_kernel(
+        const int * __restrict__ q_words,
+        const int * __restrict__ k_words,
+        int       * __restrict__ wmma_out,
+        int       * __restrict__ dot4_out) {
+    const int lane    = threadIdx.x;
+    const int lane_lo = lane & 15;
+    const int lane_hi = lane >> 4;
+
+    pbwmma_v4i32 a;
+    pbwmma_v4i32 b;
+    const int a_row = pbwmma_i8_a_row_from_lane_lo(lane_lo);
+    const int b_col = pbwmma_i8_b_col_from_lane_lo(lane_lo);
+#pragma unroll
+    for (int g = 0; g < PBWMMA_I8_WORDS_PER_K16; ++g) {
+        a[g] = q_words[a_row * PBWMMA_I8_WORDS_PER_K16 + g];
+        b[g] = k_words[b_col * PBWMMA_I8_WORDS_PER_K16 + g];
+    }
+
+    pbwmma_v8i32 acc = {0,0,0,0,0,0,0,0};
+    acc = pbwmma_mma_i8(a, b, acc);
+
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int r = pbwmma_i8_d_row_from_acc(i, lane_hi);
+        const int c = pbwmma_i8_d_col_from_lane_lo(lane_lo);
+        const int ref = pbwmma_i8_dot4_k16_ref_words(
+            q_words + r * PBWMMA_I8_WORDS_PER_K16,
+            k_words + c * PBWMMA_I8_WORDS_PER_K16);
+        wmma_out[r * 16 + c] = acc[i];
+        dot4_out[r * 16 + c] = ref;
+    }
+}
+
+static bool pbwmma_i8_dot4_shadow_probe_pass(hipStream_t stream) {
+    constexpr int N = 16;
+    constexpr int WORDS_PER_ROW = 4;
+    constexpr size_t words_bytes = N * WORDS_PER_ROW * sizeof(int);
+    constexpr size_t out_bytes = N * N * sizeof(int);
+
+    int * h_q = (int *) malloc(words_bytes);
+    int * h_k = (int *) malloc(words_bytes);
+    int * h_wmma = (int *) malloc(out_bytes);
+    int * h_dot4 = (int *) malloc(out_bytes);
+
+    srand(20260602);
+    for (int i = 0; i < N * WORDS_PER_ROW; ++i) {
+        uint32_t qw = 0;
+        uint32_t kw = 0;
+        for (int j = 0; j < 4; ++j) {
+            qw |= uint32_t(uint8_t(int8_t((rand() % 255) - 127))) << (8*j);
+            kw |= uint32_t(uint8_t(int8_t((rand() % 255) - 127))) << (8*j);
+        }
+        h_q[i] = int(qw);
+        h_k[i] = int(kw);
+    }
+
+    int * d_q = nullptr;
+    int * d_k = nullptr;
+    int * d_wmma = nullptr;
+    int * d_dot4 = nullptr;
+    CUDA_CHECK(hipMalloc(&d_q, words_bytes));
+    CUDA_CHECK(hipMalloc(&d_k, words_bytes));
+    CUDA_CHECK(hipMalloc(&d_wmma, out_bytes));
+    CUDA_CHECK(hipMalloc(&d_dot4, out_bytes));
+    CUDA_CHECK(hipMemcpyAsync(d_q, h_q, words_bytes, hipMemcpyHostToDevice, stream));
+    CUDA_CHECK(hipMemcpyAsync(d_k, h_k, words_bytes, hipMemcpyHostToDevice, stream));
+    CUDA_CHECK(hipMemsetAsync(d_wmma, 0, out_bytes, stream));
+    CUDA_CHECK(hipMemsetAsync(d_dot4, 0, out_bytes, stream));
+
+    pbwmma_i8_dot4_shadow_probe_kernel<<<1, 32, 0, stream>>>(d_q, d_k, d_wmma, d_dot4);
+    CUDA_CHECK(hipGetLastError());
+    CUDA_CHECK(hipMemcpyAsync(h_wmma, d_wmma, out_bytes, hipMemcpyDeviceToHost, stream));
+    CUDA_CHECK(hipMemcpyAsync(h_dot4, d_dot4, out_bytes, hipMemcpyDeviceToHost, stream));
+    CUDA_CHECK(hipStreamSynchronize(stream));
+
+    int max_err = 0;
+    int first = -1;
+    for (int i = 0; i < N * N; ++i) {
+        const int err = abs(h_wmma[i] - h_dot4[i]);
+        if (err > max_err) max_err = err;
+        if (err != 0 && first < 0) first = i;
+    }
+
+    CUDA_CHECK(hipFree(d_q));
+    CUDA_CHECK(hipFree(d_k));
+    CUDA_CHECK(hipFree(d_wmma));
+    CUDA_CHECK(hipFree(d_dot4));
+    free(h_q); free(h_k); free(h_wmma); free(h_dot4);
+
+    if (max_err != 0) {
+        fprintf(stderr, "PBWMMA I8 DOT4 shadow FAILED: max_err=%d first=%d\n", max_err, first);
+        return false;
+    }
+    fprintf(stderr, "PBWMMA I8 DOT4 shadow PASSED: max_err=%d\n", max_err);
     return true;
 }
 
@@ -527,6 +915,11 @@ static bool pbwmma_qk_probe_pass(hipStream_t stream) {
 static bool pbwmma_qk_probe_bm64_x4_pass(hipStream_t stream) {
     GGML_UNUSED(stream);
     fprintf(stderr, "PBWMMA BM64_X4 QK probe SKIPPED (not gfx1100)\n");
+    return false;
+}
+static bool pbwmma_pv_probe_pass(hipStream_t stream) {
+    GGML_UNUSED(stream);
+    fprintf(stderr, "PBWMMA PV WMMA probe SKIPPED (not gfx1100)\n");
     return false;
 }
 static bool pbwmma_qk_probe_bm32_pass(hipStream_t stream) {
