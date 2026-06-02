@@ -2714,10 +2714,20 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
                     const int global_r = rb * 16 + pbwmma_f16_d_row_from_acc(i, lane_hi);
                     out_pv[rb][i] *= alpha_smem[global_r];
                 }
+            }
+            #pragma unroll
+            for (int kc_base = 0; kc_base < BN_TILE; kc_base += 16) {
+                pbwmma_v16fp16 b_frag;
                 #pragma unroll
-                for (int kc_base = 0; kc_base < BN_TILE; kc_base += 16) {
+                for (int kk = 0; kk < 16; ++kk) {
+                    const int kc = kc_base + kk;
+                    b_frag[kk] = kc < valid_k
+                        ? v_tile_f16_db[kt & 1][kc][d_tile * 16 + pbwmma_f16_b_col_from_lane_lo(lane_lo)]
+                        : __float2half(0.0f);
+                }
+                #pragma unroll
+                for (int rb = 0; rb < 4; ++rb) {
                     pbwmma_v16fp16 a_frag;
-                    pbwmma_v16fp16 b_frag;
                     if (wave_active[rb]) {
                         #pragma unroll
                         for (int kk = 0; kk < 16; ++kk) {
@@ -2725,18 +2735,13 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
                             if (kc < valid_k) {
                                 if constexpr (PROBS_F16) a_frag[kk] = probs[rb * 16 + pbwmma_f16_a_row_from_lane_lo(lane_lo)][kc];
                                 else a_frag[kk] = __float2half(probs[rb * 16 + pbwmma_f16_a_row_from_lane_lo(lane_lo)][kc]);
-                                b_frag[kk] = v_tile_f16_db[kt & 1][kc][d_tile * 16 + pbwmma_f16_b_col_from_lane_lo(lane_lo)];
                             } else {
                                 a_frag[kk] = __float2half(0.0f);
-                                b_frag[kk] = __float2half(0.0f);
                             }
                         }
                     } else {
                         #pragma unroll
-                        for (int kk = 0; kk < 16; ++kk) {
-                            a_frag[kk] = __float2half(0.0f);
-                            b_frag[kk] = __float2half(0.0f);
-                        }
+                        for (int kk = 0; kk < 16; ++kk) a_frag[kk] = __float2half(0.0f);
                     }
                     pbwmma_v8fp32 pv_acc = {0,0,0,0,0,0,0,0};
                     pv_acc = pbwmma_mma(a_frag, b_frag, pv_acc);
