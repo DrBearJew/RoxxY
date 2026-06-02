@@ -1581,9 +1581,9 @@ static inline void pdmq_profile_record_and_emit(
     slots[idx].pv_cycles.fetch_add(kernel_profile.pv_cycles, std::memory_order_relaxed);
 
     fprintf(stderr,
-        "PDMQ2 summary route=rocm_packed16_dot4_mmq K=i32 V=%s last_role=%s last_nq=%d last_kernel_ms=%.3f "
+        "PDMQ2 summary route=rocm_packed16_dot4_mmq K=i32 V=%s last_role=%s last_nq=%d last_nk=%d last_kernel_ms=%.3f "
         "last_qk_cycles=%llu last_softmax_cycles=%llu last_pv_cycles=%llu\n",
-        ggml_type_name(plan.v_type), pdmq_role_name(plan.role), plan.nq, (double) kernel_ms,
+        ggml_type_name(plan.v_type), pdmq_role_name(plan.role), plan.nq, plan.nk, (double) kernel_ms,
         (unsigned long long) kernel_profile.qk_cycles,
         (unsigned long long) kernel_profile.softmax_cycles,
         (unsigned long long) kernel_profile.pv_cycles);

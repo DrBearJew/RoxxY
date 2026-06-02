@@ -33,6 +33,12 @@ PROFILE_RE = re.compile(
     r"qk_cycles=(\d+) softmax_cycles=(\d+) pv_cycles=(\d+)"
 )
 
+PDMQ_PROFILE_RE = re.compile(
+    r"PDMQ2 summary route=rocm_packed16_dot4_mmq .*?last_role=(\S+) "
+    r"last_nq=(\d+) last_nk=(\d+) last_kernel_ms=([0-9.]+) "
+    r"last_qk_cycles=(\d+) last_softmax_cycles=(\d+) last_pv_cycles=(\d+)"
+)
+
 
 @dataclass(frozen=True)
 class ProfileRow:
@@ -82,6 +88,9 @@ def parse_profiles(path: Path) -> list[ProfileRow]:
     for m in PROFILE_RE.finditer(text):
         impl, nq, nk, ms, qk, sm, pv = m.groups()
         out.append(ProfileRow(impl, int(nq), int(nk), float(ms), int(qk), int(sm), int(pv)))
+    for m in PDMQ_PROFILE_RE.finditer(text):
+        role, nq, nk, ms, qk, sm, pv = m.groups()
+        out.append(ProfileRow(f"dot4_mmq:{role}", int(nq), int(nk), float(ms), int(qk), int(sm), int(pv)))
     return out
 
 
