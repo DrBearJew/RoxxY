@@ -12,6 +12,8 @@
 #include "fattn-common.cuh"
 #include "fattn-packed16-wmma-builtin.cuh"
 
+#include <atomic>
+
 extern "C" {
 void llama_kv_cache_get_packed16_tensors(const void * k_view_data,
                                           ggml_tensor ** payload,
@@ -272,6 +274,32 @@ static __device__ __forceinline__ void pwmma_v_f16_load(
 // ── Probability storage selector ────────────────────────────────
 template<bool P16> struct pwmma_prob_storage_type { using type = float; };
 template<> struct pwmma_prob_storage_type<true> { using type = half; };
+
+// ── Lightweight phase profiling ────────────────────────────────
+struct pwmma_kernel_profile {
+    unsigned long long qk_cycles;
+    unsigned long long softmax_cycles;
+    unsigned long long pv_cycles;
+};
+
+#define PWMMA_PROFILE_PHASE_BEGIN() do { \
+    if (profile) { \
+        __syncthreads(); \
+        if (threadIdx.x == 0) { profile_t0 = clock64(); } \
+        __syncthreads(); \
+    } \
+} while (0)
+
+#define PWMMA_PROFILE_PHASE_END(FIELD) do { \
+    if (profile) { \
+        __syncthreads(); \
+        if (threadIdx.x == 0) { \
+            const unsigned long long profile_t1 = clock64(); \
+            atomicAdd(&profile->FIELD, profile_t1 >= profile_t0 ? profile_t1 - profile_t0 : 0ull); \
+        } \
+        __syncthreads(); \
+    } \
+} while (0)
 
 // ── Bounds debug error struct ───────────────────────────────────
 struct pwmma_debug_error {
@@ -1915,7 +1943,8 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_512t_wavegate_stagev_kernel(
         float attention_scale,
         unsigned long long * __restrict__ skip_counter,
         bool causal_skip_enabled,
-        pwmma_debug_error * __restrict__ bounds_err) {
+        pwmma_debug_error * __restrict__ bounds_err,
+        pwmma_kernel_profile * __restrict__ profile) {
 
     GGML_UNUSED(causal_skip_enabled);
     const int q_tile = blockIdx.x, hq = blockIdx.y, b = blockIdx.z, hk = hq / gqa_ratio;
@@ -1934,6 +1963,7 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_512t_wavegate_stagev_kernel(
     __shared__ prob_t probs [PWMMA_BM64][BN_TILE];
     __shared__ float row_m_smem[PWMMA_BM64], row_l_smem[PWMMA_BM64], alpha_smem[PWMMA_BM64];
     __shared__ bool  wave_active[4];
+    __shared__ unsigned long long profile_t0;
     extern __shared__ int pbwmma_i8_kshared_i32[];
     int  * const k_i32_smem = pbwmma_i8_kshared_i32;
     half * const k_s_smem   = reinterpret_cast<half *>(k_i32_smem + PWMMA_I8_KSHARED_I32_COUNT);
@@ -2031,6 +2061,7 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_512t_wavegate_stagev_kernel(
         for (int idx = threadIdx.x; idx < PWMMA_BM64 * BN_TILE; idx += blockDim.x) logits_f32[idx / BN_TILE][idx % BN_TILE] = 0.0f;
         __syncthreads();
 
+        PWMMA_PROFILE_PHASE_BEGIN();
         if (threadIdx.x < 128) {
             const int wave_id = threadIdx.x >> 5;
             if (wave_active[wave_id]) {
@@ -2184,6 +2215,8 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_512t_wavegate_stagev_kernel(
             }
         }
         __syncthreads();
+        PWMMA_PROFILE_PHASE_END(qk_cycles);
+        PWMMA_PROFILE_PHASE_BEGIN();
 
         for (int idx = threadIdx.x; idx < PWMMA_BM64 * BN_TILE; idx += blockDim.x) {
             const int r = idx / BN_TILE, c = idx % BN_TILE, qq = q0 + r;
@@ -2213,6 +2246,8 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_512t_wavegate_stagev_kernel(
             alpha_smem[r] = alpha; row_m_smem[r] = new_m; row_l_smem[r] = row_l_smem[r] * alpha + p_sum;
         }
         __syncthreads();
+        PWMMA_PROFILE_PHASE_END(softmax_cycles);
+        PWMMA_PROFILE_PHASE_BEGIN();
 
         if constexpr (PV_WMMA) {
             const int lane    = threadIdx.x & 31;
@@ -2309,6 +2344,7 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_512t_wavegate_stagev_kernel(
             }
         }
         __syncthreads();
+        PWMMA_PROFILE_PHASE_END(pv_cycles);
     }
 
     if constexpr (PV_WMMA) {
@@ -3391,6 +3427,31 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
         CUDA_CHECK(hipMemset(d_live_shadow_err, 0, sizeof(pwmma_debug_error)));
     }
 
+    bool profile_enabled = impl_i8qk && impl != 15 &&
+        getenv("GGML_CUDA_PWMMA_PROFILE") && atoi(getenv("GGML_CUDA_PWMMA_PROFILE")) != 0;
+    if (profile_enabled) {
+        hipStreamCaptureStatus profile_cap_status = hipStreamCaptureStatusNone;
+        if (hipStreamIsCapturing(stream, &profile_cap_status) == hipSuccess &&
+                profile_cap_status != hipStreamCaptureStatusNone) {
+            static bool profile_capture_warned = false;
+            if (!profile_capture_warned) {
+                profile_capture_warned = true;
+                fprintf(stderr, "PWMMA PROFILE skipped during graph capture\n");
+            }
+            profile_enabled = false;
+        }
+    }
+    pwmma_kernel_profile * profile_dev = nullptr;
+    hipEvent_t profile_start = nullptr;
+    hipEvent_t profile_stop  = nullptr;
+    if (profile_enabled) {
+        CUDA_CHECK(hipMalloc((void **) &profile_dev, sizeof(pwmma_kernel_profile)));
+        CUDA_CHECK(hipMemsetAsync(profile_dev, 0, sizeof(pwmma_kernel_profile), stream));
+        CUDA_CHECK(hipEventCreate(&profile_start));
+        CUDA_CHECK(hipEventCreate(&profile_stop));
+        CUDA_CHECK(hipEventRecord(profile_start, stream));
+    }
+
     { static bool once = false; if (!once) { once = true;
         fprintf(stderr, "PWMMA v0.6 variant=%s BM=%d GQA_GROUP=%d IMPL=%s Q4fix=%d nq=%d nk=%d hq=%d hk=%d b=%d sc=%g "
                 "gqa_ratio=%d grid_y_old=%d grid_y_new=%d payload_ne1=%lld payload_ne2=%lld packed_kv_size=%d head_stride=%d\n",
@@ -3593,7 +3654,7 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
         mask ? (const char*)mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
         k_payload, k_scales, \
         nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_kv_size, attention_scale, \
-        d_skip_counter, causal_skip_active, d_live_shadow_err)
+        d_skip_counter, causal_skip_active, d_live_shadow_err, profile_dev)
 #define LAUNCH_BM64_I8QK_PSEL(VT) do { \
     if (impl == 10) { LAUNCH_BM64_I8QK_WG_SV(VT, true, false, false, false, false); } \
     else if (impl == 11) { LAUNCH_BM64_I8QK_WG_SV(VT, false, true, false, false, false); } \
@@ -3732,6 +3793,23 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
                 impl_name,
                 hipGetErrorString(sync_err));
         }
+    }
+
+    if (profile_enabled) {
+        CUDA_CHECK(hipEventRecord(profile_stop, stream));
+        pwmma_kernel_profile profile_host = {};
+        CUDA_CHECK(hipMemcpyAsync(&profile_host, profile_dev, sizeof(profile_host), hipMemcpyDeviceToHost, stream));
+        CUDA_CHECK(hipStreamSynchronize(stream));
+        float kernel_ms = 0.0f;
+        CUDA_CHECK(hipEventElapsedTime(&kernel_ms, profile_start, profile_stop));
+        fprintf(stderr, "PWMMA PROFILE: impl=%s nq=%d nk=%d kernel_ms=%.3f qk_cycles=%llu softmax_cycles=%llu pv_cycles=%llu\n",
+            impl_name, nq, nk, (double) kernel_ms,
+            (unsigned long long) profile_host.qk_cycles,
+            (unsigned long long) profile_host.softmax_cycles,
+            (unsigned long long) profile_host.pv_cycles);
+        CUDA_CHECK(hipEventDestroy(profile_start));
+        CUDA_CHECK(hipEventDestroy(profile_stop));
+        CUDA_CHECK(hipFree(profile_dev));
     }
 
     if (live_dot4_shadow && d_live_shadow_err) {
