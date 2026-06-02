@@ -1,8 +1,12 @@
-# llama.cpp — Packed16 FlashAttention for RDNA3
+# RoxxY — Packed16 FlashAttention for RDNA3
 
-RDNA3-focused `llama.cpp` branch for packed16 K-cache FlashAttention. The
-normal path is simple: build the branch, run `llama-server` or `llama-bench`,
-and let the route selector pick the packed16 kernels automatically.
+RoxxY is the standalone GitHub home for this RDNA3-focused `llama.cpp` branch
+with packed16 K-cache FlashAttention. Clone this repository directly; it is no
+longer installed from `DrBearJew/llama.cpp`.
+
+The normal path is simple: build the default branch, run `llama-server` or
+`llama-bench`, and let the route selector pick the packed16 kernels
+automatically.
 
 Packed16 is a **runtime K-cache layout**, not a new GGUF model format. K is
 stored as I32 payload rows, with each 32-bit word carrying four packed 8-bit K
@@ -119,9 +123,9 @@ You need a compatible GGUF model. The tested model families and example
 Hugging Face sources are listed below under [Tested models](#tested-models).
 
 ```bash
-git clone https://github.com/DrBearJew/llama.cpp
-cd llama.cpp
-git checkout tbq4-rdna3-experiment
+git clone https://github.com/DrBearJew/RoxxY
+cd RoxxY
+# The default branch is tbq4-rdna3-experiment.
 
 cmake -S . -B build-rocm \
   -DGGML_HIP=ON \
