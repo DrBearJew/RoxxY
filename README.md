@@ -68,7 +68,7 @@ packed16-K + q8-V is about 17 bits per K+V pair.
 Expected route evidence for normal long prefill is the packed16/I32 family, usually the production auto PWMMA prefill route on target Qwen shapes:
 
 ```text
-selected=pwmma_bm32_regout_directv ... K=I32 V=<value-type>
+selected=pwmma_bm64_i8qk_pvwmma_dbv ... K=I32 V=<value-type>
 FATTN COMPUTE SELECT selected=... name=rocm_packed16_wmma_tile
 ```
 
@@ -154,7 +154,7 @@ Benchmark prefill:
   -fa 1 -ngl 99 -p 512 -n 1
 ```
 
-On the benchmark system used for the results below, this is expected to use the automatic PWMMA BM32 reg-out direct-V packed16 route for target Qwen shapes; historical 35B pp512 measurements were around **2700 tok/s** on that route.
+On the benchmark system used for the results below, long-context runs are expected to use the automatic PWMMA BM64 i8-QK PV-WMMA DBV packed16 route for target Qwen shapes. Short pp512 historical measurements were around **2700 tok/s** on the prior BM32 reg-out route.
 
 ---
 
@@ -190,9 +190,9 @@ Decode uses DOT4 decode kernels, not the prefill WMMA kernels.
 
 ### What these numbers show
 
-- PWMMA BM32 reg-out direct-V is the production auto packed16 prefill route for the listed target Qwen shapes once `pp/nk >= 512`.
+- PWMMA BM64 i8-QK PV-WMMA DBV is the production auto packed16 prefill route for long-context target Qwen shapes once `nk >= 1024`; BM32 reg-out direct-V remains the short-context route.
 - DOT4-MMQ/PDMQ remains available for route-pinned validation, small-Q/MTP roles, and experimental V formats.
-- PWMMA BM32 reg-out direct-V is the fastest measured prefill route on the listed workloads: +3.0% over DOT4-MMQ on 35B pp512 and +3.9% on 27B pp512.
+- PWMMA BM32 reg-out direct-V remains the fastest measured short pp512 route in the listed table (+3.0% over DOT4-MMQ on 35B pp512 and +3.9% on 27B pp512), while DBV PV-WMMA is the promoted long-context route based on the follow-up 9B/27B long-context artifacts.
 - A clean upstream q8_0 VEC FA baseline table is still TODO; current tables
   compare the packed16 route family and measured variants.
 

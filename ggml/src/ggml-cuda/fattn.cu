@@ -3501,7 +3501,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
         // nq > 1 prefill/verify:
         // - PDMQ/DOT4-MMQ remains the small-Q, forced-route, and experimental-V path.
-        // - PWMMA BM32 reg-out direct-V is the production prefill path once the
+        // - PWMMA BM64 i8-QK PV-WMMA DBV is the production prefill path once the
         //   prompt is large enough to amortize its setup work.
         // - DOT4_KQ is the last resort.
         const bool auto_verbose =
@@ -3514,7 +3514,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
         if ((prefill_or_verify || v_requires_dot4_mmq) && dot4_sup) {
             // ── Packed16 PWMMA auto-selection ──────────
-            // Use PV-WMMA for long-context prefill; keep BM32 direct-V for shorter chunks.
+            // Use DBV PV-WMMA for long-context prefill; keep BM32 direct-V for shorter chunks.
             const char * explicit_impl = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL");
             const bool impl_is_wmma =
                 explicit_impl && (
@@ -3554,7 +3554,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             // subsequent calls (IMPL is already set).
             if (!v_requires_dot4_mmq && (use_auto_wmma || (impl_is_wmma && wmma_available))) {
                 if (use_pvwmma) {
-                    setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL", "bm64_i8qk_pvwmma_512t_wavegate_stagev", 1);
+                    setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL", "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev", 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM", "64", 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_CAUSAL_SKIP", "1", 1);
                 } else if (use_bm32_regout) {
@@ -3564,12 +3564,19 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 }
                 packed16_kernel = BEST_FATTN_KERNEL_PACKED16_WMMA_TILE;
                 if (use_pvwmma) {
-                    packed16_route_name = "pwmma_bm64_i8qk_pvwmma";
+                    packed16_route_name = "pwmma_bm64_i8qk_pvwmma_dbv";
                 } else if (use_bm32_regout) {
                     packed16_route_name = "pwmma_bm32_regout_directv";
                 } else {
-                    const int bm = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM") ? atoi(getenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM")) : 32;
-                    packed16_route_name = (bm == 16) ? "pwmma_bm16" : (bm == 32 ? "pwmma_bm32" : "pwmma_bm64");
+                    explicit_impl = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL");
+                    if (explicit_impl && strcmp(explicit_impl, "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev") == 0) {
+                        packed16_route_name = "pwmma_bm64_i8qk_pvwmma_dbv";
+                    } else if (explicit_impl && strcmp(explicit_impl, "bm64_i8qk_pvwmma_512t_wavegate_stagev") == 0) {
+                        packed16_route_name = "pwmma_bm64_i8qk_pvwmma";
+                    } else {
+                        const int bm = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM") ? atoi(getenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM")) : 32;
+                        packed16_route_name = (bm == 16) ? "pwmma_bm16" : (bm == 32 ? "pwmma_bm32" : "pwmma_bm64");
+                    }
                 }
             } else {
                 packed16_kernel = BEST_FATTN_KERNEL_PACKED16_DOT4_MMQ;
@@ -3580,15 +3587,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             }
         } else if (prefill_or_verify && wmma_sup) {
             packed16_kernel = BEST_FATTN_KERNEL_PACKED16_WMMA_TILE;
-            // Auto-select BM32_regout_directv as best PWMMA impl
+            // Auto-select DBV PV-WMMA for long context and BM32 regout for short context.
             const char * explicit_impl = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL");
             const bool impl_auto = (!explicit_impl || !*explicit_impl || strcmp(explicit_impl, "smem") == 0);
             if (impl_auto) {
                 if (K->ne[1] >= 1024) {
-                    setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL", "bm64_i8qk_pvwmma_512t_wavegate_stagev", 1);
+                    setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL", "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev", 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM", "64", 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_CAUSAL_SKIP", "1", 1);
-                    packed16_route_name = "pwmma_bm64_i8qk_pvwmma";
+                    packed16_route_name = "pwmma_bm64_i8qk_pvwmma_dbv";
                 } else {
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL", "bm32_regout_directv", 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM", "32", 1);
@@ -3596,8 +3603,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                     packed16_route_name = "pwmma_bm32_regout_directv";
                 }
             } else {
-                const int bm = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM") ? atoi(getenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM")) : 32;
-                packed16_route_name = (bm == 16) ? "pwmma_bm16" : (bm == 32 ? "pwmma_bm32" : "pwmma_bm64");
+                explicit_impl = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL");
+                if (explicit_impl && strcmp(explicit_impl, "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev") == 0) {
+                    packed16_route_name = "pwmma_bm64_i8qk_pvwmma_dbv";
+                } else if (explicit_impl && strcmp(explicit_impl, "bm64_i8qk_pvwmma_512t_wavegate_stagev") == 0) {
+                    packed16_route_name = "pwmma_bm64_i8qk_pvwmma";
+                } else {
+                    const int bm = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM") ? atoi(getenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM")) : 32;
+                    packed16_route_name = (bm == 16) ? "pwmma_bm16" : (bm == 32 ? "pwmma_bm32" : "pwmma_bm64");
+                }
             }
         } else if (ggml_cuda_q8k_dot4_kq_enabled() || getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE")) {
             packed16_kernel = BEST_FATTN_KERNEL_Q8K_DOT4_KQ;
