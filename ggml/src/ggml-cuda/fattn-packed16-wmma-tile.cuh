@@ -66,6 +66,7 @@ static int ggml_cuda_rocm_packed16_wmma_impl() {
     if (strcmp(s, "bm64_i8qk_k32acc_kshared_512t_wavegate_stagev") == 0) return 13;
     if (strcmp(s, "bm64_i8qk_pvwmma_512t_wavegate_stagev") == 0) return 14;
     if (strcmp(s, "bm64_i8qk_pvwmma_bn32_512t_wavegate_stagev") == 0) return 15;
+    if (strcmp(s, "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev") == 0) return 16;
     GGML_ABORT("invalid GGML_CUDA_ROCM_PACKED16_WMMA_IMPL=%s", s);
 }
 
@@ -3344,7 +3345,7 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
 
     // impl validation: bm32_regout only valid with BM32; bm64_regout only valid with BM64
     const bool impl_bm32_regout = (impl == 1 || impl == 2);
-    const bool impl_bm64_regout = (impl == 3 || impl == 4 || impl == 5 || impl == 6 || impl == 7 || impl == 8 || impl == 9 || impl == 10 || impl == 11 || impl == 12 || impl == 13 || impl == 14 || impl == 15);
+    const bool impl_bm64_regout = (impl == 3 || impl == 4 || impl == 5 || impl == 6 || impl == 7 || impl == 8 || impl == 9 || impl == 10 || impl == 11 || impl == 12 || impl == 13 || impl == 14 || impl == 15 || impl == 16);
     if (impl_bm32_regout && !is_bm32) GGML_ABORT("PWMMA BM32 regout impl requires BM=32, got BM=%d impl=%d", bm, impl);
     if (impl_bm64_regout && !is_bm64) GGML_ABORT("PWMMA BM64 regout impl requires BM=64, got BM=%d impl=%d", bm, impl);
 
@@ -3364,6 +3365,7 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
         (impl == 13) ? "bm64_i8qk_k32acc_kshared_512t_wavegate_stagev" :
         (impl == 14) ? "bm64_i8qk_pvwmma_512t_wavegate_stagev" :
         (impl == 15) ? "bm64_i8qk_pvwmma_bn32_512t_wavegate_stagev" :
+        (impl == 16) ? "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev" :
         "unknown";
 
     // GQA2 validation: only BM16, GQA ratio >= 2, nq > 1
@@ -3404,8 +3406,8 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
         CUDA_CHECK(hipMemset(d_skip_counter, 0, sizeof(unsigned long long)));
     }
 
-    const bool impl_i8qk = (impl == 9 || impl == 10 || impl == 11 || impl == 12 || impl == 13 || impl == 14 || impl == 15);
-    const bool impl_pvwmma = (impl == 14 || impl == 15);
+    const bool impl_i8qk = (impl == 9 || impl == 10 || impl == 11 || impl == 12 || impl == 13 || impl == 14 || impl == 15 || impl == 16);
+    const bool impl_pvwmma = (impl == 14 || impl == 15 || impl == 16);
     const bool live_dot4_shadow_requested = impl_i8qk && getenv("GGML_CUDA_PWMMA_I8_LIVE_DOT4_SHADOW");
     const bool live_pv_shadow_requested = impl_pvwmma && getenv("GGML_CUDA_PWMMA_PV_WMMA_SHADOW");
     bool live_dot4_shadow = live_dot4_shadow_requested || live_pv_shadow_requested;
@@ -3661,6 +3663,7 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
     else if (impl == 12) { LAUNCH_BM64_I8QK_WG_SV(VT, false, false, true, false, false); } \
     else if (impl == 13) { LAUNCH_BM64_I8QK_WG_SV(VT, false, true, true, false, false); } \
     else if (impl == 14) { LAUNCH_BM64_I8QK_WG_SV(VT, true, false, false, true, false); } \
+    else if (impl == 16) { LAUNCH_BM64_I8QK_WG_SV(VT, true, false, false, true, false); } \
     else { LAUNCH_BM64_I8QK_WG_SV(VT, false, false, false, false, false); } \
 } while (0)
             switch (V->type) {

@@ -3532,7 +3532,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                     strcmp(explicit_impl, "bm64_i8qk_kshared_512t_wavegate_stagev") == 0 ||
                     strcmp(explicit_impl, "bm64_i8qk_k32acc_kshared_512t_wavegate_stagev") == 0 ||
                     strcmp(explicit_impl, "bm64_i8qk_pvwmma_512t_wavegate_stagev") == 0 ||
-                    strcmp(explicit_impl, "bm64_i8qk_pvwmma_bn32_512t_wavegate_stagev") == 0);
+                    strcmp(explicit_impl, "bm64_i8qk_pvwmma_bn32_512t_wavegate_stagev") == 0 ||
+                    strcmp(explicit_impl, "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev") == 0);
             const bool impl_auto = (!explicit_impl || !*explicit_impl || strcmp(explicit_impl, "smem") == 0);
             // Qwen 27B-like shape: gqa_ratio=6, heads_q=24, heads_k=4.
             // Qwen 35B-like shape: gqa_ratio=8, heads_q=16, heads_k=2.

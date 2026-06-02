@@ -163,12 +163,14 @@ This is lower math risk but may require output-index remapping or grid-to-q tile
 - Do not prioritize softmax polynomial work first: PWMMA profile has softmax at ~13%.
 - Do not promote BN32 yet: earlier pp2048 result was slower than BN16 PV-WMMA.
 
-## Next concrete patch
+## Implementation status
 
-Add impl ID 16:
+Initial opt-in impl ID 16 was added:
 
 ```text
 16 = bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev
 ```
 
-Create a dedicated kernel copied from impl 14 with V buffer dimension `[2][BN][D]`, minimal changes, no K_SHARED. Keep it opt-in until profile and speed artifacts prove a win.
+The first attempted 3D shared V-buffer template (`v_tile_f16_db[2][BN][D]`) built through semantic checking but crashed ROCm clang 22 during backend codegen, similar to earlier BN32 template-pressure failures. The committed impl-16 selector therefore currently maps to the proven BN16 PV-WMMA body as a safe scaffold/route knob while the dedicated DBV kernel is split out in a future patch to avoid extra template instantiations.
+
+Smoke artifact: `dbv-alias-smoke-20260602-215340` selects `IMPL=bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev`, passes QK/i8/PV probes, and emits `PWMMA PROFILE` lines.
