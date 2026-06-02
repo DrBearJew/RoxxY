@@ -174,3 +174,5 @@ Initial opt-in impl ID 16 was added:
 The first attempted 3D shared V-buffer inside the generic template (`v_tile_f16_db[2][BN][D]`) built through semantic checking but crashed ROCm clang 22 during backend codegen, similar to earlier BN32 template-pressure failures. The next patch split impl 16 into a dedicated DBV kernel with fewer template parameters and a real alternating V buffer.
 
 Smoke artifact: `dbv-dedicated-smoke-20260602-220035` selects `IMPL=bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev`, passes QK/i8/PV probes, emits `PWMMA PROFILE` lines, and runs pp1024 at `915.04 tok/s` in a one-rep smoke.
+
+A/B artifact: `dbv-vs-pvwmma-ab-20260602-220737` compares standard impl 14 vs dedicated DBV at pp1024/2048/4096. Throughput is neutral (`-0.13%`, `-0.02%`, `+0.01%`), while profiled kernel medians improve by roughly `1.6–3.1%`. Do not promote DBV yet; keep as opt-in scaffold. The next real overlap attempt should reduce whole-graph time, not just profiled kernel medians.
