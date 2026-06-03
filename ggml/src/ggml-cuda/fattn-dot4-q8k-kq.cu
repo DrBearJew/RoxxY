@@ -3854,9 +3854,9 @@ bool impl_small_verify = strcmp(packed16_decode_impl, "small_verify") == 0;
                     if (impl_small_verify_fa2) {
                         if (gqa_ratio > 8) GGML_ABORT("packed16 %s supports gqa_ratio <= 8, got %d", packed16_decode_impl, gqa_ratio);
                         if (decode_bn == 64 && decode_vsub == 8) {
-                            if (nq <= 2) { LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(64, 8, 8, 2, 128) }
-                            else if (nq <= 3) { LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(64, 8, 8, 3, 128) }
-                            else { LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(64, 8, 8, 4, 128) }
+                            if (nq <= 2) { LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(64, 8, 8, 2, 112) }
+                            else if (nq <= 3) { LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(64, 8, 8, 3, 112) }
+                            else { LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(64, 8, 8, 4, 112) }
                         }
                         else { GGML_ABORT("packed16 %s: expected BN=64 VSUB=8, got BN=%d VSUB=%d", packed16_decode_impl, decode_bn, decode_vsub); }
                         return;
