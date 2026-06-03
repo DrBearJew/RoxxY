@@ -3735,7 +3735,9 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                 const char * packed16_decode_route = getenv("GGML_CUDA_FA_ROUTE_REQUIRE");
                 const bool packed16_small_verify_requested =
                     (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify") == 0) ||
-                    (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify") == 0);
+                    (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify_batched_splitk") == 0) ||
+                    (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify") == 0) ||
+                    (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_batched_splitk") == 0);
                 const bool packed16_small_verify_splitk_requested =
                     (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify_splitk") == 0) ||
                     (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_splitk") == 0);

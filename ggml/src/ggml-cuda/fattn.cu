@@ -3653,10 +3653,21 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
 
         // nq > 1 prefill/verify:
+        // - Small-verify decode route: for nq=2..4 verify, use the decode-style
+        //   small_verify kernel which is optimized for small-batch nq>1 (shared K/V,
+        //   DOT4-batched QK, fused softmax+P×V). Much cheaper than full prefill.
+        //   Gated behind the existing packed16 decode env: GGML_CUDA_ROCM_Q8K_DOT4_KQ.
         // - PDMQ/DOT4-MMQ remains the small-Q, forced-route, and experimental-V path.
         // - PWMMA BM64 i8-QK PV-WMMA DBV is the production prefill path once the
         //   prompt is large enough to amortize its setup work.
         // - DOT4_KQ is the last resort.
+        if (inst != GGML_FATTN_INST_PREFILL_QK &&
+            Q->ne[1] >= 2 && Q->ne[1] <= small_verify_max_nq &&
+            V->type == GGML_TYPE_Q4_0 && getenv("LLAMA_MTP_FA_ROUTE")) { // opt-in: route MTP verify through packed16 decode lane
+            // Route verify instructions through the packed16 decode lane which
+            // contains the small_verify / small_verify_batched_splitk kernels
+            return BEST_FATTN_KERNEL_PACKED16_DECODE;
+        }
         const bool auto_verbose =
             (getenv("GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE") && atoi(getenv("GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE"))) ||
             (getenv("COMPRESSED_KV_FATTN_LOG") && atoi(getenv("COMPRESSED_KV_FATTN_LOG")));

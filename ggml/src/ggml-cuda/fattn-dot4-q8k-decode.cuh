@@ -1325,36 +1325,63 @@ void ggml_cuda_q8k_dot4_small_verify_batched_gqa_splitk_stage1_kernel(
     for (int k0 = k_begin; k0 < k_end; k0 += BN) {
         const int tile_n = (k0 + BN <= k_end) ? BN : (k_end - k0);
 
-        // ── Phase 1: ALL Q×K scores in one parallel sweep (one sync barrier) ──
-        // Each thread computes up to ceil(NQ_MAX*GH_MAX*BN / blockDim.x) scores.
-        // K positions are read once; threads for different (q_idx,g) but same kk
-        // coalesce on the same K address via GPU cache broadcast.
+        // ── Phase 1: ALL Q×K scores in one parallel sweep using DOT4 batched across 4 queries ──
+        // Each thread processes up to 4 consecutive logits positions (q_idx, g, kk) where
+        // (g, kk) are shared and K is loaded ONCE for all 4 queries. DOT4 computes 4 I8
+        // element-products per instruction; with 4 query chains interleaved, K elements are
+        // reused 4×, reducing K memory traffic by ~4× vs per-query dot calls.
         const int NQK_STRIDE = NQ_MAX * GH_MAX * BN;
-        for (int i = tid; i < NQK_STRIDE; i += blockDim.x) {
-            const int q_idx = i / (GH_MAX * BN);
-            const int guard  = i - q_idx * (GH_MAX * BN);
+        for (int i4 = tid * 4; i4 < NQK_STRIDE; i4 += blockDim.x * 4) {
+            const int q0 = i4 / (GH_MAX * BN);
+            const int guard  = i4 - q0 * (GH_MAX * BN);
             const int g      = guard / BN;
             const int kk     = guard - g * BN;
             const int k      = k0 + kk;
-            float s = -1e38f;
-            if (q_idx < nq && g < gh && kk < tile_n && k < nk) {
-                const int q_pos = q_offset + q_idx;
-                bool valid = mask ? true : (k <= q_pos);
-                if (valid) {
-                    const size_t kb = k_head_base + k;
-                    const float raw_score = ggml_cuda_q8k_dot4_kq_dot_direct(
-                        q_i32 + (q_idx * GH_MAX + g) * DECODE_I32_PER_ROW,
-                        q_scl + (q_idx * GH_MAX + g) * DECODE_N_BLOCKS,
-                        k_payload + kb * DECODE_I32_PER_ROW,
-                        k_scales + kb * DECODE_N_BLOCKS) * scale;
-                    if (mask) {
-                        s = raw_score + ggml_cuda_q8k_dot4_mask_value(mask, nb30, nb31, nb33, ne33, q_idx, k, b);
-                    } else {
-                        s = raw_score;
+            const int n_rem  = min(4, nq - q0);
+
+            // Load K payload and scale once for this position
+            const size_t kb = k_head_base + k;
+            const int  * __restrict__ k_row = k_payload + kb * DECODE_I32_PER_ROW;
+            const half * __restrict__ ks_row = k_scales + kb * DECODE_N_BLOCKS;
+            const float k_scale = __half2float(ks_row[0]); // single block (D=256)
+
+            // Initialize 4 accumulators (one per potential query)
+            int acc[4] = {0, 0, 0, 0};
+
+            // DOT4 loop: 64 I32 positions × 4 elements per I32 = 256 elements per row
+            // For each K I32 element, compute DOT4 against up to 4 Q elements
+#pragma unroll
+            for (int pos = 0; pos < DECODE_I32_PER_ROW; ++pos) {
+                const int k_val = k_row[pos];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    if (j < n_rem && q0 + j < nq && g < gh) {
+                        const int  * qp = q_i32 + ((q0 + j) * GH_MAX + g) * DECODE_I32_PER_ROW;
+                        acc[j] = ggml_cuda_q8k_dot4_i8_i8(qp[pos], k_val, acc[j]);
                     }
                 }
             }
-            logits[i] = s;
+
+            // Store scores with per-query scale and causal mask
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float s = -1e38f;
+                if (j < n_rem && q0 + j < nq && g < gh && kk < tile_n && k < nk) {
+                    const int q_idx = q0 + j;
+                    const int q_pos = q_offset + q_idx;
+                    bool valid = mask ? true : (k <= q_pos);
+                    if (valid) {
+                        const float * qs = q_scl + (q_idx * GH_MAX + g) * DECODE_N_BLOCKS;
+                        const float raw = float(acc[j]) * qs[0] * k_scale * scale;
+                        if (mask) {
+                            s = raw + ggml_cuda_q8k_dot4_mask_value(mask, nb30, nb31, nb33, ne33, q_idx, k, b);
+                        } else {
+                            s = raw;
+                        }
+                    }
+                }
+                logits[i4 + j] = s;
+            }
         }
         __syncthreads();
 
