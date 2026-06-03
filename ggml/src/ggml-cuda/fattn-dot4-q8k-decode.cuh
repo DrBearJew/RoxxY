@@ -1264,14 +1264,14 @@ void ggml_cuda_q8k_dot4_small_verify_batched_gqa_splitk_stage1_kernel(
     // Shared memory layout:
     //   q_i32[NQ_MAX * GH_MAX * DECODE_I32_PER_ROW]  — all Q payloads
     //   q_scl[NQ_MAX * GH_MAX * DECODE_N_BLOCKS]     — all Q scales
-    //   logits[GH_MAX * BN]                            — one GH×BN tile (reused per query)
-    //   probs[GH_MAX * BN]                             — one GH×BN tile (reused per query)
+    //   logits[NQ_MAX * GH_MAX * BN]                  — ALL Q×K scores for this K tile
+    //   probs[NQ_MAX * GH_MAX * BN]                   — post-softmax probs
     //   sm[NQ_MAX * GH_MAX * 4]                        — softmax running state per (q,g)
     int   * q_i32  = reinterpret_cast<int   *>(smem);
     float * q_scl  = reinterpret_cast<float *>(q_i32 + NQ_MAX * GH_MAX * DECODE_I32_PER_ROW);
     float * logits  = q_scl + NQ_MAX * GH_MAX * DECODE_N_BLOCKS;
-    float * probs   = logits + GH_MAX * BN;
-    float * sm      = probs  + GH_MAX * BN;
+    float * probs   = logits + NQ_MAX * GH_MAX * BN;
+    float * sm      = probs  + NQ_MAX * GH_MAX * BN;
 
     // Load all Q payloads and scales for all nq queries across gh heads
     for (int i = tid; i < NQ_MAX * GH_MAX * DECODE_I32_PER_ROW; i += blockDim.x) {
@@ -1321,85 +1321,92 @@ void ggml_cuda_q8k_dot4_small_verify_batched_gqa_splitk_stage1_kernel(
                              + size_t(hk) * size_t(k_head_stride_rows);
     const char * v_head = V + int64_t(b) * nb23 + int64_t(hk) * nb22;
 
-    // ── Main K/V tile loop: K and V are read ONCE per tile, shared across all nq ──
+    // ── Main K/V tile loop: K/V read ONCE per tile, Q×K computed for ALL nq in one sweep ──
     for (int k0 = k_begin; k0 < k_end; k0 += BN) {
         const int tile_n = (k0 + BN <= k_end) ? BN : (k_end - k0);
 
-        // ── QK dot for all nq × gh heads — K tile loaded once from global memory ──
-        // For each query, compute dot product of its Q against this K tile
+        // ── Phase 1: ALL Q×K scores in one parallel sweep (one sync barrier) ──
+        // Each thread computes up to ceil(NQ_MAX*GH_MAX*BN / blockDim.x) scores.
+        // K positions are read once; threads for different (q_idx,g) but same kk
+        // coalesce on the same K address via GPU cache broadcast.
+        const int NQK_STRIDE = NQ_MAX * GH_MAX * BN;
+        for (int i = tid; i < NQK_STRIDE; i += blockDim.x) {
+            const int q_idx = i / (GH_MAX * BN);
+            const int guard  = i - q_idx * (GH_MAX * BN);
+            const int g      = guard / BN;
+            const int kk     = guard - g * BN;
+            const int k      = k0 + kk;
+            float s = -1e38f;
+            if (q_idx < nq && g < gh && kk < tile_n && k < nk) {
+                const int q_pos = q_offset + q_idx;
+                bool valid = mask ? true : (k <= q_pos);
+                if (valid) {
+                    const size_t kb = k_head_base + k;
+                    const float raw_score = ggml_cuda_q8k_dot4_kq_dot_direct(
+                        q_i32 + (q_idx * GH_MAX + g) * DECODE_I32_PER_ROW,
+                        q_scl + (q_idx * GH_MAX + g) * DECODE_N_BLOCKS,
+                        k_payload + kb * DECODE_I32_PER_ROW,
+                        k_scales + kb * DECODE_N_BLOCKS) * scale;
+                    if (mask) {
+                        s = raw_score + ggml_cuda_q8k_dot4_mask_value(mask, nb30, nb31, nb33, ne33, q_idx, k, b);
+                    } else {
+                        s = raw_score;
+                    }
+                }
+            }
+            logits[i] = s;
+        }
+        __syncthreads();
+
+        // ── Phase 2: per-query softmax + P×V (K/V already read in phase 1) ──
 #pragma unroll
         for (int q_idx = 0; q_idx < NQ_MAX; ++q_idx) {
-            if (q_idx < nq) {
-                const int q_pos = q_offset + q_idx;
+            if (q_idx >= nq) break;
 
-                for (int i = tid; i < GH_MAX * BN; i += blockDim.x) {
-                    const int g  = i / BN;
-                    const int kk = i - g * BN;
-                    const int k  = k0 + kk;
-                    float s = -1e38f;
-                    if (g < gh && kk < tile_n && k < nk && (mask || k <= q_pos)) {
-                        // K tile access: k_payload[k_head_base + k] — shared across all nq!
-                        const size_t kb = k_head_base + k;
-                        const float raw_score = ggml_cuda_q8k_dot4_kq_dot_direct(
-                            q_i32 + (q_idx * GH_MAX + g) * DECODE_I32_PER_ROW,
-                            q_scl + (q_idx * GH_MAX + g) * DECODE_N_BLOCKS,
-                            k_payload + kb * DECODE_I32_PER_ROW,
-                            k_scales + kb * DECODE_N_BLOCKS) * scale;
-                        // Apply per-query causal boundary
-                        if (mask) {
-                            s = raw_score + ggml_cuda_q8k_dot4_mask_value(mask, nb30, nb31, nb33, ne33, q_idx, k, b);
-                        } else if (k <= q_pos) {
-                            s = raw_score;
-                        }
+            // Softmax for this query's GH heads (reads from logits[q_idx][g][kk])
+            if (tid < GH_MAX) {
+                const int g = tid;
+                if (g < gh) {
+                    float tile_m = -1e38f;
+                    const int logit_base = q_idx * GH_MAX * BN + g * BN;
+                    for (int kk = 0; kk < tile_n; ++kk) tile_m = fmaxf(tile_m, logits[logit_base + kk]);
+                    float m_prev = sm[(q_idx * GH_MAX + g) * 4 + 0];
+                    float l_prev = sm[(q_idx * GH_MAX + g) * 4 + 1];
+                    float m_new  = fmaxf(m_prev, tile_m);
+                    float old_scale = (l_prev > 0.0f) ? expf(m_prev - m_new) : 0.0f;
+                    float tile_l = 0.0f;
+                    for (int kk = 0; kk < tile_n; ++kk) {
+                        float p = expf(logits[logit_base + kk] - m_new);
+                        probs[logit_base + kk] = p;
+                        tile_l += p;
                     }
-                    logits[g * BN + kk] = s;
+                    sm[(q_idx * GH_MAX + g) * 4 + 0] = m_new;
+                    sm[(q_idx * GH_MAX + g) * 4 + 1] = l_prev * old_scale + tile_l;
+                    sm[(q_idx * GH_MAX + g) * 4 + 2] = old_scale;
                 }
-                __syncthreads();
-
-                // Softmax per gh head
-                if (tid < GH_MAX) {
-                    const int g = tid;
-                    if (g < gh) {
-                        float tile_m = -1e38f;
-                        for (int kk = 0; kk < BN; ++kk) tile_m = fmaxf(tile_m, logits[g * BN + kk]);
-                        float m_prev = sm[(q_idx * GH_MAX + g) * 4 + 0];
-                        float l_prev = sm[(q_idx * GH_MAX + g) * 4 + 1];
-                        float m_new  = fmaxf(m_prev, tile_m);
-                        float old_scale = (l_prev > 0.0f) ? expf(m_prev - m_new) : 0.0f;
-                        float tile_l = 0.0f;
-                        for (int kk = 0; kk < BN; ++kk) {
-                            float p = expf(logits[g * BN + kk] - m_new);
-                            probs[g * BN + kk] = p;
-                            tile_l += p;
-                        }
-                        sm[(q_idx * GH_MAX + g) * 4 + 0] = m_new;
-                        sm[(q_idx * GH_MAX + g) * 4 + 1] = l_prev * old_scale + tile_l;
-                        sm[(q_idx * GH_MAX + g) * 4 + 2] = old_scale;
-                    }
-                }
-                __syncthreads();
-
-                // P×V accumulation — V loaded ONCE per tile, shared across all q
-                if (tid < DECODE_D) {
-#pragma unroll
-                    for (int g = 0; g < GH_MAX; ++g) {
-                        if (g < gh) out[q_idx][g] *= sm[(q_idx * GH_MAX + g) * 4 + 2];
-                    }
-                    for (int sub = 0; sub < tile_n; sub += BN_VSUB) {
-                        int end = (sub + BN_VSUB < tile_n) ? sub + BN_VSUB : tile_n;
-                        for (int kk = sub; kk < end; ++kk) {
-                            // V row — shared across all nq queries!
-                            const int k = k0 + kk;
-                            const float v = ggml_cuda_q8k_dot4_dequant_q4_0(v_head + int64_t(k) * nb21, nb20, tid);
-#pragma unroll
-                            for (int g = 0; g < GH_MAX; ++g) {
-                                if (g < gh) out[q_idx][g] += probs[g * BN + kk] * v;
-                            }
-                        }
-                    }
-                }
-                __syncthreads();
             }
+            __syncthreads();
+
+            // P×V accumulation for this query (reads from probs[q_idx][g][kk])
+            if (tid < DECODE_D) {
+                const int logit_base = q_idx * GH_MAX * BN;
+#pragma unroll
+                for (int g = 0; g < GH_MAX; ++g) {
+                    if (g < gh) out[q_idx][g] *= sm[(q_idx * GH_MAX + g) * 4 + 2];
+                }
+                for (int sub = 0; sub < tile_n; sub += BN_VSUB) {
+                    int end = (sub + BN_VSUB < tile_n) ? sub + BN_VSUB : tile_n;
+                    for (int kk = sub; kk < end; ++kk) {
+                        const int k = k0 + kk;
+                        const float v = ggml_cuda_q8k_dot4_dequant_q4_0(v_head + int64_t(k) * nb21, nb20, tid);
+#pragma unroll
+                        for (int g = 0; g < GH_MAX; ++g) {
+                            if (g < gh) out[q_idx][g] += probs[logit_base + g * BN + kk] * v;
+                        }
+                    }
+                }
+            }
+            __syncthreads();
         }
     }
 
@@ -1707,7 +1714,7 @@ void ggml_cuda_q8k_dot4_decode_splitk_reduce_kernel(
 #define LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(BN, BN_VSUB, GH_MAX, NQ_MAX) { \
     int sm = (NQ_MAX * GH_MAX * DECODE_I32_PER_ROW) * (int)sizeof(int) \
            + (NQ_MAX * GH_MAX * DECODE_N_BLOCKS) * (int)sizeof(float) \
-           + (GH_MAX * BN * 2) * (int)sizeof(float) \
+           + (NQ_MAX * GH_MAX * BN * 2) * (int)sizeof(float) \
            + (NQ_MAX * GH_MAX * 4) * (int)sizeof(float); \
     int split_size = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_SPLITK_SIZE", 512); \
     int n_splits = (nk + split_size - 1) / split_size; \
