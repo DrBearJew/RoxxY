@@ -373,6 +373,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_PACKED16_WMMA_TILE = 585, // packed16 K cache → f16 tile materializer → WMMA/MFMA FA
     BEST_FATTN_KERNEL_PACKED16_DOT4_MMQ = 586, // packed16 K cache → q8 Q tile → sudot4/MMQ FA
     BEST_FATTN_KERNEL_MTP_F16K_Q4V_VEC = 587, // MTP decode: exact/source f16 K + q4_0 V through VEC FA
+    BEST_FATTN_KERNEL_PACKED16_DECODE = 588, // packed16 I32 K + q4_0 V nq==1 MTP decode lane
 };
 
 static const char * ggml_cuda_fattn_instruction_name(const ggml_fattn_instruction inst);
@@ -396,6 +397,7 @@ static const char * ggml_cuda_fattn_kernel_name(const best_fattn_kernel kernel) 
         case BEST_FATTN_KERNEL_PACKED16_WMMA_TILE:    return "rocm_packed16_wmma_tile";
         case BEST_FATTN_KERNEL_PACKED16_DOT4_MMQ:       return "rocm_packed16_dot4_mmq";
         case BEST_FATTN_KERNEL_MTP_F16K_Q4V_VEC:        return "rocm_mtp_f16k_q4v_decode";
+        case BEST_FATTN_KERNEL_PACKED16_DECODE:         return "rocm_packed16_decode";
     }
     return "unknown";
 }
@@ -731,9 +733,27 @@ static bool ggml_cuda_fattn_route_contract_matches(const char * required, const 
         return true;
     }
     if ((strcmp(required, "rocm_q8k_dot4_kq") == 0 ||
-         strcmp(required, DP16_ROUTE_FA2_PACKED16_DOT4_DECODE) == 0 ||
          strcmp(required, DP16_ROUTE_FA2_F16K_ADAPT_DOT4_DECODE) == 0) &&
             kernel == BEST_FATTN_KERNEL_Q8K_DOT4_KQ) {
+        return true;
+    }
+    if ((strcmp(required, DP16_ROUTE_FA2_PACKED16_DOT4_DECODE) == 0 ||
+         strcmp(required, "rocm_packed16_decode") == 0 ||
+         strcmp(required, "rocm_packed16_decode_scalar") == 0 ||
+         strcmp(required, "rocm_packed16_decode_q4pair") == 0 ||
+         strcmp(required, "rocm_packed16_decode_gqa_scalar") == 0 ||
+         strcmp(required, "rocm_packed16_decode_waveqk") == 0 ||
+         strcmp(required, "rocm_packed16_decode_pvwmma") == 0 ||
+         strcmp(required, "rocm_packed16_decode_gqa_pvwmma") == 0 ||
+         strcmp(required, "rocm_packed16_decode_wmma_full") == 0 ||
+         strcmp(required, "rocm_packed16_decode_gqa_wmma_full") == 0 ||
+         strcmp(required, "rocm_packed16_decode_dsplit") == 0 ||
+         strcmp(required, "rocm_packed16_decode_logits_debug") == 0 ||
+         strcmp(required, "rocm_packed16_decode_waveqk_q4pair") == 0 ||
+         strcmp(required, "rocm_packed16_decode_splitk") == 0 ||
+         strcmp(required, "rocm_packed16_small_verify") == 0 ||
+         strcmp(required, "rocm_packed16_small_verify_splitk") == 0) &&
+            kernel == BEST_FATTN_KERNEL_PACKED16_DECODE) {
         return true;
     }
     if ((strcmp(required, "rocm_mtp_verify_dot4_recthist") == 0 ||
@@ -835,6 +855,21 @@ static bool ggml_cuda_fattn_route_contract_is_i8(const char * required) {
         strcmp(required, "q8tbq4_dot4") == 0 ||
         strcmp(required, "rocm_tbq4_dot4") == 0 ||
         strcmp(required, "tbq4_dot4") == 0 ||
+        strcmp(required, "rocm_packed16_decode") == 0 ||
+        strcmp(required, "rocm_packed16_decode_scalar") == 0 ||
+        strcmp(required, "rocm_packed16_decode_q4pair") == 0 ||
+        strcmp(required, "rocm_packed16_decode_gqa_scalar") == 0 ||
+        strcmp(required, "rocm_packed16_decode_waveqk") == 0 ||
+         strcmp(required, "rocm_packed16_decode_pvwmma") == 0 ||
+         strcmp(required, "rocm_packed16_decode_gqa_pvwmma") == 0 ||
+         strcmp(required, "rocm_packed16_decode_wmma_full") == 0 ||
+         strcmp(required, "rocm_packed16_decode_gqa_wmma_full") == 0 ||
+         strcmp(required, "rocm_packed16_decode_dsplit") == 0 ||
+         strcmp(required, "rocm_packed16_decode_logits_debug") == 0 ||
+        strcmp(required, "rocm_packed16_decode_waveqk_q4pair") == 0 ||
+        strcmp(required, "rocm_packed16_decode_splitk") == 0 ||
+        strcmp(required, "rocm_packed16_small_verify") == 0 ||
+        strcmp(required, "rocm_packed16_small_verify_splitk") == 0 ||
         strcmp(required, "rocm_q8q4_wmma_i8") == 0);
 }
 
@@ -927,7 +962,22 @@ static bool ggml_cuda_fattn_route_contract_applicable(
             Q->ne[1] == 1;
     }
 
-    if (strcmp(required, DP16_ROUTE_FA2_PACKED16_DOT4_DECODE) == 0) {
+    if (strcmp(required, DP16_ROUTE_FA2_PACKED16_DOT4_DECODE) == 0 ||
+            strcmp(required, "rocm_packed16_decode") == 0 ||
+            strcmp(required, "rocm_packed16_decode_scalar") == 0 ||
+            strcmp(required, "rocm_packed16_decode_q4pair") == 0 ||
+            strcmp(required, "rocm_packed16_decode_gqa_scalar") == 0 ||
+            strcmp(required, "rocm_packed16_decode_waveqk") == 0 ||
+         strcmp(required, "rocm_packed16_decode_pvwmma") == 0 ||
+         strcmp(required, "rocm_packed16_decode_gqa_pvwmma") == 0 ||
+         strcmp(required, "rocm_packed16_decode_wmma_full") == 0 ||
+         strcmp(required, "rocm_packed16_decode_gqa_wmma_full") == 0 ||
+         strcmp(required, "rocm_packed16_decode_dsplit") == 0 ||
+         strcmp(required, "rocm_packed16_decode_logits_debug") == 0 ||
+            strcmp(required, "rocm_packed16_decode_waveqk_q4pair") == 0 ||
+            strcmp(required, "rocm_packed16_decode_splitk") == 0 ||
+            strcmp(required, "rocm_packed16_small_verify") == 0 ||
+            strcmp(required, "rocm_packed16_small_verify_splitk") == 0) {
         const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
         return fa_inst_i32 == GGML_FATTN_INST_MTP_DRAFT_DECODE_QK &&
             Q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
@@ -1168,6 +1218,8 @@ static void ggml_cuda_fattn_log_selection(const best_fattn_kernel kernel, const 
         route = "q8k_dot4_packed16_vec";
     } else if (kernel == BEST_FATTN_KERNEL_Q8K_DOT4_KQ && K->type == GGML_TYPE_I32) {
         route = DP16_ROUTE_FA2_PACKED16_DOT4_DECODE;
+    } else if (kernel == BEST_FATTN_KERNEL_PACKED16_DECODE) {
+        route = "rocm_packed16_decode";
     } else if (tbq4_lds_d_k) {
         if (Q->ne[0] == 256) {
             route = sparse_v_dequant ? "tbq4_lds_route_d_k_d256_sparsev" : "tbq4_lds_route_d_k_d256";
@@ -1391,10 +1443,45 @@ static void ggml_cuda_fattn_log_mixed_kv_reject(const ggml_tensor * Q, const ggm
     if (!ggml_cuda_fattn_route_log_enabled()) {
         return;
     }
-    GGML_LOG_INFO("%s: route=none reject=unsupported_mixed_kv Q=%s K=%s V=%s nq=%lld nkv=%lld d_q=%lld d_v=%lld\n",
+
+    // This probe can run once per layer/op.  When COMPRESSED_KV_FATTN_LOG is
+    // enabled for route proof, printing every identical mixed-KV reject creates
+    // huge logs and can dominate short live requests.  Keep the diagnostic value
+    // but emit only once per observed shape/type tuple.
+    struct reject_key {
+        ggml_type q_type;
+        ggml_type k_type;
+        ggml_type v_type;
+        int64_t nq;
+        int64_t nkv;
+        int64_t d_q;
+        int64_t d_v;
+    };
+    static reject_key printed[64];
+    static int n_printed = 0;
+    static bool overflow_printed = false;
+
+    const reject_key key = { Q->type, K->type, V->type, Q->ne[1], K->ne[1], Q->ne[0], V->ne[0] };
+    for (int i = 0; i < n_printed; ++i) {
+        const reject_key & p = printed[i];
+        if (p.q_type == key.q_type && p.k_type == key.k_type && p.v_type == key.v_type &&
+                p.nq == key.nq && p.nkv == key.nkv && p.d_q == key.d_q && p.d_v == key.d_v) {
+            return;
+        }
+    }
+    if (n_printed < (int)(sizeof(printed) / sizeof(printed[0]))) {
+        printed[n_printed++] = key;
+    } else if (overflow_printed) {
+        return;
+    } else {
+        overflow_printed = true;
+    }
+
+    GGML_LOG_INFO("%s: route=none reject=unsupported_mixed_kv Q=%s K=%s V=%s nq=%lld nkv=%lld d_q=%lld d_v=%lld%s\n",
         __func__, ggml_type_name(Q->type), ggml_type_name(K->type), ggml_type_name(V->type),
         (long long) Q->ne[1], (long long) K->ne[1],
-        (long long) Q->ne[0], (long long) V->ne[0]);
+        (long long) Q->ne[0], (long long) V->ne[0],
+        overflow_printed ? " (further unique mixed-KV reject shapes suppressed)" : "");
 }
 
 enum ggml_cuda_rocm_quant_prefill_f16_mode {
@@ -1526,6 +1613,7 @@ enum ggml_cuda_fattn_backend_family {
     GGML_CUDA_FATTN_BACKEND_DOT4_DECODE_BN64,
     GGML_CUDA_FATTN_BACKEND_DOT4_DECODE_SPLITK,
     GGML_CUDA_FATTN_BACKEND_PACKED16_DOT4_MMQ,
+    GGML_CUDA_FATTN_BACKEND_PACKED16_DECODE,
 
     // Tensor-core / fallback families
     GGML_CUDA_FATTN_BACKEND_WMMA_F16,
@@ -1542,6 +1630,7 @@ static const char * ggml_cuda_fattn_backend_family_name(
         case GGML_CUDA_FATTN_BACKEND_DOT4_DECODE_BN64:   return "dot4_decode_bn64";
         case GGML_CUDA_FATTN_BACKEND_DOT4_DECODE_SPLITK: return "dot4_decode_splitk";
         case GGML_CUDA_FATTN_BACKEND_PACKED16_DOT4_MMQ:   return "packed16_dot4_mmq";
+        case GGML_CUDA_FATTN_BACKEND_PACKED16_DECODE:      return "packed16_decode";
         case GGML_CUDA_FATTN_BACKEND_WMMA_F16:           return "wmma_f16";
         case GGML_CUDA_FATTN_BACKEND_MMA_F16:            return "mma_f16";
         case GGML_CUDA_FATTN_BACKEND_VEC:                return "vec";
@@ -1566,6 +1655,9 @@ static ggml_cuda_fattn_backend_family ggml_cuda_fattn_backend_family_from_kernel
 
         case BEST_FATTN_KERNEL_PACKED16_DOT4_MMQ:
             return GGML_CUDA_FATTN_BACKEND_PACKED16_DOT4_MMQ;
+
+        case BEST_FATTN_KERNEL_PACKED16_DECODE:
+            return GGML_CUDA_FATTN_BACKEND_PACKED16_DECODE;
 
         case BEST_FATTN_KERNEL_WMMA_F16:
             return GGML_CUDA_FATTN_BACKEND_WMMA_F16;
@@ -2452,9 +2544,11 @@ static best_fattn_kernel ggml_cuda_dp16_fa_plan_to_best_kernel(
 
     switch (plan.backend) {
         case DP16_BACKEND_FA2_Q8K_DOT4_DECODE:
-        case DP16_BACKEND_FA2_PACKED16_DOT4_DECODE:
         case DP16_BACKEND_FA2_F16K_ADAPT_DOT4_DECODE:
             return BEST_FATTN_KERNEL_Q8K_DOT4_KQ;
+
+        case DP16_BACKEND_FA2_PACKED16_DOT4_DECODE:
+            return BEST_FATTN_KERNEL_PACKED16_DECODE;
 
         case DP16_BACKEND_FA2_PACKED16_DOT4_MMQ_VERIFY:
             return BEST_FATTN_KERNEL_PACKED16_DOT4_MMQ;
@@ -2498,7 +2592,23 @@ static bool ggml_cuda_dp16_fa_route_is_vec_alias(const char * required) {
 }
 
 static bool ggml_cuda_dp16_fa_route_is_packed16_decode_alias(const char * required) {
-    return required && strcmp(required, DP16_ROUTE_FA2_PACKED16_DOT4_DECODE) == 0;
+    return required && (
+        strcmp(required, DP16_ROUTE_FA2_PACKED16_DOT4_DECODE) == 0 ||
+        strcmp(required, "rocm_packed16_decode") == 0 ||
+        strcmp(required, "rocm_packed16_decode_scalar") == 0 ||
+        strcmp(required, "rocm_packed16_decode_q4pair") == 0 ||
+        strcmp(required, "rocm_packed16_decode_gqa_scalar") == 0 ||
+        strcmp(required, "rocm_packed16_decode_waveqk") == 0 ||
+         strcmp(required, "rocm_packed16_decode_pvwmma") == 0 ||
+         strcmp(required, "rocm_packed16_decode_gqa_pvwmma") == 0 ||
+         strcmp(required, "rocm_packed16_decode_wmma_full") == 0 ||
+         strcmp(required, "rocm_packed16_decode_gqa_wmma_full") == 0 ||
+         strcmp(required, "rocm_packed16_decode_dsplit") == 0 ||
+         strcmp(required, "rocm_packed16_decode_logits_debug") == 0 ||
+        strcmp(required, "rocm_packed16_decode_waveqk_q4pair") == 0 ||
+        strcmp(required, "rocm_packed16_decode_splitk") == 0 ||
+        strcmp(required, "rocm_packed16_small_verify") == 0 ||
+        strcmp(required, "rocm_packed16_small_verify_splitk") == 0);
 }
 
 static bool ggml_cuda_dp16_fa_route_is_f16_adapt_alias(const char * required) {
@@ -2935,11 +3045,14 @@ static best_fattn_kernel ggml_cuda_select_mtp_draft_decode_fattn(
                     ggml_cuda_dot4_k_repr_name(ggml_cuda_dot4_resolve_k_repr(Q, K, V));
                 const char * v_repr = ggml_cuda_dot4_v_repr_name(V);
                 const bool dot4_active = (selected == BEST_FATTN_KERNEL_Q8K_DOT4_KQ);
+                const bool packed16_decode_active = (selected == BEST_FATTN_KERNEL_PACKED16_DECODE);
                 const auto family = dot4_active
                     ? (dot4_role == GGML_CUDA_DOT4_ROLE_DECODE_SPLITK_MTP_DRAFT
                         ? GGML_CUDA_FATTN_BACKEND_DOT4_DECODE_SPLITK
                         : GGML_CUDA_FATTN_BACKEND_DOT4_DECODE_BN64)
-                    : ggml_cuda_fattn_backend_family_from_kernel(selected);
+                    : (packed16_decode_active
+                        ? GGML_CUDA_FATTN_BACKEND_PACKED16_DECODE
+                        : ggml_cuda_fattn_backend_family_from_kernel(selected));
                 const char * family_name = ggml_cuda_fattn_backend_family_name(family);
                 GGML_LOG_INFO("%s: fa_instruction=mtp_draft_decode_qk "
                         "dot4_role=%s backend_family=%s nq=%lld nk=%lld K=%s V=%s "
@@ -2953,6 +3066,7 @@ static best_fattn_kernel ggml_cuda_select_mtp_draft_decode_fattn(
                         dot4_active ? "k_repr" : "k_repr_candidate", k_repr, v_repr,
                         decode_impl, impl_status,
                         selected == BEST_FATTN_KERNEL_Q8K_DOT4_KQ ? "rocm_q8k_dot4_kq" :
+                        selected == BEST_FATTN_KERNEL_PACKED16_DECODE ? "rocm_packed16_decode" :
                         selected == BEST_FATTN_KERNEL_MTP_F16K_Q4V_VEC ? "rocm_mtp_f16k_q4v_decode" :
                         selected == BEST_FATTN_KERNEL_VEC ? "rocm_fattn_vec" :
                         "<existing_policy>");
@@ -3415,7 +3529,41 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             if (!ggml_cuda_dp16_fa_route_contract_matches_plan(required_route, problem, plan)) {
                 ggml_cuda_dp16_fa_abort_route_mismatch(required_route, problem, plan);
             }
-            return BEST_FATTN_KERNEL_Q8K_DOT4_KQ;
+            return BEST_FATTN_KERNEL_PACKED16_DECODE;
+        }
+
+        const bool require_packed16_decode_alias =
+            required_route &&
+            (strcmp(required_route, "rocm_packed16_decode") == 0 ||
+             strcmp(required_route, "rocm_packed16_decode_scalar") == 0 ||
+             strcmp(required_route, "rocm_packed16_decode_q4pair") == 0 ||
+             strcmp(required_route, "rocm_packed16_decode_gqa_scalar") == 0 ||
+             strcmp(required_route, "rocm_packed16_decode_waveqk") == 0 ||
+             strcmp(required_route, "rocm_packed16_decode_pvwmma") == 0 ||
+             strcmp(required_route, "rocm_packed16_decode_gqa_pvwmma") == 0 ||
+             strcmp(required_route, "rocm_packed16_decode_wmma_full") == 0 ||
+             strcmp(required_route, "rocm_packed16_decode_gqa_wmma_full") == 0 ||
+             strcmp(required_route, "rocm_packed16_decode_dsplit") == 0 ||
+             strcmp(required_route, "rocm_packed16_decode_logits_debug") == 0 ||
+             strcmp(required_route, "rocm_packed16_decode_waveqk_q4pair") == 0 ||
+             strcmp(required_route, "rocm_packed16_decode_splitk") == 0 ||
+             strcmp(required_route, "rocm_packed16_small_verify") == 0 ||
+             strcmp(required_route, "rocm_packed16_small_verify_splitk") == 0);
+        const bool require_packed16_decode_splitk_alias =
+            required_route && strcmp(required_route, "rocm_packed16_decode_splitk") == 0;
+        const bool require_packed16_small_verify =
+            required_route && strcmp(required_route, "rocm_packed16_small_verify") == 0;
+        const bool require_packed16_small_verify_splitk =
+            required_route && strcmp(required_route, "rocm_packed16_small_verify_splitk") == 0;
+        const char * decode_max_nq_env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_MAX_NQ");
+        const int decode_max_nq = decode_max_nq_env ? atoi(decode_max_nq_env) : 1;
+        const char * small_verify_max_nq_env = getenv("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ");
+        const int small_verify_max_nq = small_verify_max_nq_env ? atoi(small_verify_max_nq_env) : 4;
+        if (require_packed16_decode_alias &&
+                ((fa_inst_i32 == GGML_FATTN_INST_MTP_DRAFT_DECODE_QK && Q->ne[1] == 1) ||
+                 (require_packed16_decode_splitk_alias && Q->ne[1] <= decode_max_nq && V->type == GGML_TYPE_Q4_0) ||
+                 ((require_packed16_small_verify || require_packed16_small_verify_splitk) && Q->ne[1] >= 2 && Q->ne[1] <= small_verify_max_nq && V->type == GGML_TYPE_Q4_0))) {
+            return BEST_FATTN_KERNEL_PACKED16_DECODE;
         }
 
         const bool require_q8k_dot4_kq =
@@ -3468,7 +3616,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
         if (require_packed16_wmma && ggml_cuda_packed16_wmma_tile_enabled()) {
             if (Q->ne[1] == 1) {
-                return BEST_FATTN_KERNEL_Q8K_DOT4_KQ;  // nq==1 decode has no WMMA kernel yet
+                return BEST_FATTN_KERNEL_PACKED16_DECODE;  // nq==1 decode uses the explicit packed16 decode lane
             }
             return BEST_FATTN_KERNEL_PACKED16_WMMA_TILE;
         }
@@ -3486,16 +3634,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
              (mtp_packed16_enabled && inst == GGML_FATTN_INST_MTP_VERIFY_QK));
         const bool v_requires_dot4_mmq = V->type == GGML_TYPE_TBQ4_0 || V->type == GGML_TYPE_PLANAR3_0 || V->type == GGML_TYPE_ISO3_0;
 
-        // nq == 1 decode: always route to DOT4 (BN64/split-K).
-        // packed16_wmma_tile only supports nq > 1.
-        // When WMMA is explicitly required via env, nq==1 is still
-        // allowed to use DOT4 (WMMA decode kernel doesn't exist).
+        // nq == 1 decode: use the explicit packed16 decode family.
+        // packed16_wmma_tile only supports nq > 1; decode variants are selected
+        // inside the packed16 decode launcher via GGML_CUDA_ROCM_PACKED16_DECODE_IMPL.
         if (Q->ne[1] == 1) {
             ggml_cuda_dp16_fa_emit_packed16_mtp_draft_trace_if_needed(dst, cc);
             if (v_requires_dot4_mmq && ggml_cuda_packed16_dot4_mmq_supported(cc, dst)) {
                 return BEST_FATTN_KERNEL_PACKED16_DOT4_MMQ;
             }
-            return BEST_FATTN_KERNEL_Q8K_DOT4_KQ;
+            return BEST_FATTN_KERNEL_PACKED16_DECODE;
         }
 
         // nq > 1 prefill/verify:
@@ -4275,6 +4422,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             ggml_cuda_flash_attn_ext_tbq4_dot4_prefill(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_Q8K_DOT4_KQ:
+        case BEST_FATTN_KERNEL_PACKED16_DECODE:
             ggml_cuda_flash_attn_ext_q8k_dot4_kq(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_Q8K_DOT4_PACKED16_VEC:

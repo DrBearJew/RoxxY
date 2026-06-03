@@ -3,7 +3,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 // Packed16 K cache tensor registry (shared with llama-kv-cache)
 static std::mutex s_packed16_mutex;
@@ -3209,6 +3211,7 @@ static __global__ void ggml_cuda_q8k_dot4_kq_error_kernel(
     atomicAdd(metrics + 2, diff > 0.5f ? 1.0f : 0.0f);
 }
 
+#include "fattn-packed16-wmma-builtin.cuh"
 #include "fattn-dot4-q8k-decode.cuh"
 
 void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -3725,37 +3728,156 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                 const dim3 recthist_grid((nq + v4_bm - 1) / v4_bm, n_heads_q, batch);
                 const bool use_f16_v = (V->type == GGML_TYPE_F16);
                 const bool use_q8_v  = (V->type == GGML_TYPE_Q8_0);
-                // ---- Packed16 decode fast-path (nq=1) ----
+                // ---- Packed16 decode / small verify fast-path ----
                 const int32_t fa_inst = ((const int32_t *)dst->op_params)[4];
                 const bool is_mtp_draft_decode = (fa_inst == GGML_FATTN_INST_MTP_DRAFT_DECODE_QK);
+                const char * packed16_decode_impl_env = getenv("GGML_CUDA_ROCM_PACKED16_DECODE_IMPL");
+                const char * packed16_decode_route = getenv("GGML_CUDA_FA_ROUTE_REQUIRE");
+                const bool packed16_small_verify_requested =
+                    (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify") == 0) ||
+                    (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify") == 0);
+                const bool packed16_small_verify_splitk_requested =
+                    (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify_splitk") == 0) ||
+                    (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_splitk") == 0);
+                const bool packed16_decode_splitk_requested =
+                    packed16_small_verify_splitk_requested ||
+                    (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "splitk") == 0) ||
+                    (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_decode_splitk") == 0);
                 const bool use_default_packed16_mtp_decode =
                     nq == 1 && K->type == GGML_TYPE_I32 && V->type == GGML_TYPE_Q4_0 && is_mtp_draft_decode;
                 const int decode_bn = ggml_cuda_q8k_dot4_kq_env_int(
-                    "GGML_CUDA_ROCM_Q8K_DOT4_DECODE_BN", use_default_packed16_mtp_decode ? 64 : 0);
+                    "GGML_CUDA_ROCM_Q8K_DOT4_DECODE_BN", (use_default_packed16_mtp_decode || packed16_small_verify_requested || packed16_small_verify_splitk_requested) ? 64 : 0);
+                const int decode_max_nq = (packed16_small_verify_requested || packed16_small_verify_splitk_requested) ?
+                    ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ", 4) :
+                    (packed16_decode_splitk_requested ? ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_MAX_NQ", 1) : 1);
 
-                if (decode_bn > 0 && nq == 1 && (K->type == GGML_TYPE_I32 || is_mtp_draft_decode)) {
+                if (decode_bn > 0 && nq <= decode_max_nq && (K->type == GGML_TYPE_I32 || is_mtp_draft_decode)) {
                     // For f16-source K, packed16 is already materialized in k_payload/k_scales.
                     // Strides are computed from packed16 layout, not from K tensor strides.
-                    const int packed16_per_row = 64; // D=256 / 4
-                    const int k_head_stride_rows  = nk * packed16_per_row;
+                    const int k_head_stride_rows  = nk;
                     const int k_batch_stride_rows = n_heads_k * k_head_stride_rows;
                     const int decode_vsub = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_VSUB", 8);
-                    const bool inline_q4 = ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_INLINE_Q4");
-                    const bool q4pair = V->type == GGML_TYPE_Q4_0 && ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_Q4PAIR");
+                    const char * packed16_decode_impl =
+                        (packed16_decode_impl_env && packed16_decode_impl_env[0]) ? packed16_decode_impl_env :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_decode_q4pair") == 0) ? "q4pair" :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_decode_gqa_scalar") == 0) ? "gqa_scalar" :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_decode_waveqk") == 0) ? "waveqk" :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_decode_waveqk_q4pair") == 0) ? "waveqk_q4pair" :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_decode_pvwmma") == 0) ? "pvwmma" :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_decode_gqa_pvwmma") == 0) ? "gqa_pvwmma" :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_decode_wmma_full") == 0) ? "wmma_full" :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_decode_gqa_wmma_full") == 0) ? "gqa_wmma_full" :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_decode_dsplit") == 0) ? "dsplit" :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_decode_logits_debug") == 0) ? "logits_debug" :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify") == 0) ? (nq == 1 ? "splitk" : "small_verify") :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_splitk") == 0) ? (nq == 1 ? "splitk" : "small_verify_splitk") :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_decode_splitk") == 0) ? "splitk" :
+                        "scalar";
+                    const bool impl_gqa_scalar = strcmp(packed16_decode_impl, "gqa_scalar") == 0;
+                    const bool impl_scalar = strcmp(packed16_decode_impl, "scalar") == 0;
+                    const bool impl_inline_q4 = strcmp(packed16_decode_impl, "inline_q4") == 0;
+                    const bool impl_q4pair = strcmp(packed16_decode_impl, "q4pair") == 0;
+                    const bool impl_waveqk = strcmp(packed16_decode_impl, "waveqk") == 0 || strcmp(packed16_decode_impl, "gqa_waveqk") == 0;
+                    const bool impl_waveqk_q4pair = strcmp(packed16_decode_impl, "waveqk_q4pair") == 0;
+                    const bool impl_pvwmma = strcmp(packed16_decode_impl, "pvwmma") == 0 || strcmp(packed16_decode_impl, "gqa_pvwmma") == 0;
+                    const bool impl_wmma_full = strcmp(packed16_decode_impl, "wmma_full") == 0 || strcmp(packed16_decode_impl, "gqa_wmma_full") == 0;
+                    const bool impl_dsplit = strcmp(packed16_decode_impl, "dsplit") == 0;
+                    const bool impl_logits_debug = strcmp(packed16_decode_impl, "logits_debug") == 0;
+                    const bool impl_splitk = strcmp(packed16_decode_impl, "splitk") == 0;
+                    const bool impl_small_verify = strcmp(packed16_decode_impl, "small_verify") == 0;
+                    const bool impl_small_verify_splitk = strcmp(packed16_decode_impl, "small_verify_splitk") == 0;
+                    const bool impl_supported = impl_scalar || impl_gqa_scalar || impl_inline_q4 || impl_q4pair || impl_waveqk || impl_waveqk_q4pair || impl_pvwmma || impl_wmma_full || impl_dsplit || impl_logits_debug || impl_splitk || impl_small_verify || impl_small_verify_splitk;
+                    if (!impl_supported) {
+                        GGML_ABORT("packed16 decode impl '%s' is not implemented yet; supported in this build: scalar, gqa_scalar, inline_q4, q4pair, waveqk, waveqk_q4pair, splitk, small_verify, small_verify_splitk, dsplit, pvwmma, gqa_pvwmma, wmma_full, gqa_wmma_full, logits_debug", packed16_decode_impl);
+                    }
+                    const bool packed16_decode_impl_explicit = packed16_decode_impl_env && packed16_decode_impl_env[0];
+                    const bool packed16_decode_log =
+                        ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_PACKED16_DECODE_LOG") ||
+                        ggml_cuda_q8k_dot4_kq_env_enabled("COMPRESSED_KV_FATTN_LOG");
+                    if (packed16_decode_log) {
+                        static std::unordered_set<std::string> packed16_decode_impl_seen;
+                        std::string shape_key = std::string(packed16_decode_impl) + "_nq" + std::to_string(nq) + "_nk" + std::to_string(nk) + "_hq" + std::to_string(n_heads_q) + "_hk" + std::to_string(n_heads_k) + "_gqa" + std::to_string(gqa_ratio);
+                        if (packed16_decode_impl_explicit || packed16_decode_impl_seen.find(shape_key) == packed16_decode_impl_seen.end()) {
+                            packed16_decode_impl_seen.insert(shape_key);
+                            fprintf(stderr,
+                                "packed16_decode_impl selected=%s route=%s nq=%d nk=%d hq=%d hk=%d batch=%d gqa=%d V=%s\n",
+                                packed16_decode_impl, packed16_decode_route ? packed16_decode_route : "",
+                                nq, nk, n_heads_q, n_heads_k, batch, gqa_ratio, ggml_type_name(V->type));
+                        }
+                    }
+                    const bool inline_q4 = ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_INLINE_Q4") || impl_inline_q4;
+                    const bool q4pair = V->type == GGML_TYPE_Q4_0 &&
+                        (ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_Q4PAIR") || impl_q4pair);
                     const int splitk_threshold = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_SPLITK_THRESHOLD", 2048);
-                    const bool splitk = (ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_SPLITK") || nk >= splitk_threshold) && V->type == GGML_TYPE_Q4_0;
+                    const bool splitk = !impl_logits_debug && !impl_dsplit &&
+                        (ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_SPLITK") || impl_splitk || impl_small_verify_splitk || nk >= splitk_threshold) && V->type == GGML_TYPE_Q4_0;
+                    if ((impl_small_verify || impl_small_verify_splitk) && !(nq >= 2 && nq <= decode_max_nq && K->type == GGML_TYPE_I32 && V->type == GGML_TYPE_Q4_0)) {
+                        GGML_ABORT("packed16 %s requires I32 K, q4_0 V, and 2 <= nq <= %d; got nq=%d K=%s V=%s",
+                            packed16_decode_impl, decode_max_nq, nq, ggml_type_name(K->type), ggml_type_name(V->type));
+                    }
+                    if (impl_small_verify) {
+                        if (gqa_ratio > 8) GGML_ABORT("packed16 small_verify supports gqa_ratio <= 8, got %d", gqa_ratio);
+                        if (decode_bn == 64 && decode_vsub == 8) { LAUNCH_DECODE_SMALL_VERIFY(64, 8, 8) }
+                        else { GGML_ABORT("packed16 small_verify: expected BN=64 VSUB=8, got BN=%d VSUB=%d", decode_bn, decode_vsub); }
+                        return;
+                    }
+                    if (impl_small_verify_splitk) {
+                        if (gqa_ratio > 8) GGML_ABORT("packed16 small_verify_splitk supports gqa_ratio <= 8, got %d", gqa_ratio);
+                        if (decode_bn == 64 && decode_vsub == 8) { LAUNCH_DECODE_SMALL_VERIFY_SPLITK(64, 8, 8) }
+                        else { GGML_ABORT("packed16 small_verify_splitk: expected BN=64 VSUB=8, got BN=%d VSUB=%d", decode_bn, decode_vsub); }
+                        return;
+                    }
+                    if (impl_logits_debug) {
+                        ggml_cuda_pool_alloc<float> decode_logits(pool);
+                        decode_logits.alloc(logits_ne);
+                        ggml_cuda_q8k_dot4_kq_kernel<<<kq_grid, block, 0, stream>>>(
+                            q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, decode_logits.ptr, scale,
+                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch);
+                        CUDA_CHECK(cudaGetLastError());
+                        dim3 fa_grid(nq, n_heads_q, batch);
+                        ggml_cuda_q8k_dot4_fattn_from_logits_q4_0_kernel<<<fa_grid, block, 0, stream>>>(
+                            decode_logits.ptr, (const char *) V->data, mask ? (const char *) mask->data : nullptr, (float *) dst->data,
+                            V->nb[0], V->nb[1], V->nb[2], V->nb[3],
+                            mask ? mask->nb[0] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[3] : 0, mask ? mask->ne[3] : 1,
+                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch);
+                        CUDA_CHECK(cudaGetLastError());
+                        return;
+                    }
                     if (splitk) {
                         const int split_size = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_SPLITK_SIZE", 512);
                         const int n_splits = (nk + split_size - 1) / split_size;
-                        blockfa_partial_o.alloc((size_t) batch * n_heads_q * n_splits * 256);
-                        blockfa_partial_m.alloc((size_t) batch * n_heads_q * n_splits);
-                        blockfa_partial_l.alloc((size_t) batch * n_heads_q * n_splits);
+                        blockfa_partial_o.alloc((size_t) batch * nq * n_heads_q * n_splits * 256);
+                        blockfa_partial_m.alloc((size_t) batch * nq * n_heads_q * n_splits);
+                        blockfa_partial_l.alloc((size_t) batch * nq * n_heads_q * n_splits);
                         if (decode_bn == 64 && decode_vsub == 8) { LAUNCH_DECODE_SPLITK(64, 8) }
                         else { GGML_ABORT("q8k_dot4_kq split-K decode: expected BN=64 VSUB=8, got BN=%d VSUB=%d", decode_bn, decode_vsub); }
                         return;
                     }
+                    if (impl_dsplit) {
+                        if (V->type != GGML_TYPE_Q4_0) GGML_ABORT("packed16 dsplit decode currently requires V=q4_0");
+                        if (decode_bn == 64 && decode_vsub == 8) { LAUNCH_DECODE_DSPLIT(64, 8, 64) }
+                        else { GGML_ABORT("q8k_dot4_kq D-split decode: expected BN=64 VSUB=8, got BN=%d VSUB=%d", decode_bn, decode_vsub); }
+                        return;
+                    }
                     if (decode_bn == 64 && decode_vsub == 8) {
-                        if (q4pair)      LAUNCH_DECODE_Q4PAIR(64, 8)
+                        if (impl_wmma_full) {
+                            if (V->type != GGML_TYPE_Q4_0) GGML_ABORT("packed16 gqa_wmma_full decode currently requires V=q4_0");
+                            if (gqa_ratio > 8) GGML_ABORT("packed16 gqa_wmma_full decode supports gqa_ratio <= 8, got %d", gqa_ratio);
+                            LAUNCH_DECODE_GQA_WMMA_FULL(64, 8)
+                        } else if (impl_waveqk_q4pair) {
+                            if (V->type != GGML_TYPE_Q4_0) GGML_ABORT("packed16 waveqk_q4pair decode currently requires V=q4_0");
+                            LAUNCH_DECODE_WAVEQK_Q4PAIR(64, 8)
+                        } else if (impl_waveqk) {
+                            if (V->type != GGML_TYPE_Q4_0) GGML_ABORT("packed16 waveqk decode currently requires V=q4_0");
+                            LAUNCH_DECODE_WAVEQK(64, 8)
+                        } else if (impl_pvwmma) {
+                            if (V->type != GGML_TYPE_Q4_0) GGML_ABORT("packed16 gqa_pvwmma decode currently requires V=q4_0");
+                            if (gqa_ratio > 8) GGML_ABORT("packed16 gqa_pvwmma decode supports gqa_ratio <= 8, got %d", gqa_ratio);
+                            LAUNCH_DECODE_GQA_PVWMMA(64, 8)
+                        } else if (impl_gqa_scalar) {
+                            if (gqa_ratio > 8) GGML_ABORT("packed16 gqa_scalar decode supports gqa_ratio <= 8, got %d", gqa_ratio);
+                            LAUNCH_DECODE_GQA(64, 8, 8)
+                        } else if (q4pair)      LAUNCH_DECODE_Q4PAIR(64, 8)
                         else if (inline_q4) LAUNCH_DECODE_INLINE_Q4(64, 8)
                         else             LAUNCH_DECODE_VSUB(64, 8)
                     } else {

@@ -593,16 +593,24 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     }
 
     ~ggml_cuda_pool_leg() {
-        clear_pool();
+        clear_pool(false);
         GGML_ASSERT(pool_size == 0);
     }
 
-    void clear_pool() {
+    void clear_pool(bool abort_on_error = true) {
         ggml_cuda_set_device(device);
         for (int i = 0; i < MAX_BUFFERS; ++i) {
             ggml_cuda_buffer & b = buffer_pool[i];
             if (b.ptr != nullptr) {
-                CUDA_CHECK(cudaFree(b.ptr));
+                cudaError_t err = cudaFree(b.ptr);
+                if (err != cudaSuccess) {
+                    if (abort_on_error) {
+                        CUDA_CHECK(err);
+                    }
+                    GGML_LOG_WARN("%s pool[%d]: ignoring cudaFree failure during backend teardown: ptr=%p size=%zu err=%d (%s)\n",
+                            GGML_CUDA_NAME, device, b.ptr, b.size, (int) err, cudaGetErrorString(err));
+                    (void) cudaGetLastError();
+                }
                 pool_size -= b.size;
                 b.ptr  = nullptr;
                 b.size = 0;
@@ -611,6 +619,10 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     }
 
     void * alloc(size_t size, size_t * actual_size) override {
+        if (size == 0) {
+            *actual_size = 0;
+            return nullptr;
+        }
 #ifdef DEBUG_CUDA_MALLOC
         int nnz = 0;
         size_t max_size = 0;
@@ -676,6 +688,9 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     }
 
     void free(void * ptr, size_t size) override {
+        if (ptr == nullptr || size == 0) {
+            return;
+        }
         for (int i = 0; i < MAX_BUFFERS; ++i) {
             ggml_cuda_buffer& b = buffer_pool[i];
             if (b.ptr == nullptr) {
@@ -852,7 +867,15 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
-        CUDA_CHECK(cudaFree(dev_ptr));
+        if (dev_ptr == nullptr) {
+            return;
+        }
+        cudaError_t err = cudaFree(dev_ptr);
+        if (err != cudaSuccess) {
+            GGML_LOG_WARN("%s buffer[%d]: ignoring cudaFree failure during backend buffer teardown: ptr=%p err=%d (%s)\n",
+                    GGML_CUDA_NAME, device, dev_ptr, (int) err, cudaGetErrorString(err));
+            (void) cudaGetLastError();
+        }
     }
 };
 
@@ -1011,13 +1034,15 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
 
     ggml_cuda_set_device(buft_ctx->device);
 
-    void * dev_ptr;
-    cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
-    if (err != cudaSuccess) {
-        // clear the error
-        (void)cudaGetLastError();
-        GGML_LOG_ERROR("%s: allocating %.2f MiB on device %d: cudaMalloc failed: %s\n", __func__, size / 1024.0 / 1024.0, buft_ctx->device, cudaGetErrorString(err));
-        return nullptr;
+    void * dev_ptr = nullptr;
+    if (size > 0) {
+        cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
+        if (err != cudaSuccess) {
+            // clear the error
+            (void)cudaGetLastError();
+            GGML_LOG_ERROR("%s: allocating %.2f MiB on device %d: cudaMalloc failed: %s\n", __func__, size / 1024.0 / 1024.0, buft_ctx->device, cudaGetErrorString(err));
+            return nullptr;
+        }
     }
 
     ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);

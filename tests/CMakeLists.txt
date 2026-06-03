@@ -255,6 +255,10 @@ add_custom_target(test-fattn-mtp-hip-replay
 add_executable(test-dot4-harness test-dot4-harness.cpp)
 target_link_libraries(test-dot4-harness PRIVATE llama llama-common ggml ggml-cpu ggml-base)
 
+# Packed16 decode variant harness (ROCm-focused, opt-in executable)
+add_executable(test-packed16-decode-variants test-packed16-decode-variants.cpp)
+target_link_libraries(test-packed16-decode-variants PRIVATE llama llama-common ggml ggml-cpu ggml-base)
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
