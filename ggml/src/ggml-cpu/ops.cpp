@@ -8895,7 +8895,9 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int64_t DV = nev0;
     const int64_t N  = neq1;
 
-    fprintf(stderr, "OPS FA V: type=%s ne=(%lld,%lld,%lld,%lld) nb=(%lld,%lld,%lld,%lld) nbv0=%lld ts=%zu\n", ggml_type_name(v->type), (long long)v->ne[0], (long long)v->ne[1], (long long)v->ne[2], (long long)v->ne[3], (long long)v->nb[0], (long long)v->nb[1], (long long)v->nb[2], (long long)v->nb[3], (long long)nbv0, ggml_type_size(v->type));
+    if (getenv("COMPRESSED_KV_FATTN_LOG") && atoi(getenv("COMPRESSED_KV_FATTN_LOG"))) {
+        fprintf(stderr, "OPS FA V: type=%s ne=(%lld,%lld,%lld,%lld) nb=(%lld,%lld,%lld,%lld) nbv0=%lld ts=%zu\n", ggml_type_name(v->type), (long long)v->ne[0], (long long)v->ne[1], (long long)v->ne[2], (long long)v->ne[3], (long long)v->nb[0], (long long)v->nb[1], (long long)v->nb[2], (long long)v->nb[3], (long long)nbv0, ggml_type_size(v->type));
+    }
 
     GGML_ASSERT(ne0 == DV);
     GGML_ASSERT(ne2 == N);

@@ -2239,8 +2239,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                     inst = GGML_FATTN_INST_NONE;
                     inst_reason = "forced_none";
                 } else {
-                    fprintf(stderr, "MTP_INST_SELECT: rejected_force=%s n_tokens=%u n_outputs=%d token=%d embd=%d selected=none reason=invalid_force\n",
-                        force, ubatch.n_tokens, n_outputs, ubatch.token != nullptr, ubatch.embd != nullptr);
+                    // invalid force value — leave inst as NONE
                 }
             }
 
@@ -2250,11 +2249,6 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             GGML_ASSERT(inst != GGML_FATTN_INST_MTP_DRAFT || ubatch.n_tokens > 1);
 
             ggml_flash_attn_ext_set_instruction(cur, inst);
-
-            if (getenv("LLAMA_MTP_FA_ROUTE") || getenv("LLAMA_MTP_VALIDATE_INPUTS")) {
-                fprintf(stderr, "MTP_INST_SELECT: n_tokens=%u n_outputs=%d token=%d embd=%d selected=%d reason=%s\n",
-                    ubatch.n_tokens, n_outputs, ubatch.token != nullptr, ubatch.embd != nullptr, inst, inst_reason);
-            }
         }
 
         if (v_mla) {
