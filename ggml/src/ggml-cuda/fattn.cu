@@ -3467,7 +3467,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_PACKED16_DOT4_MMQ;
         }
         if (require_packed16_wmma && ggml_cuda_packed16_wmma_tile_enabled()) {
-        fprintf(stderr, "ROUTE: require_packed16_wmma=1 enabled=1 nq=%lld\n", (long long)Q->ne[1]);
             if (Q->ne[1] == 1) {
                 return BEST_FATTN_KERNEL_Q8K_DOT4_KQ;  // nq==1 decode has no WMMA kernel yet
             }
@@ -4283,7 +4282,6 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_PACKED16_WMMA_TILE:
-            fprintf(stderr, "PWMMA SWITCH CASE HIT\n");
             ggml_cuda_flash_attn_ext_packed16_wmma_tile(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_PACKED16_DOT4_MMQ:
@@ -4297,9 +4295,7 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     g_fattn_capture_ctx = { false, false };
     const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
     const ggml_tensor * Q = dst->src[0];
-    fprintf(stderr, "FATTN SUPPORT ENTER dst=%p\n", (void*)dst); fflush(stderr);
     const best_fattn_kernel k = ggml_cuda_get_best_fattn_kernel(device, dst);
-    fprintf(stderr, "FATTN SUPPORT SELECT selected=%d name=%s dst=%p\n", (int)k, ggml_cuda_fattn_kernel_name(k), (void*)dst); fflush(stderr);
     const bool result = k != BEST_FATTN_KERNEL_NONE;
     if (const char * log_env = getenv("COMPRESSED_KV_FATTN_LOG")) {
         if (log_env && atoi(log_env) != 0) {
