@@ -1417,32 +1417,24 @@ void ggml_cuda_q8k_dot4_small_verify_batched_gqa_splitk_stage1_kernel(
         __syncthreads();
 
         // ── Phase 3: All-query P×V accumulation in one phase ──
-        // Apply online-softmax old_scale for every (q,g), then stream V once
-        // per K position and reuse the dequantized value across all queries.
-        // The older ordering put q outside the K/V loop and reloaded V nq times.
+        // Each of D=256 threads iterates across all nq queries for its dimension.
         if (tid < DECODE_D) {
 #pragma unroll
             for (int q_idx = 0; q_idx < NQ_MAX; ++q_idx) {
-                if (q_idx < nq) {
+                if (q_idx >= nq) break;
+                const int logit_base = q_idx * GH_MAX * BN;
 #pragma unroll
-                    for (int g = 0; g < GH_MAX; ++g) {
-                        if (g < gh) out[q_idx][g] *= sm[(q_idx * GH_MAX + g) * 4 + 2];
-                    }
+                for (int g = 0; g < GH_MAX; ++g) {
+                    if (g < gh) out[q_idx][g] *= sm[(q_idx * GH_MAX + g) * 4 + 2];
                 }
-            }
-            for (int sub = 0; sub < tile_n; sub += BN_VSUB) {
-                int end = (sub + BN_VSUB < tile_n) ? sub + BN_VSUB : tile_n;
-                for (int kk = sub; kk < end; ++kk) {
-                    const int k = k0 + kk;
-                    const float v = ggml_cuda_q8k_dot4_dequant_q4_0(v_head + int64_t(k) * nb21, nb20, tid);
+                for (int sub = 0; sub < tile_n; sub += BN_VSUB) {
+                    int end = (sub + BN_VSUB < tile_n) ? sub + BN_VSUB : tile_n;
+                    for (int kk = sub; kk < end; ++kk) {
+                        const int k = k0 + kk;
+                        const float v = ggml_cuda_q8k_dot4_dequant_q4_0(v_head + int64_t(k) * nb21, nb20, tid);
 #pragma unroll
-                    for (int q_idx = 0; q_idx < NQ_MAX; ++q_idx) {
-                        if (q_idx < nq) {
-                            const int logit_base = q_idx * GH_MAX * BN;
-#pragma unroll
-                            for (int g = 0; g < GH_MAX; ++g) {
-                                if (g < gh) out[q_idx][g] += probs[logit_base + g * BN + kk] * v;
-                            }
+                        for (int g = 0; g < GH_MAX; ++g) {
+                            if (g < gh) out[q_idx][g] += probs[logit_base + g * BN + kk] * v;
                         }
                     }
                 }
