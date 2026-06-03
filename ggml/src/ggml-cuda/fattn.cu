@@ -3384,6 +3384,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const ggml_tensor * Q     = dst->src[0];
     const ggml_tensor * K     = dst->src[1];
     const ggml_tensor * V     = dst->src[2];
+    if (Q && K && K->type == GGML_TYPE_I32 && Q->ne[1] >= 2) {
+        fprintf(stderr, "FA_ENTRY_I32: nq=%lld nk=%lld inst=%d\n", (long long)Q->ne[1], (long long)K->ne[1], (int)((const int32_t*)dst->op_params)[4]); fflush(stderr);
+    }
     const ggml_tensor * mask  = dst->src[3];
 
 
@@ -3663,9 +3666,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         // - DOT4_KQ is the last resort.
         if (inst != GGML_FATTN_INST_PREFILL_QK &&
             Q->ne[1] >= 2 && Q->ne[1] <= small_verify_max_nq &&
-            V->type == GGML_TYPE_Q4_0 && getenv("LLAMA_MTP_FA_ROUTE")) { // opt-in: route MTP verify through packed16 decode lane
-            // Route verify instructions through the packed16 decode lane which
-            // contains the small_verify / small_verify_batched_splitk kernels
+            V->type == GGML_TYPE_Q4_0 && getenv("LLAMA_MTP_FA_ROUTE")) { // opt-in
+            fprintf(stderr, "SMALL_VERIFY_ROUTE nq=%lld inst=%d\n", (long long)Q->ne[1], (int)inst); fflush(stderr);
             return BEST_FATTN_KERNEL_PACKED16_DECODE;
         }
         const bool auto_verbose =
