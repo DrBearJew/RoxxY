@@ -1264,12 +1264,16 @@ void ggml_cuda_q8k_dot4_small_verify_batched_gqa_splitk_stage1_kernel(
     // Shared memory layout:
     //   q_i32[NQ_MAX * GH_MAX * DECODE_I32_PER_ROW]  — all Q payloads
     //   q_scl[NQ_MAX * GH_MAX * DECODE_N_BLOCKS]     — all Q scales
+    //   k_i32[BN * DECODE_I32_PER_ROW]                — K tile payload, loaded once from global
+    //   k_scl[BN]                                     — K tile scale, loaded once from global
     //   logits[NQ_MAX * GH_MAX * BN]                  — ALL Q×K scores for this K tile
     //   probs[NQ_MAX * GH_MAX * BN]                   — post-softmax probs
     //   sm[NQ_MAX * GH_MAX * 4]                        — softmax running state per (q,g)
     int   * q_i32  = reinterpret_cast<int   *>(smem);
     float * q_scl  = reinterpret_cast<float *>(q_i32 + NQ_MAX * GH_MAX * DECODE_I32_PER_ROW);
-    float * logits  = q_scl + NQ_MAX * GH_MAX * DECODE_N_BLOCKS;
+    int   * k_i32  = reinterpret_cast<int   *>(q_scl + NQ_MAX * GH_MAX * DECODE_N_BLOCKS);
+    float * k_scl  = reinterpret_cast<float *>(k_i32 + BN * DECODE_I32_PER_ROW);
+    float * logits  = k_scl + BN;
     float * probs   = logits + NQ_MAX * GH_MAX * BN;
     float * sm      = probs  + NQ_MAX * GH_MAX * BN;
 
@@ -1330,58 +1334,59 @@ void ggml_cuda_q8k_dot4_small_verify_batched_gqa_splitk_stage1_kernel(
         // (g, kk) are shared and K is loaded ONCE for all 4 queries. DOT4 computes 4 I8
         // element-products per instruction; with 4 query chains interleaved, K elements are
         // reused 4×, reducing K memory traffic by ~4× vs per-query dot calls.
+        // Load the K tile once into shared memory. This preserves the FA2 reuse
+        // invariant while allowing the QK compute below to run with full
+        // (NQ*GH*BN) parallelism instead of serialising all q per thread.
+        for (int i = tid; i < BN * DECODE_I32_PER_ROW; i += blockDim.x) {
+            const int kk  = i / DECODE_I32_PER_ROW;
+            const int pos = i - kk * DECODE_I32_PER_ROW;
+            const int k   = k0 + kk;
+            int val = 0;
+            if (kk < tile_n && k < nk) {
+                const size_t kb = k_head_base + k;
+                val = k_payload[kb * DECODE_I32_PER_ROW + pos];
+            }
+            k_i32[i] = val;
+        }
+        for (int kk = tid; kk < BN; kk += blockDim.x) {
+            const int k = k0 + kk;
+            float val = 0.0f;
+            if (kk < tile_n && k < nk) {
+                const size_t kb = k_head_base + k;
+                val = __half2float(k_scales[kb * DECODE_N_BLOCKS]);
+            }
+            k_scl[kk] = val;
+        }
+        __syncthreads();
+
         const int NQK_STRIDE = NQ_MAX * GH_MAX * BN;
-        for (int i4 = tid * 4; i4 < NQK_STRIDE; i4 += blockDim.x * 4) {
-            const int q0 = i4 / (GH_MAX * BN);
-            const int guard  = i4 - q0 * (GH_MAX * BN);
-            const int g      = guard / BN;
-            const int kk     = guard - g * BN;
-            const int k      = k0 + kk;
-            const int n_rem  = min(4, nq - q0);
+        for (int idx = tid; idx < NQK_STRIDE; idx += blockDim.x) {
+            const int q_idx = idx / (GH_MAX * BN);
+            const int guard = idx - q_idx * (GH_MAX * BN);
+            const int g     = guard / BN;
+            const int kk    = guard - g * BN;
+            const int k     = k0 + kk;
 
-            // Load K payload and scale once for this position
-            const size_t kb = k_head_base + k;
-            const int  * __restrict__ k_row = k_payload + kb * DECODE_I32_PER_ROW;
-            const half * __restrict__ ks_row = k_scales + kb * DECODE_N_BLOCKS;
-            const float k_scale = __half2float(ks_row[0]); // single block (D=256)
-
-            // Initialize 4 accumulators (one per potential query)
-            int acc[4] = {0, 0, 0, 0};
-
-            // DOT4 loop: 64 I32 positions × 4 elements per I32 = 256 elements per row
-            // For each K I32 element, compute DOT4 against up to 4 Q elements
+            int acc = 0;
+            const bool have = q_idx < nq && g < gh && kk < tile_n && k < nk;
+            const int * qp = q_i32 + (q_idx * GH_MAX + g) * DECODE_I32_PER_ROW;
 #pragma unroll
             for (int pos = 0; pos < DECODE_I32_PER_ROW; ++pos) {
-                const int k_val = k_row[pos];
-#pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    if (j < n_rem && q0 + j < nq && g < gh) {
-                        const int  * qp = q_i32 + ((q0 + j) * GH_MAX + g) * DECODE_I32_PER_ROW;
-                        acc[j] = ggml_cuda_q8k_dot4_i8_i8(qp[pos], k_val, acc[j]);
-                    }
-                }
+                const int k_val = k_i32[kk * DECODE_I32_PER_ROW + pos];
+                acc = have ? ggml_cuda_q8k_dot4_i8_i8(qp[pos], k_val, acc) : acc;
             }
 
-            // Store scores with per-query scale and causal mask
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                float s = -1e38f;
-                if (j < n_rem && q0 + j < nq && g < gh && kk < tile_n && k < nk) {
-                    const int q_idx = q0 + j;
-                    const int q_pos = q_offset + q_idx;
-                    bool valid = mask ? true : (k <= q_pos);
-                    if (valid) {
-                        const float * qs = q_scl + (q_idx * GH_MAX + g) * DECODE_N_BLOCKS;
-                        const float raw = float(acc[j]) * qs[0] * k_scale * scale;
-                        if (mask) {
-                            s = raw + ggml_cuda_q8k_dot4_mask_value(mask, nb30, nb31, nb33, ne33, q_idx, k, b);
-                        } else {
-                            s = raw;
-                        }
-                    }
+            float s = -1e38f;
+            if (have) {
+                const int q_pos = q_offset + q_idx;
+                bool valid = mask ? true : (k <= q_pos);
+                if (valid) {
+                    const float * qs = q_scl + (q_idx * GH_MAX + g) * DECODE_N_BLOCKS;
+                    const float raw = float(acc) * qs[0] * k_scl[kk] * scale;
+                    s = mask ? raw + ggml_cuda_q8k_dot4_mask_value(mask, nb30, nb31, nb33, ne33, q_idx, k, b) : raw;
                 }
-                logits[i4 + j] = s;
             }
+            logits[idx] = s;
         }
         __syncthreads();
 
@@ -1717,7 +1722,7 @@ void ggml_cuda_q8k_dot4_decode_splitk_reduce_kernel(
 
 #define LAUNCH_DECODE_SMALL_VERIFY_SPLITK(BN, BN_VSUB, GH_MAX) { \
     int sm = (GH_MAX * BN * 2 + GH_MAX * 4 + GH_MAX * DECODE_I32_PER_ROW + GH_MAX * DECODE_N_BLOCKS) * (int)sizeof(float); \
-    int split_size = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_SPLITK_SIZE", 512); \
+    int split_size = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_SPLIT_SIZE", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_SPLITK_SIZE", 512)); \
     int n_splits = (nk + split_size - 1) / split_size; \
     dim3 g1(n_splits, n_heads_k, nq * batch); \
     blockfa_partial_o.alloc((size_t) batch * nq * n_heads_k * n_splits * GH_MAX * 256); \
@@ -1739,12 +1744,14 @@ void ggml_cuda_q8k_dot4_decode_splitk_reduce_kernel(
     CUDA_CHECK(cudaGetLastError()); \
 }
 
-#define LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(BN, BN_VSUB, GH_MAX, NQ_MAX) { \
+#define LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(BN, BN_VSUB, GH_MAX, NQ_MAX, SPLIT_DEFAULT) { \
     int sm = (NQ_MAX * GH_MAX * DECODE_I32_PER_ROW) * (int)sizeof(int) \
            + (NQ_MAX * GH_MAX * DECODE_N_BLOCKS) * (int)sizeof(float) \
+           + (BN * DECODE_I32_PER_ROW) * (int)sizeof(int) \
+           + BN * (int)sizeof(float) \
            + (NQ_MAX * GH_MAX * BN * 2) * (int)sizeof(float) \
            + (NQ_MAX * GH_MAX * 4) * (int)sizeof(float); \
-    int split_size = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_SPLITK_SIZE", 512); \
+    int split_size = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_SPLIT_SIZE", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_SPLITK_SIZE", SPLIT_DEFAULT)); \
     int n_splits = (nk + split_size - 1) / split_size; \
     dim3 g1(n_splits, n_heads_k, batch); \
     blockfa_partial_o.alloc((size_t) batch * nq * n_heads_k * n_splits * GH_MAX * 256); \

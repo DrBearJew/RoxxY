@@ -144,6 +144,18 @@ static run_result run_variant(
         char max_nq_buf[16];
         snprintf(max_nq_buf, sizeof(max_nq_buf), "%d", nq);
         setenv("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ", max_nq_buf, 1);
+    } else if (strcmp(variant, "small_verify_batched_splitk") == 0) {
+        setenv("GGML_CUDA_FA_ROUTE_REQUIRE", "rocm_packed16_small_verify_batched_splitk", 1);
+        setenv("GGML_CUDA_ROCM_PACKED16_DECODE_IMPL", "small_verify_batched_splitk", 1);
+        char max_nq_buf[16];
+        snprintf(max_nq_buf, sizeof(max_nq_buf), "%d", nq);
+        setenv("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ", max_nq_buf, 1);
+    } else if (strcmp(variant, "small_verify_fa2") == 0) {
+        setenv("GGML_CUDA_FA_ROUTE_REQUIRE", "rocm_packed16_small_verify_fa2", 1);
+        setenv("GGML_CUDA_ROCM_PACKED16_DECODE_IMPL", "small_verify_fa2", 1);
+        char max_nq_buf[16];
+        snprintf(max_nq_buf, sizeof(max_nq_buf), "%d", nq);
+        setenv("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ", max_nq_buf, 1);
     } else {
         setenv("GGML_CUDA_FA_ROUTE_REQUIRE", "rocm_packed16_decode", 1);
         setenv("GGML_CUDA_ROCM_PACKED16_DECODE_IMPL", variant, 1);
@@ -184,7 +196,9 @@ static run_result run_variant(
     const float sm_scale = 1.0f / std::sqrt((float) D);
     ggml_tensor * O = ggml_flash_attn_ext(ctx, Q, K, V, M, sm_scale, 0.0f, 0.0f);
     ggml_flash_attn_ext_set_prec(O, GGML_PREC_F32);
-    ((int32_t *) O->op_params)[4] = GGML_FATTN_INST_MTP_DRAFT_DECODE_QK;
+    // MTP target verification with nq>1 is stamped as PREFILL_QK in the live graph;
+    // the draft-decode instruction is only valid for nq==1.
+    ((int32_t *) O->op_params)[4] = nq > 1 ? GGML_FATTN_INST_PREFILL_QK : GGML_FATTN_INST_MTP_DRAFT_DECODE_QK;
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, O);
@@ -273,7 +287,7 @@ int main() {
             if (!item.empty()) variants.push_back(item);
         }
     } else {
-        variants = {"scalar", "gqa_scalar", "waveqk", "waveqk_q4pair", "pvwmma", "wmma_full", "dsplit", "splitk", "small_verify", "small_verify_splitk", "logits_debug"};
+        variants = {"scalar", "gqa_scalar", "waveqk", "waveqk_q4pair", "pvwmma", "wmma_full", "dsplit", "splitk", "small_verify", "small_verify_splitk", "small_verify_batched_splitk", "small_verify_fa2", "logits_debug"};
     }
 
     run_result scalar = run_variant("scalar", nq, nk, n_heads_q, n_heads_k, Q, K_payload, K_scales, V_q4);

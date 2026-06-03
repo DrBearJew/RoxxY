@@ -753,7 +753,8 @@ static bool ggml_cuda_fattn_route_contract_matches(const char * required, const 
          strcmp(required, "rocm_packed16_decode_splitk") == 0 ||
          strcmp(required, "rocm_packed16_small_verify") == 0 ||
          strcmp(required, "rocm_packed16_small_verify_splitk") == 0 ||
-         strcmp(required, "rocm_packed16_small_verify_batched_splitk") == 0) &&
+         strcmp(required, "rocm_packed16_small_verify_batched_splitk") == 0 ||
+         strcmp(required, "rocm_packed16_small_verify_fa2") == 0) &&
             kernel == BEST_FATTN_KERNEL_PACKED16_DECODE) {
         return true;
     }
@@ -872,6 +873,7 @@ static bool ggml_cuda_fattn_route_contract_is_i8(const char * required) {
         strcmp(required, "rocm_packed16_small_verify") == 0 ||
         strcmp(required, "rocm_packed16_small_verify_splitk") == 0 ||
         strcmp(required, "rocm_packed16_small_verify_batched_splitk") == 0 ||
+        strcmp(required, "rocm_packed16_small_verify_fa2") == 0 ||
         strcmp(required, "rocm_q8q4_wmma_i8") == 0);
 }
 
@@ -980,7 +982,8 @@ static bool ggml_cuda_fattn_route_contract_applicable(
             strcmp(required, "rocm_packed16_decode_splitk") == 0 ||
             strcmp(required, "rocm_packed16_small_verify") == 0 ||
             strcmp(required, "rocm_packed16_small_verify_splitk") == 0 ||
-            strcmp(required, "rocm_packed16_small_verify_batched_splitk") == 0) {
+            strcmp(required, "rocm_packed16_small_verify_batched_splitk") == 0 ||
+            strcmp(required, "rocm_packed16_small_verify_fa2") == 0) {
         const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
         return fa_inst_i32 == GGML_FATTN_INST_MTP_DRAFT_DECODE_QK &&
             Q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
@@ -2612,7 +2615,8 @@ static bool ggml_cuda_dp16_fa_route_is_packed16_decode_alias(const char * requir
         strcmp(required, "rocm_packed16_decode_splitk") == 0 ||
         strcmp(required, "rocm_packed16_small_verify") == 0 ||
         strcmp(required, "rocm_packed16_small_verify_splitk") == 0 ||
-        strcmp(required, "rocm_packed16_small_verify_batched_splitk") == 0);
+        strcmp(required, "rocm_packed16_small_verify_batched_splitk") == 0 ||
+        strcmp(required, "rocm_packed16_small_verify_fa2") == 0);
 }
 
 static bool ggml_cuda_dp16_fa_route_is_f16_adapt_alias(const char * required) {
@@ -3553,7 +3557,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
              strcmp(required_route, "rocm_packed16_decode_splitk") == 0 ||
              strcmp(required_route, "rocm_packed16_small_verify") == 0 ||
              strcmp(required_route, "rocm_packed16_small_verify_splitk") == 0 ||
-             strcmp(required_route, "rocm_packed16_small_verify_batched_splitk") == 0);
+             strcmp(required_route, "rocm_packed16_small_verify_batched_splitk") == 0 ||
+        strcmp(required_route, "rocm_packed16_small_verify_fa2") == 0);
         const bool require_packed16_decode_splitk_alias =
             required_route && strcmp(required_route, "rocm_packed16_decode_splitk") == 0;
         const bool require_packed16_small_verify =
@@ -3561,7 +3566,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         const bool require_packed16_small_verify_splitk =
             required_route && strcmp(required_route, "rocm_packed16_small_verify_splitk") == 0;
         const bool require_packed16_small_verify_batched_splitk =
-            required_route && strcmp(required_route, "rocm_packed16_small_verify_batched_splitk") == 0;
+            required_route && (strcmp(required_route, "rocm_packed16_small_verify_batched_splitk") == 0 ||
+                strcmp(required_route, "rocm_packed16_small_verify_fa2") == 0);
         const char * decode_max_nq_env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_MAX_NQ");
         const int decode_max_nq = decode_max_nq_env ? atoi(decode_max_nq_env) : 1;
         const char * small_verify_max_nq_env = getenv("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ");
@@ -3665,7 +3671,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         const bool packed16_decode_small_verify_env =
             (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify") == 0) ||
             (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify_splitk") == 0) ||
-            (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify_batched_splitk") == 0);
+            (packed16_decode_impl_env && (strcmp(packed16_decode_impl_env, "small_verify_batched_splitk") == 0 ||
+                strcmp(packed16_decode_impl_env, "small_verify_fa2") == 0));
         const bool small_verify_decode_opt_in =
             getenv("LLAMA_MTP_FA_ROUTE") &&
             (packed16_decode_small_verify_env ||

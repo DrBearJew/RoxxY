@@ -3736,8 +3736,10 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                 const bool packed16_small_verify_requested =
                     (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify") == 0) ||
                     (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify_batched_splitk") == 0) ||
+                    (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify_fa2") == 0) ||
                     (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify") == 0) ||
-                    (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_batched_splitk") == 0);
+                    (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_batched_splitk") == 0) ||
+                    (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_fa2") == 0);
                 const bool packed16_small_verify_splitk_requested =
                     (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify_splitk") == 0) ||
                     (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_splitk") == 0);
@@ -3773,6 +3775,8 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                         (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_decode_logits_debug") == 0) ? "logits_debug" :
                         (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify") == 0) ? (nq == 1 ? "splitk" : "small_verify") :
                         (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_splitk") == 0) ? (nq == 1 ? "splitk" : "small_verify_splitk") :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_batched_splitk") == 0) ? (nq == 1 ? "splitk" : "small_verify_batched_splitk") :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_fa2") == 0) ? (nq == 1 ? "splitk" : "small_verify_fa2") :
                         (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_decode_splitk") == 0) ? "splitk" :
                         "scalar";
                     const bool impl_gqa_scalar = strcmp(packed16_decode_impl, "gqa_scalar") == 0;
@@ -3789,9 +3793,10 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
 bool impl_small_verify = strcmp(packed16_decode_impl, "small_verify") == 0;
                     bool impl_small_verify_splitk = strcmp(packed16_decode_impl, "small_verify_splitk") == 0;
                     bool impl_small_verify_batched_splitk = strcmp(packed16_decode_impl, "small_verify_batched_splitk") == 0;
-                    const bool impl_supported = impl_scalar || impl_gqa_scalar || impl_inline_q4 || impl_q4pair || impl_waveqk || impl_waveqk_q4pair || impl_pvwmma || impl_wmma_full || impl_dsplit || impl_logits_debug || impl_splitk || impl_small_verify || impl_small_verify_splitk || impl_small_verify_batched_splitk;
+                    bool impl_small_verify_fa2 = strcmp(packed16_decode_impl, "small_verify_fa2") == 0;
+                    const bool impl_supported = impl_scalar || impl_gqa_scalar || impl_inline_q4 || impl_q4pair || impl_waveqk || impl_waveqk_q4pair || impl_pvwmma || impl_wmma_full || impl_dsplit || impl_logits_debug || impl_splitk || impl_small_verify || impl_small_verify_splitk || impl_small_verify_batched_splitk || impl_small_verify_fa2;
                     if (!impl_supported) {
-                        GGML_ABORT("packed16 decode impl '%s' is not implemented yet; supported in this build: scalar, gqa_scalar, inline_q4, q4pair, waveqk, waveqk_q4pair, splitk, small_verify, small_verify_splitk, small_verify_batched_splitk, dsplit, pvwmma, gqa_pvwmma, wmma_full, gqa_wmma_full, logits_debug", packed16_decode_impl);
+                        GGML_ABORT("packed16 decode impl '%s' is not implemented yet; supported in this build: scalar, gqa_scalar, inline_q4, q4pair, waveqk, waveqk_q4pair, splitk, small_verify, small_verify_splitk, small_verify_batched_splitk, small_verify_fa2, dsplit, pvwmma, gqa_pvwmma, wmma_full, gqa_wmma_full, logits_debug", packed16_decode_impl);
                     }
                     const bool packed16_decode_impl_explicit = packed16_decode_impl_env && packed16_decode_impl_env[0];
                     const bool packed16_decode_log =
@@ -3819,7 +3824,8 @@ bool impl_small_verify = strcmp(packed16_decode_impl, "small_verify") == 0;
                     if (impl_small_verify && nq < 2) impl_small_verify = false;
                     if (impl_small_verify_splitk && nq < 2) impl_small_verify_splitk = false;
                     if (impl_small_verify_batched_splitk && nq < 2) impl_small_verify_batched_splitk = false;
-                    if ((impl_small_verify || impl_small_verify_splitk || impl_small_verify_batched_splitk) && !(nq >= 2 && nq <= decode_max_nq && K->type == GGML_TYPE_I32 && V->type == GGML_TYPE_Q4_0)) {
+                    if (impl_small_verify_fa2 && nq < 2) impl_small_verify_fa2 = false;
+                    if ((impl_small_verify || impl_small_verify_splitk || impl_small_verify_batched_splitk || impl_small_verify_fa2) && !(nq >= 2 && nq <= decode_max_nq && K->type == GGML_TYPE_I32 && V->type == GGML_TYPE_Q4_0)) {
                         GGML_ABORT("packed16 %s requires I32 K, q4_0 V, and 2 <= nq <= %d; got nq=%d K=%s V=%s",
                             packed16_decode_impl, decode_max_nq, nq, ggml_type_name(K->type), ggml_type_name(V->type));
                     }
@@ -3836,13 +3842,23 @@ bool impl_small_verify = strcmp(packed16_decode_impl, "small_verify") == 0;
                         return;
                     }
                     if (impl_small_verify_batched_splitk) {
-                        if (gqa_ratio > 8) GGML_ABORT("packed16 small_verify_batched_splitk supports gqa_ratio <= 8, got %d", gqa_ratio);
+                        if (gqa_ratio > 8) GGML_ABORT("packed16 %s supports gqa_ratio <= 8, got %d", packed16_decode_impl, gqa_ratio);
                         if (decode_bn == 64 && decode_vsub == 8) {
-                            if (nq <= 2) { LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(64, 8, 8, 2) }
-                            else if (nq <= 3) { LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(64, 8, 8, 3) }
-                            else { LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(64, 8, 8, 4) }
+                            if (nq <= 2) { LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(64, 8, 8, 2, 512) }
+                            else if (nq <= 3) { LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(64, 8, 8, 3, 512) }
+                            else { LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(64, 8, 8, 4, 512) }
                         }
-                        else { GGML_ABORT("packed16 small_verify_batched_splitk: expected BN=64 VSUB=8, got BN=%d VSUB=%d", decode_bn, decode_vsub); }
+                        else { GGML_ABORT("packed16 %s: expected BN=64 VSUB=8, got BN=%d VSUB=%d", packed16_decode_impl, decode_bn, decode_vsub); }
+                        return;
+                    }
+                    if (impl_small_verify_fa2) {
+                        if (gqa_ratio > 8) GGML_ABORT("packed16 %s supports gqa_ratio <= 8, got %d", packed16_decode_impl, gqa_ratio);
+                        if (decode_bn == 64 && decode_vsub == 8) {
+                            if (nq <= 2) { LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(64, 8, 8, 2, 128) }
+                            else if (nq <= 3) { LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(64, 8, 8, 3, 128) }
+                            else { LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(64, 8, 8, 4, 128) }
+                        }
+                        else { GGML_ABORT("packed16 %s: expected BN=64 VSUB=8, got BN=%d VSUB=%d", packed16_decode_impl, decode_bn, decode_vsub); }
                         return;
                     }
                     if (impl_logits_debug) {
