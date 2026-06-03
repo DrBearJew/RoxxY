@@ -3754,11 +3754,6 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                     (packed16_decode_splitk_requested ? ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_MAX_NQ", 1) : 1);
 
                 if (decode_bn > 0 && nq <= decode_max_nq && (K->type == GGML_TYPE_I32 || is_mtp_draft_decode)) {
-                    // ── DEBUG: trace decode dispatch ──
-                    fprintf(stderr, "P16_DECODE_GATE: decode_bn=%d nq=%d max_nq=%d k_i32=%d full_fa=%d recthist=%d small_verify=%d env_impl=%s\n",
-                        decode_bn, nq, decode_max_nq, (int)(K->type == GGML_TYPE_I32), (int)full_fa, (int)blockfa_recthist_v4_single_effective, (int)packed16_small_verify_requested,
-                        packed16_decode_impl_env ? packed16_decode_impl_env : "(null)");
-                    fflush(stderr);
                     // For f16-source K, packed16 is already materialized in k_payload/k_scales.
                     // Strides are computed from packed16 layout, not from K tensor strides.
                     const int k_head_stride_rows  = nk;

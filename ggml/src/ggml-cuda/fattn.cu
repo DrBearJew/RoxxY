@@ -3384,9 +3384,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const ggml_tensor * Q     = dst->src[0];
     const ggml_tensor * K     = dst->src[1];
     const ggml_tensor * V     = dst->src[2];
-    if (Q && K && K->type == GGML_TYPE_I32 && Q->ne[1] >= 2) {
-        fprintf(stderr, "FA_ENTRY_I32: nq=%lld nk=%lld inst=%d\n", (long long)Q->ne[1], (long long)K->ne[1], (int)((const int32_t*)dst->op_params)[4]); fflush(stderr);
-    }
     const ggml_tensor * mask  = dst->src[3];
 
 
@@ -3664,10 +3661,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         // - PWMMA BM64 i8-QK PV-WMMA DBV is the production prefill path once the
         //   prompt is large enough to amortize its setup work.
         // - DOT4_KQ is the last resort.
-        if (inst != GGML_FATTN_INST_PREFILL_QK &&
+        const char * packed16_decode_impl_env = getenv("GGML_CUDA_ROCM_PACKED16_DECODE_IMPL");
+        const bool packed16_decode_small_verify_env =
+            (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify") == 0) ||
+            (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify_splitk") == 0) ||
+            (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify_batched_splitk") == 0);
+        const bool small_verify_decode_opt_in =
+            getenv("LLAMA_MTP_FA_ROUTE") &&
+            (packed16_decode_small_verify_env ||
+             require_packed16_small_verify ||
+             require_packed16_small_verify_splitk ||
+             require_packed16_small_verify_batched_splitk);
+        if (small_verify_decode_opt_in &&
             Q->ne[1] >= 2 && Q->ne[1] <= small_verify_max_nq &&
-            V->type == GGML_TYPE_Q4_0 && getenv("LLAMA_MTP_FA_ROUTE")) { // opt-in
-            fprintf(stderr, "SMALL_VERIFY_ROUTE nq=%lld inst=%d\n", (long long)Q->ne[1], (int)inst); fflush(stderr);
+            K->type == GGML_TYPE_I32 && V->type == GGML_TYPE_Q4_0) {
             return BEST_FATTN_KERNEL_PACKED16_DECODE;
         }
         const bool auto_verbose =
