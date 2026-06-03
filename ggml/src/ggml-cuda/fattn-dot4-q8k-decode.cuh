@@ -1358,37 +1358,38 @@ void ggml_cuda_q8k_dot4_small_verify_batched_gqa_splitk_stage1_kernel(
         }
         __syncthreads();
 
-        // ── Phase 2: per-query softmax + P×V (K/V already read in phase 1) ──
-#pragma unroll
-        for (int q_idx = 0; q_idx < NQ_MAX; ++q_idx) {
-            if (q_idx >= nq) break;
-
-            // Softmax for this query's GH heads (reads from logits[q_idx][g][kk])
-            if (tid < GH_MAX) {
-                const int g = tid;
-                if (g < gh) {
-                    float tile_m = -1e38f;
-                    const int logit_base = q_idx * GH_MAX * BN + g * BN;
-                    for (int kk = 0; kk < tile_n; ++kk) tile_m = fmaxf(tile_m, logits[logit_base + kk]);
-                    float m_prev = sm[(q_idx * GH_MAX + g) * 4 + 0];
-                    float l_prev = sm[(q_idx * GH_MAX + g) * 4 + 1];
-                    float m_new  = fmaxf(m_prev, tile_m);
-                    float old_scale = (l_prev > 0.0f) ? expf(m_prev - m_new) : 0.0f;
-                    float tile_l = 0.0f;
-                    for (int kk = 0; kk < tile_n; ++kk) {
-                        float p = expf(logits[logit_base + kk] - m_new);
-                        probs[logit_base + kk] = p;
-                        tile_l += p;
-                    }
-                    sm[(q_idx * GH_MAX + g) * 4 + 0] = m_new;
-                    sm[(q_idx * GH_MAX + g) * 4 + 1] = l_prev * old_scale + tile_l;
-                    sm[(q_idx * GH_MAX + g) * 4 + 2] = old_scale;
+        // ── Phase 2: All-query softmax in one phase ──
+        // Each thread handles one (q_idx, g) pair.
+        if (tid < NQ_MAX * GH_MAX) {
+            const int q_idx = tid / GH_MAX;
+            const int g     = tid - q_idx * GH_MAX;
+            if (q_idx < nq && g < gh) {
+                float tile_m = -1e38f;
+                const int logit_base = q_idx * GH_MAX * BN + g * BN;
+                for (int kk = 0; kk < tile_n; ++kk) tile_m = fmaxf(tile_m, logits[logit_base + kk]);
+                float m_prev = sm[(q_idx * GH_MAX + g) * 4 + 0];
+                float l_prev = sm[(q_idx * GH_MAX + g) * 4 + 1];
+                float m_new  = fmaxf(m_prev, tile_m);
+                float old_scale = (l_prev > 0.0f) ? expf(m_prev - m_new) : 0.0f;
+                float tile_l = 0.0f;
+                for (int kk = 0; kk < tile_n; ++kk) {
+                    float p = expf(logits[logit_base + kk] - m_new);
+                    probs[logit_base + kk] = p;
+                    tile_l += p;
                 }
+                sm[(q_idx * GH_MAX + g) * 4 + 0] = m_new;
+                sm[(q_idx * GH_MAX + g) * 4 + 1] = l_prev * old_scale + tile_l;
+                sm[(q_idx * GH_MAX + g) * 4 + 2] = old_scale;
             }
-            __syncthreads();
+        }
+        __syncthreads();
 
-            // P×V accumulation for this query (reads from probs[q_idx][g][kk])
-            if (tid < DECODE_D) {
+        // ── Phase 3: All-query P×V accumulation in one phase ──
+        // Each of D=256 threads iterates across all nq queries for its dimension.
+        if (tid < DECODE_D) {
+#pragma unroll
+            for (int q_idx = 0; q_idx < NQ_MAX; ++q_idx) {
+                if (q_idx >= nq) break;
                 const int logit_base = q_idx * GH_MAX * BN;
 #pragma unroll
                 for (int g = 0; g < GH_MAX; ++g) {
@@ -1406,8 +1407,8 @@ void ggml_cuda_q8k_dot4_small_verify_batched_gqa_splitk_stage1_kernel(
                     }
                 }
             }
-            __syncthreads();
         }
+        __syncthreads();
     }
 
     // Write unnormalised partials per (q, g)
