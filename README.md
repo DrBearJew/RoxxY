@@ -80,32 +80,18 @@ safe baseline unless you explicitly force/cache a policy.
 
 ---
 
-## PROPER STARTING OPTIONS — I32 packed16 FlashAttention
+## Cache/layout notes — I32 packed16 FlashAttention
 
-For this branch's RDNA3 FlashAttention work, **K is the packed16/I32 route**.
-Do **not** pass a K cache-type flag for this path. In particular, do not use
-`--cache-type-k q8_0` when testing the I32/DOT4 route.
+The copy/paste MTP launch command is the one above. These are the rules behind
+it:
 
-Use the V cache type to choose the value format, and let packed16 allocate the
-physical I32 K payload/scales. For normal use, do not force the route with
-environment variables; the packed16 FlashAttention route is selected
-automatically when the shape and cache layout match.
-
-```bash
-LLAMA_MTP_ENABLE_FA=1 \
-LLAMA_MTP_PREFILL_CHUNK=2048 \
-./build-rocm/bin/llama-server \
-  --device ROCm0 \
-  --model /path/to/Qwen3.6-27B-Q4_K_M-mtp.gguf \
-  --flash-attn on \
-  --cache-type-v q4_0 \
-  --ctx-size 40960 --batch-size 2048 --ubatch-size 1024 \
-  --parallel 1 --no-warmup \
-  --spec-type draft-mtp --spec-default \
-  --spec-draft-n-max 3 --spec-draft-p-min 0 \
-  --spec-draft-type-v q4_0 \
-  --spec-draft-prio 2 --spec-draft-prio-batch 2
-```
+- **K is the packed16/I32 route.** Do not pass a K cache-type flag; in
+  particular, do not use `--cache-type-k q8_0` for this path.
+- Use the V cache type to choose the value format. Packed16 allocates the
+  physical I32 K payload/scales automatically.
+- For normal use, do not force FlashAttention routes with environment variables;
+  the packed16 route is selected automatically when the shape and cache layout
+  match.
 
 The generic quantized-matmul/f16-temp knobs `LLAMA_MTP_PREFILL_FORCE_MMQ` and
 `GGML_CUDA_ROCM_QUANT_PREFILL_F16` are intentionally omitted here. The old
