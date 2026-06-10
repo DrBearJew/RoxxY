@@ -14,29 +14,48 @@ values, while f16 scales remain separate.
 
 ---
 
-## Start here: recommended MTP launch
+## Start here: recommended MTP server launch
 
-Set your model path once, then run the server through the RoxxY launcher:
+Set your model path once, then run the normal MTP server command through the
+RoxxY launcher:
 
 ```bash
-MODEL=/path/to/model.gguf
+MODEL=/path/to/Qwen3.6-27B-Q4_K_M-mtp.gguf
 
+LLAMA_MTP_ENABLE_FA=1 \
+LLAMA_MTP_PREFILL_CHUNK=2048 \
 scripts/mtp-mmvq-interleaved-auto.py --model "$MODEL" -- \
   ./build-rocm/bin/llama-server \
     --device ROCm0 \
     --model "$MODEL" \
     --flash-attn on \
     --cache-type-v q4_0 \
-    --ctx-size 40960 \
-    --parallel 1
+    --ctx-size 40960 --batch-size 2048 --ubatch-size 1024 \
+    --parallel 1 --no-warmup \
+    --spec-type draft-mtp --spec-default \
+    --spec-draft-n-max 3 --spec-draft-p-min 0 \
+    --spec-draft-type-v q4_0 \
+    --spec-draft-prio 2 --spec-draft-prio-batch 2
 ```
 
-That is the normal path. You do not need to set the internal
-`LLAMA_MTP_MMVQ_*` knobs by hand.
+That is the normal MTP path. You do not need to set the internal
+`LLAMA_MTP_MMVQ_*` route knobs by hand.
+
+`q4_0` is the default V-cache choice because it is the tested compression path.
+It is **not** the only option. If you want higher V precision, use `q8_0` for
+both the main and draft V types:
+
+```bash
+--cache-type-v q8_0 \
+--spec-draft-type-v q8_0
+```
+
+Do not add `--cache-type-k` for the packed16/I32 path; K is selected by the
+RoxxY packed16 runtime layout.
 
 What the launcher does:
 
-- known tested GGUFs get the measured fast policy;
+- known tested GGUFs get the measured fast MMVQ policy;
 - unknown GGUFs stay on the safe baseline;
 - stale MMVQ env vars from old experiments are cleared before launch.
 
