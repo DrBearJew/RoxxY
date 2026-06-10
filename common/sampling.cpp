@@ -654,6 +654,105 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
+static bool common_sampler_mtp_verify_topk_trace_enabled() {
+    const char * env = getenv("LLAMA_MTP_VERIFY_TOPK_TRACE");
+    return env && atoi(env) != 0;
+}
+
+static void common_sampler_mtp_verify_topk_trace(
+        struct llama_context * ctx,
+        int idx,
+        int depth,
+        llama_token draft_id,
+        llama_token sampled_id,
+        bool accepted) {
+    if (!common_sampler_mtp_verify_topk_trace_enabled()) {
+        return;
+    }
+
+    llama_token top1_id = LLAMA_TOKEN_NULL;
+    llama_token top2_id = LLAMA_TOKEN_NULL;
+    float top1_logit = -INFINITY;
+    float top2_logit = -INFINITY;
+    float draft_logit = NAN;
+    int draft_rank = -1;
+    const char * source = "full_logits";
+
+    auto better = [](float a_logit, llama_token a_id, float b_logit, llama_token b_id) {
+        return a_logit > b_logit || (a_logit == b_logit && a_id < b_id);
+    };
+
+    auto consider_top2 = [&](llama_token id, float logit) {
+        if (!std::isfinite(logit)) {
+            return;
+        }
+        if (better(logit, id, top1_logit, top1_id)) {
+            top2_id = top1_id;
+            top2_logit = top1_logit;
+            top1_id = id;
+            top1_logit = logit;
+        } else if (better(logit, id, top2_logit, top2_id)) {
+            top2_id = id;
+            top2_logit = logit;
+        }
+    };
+
+    auto count_rank = [&](llama_token id, float logit) {
+        if (draft_id == LLAMA_TOKEN_NULL || !std::isfinite(draft_logit) || !std::isfinite(logit)) {
+            return;
+        }
+        if (better(logit, id, draft_logit, draft_id)) {
+            ++draft_rank;
+        }
+    };
+
+    const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
+    const float       * sampled_logits = llama_get_sampled_logits_ith(ctx, idx);
+    const uint32_t sampled_count = sampled_logits ? llama_get_sampled_logits_count_ith(ctx, idx) : 0;
+    if (sampled_ids && sampled_logits && sampled_count > 0) {
+        source = "sampled_logits";
+        for (uint32_t i = 0; i < sampled_count; ++i) {
+            consider_top2(sampled_ids[i], sampled_logits[i]);
+            if (sampled_ids[i] == draft_id) {
+                draft_logit = sampled_logits[i];
+                draft_rank = 1;
+            }
+        }
+        if (draft_rank > 0) {
+            for (uint32_t i = 0; i < sampled_count; ++i) {
+                count_rank(sampled_ids[i], sampled_logits[i]);
+            }
+        }
+    } else {
+        const float * logits = llama_get_logits_ith(ctx, idx);
+        if (!logits) {
+            fprintf(stderr,
+                    "MTP_VERIFY_TOPK: depth=%d status=missing_logits idx=%d draft=%d sampled=%d accepted=%d\n",
+                    depth, idx, (int) draft_id, (int) sampled_id, accepted ? 1 : 0);
+            return;
+        }
+        const llama_model * model = llama_get_model(ctx);
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+        const int n_vocab = llama_vocab_n_tokens(vocab);
+        if (draft_id >= 0 && draft_id < n_vocab) {
+            draft_logit = logits[draft_id];
+            draft_rank = std::isfinite(draft_logit) ? 1 : -1;
+        }
+        for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+            const float logit = logits[token_id];
+            consider_top2(token_id, logit);
+            count_rank(token_id, logit);
+        }
+    }
+
+    const float margin = (top1_id != LLAMA_TOKEN_NULL && top2_id != LLAMA_TOKEN_NULL) ? top1_logit - top2_logit : 0.0f;
+    const float draft_delta = std::isfinite(draft_logit) && std::isfinite(top1_logit) ? top1_logit - draft_logit : 0.0f;
+    fprintf(stderr,
+            "MTP_VERIFY_TOPK: depth=%d idx=%d draft=%d sampled=%d accepted=%d raw_top1=%d raw_top2=%d raw_match=%d raw_margin=%.8g draft_rank=%d draft_delta=%.8g source=%s\n",
+            depth, idx, (int) draft_id, (int) sampled_id, accepted ? 1 : 0,
+            (int) top1_id, (int) top2_id, draft_id == top1_id ? 1 : 0, margin, draft_rank, draft_delta, source);
+}
+
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
@@ -667,6 +766,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         common_sampler_accept(gsmpl, id, true);
 
         result.push_back(id);
+        common_sampler_mtp_verify_topk_trace(ctx, idxs[i], (int) i + 1, draft[i], id, draft[i] == id);
 
         if (draft[i] != id) {
             break;
@@ -679,6 +779,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         common_sampler_accept(gsmpl, id, true);
 
         result.push_back(id);
+        common_sampler_mtp_verify_topk_trace(ctx, idxs[i], (int) i + 1, LLAMA_TOKEN_NULL, id, true);
     }
 
     return result;

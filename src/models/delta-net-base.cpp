@@ -3,6 +3,8 @@
 #include "llama-impl.h"
 #include "llama-memory-recurrent.h"
 
+#include <string>
+
 // utility to get one slice from the third dimension
 // input dim:  [x, y, c, b]
 // output dim: [x, y, 1, b]
@@ -423,6 +425,50 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     return {output, new_state};
 }
 
+ggml_tensor * llm_build_delta_net_base::build_delta_net_fused_state_only(
+        ggml_tensor * q,
+        ggml_tensor * k,
+        ggml_tensor * v,
+        ggml_tensor * g,
+        ggml_tensor * b,
+        ggml_tensor * s,
+        int           il) {
+    const int64_t S_k      = q->ne[0];
+    const int64_t H_k      = q->ne[1];
+    const int64_t n_tokens = q->ne[2];
+    const int64_t n_seqs   = q->ne[3];
+
+    const int64_t S_v = v->ne[0];
+    const int64_t H_v = v->ne[1];
+
+    GGML_ASSERT(S_k == S_v);
+    GGML_ASSERT(H_v % H_k == 0);
+
+    GGML_ASSERT(q->ne[0] == S_k && q->ne[1] == H_k && q->ne[2] == n_tokens && q->ne[3] == n_seqs);
+    GGML_ASSERT(k->ne[0] == S_k && k->ne[1] == H_k && k->ne[2] == n_tokens && k->ne[3] == n_seqs);
+    GGML_ASSERT(v->ne[0] == S_v && v->ne[1] == H_v && v->ne[2] == n_tokens && v->ne[3] == n_seqs);
+
+    GGML_ASSERT(g->ne[0] == 1   || g->ne[0] == S_v);
+    GGML_ASSERT(                   g->ne[1] == H_v && g->ne[2] == n_tokens && g->ne[3] == n_seqs);
+    GGML_ASSERT(b->ne[0] == 1   && b->ne[1] == H_v && b->ne[2] == n_tokens && b->ne[3] == n_seqs);
+    GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
+
+    // K=1 (final state only): same result layout as ggml_gated_delta_net, but
+    // CUDA may skip writing the attention/output prefix when only state is used.
+    ggml_tensor * s_3d = ggml_reshape_3d(ctx0, s, S_v * S_v * H_v, 1, n_seqs);
+    ggml_tensor * result = ggml_gated_delta_net_state_only(ctx0, q, k, v, g, b, s_3d, /*keep_intermediates=*/false);
+    cb(result, n_tokens == 1 ? "__fgdn_ar_state_only__" : "__fgdn_ch_state_only__", il);
+
+    ggml_tensor * new_state = ggml_view_4d(ctx0, result,
+            S_v, S_v, H_v, n_seqs,
+            ggml_row_size(result->type, S_v),
+            ggml_row_size(result->type, S_v * S_v),
+            ggml_row_size(result->type, S_v * S_v * H_v),
+            ggml_row_size(result->type, S_v * H_v * n_tokens * n_seqs));
+
+    return new_state;
+}
+
 ggml_tensor * llm_build_delta_net_base::build_delta_net_fused_keep_intermediates(
         ggml_tensor * q,
         ggml_tensor * k,
@@ -527,7 +573,9 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
                          kv_head * (conv_kernel_size - 1) * conv_channels * ggml_element_size(conv_states_all));
         cb(state_update_target, "state_update_target", il);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv_states, state_update_target));
+        ggml_tensor * conv_state_copy = ggml_cpy(ctx0, last_conv_states, state_update_target);
+        cb(conv_state_copy, "conv_state_copy_k0_of_1", il);
+        ggml_build_forward_expand(gf, conv_state_copy);
     } else {
         const int64_t row_count = (conv_kernel_size - 1) * conv_channels;
         const size_t  row_size  = row_count * ggml_element_size(conv_states_all);
@@ -541,7 +589,10 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
                 ggml_view_2d(ctx0, conv_states_all, row_count, n_seqs,
                              conv_states_all->nb[1],
                              ((size_t) slot * mem_size + kv_head) * row_size);
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+            ggml_tensor * conv_state_copy = ggml_cpy(ctx0, src, dst);
+            const std::string conv_state_copy_name = "conv_state_copy_k" + std::to_string(t - 1) + "_of_" + std::to_string(n_seq_tokens);
+            cb(conv_state_copy, conv_state_copy_name.c_str(), il);
+            ggml_build_forward_expand(gf, conv_state_copy);
         }
     }
 
@@ -574,10 +625,11 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         cb(output, "attn_output", il);
         cb(new_state, "new_state", il);
 
-        ggml_build_forward_expand(gf,
-                ggml_cpy(ctx0, new_state,
-                    ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
-                        kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+        ggml_tensor * state_copy = ggml_cpy(ctx0, new_state,
+                ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+                    kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all)));
+        cb(state_copy, "ssm_state_copy_k0_of_1", il);
+        ggml_build_forward_expand(gf, state_copy);
 
         return output;
     }
@@ -615,7 +667,10 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_tensor * dst = ggml_view_2d(ctx0, ssm_states_all,
             hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
             ((size_t) cache_slot * mem_size + kv_head) * row_size);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+        ggml_tensor * state_copy = ggml_cpy(ctx0, src, dst);
+        const std::string state_copy_name = "ssm_state_copy_k" + std::to_string(k_i) + "_of_" + std::to_string(K);
+        cb(state_copy, state_copy_name.c_str(), il);
+        ggml_build_forward_expand(gf, state_copy);
     }
 
     return output;

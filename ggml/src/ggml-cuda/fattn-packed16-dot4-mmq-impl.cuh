@@ -230,10 +230,12 @@ bool ggml_cuda_packed16_dot4_mmq_supported(const int cc, const ggml_tensor * dst
     if (!GGML_CUDA_CC_IS_RDNA3(cc)) {
         return false;
     }
-    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_I32 || dst->type != GGML_TYPE_F32) {
+    const bool k_persistent_i32 = K->type == GGML_TYPE_I32 && K->ne[0] * 4 == PDMQ_D;
+    const bool k_f16_hotcold_sidecar = K->type == GGML_TYPE_F16 && K->ne[0] == PDMQ_D;
+    if (Q->type != GGML_TYPE_F32 || !(k_persistent_i32 || k_f16_hotcold_sidecar) || dst->type != GGML_TYPE_F32) {
         return false;
     }
-    if (Q->ne[0] != PDMQ_D || K->ne[0] * 4 != PDMQ_D || V->ne[0] != PDMQ_D || dst->ne[0] != PDMQ_D) {
+    if (Q->ne[0] != PDMQ_D || V->ne[0] != PDMQ_D || dst->ne[0] != PDMQ_D) {
         return false;
     }
     const bool v_needs_mmq_decode = V->type == GGML_TYPE_TBQ4_0 || V->type == GGML_TYPE_PLANAR3_0 || V->type == GGML_TYPE_ISO3_0;
@@ -727,12 +729,12 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqa2
             for (int idx = tid; idx < tile_n * KP_PER_ROW; idx += int(blockDim.x)) {
                 const int kk = idx / KP_PER_ROW, w = idx - kk * KP_PER_ROW;
                 const size_t k_row = k_head_base + size_t(k0 + kk);
-                k_payload_s[kk * (KP_PER_ROW + 1) + w] = k_payload[k_row + w];
+                k_payload_s[kk * (KP_PER_ROW + 1) + w] = k_payload[k_row * KP_PER_ROW + w];
             }
             for (int idx = tid; idx < tile_n * KS_PER_ROW; idx += int(blockDim.x)) {
                 const int kk = idx / KS_PER_ROW, s_val = idx - kk * KS_PER_ROW;
                 const size_t k_row = k_head_base + size_t(k0 + kk);
-                k_scales_s[kk * (KS_PER_ROW + 1) + s_val] = k_scales[k_row + s_val];
+                k_scales_s[kk * (KS_PER_ROW + 1) + s_val] = k_scales[k_row * KS_PER_ROW + s_val];
             }
             __syncthreads();
         }
@@ -862,6 +864,362 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqa2
     }
 }
 
+
+// ── GQAX/XQA Kernel (9B grouped-Q-head verifier experiment) ───────
+// Unlike the older GQA2 canary, this keeps all slot probabilities live until
+// PV so a q4 V value is decoded once per K/V tile element and reused across
+// grouped Q heads. This is deliberately narrow: it is a verifier dataflow
+// experiment for hq=16,hk=4,V=q4_0, not a generic policy.
+template<packed16_dot4_mmq_v_type V_TYPE, int BM, int BN, int D, bool CAUSAL_MASK, bool STAGE_V, bool RAW_LDS_Q4, bool KSHARED, int GQA_GROUP>
+static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax_kernel(
+        const float * __restrict__ Q,
+        const char  * __restrict__ V,
+        float       * __restrict__ dst,
+        float       * __restrict__ partial_m,
+        float       * __restrict__ partial_l,
+        float       * __restrict__ partial_out,
+        int64_t q_nb01, int64_t q_nb02, int64_t q_nb03,
+        int64_t v_nb10, int64_t v_nb11, int64_t v_nb12, int64_t v_nb13, int64_t v_ne13,
+        const char * __restrict__ mask,
+        int64_t mask_ne00, int64_t mask_ne01, int64_t mask_ne03,
+        int64_t mask_nb00, int64_t mask_nb01, int64_t mask_nb03,
+        const int  * __restrict__ k_payload,
+        const half * __restrict__ k_scales,
+        int nq, int nk, int n_heads_q, int n_heads_k, int gqa_ratio,
+        int packed_rows, int q_offset, float attention_scale,
+        int batch, int split_k_factor,
+        pdmq_kernel_profile * __restrict__ profile) {
+
+    static_assert(D == PDMQ_D, "packed16_dot4_mmq_gqax is D256-only");
+    static_assert(BM * BN == PDMQ_THREADS, "packed16_dot4_mmq_gqax maps one QK logit subset per CTA");
+    static_assert(GQA_GROUP == 2 || GQA_GROUP == 4, "packed16_dot4_mmq_gqax supports GQA groups 2 or 4");
+
+    const int tid = int(threadIdx.x);
+    const int q_tile = int(blockIdx.x);
+    const int gy     = int(blockIdx.y);
+    const int bz     = int(blockIdx.z);
+    const bool split_mode = partial_out != nullptr;
+    const int split_k     = split_mode ? split_k_factor : 1;
+    const int b           = split_mode ? bz / split_k : bz;
+    const int split_idx   = split_mode ? (bz - b * split_k) : 0;
+
+    const int groups_per_kv = CEIL_DIV(gqa_ratio, GQA_GROUP);
+    const int hk            = gy / groups_per_kv;
+    const int local_group   = gy - hk * groups_per_kv;
+    const int hq_base       = hk * gqa_ratio + local_group * GQA_GROUP;
+    const int q0            = q_tile * BM;
+
+    if (hk >= n_heads_k || q0 >= nq || b >= batch) {
+        return;
+    }
+
+    const int head_stride = packed_rows / n_heads_k;
+    const size_t k_head_base = size_t(hk) * size_t(head_stride);
+
+    const int k_blocks_total = CEIL_DIV(nk, BN);
+    const int k_block_begin  = split_mode ? (k_blocks_total * split_idx) / split_k : 0;
+    const int k_block_end    = split_mode ? (k_blocks_total * (split_idx + 1)) / split_k : k_blocks_total;
+    const int k_begin        = k_block_begin * BN;
+    const int k_end          = pdmq_min_i(nk, k_block_end * BN);
+
+    // Fast path for intentionally oversubscribed split-K CTAs.  Raw split8
+    // restores occupancy for GQA2X, but for nk=256/M4N64 only four K tiles
+    // contain work.  Empty split shards must still publish m/l sentinels so
+    // the merge can ignore them; they do not need Q quantization, V staging,
+    // QK/PV work, or partial_out writes.
+    if (split_mode && k_begin >= k_end) {
+        const size_t rows_per_split = size_t(batch) * size_t(nq) * size_t(n_heads_q);
+        if (tid == 0) {
+#pragma unroll
+            for (int slot = 0; slot < GQA_GROUP; ++slot) {
+                const int hq = hq_base + slot;
+                if (hq >= n_heads_q || hq >= (hk + 1) * gqa_ratio) continue;
+#pragma unroll
+                for (int qr = 0; qr < BM; ++qr) {
+                    const int q = q0 + qr;
+                    if (q >= nq) continue;
+                    const size_t row = ((size_t(b) * size_t(nq) + size_t(q)) * size_t(n_heads_q) + size_t(hq));
+                    const size_t partial_row = size_t(split_idx) * rows_per_split + row;
+                    partial_m[partial_row] = pdmq_neg();
+                    partial_l[partial_row] = 0.0f;
+                }
+            }
+        }
+        return;
+    }
+
+    __shared__ int   q_tile_i32[GQA_GROUP][BM][D / 4 + 1];
+    __shared__ float q_tile_scales[GQA_GROUP][BM][D / QK8_0 + 1];
+    __shared__ float logits[GQA_GROUP][BM][BN + 1];
+    static constexpr bool RAW_Q4_LDS = RAW_LDS_Q4 && V_TYPE == PACKED16_DOT4_MMQ_V_Q4_0;
+
+    __shared__ float row_m[GQA_GROUP][BM + 1];
+    __shared__ float row_l[GQA_GROUP][BM + 1];
+    __shared__ float old_s[GQA_GROUP][BM + 1];
+    __shared__ float v_tile[STAGE_V ? BN * (D + 1) : 1];
+    __shared__ block_q4_0 v_raw_tile[RAW_Q4_LDS ? BN * (D / QK4_0) : 1];
+    __shared__ int   k_payload_s[KSHARED ? BN * (PDMQ_D / 4 + 1) : 1];
+    __shared__ half  k_scales_s [KSHARED ? BN * (PDMQ_D / QK8_0 + 1) : 1];
+    __shared__ unsigned long long profile_t0;
+
+    for (int idx = tid; idx < GQA_GROUP * BM; idx += int(blockDim.x)) {
+        const int s = idx / BM;
+        const int qr = idx - s * BM;
+        row_m[s][qr] = pdmq_neg();
+        row_l[s][qr] = 0.0f;
+        old_s[s][qr] = 0.0f;
+    }
+
+    float out[GQA_GROUP][BM];
+#pragma unroll
+    for (int s = 0; s < GQA_GROUP; ++s) {
+#pragma unroll
+        for (int qr = 0; qr < BM; ++qr) {
+            out[s][qr] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int s = 0; s < GQA_GROUP; ++s) {
+        const int hq = hq_base + s;
+        const bool slot_valid = hq < n_heads_q && hq < (hk + 1) * gqa_ratio;
+        if (slot_valid) {
+            pdmq_quantize_q_tile<BM, D>(Q, q_nb01, q_nb02, q_nb03, q0, hq, b, nq,
+                                        q_tile_i32[s], q_tile_scales[s]);
+        }
+    }
+
+    for (int k0 = k_begin; k0 < k_end; k0 += BN) {
+        const int tile_n = pdmq_min_i(BN, nk - k0);
+
+        if constexpr (CAUSAL_MASK) {
+            const int q_last = pdmq_min_i(q0 + BM - 1, nq - 1);
+            if (k0 > q_offset + q_last) break;
+        }
+
+        if constexpr (STAGE_V) {
+            for (int v_idx = tid; v_idx < BN * D; v_idx += int(blockDim.x)) {
+                const int kk = v_idx / D;
+                const int d  = v_idx - kk * D;
+                const int k  = k0 + kk;
+                v_tile[kk * (D + 1) + d] = kk < tile_n
+                    ? pdmq_decode_v<V_TYPE>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k, hk, b, d)
+                    : 0.0f;
+            }
+            __syncthreads();
+        } else if constexpr (RAW_Q4_LDS) {
+            constexpr int V_BLOCKS = D / QK4_0;
+            for (int v_idx = tid; v_idx < tile_n * V_BLOCKS; v_idx += int(blockDim.x)) {
+                const int kk = v_idx / V_BLOCKS;
+                const int blk = v_idx - kk * V_BLOCKS;
+                v_raw_tile[kk * V_BLOCKS + blk] = *pdmq_v_q4_0_block_ptr(
+                    V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k0 + kk, hk, b, blk);
+            }
+            __syncthreads();
+        }
+
+        if constexpr (KSHARED) {
+            constexpr int KP_PER_ROW = PDMQ_D / 4;
+            constexpr int KS_PER_ROW = PDMQ_D / QK8_0;
+            for (int idx = tid; idx < tile_n * KP_PER_ROW; idx += int(blockDim.x)) {
+                const int kk = idx / KP_PER_ROW, w = idx - kk * KP_PER_ROW;
+                const size_t k_row = k_head_base + size_t(k0 + kk);
+                k_payload_s[kk * (KP_PER_ROW + 1) + w] = k_payload[k_row * KP_PER_ROW + w];
+            }
+            for (int idx = tid; idx < tile_n * KS_PER_ROW; idx += int(blockDim.x)) {
+                const int kk = idx / KS_PER_ROW, s_val = idx - kk * KS_PER_ROW;
+                const size_t k_row = k_head_base + size_t(k0 + kk);
+                k_scales_s[kk * (KS_PER_ROW + 1) + s_val] = k_scales[k_row * KS_PER_ROW + s_val];
+            }
+            __syncthreads();
+        }
+
+        PDMQ_PROFILE_PHASE_BEGIN();
+
+        for (int idx = tid; idx < GQA_GROUP * BM * BN; idx += int(blockDim.x)) {
+            const int slot = idx / (BM * BN);
+            const int rem  = idx - slot * BM * BN;
+            const int qr   = rem / BN;
+            const int kk   = rem - qr * BN;
+            const int hq   = hq_base + slot;
+            const int q    = q0 + qr;
+            const int k    = k0 + kk;
+
+            float s_val = pdmq_neg();
+            bool valid = hq < n_heads_q && hq < (hk + 1) * gqa_ratio && q < nq && kk < tile_n && k < nk;
+            if constexpr (CAUSAL_MASK) {
+                valid = valid && (k <= q_offset + q);
+            }
+            if (valid) {
+                const int  * kp_row;
+                const half * ks_row;
+                if constexpr (KSHARED) {
+                    kp_row = &k_payload_s[kk * (PDMQ_D / 4 + 1)];
+                    ks_row = &k_scales_s [kk * (PDMQ_D / QK8_0 + 1)];
+                } else {
+                    const size_t k_row = k_head_base + size_t(k);
+                    kp_row = k_payload + k_row * (D / 4);
+                    ks_row = k_scales  + k_row * (D / QK8_0);
+                }
+                s_val = pdmq_qk_dot<BM, D>(q_tile_i32[slot], q_tile_scales[slot], qr, kp_row, ks_row) * attention_scale;
+                if (!CAUSAL_MASK && mask) {
+                    s_val += pdmq_mask_val(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q, k, b);
+                }
+            }
+            logits[slot][qr][kk] = s_val;
+        }
+        __syncthreads();
+        PDMQ_PROFILE_PHASE_END(qk_cycles);
+
+        PDMQ_PROFILE_PHASE_BEGIN();
+
+        for (int idx = tid; idx < GQA_GROUP * BM; idx += int(blockDim.x)) {
+            const int slot = idx / BM;
+            const int qr   = idx - slot * BM;
+            const int hq   = hq_base + slot;
+            const int q    = q0 + qr;
+            float tile_m = pdmq_neg();
+            if (hq < n_heads_q && hq < (hk + 1) * gqa_ratio && q < nq) {
+#pragma unroll
+                for (int kk = 0; kk < BN; ++kk) {
+                    tile_m = fmaxf(tile_m, logits[slot][qr][kk]);
+                }
+            }
+            const float m_new = fmaxf(row_m[slot][qr], tile_m);
+            const float alpha = row_l[slot][qr] > 0.0f && pdmq_logit_is_live(row_m[slot][qr]) && pdmq_logit_is_live(m_new)
+                ? expf(row_m[slot][qr] - m_new) : 0.0f;
+            float tile_l = 0.0f;
+#pragma unroll
+            for (int kk = 0; kk < BN; ++kk) {
+                const float lv = logits[slot][qr][kk];
+                const float p = pdmq_logit_is_live(lv) && pdmq_logit_is_live(m_new) ? expf(lv - m_new) : 0.0f;
+                logits[slot][qr][kk] = p;
+                tile_l += p;
+            }
+            row_l[slot][qr] = row_l[slot][qr] * alpha + tile_l;
+            row_m[slot][qr] = m_new;
+            old_s[slot][qr] = alpha;
+        }
+        __syncthreads();
+        PDMQ_PROFILE_PHASE_END(softmax_cycles);
+
+        PDMQ_PROFILE_PHASE_BEGIN();
+
+        if (tid < D) {
+            float acc[GQA_GROUP][BM];
+#pragma unroll
+            for (int slot = 0; slot < GQA_GROUP; ++slot) {
+#pragma unroll
+                for (int qr = 0; qr < BM; ++qr) {
+                    const int hq = hq_base + slot;
+                    const int q  = q0 + qr;
+                    acc[slot][qr] = (hq < n_heads_q && hq < (hk + 1) * gqa_ratio && q < nq)
+                        ? out[slot][qr] * old_s[slot][qr] : 0.0f;
+                }
+            }
+#pragma unroll
+            for (int kk = 0; kk < BN; ++kk) {
+                const float vv = kk < tile_n
+                    ? (RAW_Q4_LDS
+                        ? pdmq_decode_v_q4_0_raw_lds<D>(v_raw_tile, kk, tid)
+                        : pdmq_decode_v<V_TYPE>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k0 + kk, hk, b, tid))
+                    : 0.0f;
+#pragma unroll
+                for (int slot = 0; slot < GQA_GROUP; ++slot) {
+#pragma unroll
+                    for (int qr = 0; qr < BM; ++qr) {
+                        const int hq = hq_base + slot;
+                        const int q  = q0 + qr;
+                        if (hq >= n_heads_q || hq >= (hk + 1) * gqa_ratio || q >= nq) continue;
+                        const float p = logits[slot][qr][kk];
+                        if (p != 0.0f) acc[slot][qr] += p * vv;
+                    }
+                }
+            }
+#pragma unroll
+            for (int slot = 0; slot < GQA_GROUP; ++slot) {
+#pragma unroll
+                for (int qr = 0; qr < BM; ++qr) {
+                    const int hq = hq_base + slot;
+                    const int q  = q0 + qr;
+                    if (hq < n_heads_q && hq < (hk + 1) * gqa_ratio && q < nq) {
+                        out[slot][qr] = acc[slot][qr];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        PDMQ_PROFILE_PHASE_END(pv_cycles);
+    }
+
+    if (tid < D) {
+#pragma unroll
+        for (int slot = 0; slot < GQA_GROUP; ++slot) {
+            const int hq = hq_base + slot;
+            if (hq >= n_heads_q || hq >= (hk + 1) * gqa_ratio) continue;
+#pragma unroll
+            for (int qr = 0; qr < BM; ++qr) {
+                const int q = q0 + qr;
+                if (q >= nq) continue;
+                const float denom = row_l[slot][qr];
+                const size_t row = ((size_t(b) * size_t(nq) + size_t(q)) * size_t(n_heads_q) + size_t(hq));
+                if (split_mode) {
+                    const size_t partial_row = size_t(split_idx) * size_t(batch) * size_t(nq) * size_t(n_heads_q) + row;
+                    if (tid == 0) {
+                        partial_m[partial_row] = row_m[slot][qr];
+                        partial_l[partial_row] = denom;
+                    }
+                    if (pdmq_logit_is_live(row_m[slot][qr])) {
+                        partial_out[partial_row * size_t(D) + size_t(tid)] = out[slot][qr];
+                    }
+                } else {
+                    dst[row * size_t(D) + size_t(tid)] = denom > 0.0f ? out[slot][qr] / denom : 0.0f;
+                }
+            }
+        }
+    }
+}
+
+static __global__ void packed16_dot4_mmq_gqax_splitk_merge_kernel(
+        const float * __restrict__ partial_m,
+        const float * __restrict__ partial_l,
+        const float * __restrict__ partial_out,
+        float       * __restrict__ dst,
+        int nq, int n_heads_q, int batch, int split_k) {
+    const size_t total = size_t(batch) * size_t(nq) * size_t(n_heads_q) * size_t(PDMQ_D);
+    const size_t idx = size_t(blockIdx.x) * size_t(blockDim.x) + size_t(threadIdx.x);
+    if (idx >= total) {
+        return;
+    }
+
+    const int d = int(idx % PDMQ_D);
+    const size_t row = idx / size_t(PDMQ_D);
+    const size_t rows_per_split = size_t(batch) * size_t(nq) * size_t(n_heads_q);
+
+    float m = pdmq_neg();
+    for (int s = 0; s < split_k; ++s) {
+        const float ms = partial_m[size_t(s) * rows_per_split + row];
+        m = fmaxf(m, ms);
+    }
+
+    float l = 0.0f;
+    float out = 0.0f;
+    if (pdmq_logit_is_live(m)) {
+        for (int s = 0; s < split_k; ++s) {
+            const size_t prow = size_t(s) * rows_per_split + row;
+            const float ms = partial_m[prow];
+            if (!pdmq_logit_is_live(ms)) {
+                continue;
+            }
+            const float scale = expf(ms - m);
+            l += partial_l[prow] * scale;
+            out += partial_out[prow * size_t(PDMQ_D) + size_t(d)] * scale;
+        }
+    }
+    dst[idx] = l > 0.0f ? out / l : 0.0f;
+}
+
 template<packed16_dot4_mmq_v_type V_TYPE, int BM, int BN, int D, bool CAUSAL_MASK, bool STAGE_V, bool RAW_LDS_Q4, bool KSHARED>
 static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_kernel(
         const float * __restrict__ Q,
@@ -976,12 +1334,12 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_kern
             for (int idx = tid; idx < tile_n * KP_PER_ROW; idx += int(blockDim.x)) {
                 const int kk = idx / KP_PER_ROW, w = idx - kk * KP_PER_ROW;
                 const size_t k_row = k_head_base + size_t(k0 + kk);
-                k_payload_s[kk * (KP_PER_ROW + 1) + w] = k_payload[k_row + w];
+                k_payload_s[kk * (KP_PER_ROW + 1) + w] = k_payload[k_row * KP_PER_ROW + w];
             }
             for (int idx = tid; idx < tile_n * KS_PER_ROW; idx += int(blockDim.x)) {
                 const int kk = idx / KS_PER_ROW, s = idx - kk * KS_PER_ROW;
                 const size_t k_row = k_head_base + size_t(k0 + kk);
-                k_scales_s[kk * (KS_PER_ROW + 1) + s] = k_scales[k_row + s];
+                k_scales_s[kk * (KS_PER_ROW + 1) + s] = k_scales[k_row * KS_PER_ROW + s];
             }
             __syncthreads();
         }
@@ -1290,8 +1648,38 @@ static inline int ggml_cuda_rocm_packed16_dot4_mmq_gqa_group() {
     const char * s = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQA_GROUP");
     if (!s || !*s) return 1;
     const int g = atoi(s);
-    if (g == 1 || g == 2) return g;
-    GGML_ABORT("invalid GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQA_GROUP=%s; expected 1 or 2", s);
+    if (g == 1 || g == 2 || g == 4) return g;
+    GGML_ABORT("invalid GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQA_GROUP=%s; expected 1, 2, or 4", s);
+}
+
+static inline int ggml_cuda_rocm_packed16_dot4_mmq_gqax_splitk() {
+    const char * s = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQAX_SPLITK");
+    if (!s || !*s) return 1;
+    const int split_k = atoi(s);
+    if (split_k == 1 || split_k == 2 || split_k == 4 || split_k == 8) return split_k;
+    GGML_ABORT("invalid GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQAX_SPLITK=%s; expected 1, 2, 4, or 8", s);
+}
+
+static inline bool ggml_cuda_rocm_packed16_dot4_mmq_gqax_splitk_roof_cap() {
+    const char * s = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQAX_SPLITK_ROOF_CAP");
+    return s && atoi(s) != 0;
+}
+
+static inline bool ggml_cuda_rocm_packed16_dot4_mmq_gqax_splitk_compact_empty() {
+    const char * s = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQAX_SPLITK_COMPACT_EMPTY");
+    return s && atoi(s) != 0;
+}
+
+static inline int pdmq_splitk_roof_pow2(int nk) {
+    // Keep each split shard at or above the DOT4-tile roof observed for the
+    // 9B GQA2X route.  For nk=256 this caps split-K at 4; split-K=8 creates
+    // 32-token shards and changed the speculative trajectory even though final
+    // SHA and serial-oracle tokens stayed stable.
+    constexpr int min_tokens_per_split = 64;
+    if (nk >= 8 * min_tokens_per_split) return 8;
+    if (nk >= 4 * min_tokens_per_split) return 4;
+    if (nk >= 2 * min_tokens_per_split) return 2;
+    return 1;
 }
 
 // ── GQA2 QK probe ───────────────────────────────────────────────
@@ -1491,6 +1879,7 @@ struct pdmq_plan {
     bool kshared;
     bool split_k;
 
+    ggml_type k_type;
     ggml_type v_type;
     int nq;
     int nk;
@@ -1581,9 +1970,9 @@ static inline void pdmq_profile_record_and_emit(
     slots[idx].pv_cycles.fetch_add(kernel_profile.pv_cycles, std::memory_order_relaxed);
 
     fprintf(stderr,
-        "PDMQ2 summary route=rocm_packed16_dot4_mmq K=i32 V=%s last_role=%s last_nq=%d last_nk=%d last_kernel_ms=%.3f "
+        "PDMQ2 summary route=rocm_packed16_dot4_mmq K=%s V=%s last_role=%s last_nq=%d last_nk=%d last_kernel_ms=%.3f "
         "last_qk_cycles=%llu last_softmax_cycles=%llu last_pv_cycles=%llu\n",
-        ggml_type_name(plan.v_type), pdmq_role_name(plan.role), plan.nq, plan.nk, (double) kernel_ms,
+        ggml_type_name(plan.k_type), ggml_type_name(plan.v_type), pdmq_role_name(plan.role), plan.nq, plan.nk, (double) kernel_ms,
         (unsigned long long) kernel_profile.qk_cycles,
         (unsigned long long) kernel_profile.softmax_cycles,
         (unsigned long long) kernel_profile.pv_cycles);
@@ -1591,9 +1980,9 @@ static inline void pdmq_profile_record_and_emit(
         const unsigned long long calls = slots[i].calls.load(std::memory_order_relaxed);
         if (!calls) continue;
         fprintf(stderr,
-            "PDMQ2 summary route=rocm_packed16_dot4_mmq K=i32 V=%s %s calls=%llu time_ms=%.3f "
+            "PDMQ2 summary route=rocm_packed16_dot4_mmq K=%s V=%s %s calls=%llu time_ms=%.3f "
             "qk_cycles=%llu softmax_cycles=%llu pv_cycles=%llu\n",
-            ggml_type_name(plan.v_type), pdmq_role_profile_label(i), calls,
+            ggml_type_name(plan.k_type), ggml_type_name(plan.v_type), pdmq_role_profile_label(i), calls,
             (double) slots[i].kernel_us.load(std::memory_order_relaxed) / 1000.0,
             (unsigned long long) slots[i].qk_cycles.load(std::memory_order_relaxed),
             (unsigned long long) slots[i].softmax_cycles.load(std::memory_order_relaxed),
@@ -1645,17 +2034,26 @@ static inline pdmq_v_path pdmq_parse_v_path_env(const char * env) {
 static inline pdmq_shape pdmq_select_shape_auto(
         const int nq,
         const int nk,
+        const int n_heads_q,
+        const int n_heads_k,
         const ggml_type v_type) {
     // Role-specialized MTP shapes. Decode and tiny verify should not share the
     // prefill/small-prefill policy: they have one to four Q rows and benefit
     // from wider K tiles with less inactive-M overhead.
+    if (nq <= 4 && v_type == GGML_TYPE_Q4_0 && n_heads_q == 16 && n_heads_k == 4) {
+        // 9B shape canary (hq=16,hk=4,GQA4,V=q4_0) favored M4N64 for both
+        // verifier rows and the PDMQ decode-role rows that appear inside the
+        // tg128 MTP workflow. Keep the prior narrow defaults for GQA6/GQA8
+        // models where M4N64 regressed or was not route-proven.
+        return PDMQ_SHAPE_M4N64;
+    }
     if (nq <= 1) {
         return PDMQ_SHAPE_M1N32;
     }
-    if (nq == 2) {
-        return PDMQ_SHAPE_M2N32;
-    }
     if (nq <= 4) {
+        if (nq == 2) {
+            return PDMQ_SHAPE_M2N32;
+        }
         // M4N32 remains available via SHAPE env, but the runtime canary showed
         // higher verify-nq4 time than the proven 8x32 policy.
         return PDMQ_SHAPE_M8N32;
@@ -1733,6 +2131,7 @@ static inline pdmq_plan pdmq_make_plan(
         const int n_heads_q,
         const int n_heads_k,
         const int d,
+        const ggml_type k_type,
         const ggml_type v_type,
         const bool causal,
         const pdmq_shape shape,
@@ -1746,6 +2145,7 @@ static inline pdmq_plan pdmq_make_plan(
     plan.causal = causal;
     plan.kshared = pdmq_kshared_enabled();
     plan.split_k = false;
+    plan.k_type = k_type;
     plan.v_type = v_type;
     plan.nq = nq;
     plan.nk = nk;
@@ -1763,8 +2163,10 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
 
-    GGML_ASSERT(Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(Q->ne[0] == PDMQ_D && K->ne[0] * 4 == PDMQ_D && V->ne[0] == PDMQ_D && dst->ne[0] == PDMQ_D);
+    const bool k_persistent_i32 = K->type == GGML_TYPE_I32 && K->ne[0] * 4 == PDMQ_D;
+    const bool k_f16_hotcold_sidecar = K->type == GGML_TYPE_F16 && K->ne[0] == PDMQ_D;
+    GGML_ASSERT(Q->type == GGML_TYPE_F32 && (k_persistent_i32 || k_f16_hotcold_sidecar) && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(Q->ne[0] == PDMQ_D && V->ne[0] == PDMQ_D && dst->ne[0] == PDMQ_D);
     GGML_ASSERT(Q->ne[1] > 0 && Q->ne[2] % K->ne[2] == 0);
     GGML_ASSERT(ggml_cuda_packed16_dot4_mmq_v_supported(V->type));
 
@@ -1815,7 +2217,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     }();
 
     pdmq_shape shape = shape_auto
-        ? pdmq_select_shape_auto(nq, nk, V->type)
+        ? pdmq_select_shape_auto(nq, nk, n_heads_q, n_heads_k, V->type)
         : (nq >= 16 ? PDMQ_SHAPE_M16N16 : PDMQ_SHAPE_M8N32);
 
     if (const char * env = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_SHAPE")) {
@@ -1823,7 +2225,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     }
 
     pdmq_plan plan = pdmq_make_plan(
-        nq, nk, n_heads_q, n_heads_k, PDMQ_D, V->type, assume_causal, shape,
+        nq, nk, n_heads_q, n_heads_k, PDMQ_D, K->type, V->type, assume_causal, shape,
         ggml_cuda_rocm_packed16_dot4_mmq_gqa_group());
     shape = plan.shape;
 
@@ -1843,9 +2245,19 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
                           shape == PDMQ_SHAPE_M8N32  ? PDMQ_BN_SMALL      : PDMQ_BN_LONGK;
 
     const bool request_gqa2 = (plan.requested_gqa_group == 2);
-    const bool gqa2_supported = request_gqa2 &&
+    const bool request_gqa4 = (plan.requested_gqa_group == 4);
+    const bool gqa2_xqa_supported = request_gqa2 &&
+        (shape == PDMQ_SHAPE_M4N64 || shape == PDMQ_SHAPE_M8N32) &&
+        V->type == GGML_TYPE_Q4_0 &&
+        n_heads_q == 16 && n_heads_k == 4 && gqa_ratio == 4;
+    const bool gqa2_legacy_supported = request_gqa2 &&
         (shape == PDMQ_SHAPE_M16N16 || shape == PDMQ_SHAPE_M8N32) &&
         (gqa_ratio >= 2) && (nq > 1);
+    const bool gqa2_supported = gqa2_xqa_supported || gqa2_legacy_supported;
+    const bool gqa4_supported = request_gqa4 &&
+        (shape == PDMQ_SHAPE_M4N64 || shape == PDMQ_SHAPE_M8N32) &&
+        V->type == GGML_TYPE_Q4_0 &&
+        n_heads_q == 16 && n_heads_k == 4 && gqa_ratio == 4;
     const bool gqa_require = []() {
         const char * v = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQA_REQUIRE");
         return v && atoi(v) != 0;
@@ -1854,16 +2266,31 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         GGML_ABORT("PDMQ GQA2 requested but unsupported: shape=%s nq=%d hq=%d hk=%d gqa_ratio=%d",
                    pdmq_shape_name(shape), nq, n_heads_q, n_heads_k, gqa_ratio);
     }
-    const bool is_gqa2 = request_gqa2 && gqa2_supported;
-    plan.gqa_group = is_gqa2 ? 2 : 1;
+    if (request_gqa4 && !gqa4_supported && gqa_require) {
+        GGML_ABORT("PDMQ GQA4 requested but unsupported: shape=%s nq=%d hq=%d hk=%d gqa_ratio=%d V=%s",
+                   pdmq_shape_name(shape), nq, n_heads_q, n_heads_k, gqa_ratio, ggml_type_name(V->type));
+    }
+    const bool is_gqa2_xqa = request_gqa2 && gqa2_xqa_supported;
+    const bool is_gqa2 = request_gqa2 && gqa2_supported && !is_gqa2_xqa;
+    const bool is_gqa4 = request_gqa4 && gqa4_supported;
+    const int gqax_splitk_requested = ggml_cuda_rocm_packed16_dot4_mmq_gqax_splitk();
+    const bool gqax_splitk_roof_cap = ggml_cuda_rocm_packed16_dot4_mmq_gqax_splitk_roof_cap();
+    const bool gqax_splitk_compact_empty = ggml_cuda_rocm_packed16_dot4_mmq_gqax_splitk_compact_empty();
+    const int gqax_splitk_roof = pdmq_splitk_roof_pow2(nk);
+    const int gqax_splitk_effective = gqax_splitk_roof_cap
+        ? (gqax_splitk_requested < gqax_splitk_roof ? gqax_splitk_requested : gqax_splitk_roof)
+        : gqax_splitk_requested;
+    const int gqax_k_blocks_total_raw = CEIL_DIV(nk, launch_bn);
+    const int gqax_k_blocks_total = gqax_k_blocks_total_raw > 0 ? gqax_k_blocks_total_raw : 1;
+    const int gqax_splitk_active = (gqax_splitk_compact_empty && gqax_splitk_effective > gqax_k_blocks_total)
+        ? gqax_k_blocks_total
+        : gqax_splitk_effective;
+    plan.gqa_group = is_gqa4 ? 4 : ((is_gqa2 || is_gqa2_xqa) ? 2 : 1);
 
     const int groups_per_kv = CEIL_DIV(gqa_ratio, plan.gqa_group);
-    const int grid_y_gqa2  = n_heads_k * groups_per_kv;
+    const int grid_y_grouped = n_heads_k * groups_per_kv;
     const int grid_y_old   = n_heads_q;
 
-    dim3 grid(CEIL_DIV(nq, launch_bm),
-        is_gqa2 ? grid_y_gqa2 : n_heads_q,
-        batch);
     dim3 block(PDMQ_THREADS);
     hipStream_t stream = ctx.stream();
 
@@ -1875,6 +2302,20 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     const bool stage_v = stage_v_requested && !n64_shape;
     const bool raw_lds_q4 = plan.v_path == PDMQ_V_RAW_LDS_Q4;
     const bool directv = !stage_v;
+    const bool gqax_splitk_supported = is_gqa2_xqa && raw_lds_q4 && !kshared;
+    if (gqax_splitk_requested > 1 && !gqax_splitk_supported) {
+        GGML_ABORT("PDMQ GQAX split-K requested but unsupported: split_k=%d variant=%s shape=%s V=%s vpath=%s kshared=%d nq=%d hq=%d hk=%d",
+                   gqax_splitk_requested,
+                   is_gqa4 ? "GQA4" : (is_gqa2_xqa ? "GQA2X" : (is_gqa2 ? "GQA2" : "GQA1")),
+                   pdmq_shape_name(shape), ggml_type_name(V->type), pdmq_v_path_name(plan.v_path), kshared ? 1 : 0,
+                   nq, n_heads_q, n_heads_k);
+    }
+    const bool is_gqa2_xqa_splitk = gqax_splitk_active > 1 && gqax_splitk_supported;
+    plan.split_k = is_gqa2_xqa_splitk;
+    const int grid_z = batch * (is_gqa2_xqa_splitk ? gqax_splitk_active : 1);
+    dim3 grid(CEIL_DIV(nq, launch_bm),
+        (is_gqa2 || is_gqa2_xqa || is_gqa4) ? grid_y_grouped : n_heads_q,
+        grid_z);
 
     if (dp16_trace_enabled()) {
         dp16_problem dp_problem = dp16_problem_init(DP16_OP_FA_QKPV);
@@ -1915,16 +2356,20 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         fprintf(stderr,
             "PDMQ2 route=rocm_packed16_dot4_mmq backend=dot4_packed16_fa variant=%s "
             "shape=%s(%dx%d) vpath=%s gqa_group=%d gqa_request=%d role=%s "
-            "nq=%d nk=%d hq=%d hk=%d gqa_ratio=%d grid_y_old=%d grid_y_new=%d b=%d sc=%g "
-            "K=i32 V=%s packed_rows=%d head_stride=%d causal=%d stage_v=%d raw_lds_q4=%d kshared=%d directv=%d split_k=%d\n",
-            is_gqa2 ? "GQA2" : "GQA1",
+            "nq=%d nk=%d hq=%d hk=%d gqa_ratio=%d grid_y_old=%d grid_y_new=%d effective_grid_y=%d b=%d sc=%g "
+            "K=%s V=%s f16_sidecar=%d packed_rows=%d head_stride=%d causal=%d stage_v=%d raw_lds_q4=%d kshared=%d directv=%d split_k=%d k_block_tokens=%d split_k_requested=%d split_k_effective=%d split_k_compact_empty=%d split_k_roof_cap=%d split_k_roof=%d k_blocks_total=%d\n",
+            is_gqa2_xqa_splitk ? "GQA2X_SPLITK" : (is_gqa4 ? "GQA4" : (is_gqa2_xqa ? "GQA2X" : (is_gqa2 ? "GQA2" : "GQA1"))),
             pdmq_shape_name(plan.shape), launch_bm, launch_bn,
             pdmq_v_path_name(plan.v_path), plan.gqa_group, plan.requested_gqa_group, pdmq_role_name(plan.role),
             nq, nk, n_heads_q, n_heads_k, gqa_ratio,
-            grid_y_old, is_gqa2 ? grid_y_gqa2 : grid_y_old,
+            grid_y_old, (is_gqa2 || is_gqa2_xqa || is_gqa4) ? grid_y_grouped : grid_y_old,
+            ((is_gqa2 || is_gqa2_xqa || is_gqa4) ? grid_y_grouped : grid_y_old) * (is_gqa2_xqa_splitk ? gqax_splitk_active : 1),
             batch, (double) attention_scale,
-            ggml_type_name(V->type), packed_rows, packed_rows / n_heads_k, assume_causal ? 1 : 0,
-            stage_v ? 1 : 0, raw_lds_q4 ? 1 : 0, kshared ? 1 : 0, directv ? 1 : 0, plan.split_k ? 1 : 0);
+            ggml_type_name(K->type), ggml_type_name(V->type), k_f16_hotcold_sidecar ? 1 : 0, packed_rows, packed_rows / n_heads_k, assume_causal ? 1 : 0,
+            stage_v ? 1 : 0, raw_lds_q4 ? 1 : 0, kshared ? 1 : 0, directv ? 1 : 0,
+            is_gqa2_xqa_splitk ? gqax_splitk_active : 0,
+            is_gqa2_xqa_splitk ? CEIL_DIV(nk, gqax_splitk_active) : 0,
+            gqax_splitk_requested, gqax_splitk_effective, gqax_splitk_compact_empty ? 1 : 0, gqax_splitk_roof_cap ? 1 : 0, gqax_splitk_roof, gqax_k_blocks_total);
     }
     if (!once) { once = true;
         if (!pdmq_qk_probe_pass(stream)) GGML_ABORT("PDMQ QK probe failed");
@@ -1970,6 +2415,76 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
         (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
         nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, profile_dev)
+
+#define PDMQ_LAUNCH_GQAX_SHAPE(GROUP_VAL, VT, BM_VAL, BN_VAL, CAUSAL, STAGE_V_VAL, RAW_LDS_Q4_VAL, KSHARED_VAL) \
+    packed16_dot4_mmq_gqax_kernel<VT, BM_VAL, BN_VAL, PDMQ_D, CAUSAL, STAGE_V_VAL, RAW_LDS_Q4_VAL, KSHARED_VAL, GROUP_VAL><<<grid, block, 0, stream>>>( \
+        (const float *) Q->data, (const char *) V->data, (float *) dst->data, nullptr, nullptr, nullptr, \
+        Q->nb[1], Q->nb[2], Q->nb[3], \
+        V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
+        mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+        (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
+        nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, batch, 1, profile_dev)
+
+#define PDMQ_LAUNCH_GQAX_SPLITK_SHAPE(GROUP_VAL, VT, BM_VAL, BN_VAL, CAUSAL, RAW_LDS_Q4_VAL, PM, PL, PO) \
+    packed16_dot4_mmq_gqax_kernel<VT, BM_VAL, BN_VAL, PDMQ_D, CAUSAL, false, RAW_LDS_Q4_VAL, false, GROUP_VAL><<<grid, block, 0, stream>>>( \
+        (const float *) Q->data, (const char *) V->data, (float *) dst->data, PM, PL, PO, \
+        Q->nb[1], Q->nb[2], Q->nb[3], \
+        V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
+        mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+        (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
+        nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, batch, gqax_splitk_active, profile_dev)
+
+#define PDMQ_LAUNCH_GQA4_IMPL(VT, CAUSAL, kshared_var, raw_lds_q4_var) do { \
+    if (raw_lds_q4_var && kshared_var) { \
+        PDMQ_LAUNCH_GQAX_SHAPE(4, VT, PDMQ_BM_LONGK, PDMQ_BN_LONGK, CAUSAL, false, true, true); \
+    } else if (raw_lds_q4_var) { \
+        PDMQ_LAUNCH_GQAX_SHAPE(4, VT, PDMQ_BM_LONGK, PDMQ_BN_LONGK, CAUSAL, false, true, false); \
+    } else if (kshared_var) { \
+        PDMQ_LAUNCH_GQAX_SHAPE(4, VT, PDMQ_BM_LONGK, PDMQ_BN_LONGK, CAUSAL, false, false, true); \
+    } else { \
+        PDMQ_LAUNCH_GQAX_SHAPE(4, VT, PDMQ_BM_LONGK, PDMQ_BN_LONGK, CAUSAL, false, false, false); \
+    } \
+} while (0)
+
+#define PDMQ_LAUNCH_GQA4(VT, CAUSAL, kshared_var, raw_lds_q4_var) do { \
+    if (shape == PDMQ_SHAPE_M4N64) { \
+        PDMQ_LAUNCH_GQA4_IMPL(VT, CAUSAL, kshared_var, raw_lds_q4_var); \
+    } else if (shape == PDMQ_SHAPE_M8N32) { \
+        if (raw_lds_q4_var && kshared_var) { \
+            PDMQ_LAUNCH_GQAX_SHAPE(4, VT, PDMQ_BM_SMALL, PDMQ_BN_SMALL, CAUSAL, false, true, true); \
+        } else if (raw_lds_q4_var) { \
+            PDMQ_LAUNCH_GQAX_SHAPE(4, VT, PDMQ_BM_SMALL, PDMQ_BN_SMALL, CAUSAL, false, true, false); \
+        } else if (kshared_var) { \
+            PDMQ_LAUNCH_GQAX_SHAPE(4, VT, PDMQ_BM_SMALL, PDMQ_BN_SMALL, CAUSAL, false, false, true); \
+        } else { \
+            PDMQ_LAUNCH_GQAX_SHAPE(4, VT, PDMQ_BM_SMALL, PDMQ_BN_SMALL, CAUSAL, false, false, false); \
+        } \
+    } else { \
+        GGML_ABORT("PDMQ GQA4 launch requested for unsupported shape=%s", pdmq_shape_name(shape)); \
+    } \
+} while (0)
+
+#define PDMQ_LAUNCH_GQA2X_IMPL(VT, BM_VAL, BN_VAL, CAUSAL, kshared_var, raw_lds_q4_var) do { \
+    if (raw_lds_q4_var && kshared_var) { \
+        PDMQ_LAUNCH_GQAX_SHAPE(2, VT, BM_VAL, BN_VAL, CAUSAL, false, true, true); \
+    } else if (raw_lds_q4_var) { \
+        PDMQ_LAUNCH_GQAX_SHAPE(2, VT, BM_VAL, BN_VAL, CAUSAL, false, true, false); \
+    } else if (kshared_var) { \
+        PDMQ_LAUNCH_GQAX_SHAPE(2, VT, BM_VAL, BN_VAL, CAUSAL, false, false, true); \
+    } else { \
+        PDMQ_LAUNCH_GQAX_SHAPE(2, VT, BM_VAL, BN_VAL, CAUSAL, false, false, false); \
+    } \
+} while (0)
+
+#define PDMQ_LAUNCH_GQA2X(VT, CAUSAL, kshared_var, raw_lds_q4_var) do { \
+    if (shape == PDMQ_SHAPE_M4N64) { \
+        PDMQ_LAUNCH_GQA2X_IMPL(VT, PDMQ_BM_LONGK, PDMQ_BN_LONGK, CAUSAL, kshared_var, raw_lds_q4_var); \
+    } else if (shape == PDMQ_SHAPE_M8N32) { \
+        PDMQ_LAUNCH_GQA2X_IMPL(VT, PDMQ_BM_SMALL, PDMQ_BN_SMALL, CAUSAL, kshared_var, raw_lds_q4_var); \
+    } else { \
+        GGML_ABORT("PDMQ GQA2X launch requested for unsupported shape=%s", pdmq_shape_name(shape)); \
+    } \
+} while (0)
 
 #define PDMQ_LAUNCH_GQA2_IMPL(VT, BM_VAL, BN_VAL, CAUSAL, kshared_var, directv_var, raw_lds_q4_var) do { \
     if (raw_lds_q4_var && kshared_var) { \
@@ -2055,7 +2570,60 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     } \
 } while (0)
 
-if (is_gqa2) {
+if (is_gqa4) {
+    if (assume_causal) {
+        switch (V->type) {
+            case GGML_TYPE_Q4_0:      PDMQ_LAUNCH_GQA4(PACKED16_DOT4_MMQ_V_Q4_0, true, kshared, raw_lds_q4); break;
+            default: GGML_ABORT("packed16_dot4_mmq gqa4: unsupported V type");
+        }
+    } else {
+        switch (V->type) {
+            case GGML_TYPE_Q4_0:      PDMQ_LAUNCH_GQA4(PACKED16_DOT4_MMQ_V_Q4_0, false, kshared, raw_lds_q4); break;
+            default: GGML_ABORT("packed16_dot4_mmq gqa4: unsupported V type");
+        }
+    }
+} else if (is_gqa2_xqa) {
+    if (is_gqa2_xqa_splitk) {
+        GGML_ASSERT(V->type == GGML_TYPE_Q4_0 && raw_lds_q4 && !kshared);
+        const size_t partial_rows = size_t(gqax_splitk_active) * size_t(batch) * size_t(nq) * size_t(n_heads_q);
+        ggml_cuda_pool & pool = ctx.pool();
+        ggml_cuda_pool_alloc<float> partial_m(pool, partial_rows);
+        ggml_cuda_pool_alloc<float> partial_l(pool, partial_rows);
+        ggml_cuda_pool_alloc<float> partial_out(pool, partial_rows * size_t(PDMQ_D));
+        if (assume_causal) {
+            if (shape == PDMQ_SHAPE_M4N64) {
+                PDMQ_LAUNCH_GQAX_SPLITK_SHAPE(2, PACKED16_DOT4_MMQ_V_Q4_0, PDMQ_BM_LONGK, PDMQ_BN_LONGK, true, true, partial_m.get(), partial_l.get(), partial_out.get());
+            } else if (shape == PDMQ_SHAPE_M8N32) {
+                PDMQ_LAUNCH_GQAX_SPLITK_SHAPE(2, PACKED16_DOT4_MMQ_V_Q4_0, PDMQ_BM_SMALL, PDMQ_BN_SMALL, true, true, partial_m.get(), partial_l.get(), partial_out.get());
+            } else {
+                GGML_ABORT("PDMQ GQA2X split-K launch requested for unsupported shape=%s", pdmq_shape_name(shape));
+            }
+        } else {
+            if (shape == PDMQ_SHAPE_M4N64) {
+                PDMQ_LAUNCH_GQAX_SPLITK_SHAPE(2, PACKED16_DOT4_MMQ_V_Q4_0, PDMQ_BM_LONGK, PDMQ_BN_LONGK, false, true, partial_m.get(), partial_l.get(), partial_out.get());
+            } else if (shape == PDMQ_SHAPE_M8N32) {
+                PDMQ_LAUNCH_GQAX_SPLITK_SHAPE(2, PACKED16_DOT4_MMQ_V_Q4_0, PDMQ_BM_SMALL, PDMQ_BN_SMALL, false, true, partial_m.get(), partial_l.get(), partial_out.get());
+            } else {
+                GGML_ABORT("PDMQ GQA2X split-K launch requested for unsupported shape=%s", pdmq_shape_name(shape));
+            }
+        }
+        const size_t merge_elems = size_t(batch) * size_t(nq) * size_t(n_heads_q) * size_t(PDMQ_D);
+        const int merge_blocks = (int) ((merge_elems + size_t(PDMQ_THREADS) - 1) / size_t(PDMQ_THREADS));
+        packed16_dot4_mmq_gqax_splitk_merge_kernel<<<merge_blocks, PDMQ_THREADS, 0, stream>>>(
+            partial_m.get(), partial_l.get(), partial_out.get(), (float *) dst->data,
+            nq, n_heads_q, batch, gqax_splitk_active);
+    } else if (assume_causal) {
+        switch (V->type) {
+            case GGML_TYPE_Q4_0:      PDMQ_LAUNCH_GQA2X(PACKED16_DOT4_MMQ_V_Q4_0, true, kshared, raw_lds_q4); break;
+            default: GGML_ABORT("packed16_dot4_mmq gqa2x: unsupported V type");
+        }
+    } else {
+        switch (V->type) {
+            case GGML_TYPE_Q4_0:      PDMQ_LAUNCH_GQA2X(PACKED16_DOT4_MMQ_V_Q4_0, false, kshared, raw_lds_q4); break;
+            default: GGML_ABORT("packed16_dot4_mmq gqa2x: unsupported V type");
+        }
+    }
+} else if (is_gqa2) {
     if (assume_causal) {
         switch (V->type) {
             case GGML_TYPE_Q4_0:      PDMQ_LAUNCH_GQA2(PACKED16_DOT4_MMQ_V_Q4_0,      true, kshared, directv, raw_lds_q4); break;
@@ -2103,6 +2671,12 @@ if (is_gqa2) {
 #undef PDMQ_LAUNCH_GQA2
 #undef PDMQ_LAUNCH_GQA2_IMPL
 #undef PDMQ_LAUNCH_GQA2_SHAPE
+#undef PDMQ_LAUNCH_GQA2X
+#undef PDMQ_LAUNCH_GQA2X_IMPL
+#undef PDMQ_LAUNCH_GQA4
+#undef PDMQ_LAUNCH_GQA4_IMPL
+#undef PDMQ_LAUNCH_GQAX_SPLITK_SHAPE
+#undef PDMQ_LAUNCH_GQAX_SHAPE
 #undef PDMQ_LAUNCH_SHAPE
 
     CUDA_CHECK(hipGetLastError());

@@ -2386,6 +2386,7 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
         int64_t mask_ne00, int64_t mask_ne01, int64_t mask_ne03,
         int64_t mask_nb00, int64_t mask_nb01, int64_t mask_nb03,
         const int  * __restrict__ k_payload, const half * __restrict__ k_scales,
+        int k_payload_row_stride_i32, int k_scales_row_stride_half,
         int nq, int nk, int n_heads_q, int n_heads_k, int gqa_ratio,
         int packed_rows,
         float attention_scale,
@@ -2495,7 +2496,7 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
                 const int g = idx - c * (PWMMA_D/4);
                 if (c < valid_k) {
                     const size_t row = k_head_base + size_t(k0) + size_t(c);
-                    k_i32_smem[idx] = k_payload[row * (PWMMA_D/4) + g];
+                    k_i32_smem[idx] = k_payload[row * k_payload_row_stride_i32 + g];
                 } else {
                     k_i32_smem[idx] = 0;
                 }
@@ -2505,7 +2506,7 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
                 const int s = idx - c * (PWMMA_D/QK8_0);
                 if (c < valid_k) {
                     const size_t row = k_head_base + size_t(k0) + size_t(c);
-                    k_s_smem[idx] = k_scales[row * (PWMMA_D/QK8_0) + s];
+                    k_s_smem[idx] = k_scales[row * k_scales_row_stride_half + s];
                 } else {
                     k_s_smem[idx] = __float2half(0.0f);
                 }
@@ -2551,7 +2552,7 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
                                     b_frag[g] = k_i32_smem[k_col * (PWMMA_D/4) + (sd0/4) + g];
                                 } else if (k_col_valid) {
                                     const size_t row = k_head_base + size_t(k0) + size_t(k_col);
-                                    b_frag[g] = k_payload[row * (PWMMA_D/4) + (sd0/4) + g];
+                                    b_frag[g] = k_payload[row * k_payload_row_stride_i32 + (sd0/4) + g];
                                 } else {
                                     b_frag[g] = 0;
                                 }
@@ -2592,7 +2593,7 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
                         if constexpr (K_SHARED) {
                             ks = __half2float(k_s_smem[k_col * (PWMMA_D/QK8_0) + (d0 / QK8_0)]);
                         } else if (k_col_valid) {
-                            ks = __half2float(k_scales[(k_head_base + size_t(k0) + size_t(k_col)) * (PWMMA_D/QK8_0) + (d0 / QK8_0)]);
+                            ks = __half2float(k_scales[(k_head_base + size_t(k0) + size_t(k_col)) * k_scales_row_stride_half + (d0 / QK8_0)]);
                         }
                         #pragma unroll
                         for (int i = 0; i < 8; ++i) {
@@ -2610,7 +2611,7 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
                                 b_frag[g] = k_i32_smem[k_col * (PWMMA_D/4) + (d0/4) + g];
                             } else if (k_col_valid) {
                                 const size_t row = k_head_base + size_t(k0) + size_t(k_col);
-                                b_frag[g] = k_payload[row * (PWMMA_D/4) + (d0/4) + g];
+                                b_frag[g] = k_payload[row * k_payload_row_stride_i32 + (d0/4) + g];
                             } else {
                                 b_frag[g] = 0;
                             }
@@ -2651,7 +2652,7 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
                         if constexpr (K_SHARED) {
                             ks = __half2float(k_s_smem[k_col * (PWMMA_D/QK8_0) + (d0 / QK8_0)]);
                         } else if (k_col_valid) {
-                            ks = __half2float(k_scales[(k_head_base + size_t(k0) + size_t(k_col)) * (PWMMA_D/QK8_0) + (d0 / QK8_0)]);
+                            ks = __half2float(k_scales[(k_head_base + size_t(k0) + size_t(k_col)) * k_scales_row_stride_half + (d0 / QK8_0)]);
                         }
                         #pragma unroll
                         for (int i = 0; i < 8; ++i) {
@@ -3768,8 +3769,12 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
     GGML_ASSERT(packed16_payload->ne[0] == PWMMA_D/4 && packed16_scales->ne[0] == PWMMA_D/QK8_0);
     GGML_ASSERT(packed16_payload->ne[1] >= K->ne[1] * K->ne[2] && packed16_scales->ne[1] >= K->ne[1] * K->ne[2]);
     GGML_ASSERT(packed16_payload->nb[0] == (int64_t)sizeof(int) && packed16_scales->nb[0] == (int64_t)sizeof(half));
-    GGML_ASSERT(packed16_payload->nb[1] == (PWMMA_D/4)*(int64_t)sizeof(int));
-    GGML_ASSERT(packed16_scales->nb[1] == (PWMMA_D/QK8_0)*(int64_t)sizeof(half));
+    GGML_ASSERT(packed16_payload->nb[1] >= (PWMMA_D/4)*(int64_t)sizeof(int));
+    GGML_ASSERT(packed16_scales->nb[1] >= (PWMMA_D/QK8_0)*(int64_t)sizeof(half));
+    GGML_ASSERT((packed16_payload->nb[1] % (int64_t)sizeof(int)) == 0);
+    GGML_ASSERT((packed16_scales->nb[1] % (int64_t)sizeof(half)) == 0);
+    const int k_payload_row_stride_i32 = (int)(packed16_payload->nb[1] / (int64_t)sizeof(int));
+    const int k_scales_row_stride_half = (int)(packed16_scales->nb[1] / (int64_t)sizeof(half));
     // Assert compact head/batch layout (required for k_head_base arithmetic)
     GGML_ASSERT(packed16_payload->nb[2] == packed16_payload->ne[1] * packed16_payload->nb[1]);
     GGML_ASSERT(packed16_scales->nb[2]  == packed16_scales->ne[1]  * packed16_scales->nb[1]);
@@ -3915,13 +3920,14 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
 
     { static bool once = false; if (!once) { once = true;
         fprintf(stderr, "PWMMA v0.6 variant=%s BM=%d GQA_GROUP=%d IMPL=%s Q4fix=%d nq=%d nk=%d hq=%d hk=%d b=%d sc=%g "
-                "gqa_ratio=%d grid_y_old=%d grid_y_new=%d payload_ne1=%lld payload_ne2=%lld packed_kv_size=%d head_stride=%d\n",
+                "gqa_ratio=%d grid_y_old=%d grid_y_new=%d payload_ne1=%lld payload_ne2=%lld packed_kv_size=%d head_stride=%d payload_stride_i32=%d scales_stride_half=%d\n",
                 is_gqa2 ? "BM16_GQA2" : (is_bm64 ? "BM64_X4" : (is_bm32 ? "BM32_2W" : "BM16_1W")), bm, gqa_group,
                 impl_name,
                 PWMMA_Q4_LAYOUT_FIXED, nq, nk, n_heads_q, n_heads_k, batch, (double)attention_scale,
                 gqa_ratio, grid_y_old, is_gqa2 ? grid_y_gqa2 : grid_y_old,
                 (long long)packed16_payload->ne[1], (long long)packed16_payload->ne[2],
-                packed_kv_size, packed_kv_size / n_heads_k);
+                packed_kv_size, packed_kv_size / n_heads_k,
+                k_payload_row_stride_i32, k_scales_row_stride_half);
         // Dump packed16 via device kernel (host can't deref device ptrs)
         if (getenv("GGML_CUDA_PWMMA_DUMP_PACKED16")) {
             pwmma_packed16_dump_kernel<<<1, 1, 0, stream>>>(
@@ -4113,7 +4119,7 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
         Q->nb[1], Q->nb[2], Q->nb[3], V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
         v_layout, \
         mask ? (const char*)mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
-        k_payload, k_scales, \
+        k_payload, k_scales, k_payload_row_stride_i32, k_scales_row_stride_half, \
         nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_kv_size, attention_scale, \
         d_skip_counter, causal_skip_active, d_live_shadow_err, profile_dev)
             switch (V->type) {

@@ -56,6 +56,17 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * s,
                         int   il);
 
+    // fused op state-only view (same numerical state path as build_delta_net_fused;
+    // backends may skip writing the attention/output prefix).
+    ggml_tensor * build_delta_net_fused_state_only(
+                ggml_tensor * q,
+                ggml_tensor * k,
+                ggml_tensor * v,
+                ggml_tensor * g,
+                ggml_tensor * b,
+                ggml_tensor * s,
+                        int   il);
+
     // fused op with keep_intermediates=true: returns the raw [attn | T snapshots]
     // output tensor. Caller slices snapshot views and routes them to recurrent slots.
     ggml_tensor * build_delta_net_fused_keep_intermediates(
@@ -1789,6 +1800,88 @@ struct llama_model_qwen35 : public llama_model_base {
         const llama_model & model;
     };
 
+    struct graph_prefix_verify : public llm_build_delta_net_base {
+        graph_prefix_verify(const llama_model & model, const llm_graph_params & params);
+
+    private:
+        ggml_tensor * build_layer_attn_prefix_row(
+                llm_graph_input_attn_kv * inp_attn,
+                ggml_tensor *             cur,
+                ggml_tensor *             inp_pos_row,
+                int *                     sections,
+                int                       il,
+                int64_t                   row);
+
+        ggml_tensor * build_attn_prefix_row(
+                llm_graph_input_attn_kv * inp_attn,
+                ggml_tensor *             q_cur,
+                ggml_tensor *             k_cur,
+                ggml_tensor *             v_cur,
+                float                     kq_scale,
+                int                       il,
+                int64_t                   row);
+
+        ggml_tensor * build_layer_attn_linear_prefix_row(
+                llm_graph_input_rs * inp,
+                ggml_tensor *        cur,
+                ggml_tensor *&       conv_state,
+                ggml_tensor *&       ssm_state,
+                int                  il,
+                int64_t              row,
+                int64_t              n_prefix,
+                bool                 snapshot_selected_only,
+                int64_t              snapshot_slot_limit,
+                int64_t              snapshot_slot_override);
+
+        ggml_tensor * build_layer_ffn(
+                ggml_tensor * cur,
+                int           il);
+
+        ggml_tensor * build_layer_ffn_stage41(
+                ggml_tensor * cur,
+                int           il);
+
+        ggml_tensor * build_moe_ffn_stage41(
+                ggml_tensor * cur,
+                int           il);
+
+        void trace_prefix_hidden_rows(
+                ggml_tensor * cur,
+                const char *  stem,
+                int           il);
+
+        ggml_tensor * build_norm_gated(
+                ggml_tensor * input,
+                ggml_tensor * weights,
+                ggml_tensor * gate,
+                int           layer);
+
+        void copy_prefix_snapshot(
+                llm_graph_input_rs * inp,
+                ggml_tensor *        snapshot,
+                ggml_tensor *        states_all,
+                int64_t              state_size,
+                int                  il,
+                int64_t              row,
+                int64_t              n_prefix,
+                const char *         name,
+                int64_t              slot_override = -1);
+
+        void copy_prefix_conv_reconstruct_snapshot_direct(
+                llm_graph_input_rs * inp,
+                ggml_tensor *        conv_state,
+                ggml_tensor *        qkv_mixed,
+                ggml_tensor *        conv_states_all,
+                int64_t              conv_kernel_size,
+                int64_t              conv_channels,
+                int                  il,
+                int64_t              row,
+                int64_t              n_prefix,
+                int64_t              slot_override = -1);
+
+        const llama_model & model;
+    };
+
     struct graph_mtp : public llm_graph_context {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
@@ -1837,6 +1930,93 @@ struct llama_model_qwen35moe : public llama_model_base {
 
     struct graph_mtp : public llm_graph_context {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
+    };
+
+    struct graph_prefix_verify : public llm_build_delta_net_base {
+        graph_prefix_verify(const llama_model & model, const llm_graph_params & params);
+
+    private:
+        ggml_tensor * build_layer_attn_prefix_row(
+                llm_graph_input_attn_kv * inp_attn,
+                ggml_tensor *             cur,
+                ggml_tensor *             inp_pos_row,
+                int *                     sections,
+                int                       il,
+                int64_t                   row);
+
+        ggml_tensor * build_attn_prefix_row(
+                llm_graph_input_attn_kv * inp_attn,
+                ggml_tensor *             q_cur,
+                ggml_tensor *             k_cur,
+                ggml_tensor *             v_cur,
+                float                     kq_scale,
+                int                       il,
+                int64_t                   row);
+
+        ggml_tensor * build_layer_attn_linear_prefix_row(
+                llm_graph_input_rs * inp,
+                ggml_tensor *        cur,
+                ggml_tensor *&       conv_state,
+                ggml_tensor *&       ssm_state,
+                int                  il,
+                int64_t              row,
+                int64_t              n_prefix,
+                bool                 snapshot_selected_only,
+                int64_t              snapshot_slot_limit,
+                int64_t              snapshot_slot_override);
+
+        ggml_tensor * build_layer_ffn(
+                ggml_tensor * cur,
+                int           il);
+
+        ggml_tensor * build_layer_ffn_stage41(
+                ggml_tensor * cur,
+                int           il);
+
+        ggml_tensor * build_moe_ffn_stage41(
+                ggml_tensor * cur,
+                int           il);
+
+        void trace_prefix_hidden_rows(
+                ggml_tensor * cur,
+                const char *  stem,
+                int           il);
+
+        void trace_prefix_hidden_token_rows(
+                ggml_tensor * cur,
+                const char *  stem,
+                int           il);
+
+        ggml_tensor * build_norm_gated(
+                ggml_tensor * input,
+                ggml_tensor * weights,
+                ggml_tensor * gate,
+                int           layer);
+
+        void copy_prefix_snapshot(
+                llm_graph_input_rs * inp,
+                ggml_tensor *        snapshot,
+                ggml_tensor *        states_all,
+                int64_t              state_size,
+                int                  il,
+                int64_t              row,
+                int64_t              n_prefix,
+                const char *         name,
+                int64_t              slot_override = -1);
+
+        void copy_prefix_conv_reconstruct_snapshot_direct(
+                llm_graph_input_rs * inp,
+                ggml_tensor *        conv_state,
+                ggml_tensor *        qkv_mixed,
+                ggml_tensor *        conv_states_all,
+                int64_t              conv_kernel_size,
+                int64_t              conv_channels,
+                int                  il,
+                int64_t              row,
+                int64_t              n_prefix,
+                int64_t              slot_override = -1);
+
+        const llama_model & model;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

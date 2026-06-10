@@ -94,6 +94,23 @@ LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * m
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
+// Commit a pending bounded recurrent-state rollback row into the live recurrent tail row.
+// Returns false when the memory object has no recurrent component or the pending row is invalid.
+// This is a staging helper for exact prefix-verifier commit paths; ordinary seq_rm behavior is unchanged.
+LLAMA_API bool llama_memory_recurrent_commit_pending_rs_rollback(llama_memory_t mem, llama_seq_id seq_id);
+LLAMA_API bool llama_context_recurrent_commit_pending_rs_rollback(struct llama_context * ctx, llama_seq_id seq_id);
+LLAMA_API bool llama_memory_recurrent_set_pending_rs_rollback(llama_memory_t mem, llama_seq_id seq_id, uint32_t idx);
+LLAMA_API bool llama_context_recurrent_set_pending_rs_rollback(struct llama_context * ctx, llama_seq_id seq_id, uint32_t idx);
+
+// Decode through the reserved exact prefix-verifier graph type. This is fail-closed
+// until a model implements LLM_GRAPH_TYPE_DECODER_PREFIX_VERIFY.
+LLAMA_API int32_t llama_decode_prefix_verify(struct llama_context * ctx, struct llama_batch batch);
+
+// Decode accepted prefix rows for post-sampler recurrent-state commit reconstruction.
+// The graph is logits-free and copies only its final row into dst_slot, after which
+// callers can set/commit the pending recurrent rollback row.
+LLAMA_API int32_t llama_decode_prefix_commit(struct llama_context * ctx, struct llama_batch batch, uint32_t dst_slot);
+
 //
 // pre-norm embeddings (hidden state before the final output norm)
 //
@@ -107,6 +124,10 @@ LLAMA_API void llama_set_mtp_source(struct llama_context * ctx, struct llama_con
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_pre_norm    (struct llama_context * ctx);
+
+// Return the raw model logits row, bypassing backend-sampler sampled-logit fallback in llama_get_logits_ith().
+// Intended for exactness/debug verification paths that need the full result_output row.
+LLAMA_API float * llama_get_logits_raw_ith(struct llama_context * ctx, int32_t i);
 
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_pre_norm_ith(struct llama_context * ctx, int32_t i);

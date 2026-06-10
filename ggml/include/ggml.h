@@ -559,6 +559,16 @@ extern "C" {
         GGML_OP_TIMESTEP_EMBEDDING,
         GGML_OP_ARGSORT,
         GGML_OP_TOP_K,
+        GGML_OP_LM_HEAD_TOP_K,
+        GGML_OP_ROUTER_TOPK_WEIGHTS,
+        GGML_OP_MOE_ROUTED_LANES,
+        GGML_OP_MOE_ROUTED_LANES_ROW_SLOT_MAP,
+        GGML_OP_MOE_ROUTED_LANES_EXPERT_BOUNDS,
+        GGML_OP_MOE_ROUTED_LANES_PROJECTION,
+        GGML_OP_MOE_ROUTED_LANES_PACK_SLOTS,
+        GGML_OP_MOE_ROUTED_LANES_UNPACK_SLOTS,
+        GGML_OP_MOE_ROUTED_LANES_GATHER,
+        GGML_OP_MOE_ROUTED_LANES_SCATTER_REDUCE,
         GGML_OP_LEAKY_RELU,
         GGML_OP_TRI,
         GGML_OP_FILL,
@@ -2399,6 +2409,109 @@ extern "C" {
             struct ggml_tensor  * a,
             int                   k);
 
+    // exact LM-head top-k over rows of weight matrix a and hidden rows b
+    // a: [n_embd, n_vocab], b: [n_embd, n_rows], result: token ids [k, n_rows]
+    GGML_API struct ggml_tensor * ggml_lm_head_top_k(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            int                   k);
+
+    // Qwen35MoE verifier helper: fused row-local router top-k/weights payload.
+    // logits: [n_expert, n_rows]; result F32: [2*k, n_rows].
+    // result[0:k, row] stores selected expert ids as exactly-representable F32;
+    // result[k:2*k, row] stores normalized/scaled expert weights.
+    GGML_API struct ggml_tensor * ggml_router_topk_weights(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            int                   k,
+            int                   n_expert_groups,
+            int                   n_group_used,
+            float                 expert_weights_scale);
+
+    // Diagnostic MoE routed-lane metadata builder.
+    // selected_experts: [n_expert_used, n_rows] I32
+    // routing_weights:  [1, n_expert_used, n_rows] F32
+    // result: [4, n_expert_used*n_rows + n_expert] I32
+    // lane rows 0..n_lanes-1: [expert, row, slot, row*n_expert_used + slot]
+    // expert rows n_lanes+e:  [expert_start, expert_count, e, 0]
+    GGML_API struct ggml_tensor * ggml_moe_routed_lanes(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * selected_experts,
+            struct ggml_tensor  * routing_weights,
+            int                   n_expert);
+
+    // Diagnostic row/slot -> compact-lane lookup over ggml_moe_routed_lanes metadata.
+    // routing_weights: [1, n_expert_used, n_rows] F32
+    // lanes:           [4, n_lanes + n_expert] I32
+    // result:          [n_expert_used, n_rows] I32, where result[slot,row] = lane
+    GGML_API struct ggml_tensor * ggml_moe_routed_lanes_row_slot_map(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * routing_weights,
+            struct ggml_tensor  * lanes);
+
+    // Diagnostic expert segment bounds over ggml_moe_routed_lanes metadata.
+    // lanes:  [4, n_lanes + n_expert] I32
+    // result: [2, n_expert] I32, where result[0,e] = expert_start and result[1,e] = expert_count
+    GGML_API struct ggml_tensor * ggml_moe_routed_lanes_expert_bounds(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * lanes);
+
+    // Diagnostic compact selected projection over explicit expert segment bounds.
+    // weights:       [n_in, n_out, n_expert] F32, Q8_0, IQ4_XS, or IQ3_S
+    // compact_x:     [n_in, n_lanes] F32
+    // lanes:         [4, n_lanes + n_expert] I32
+    // expert_bounds: [2, n_expert] I32
+    // result:        [n_out, n_lanes] F32
+    // Quantized weights are currently diagnostic/shadow support only; they are not
+    // a production MoE replacement path and require backend-specific exactness gates.
+    // Quantized CUDA/HIP support requires compact_x to have unit F32 stride on ne[0]
+    // and a lane stride aligned for vectorized Q8_1 activation quantization.
+    GGML_API struct ggml_tensor * ggml_moe_routed_lanes_projection(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * compact_x,
+            struct ggml_tensor  * lanes,
+            struct ggml_tensor  * expert_bounds);
+
+    // Diagnostic pack from original slot-major layout to compact lane order.
+    // slot_x:          [n_in, n_expert_used, n_rows] F32
+    // row_slot_to_lane: [n_expert_used, n_rows] I32
+    // result:          [n_in, n_lanes] F32, where result[:, lane] = slot_x[:, slot, row]
+    GGML_API struct ggml_tensor * ggml_moe_routed_lanes_pack_slots(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * slot_x,
+            struct ggml_tensor  * row_slot_to_lane);
+
+    // Diagnostic unpack from compact lane order back to original slot-major layout.
+    // compact_x:       [n_out, n_lanes] F32
+    // row_slot_to_lane: [n_expert_used, n_rows] I32
+    // result:          [n_out, n_expert_used, n_rows] F32
+    GGML_API struct ggml_tensor * ggml_moe_routed_lanes_unpack_slots(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * compact_x,
+            struct ggml_tensor  * row_slot_to_lane);
+
+    // Diagnostic gather over ggml_moe_routed_lanes metadata.
+    // x:      [n_embd, n_rows] F32
+    // lanes:  [4, n_lanes + n_expert] I32
+    // result: [n_embd, n_lanes] F32, where result[:, lane] = x[:, lane_row]
+    GGML_API struct ggml_tensor * ggml_moe_routed_lanes_gather(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * lanes);
+
+    // Diagnostic weighted scatter/reduce over ggml_moe_routed_lanes metadata.
+    // compact_x:       [n_embd, n_lanes] F32
+    // routing_weights: [1, n_expert_used, n_rows] F32
+    // lanes:           [4, n_lanes + n_expert] I32
+    // result:          [n_embd, n_rows] F32, accumulated in original row/slot order
+    GGML_API struct ggml_tensor * ggml_moe_routed_lanes_scatter_reduce(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * compact_x,
+            struct ggml_tensor  * routing_weights,
+            struct ggml_tensor  * lanes);
+
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,
             float                 start,
@@ -2593,6 +2706,20 @@ extern "C" {
     //   K  > 1: output carries K snapshot slots; the kernel writes the last min(n_tokens, K)
     //   per-token snapshots into the trailing slots
     GGML_API struct ggml_tensor * ggml_gated_delta_net(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            bool                  keep_intermediates);
+
+    // Same output layout as ggml_gated_delta_net, but backends may skip writing
+    // the attention/output prefix when callers only consume the final state.
+    // Experimental contract: keep_intermediates must be false and state must have
+    // exactly one snapshot slot (state->ne[1] == 1).
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_state_only(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
             struct ggml_tensor  * k,

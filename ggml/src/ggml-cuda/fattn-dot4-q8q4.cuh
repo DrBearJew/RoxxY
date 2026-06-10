@@ -95,9 +95,10 @@ static inline bool ggml_cuda_q8q4_dot4_prefill_supported(const int cc, const ggm
 
 static inline bool ggml_cuda_q8tbq4_dot4_prefill_enabled() {
 #ifdef GGML_USE_HIP
-    // Default-enabled. Explicitly disabled by EXPERIMENTAL_UNSAFE=0 or Q8TBQ4_DOT4_PREFILL=0.
+    // Experimental/lab-only: require explicit opt-in so q8_0/tbq4_0 keeps the
+    // daily-compatible VEC prompt route unless this DOT4 prefill is requested.
     const char * v = getenv("GGML_CUDA_ROCM_Q8TBQ4_DOT4_PREFILL");
-    return ggml_cuda_dot4_prefill_unsafe_enabled() && !(v && atoi(v) == 0);
+    return ggml_cuda_dot4_prefill_unsafe_enabled() && v && atoi(v) != 0;
 #else
     return false;
 #endif

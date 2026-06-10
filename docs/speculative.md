@@ -133,7 +133,7 @@ If a draft model is combined with a draftless decoding the draftless decoding ha
                                         speculative decoding split probability (default: 0.10)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT)
 --spec-draft-p-min, --draft-p-min       P
-                                        minimum speculative decoding probability (greedy) (default: 0.75)
+                                        minimum speculative decoding probability (greedy) (default: 0.00)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_MIN)
 --spec-draft-ctx-size, -cd, --ctx-size-draft  N
                                         size of the prompt context for the draft model (default: 0, 0 = loaded from model)

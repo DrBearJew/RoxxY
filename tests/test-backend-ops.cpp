@@ -5681,6 +5681,2317 @@ struct test_topk_moe : public test_case {
     }
 };
 
+struct test_moe_routed_lanes : public test_case {
+    ggml_tensor * selected_experts {};
+    ggml_tensor * routing_weights {};
+
+    static constexpr int n_expert = 6;
+    static constexpr int n_slots  = 3;
+    static constexpr int n_rows   = 3;
+
+    std::string vars() override {
+        return "n_expert=6,n_slots=3,n_rows=3";
+    }
+
+    double max_err() override {
+        return 0.0;
+    }
+
+    std::vector<float> expected_output() const {
+        return {
+            // compact lanes, sorted by expert, stable by row then slot
+            0, 0, 1, 1,
+            0, 1, 2, 5,
+            1, 1, 0, 3,
+            1, 2, 2, 8,
+            2, 0, 0, 0,
+            2, 0, 2, 2,
+            2, 2, 1, 7,
+            3, 2, 0, 6,
+            4, 1, 1, 4,
+            // per-expert footers: [expert_start, expert_count, expert_id, 0]
+            0, 2, 0, 0,
+            2, 2, 1, 0,
+            4, 3, 2, 0,
+            7, 1, 3, 0,
+            8, 1, 4, 0,
+            9, 0, 5, 0,
+        };
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double diff = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            if (a[i] != b[i]) {
+                diff += 1.0 + std::fabs(a[i] - b[i]);
+            }
+        }
+
+        const std::vector<float> expected = expected_output();
+        if (n == expected.size()) {
+            for (size_t i = 0; i < n; ++i) {
+                if (a[i] != expected[i]) {
+                    diff += 1.0 + std::fabs(a[i] - expected[i]);
+                }
+                if (b[i] != expected[i]) {
+                    diff += 1.0 + std::fabs(b[i] - expected[i]);
+                }
+            }
+        }
+        return diff;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        selected_experts = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_slots, n_rows);
+        ggml_set_name(selected_experts, "selected_experts");
+
+        routing_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_slots, n_rows);
+        ggml_set_name(routing_weights, "routing_weights");
+
+        ggml_tensor * out = ggml_moe_routed_lanes(ctx, selected_experts, routing_weights, n_expert);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t == selected_experts) {
+                // selected_experts[slot, row]
+                const std::vector<int32_t> data = {
+                    2, 0, 2,
+                    1, 4, 0,
+                    3, 2, 1,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else if (t == routing_weights) {
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = 0.125f * (float) (i + 1);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_F32) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t), 0);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            }
+        }
+    }
+};
+
+struct test_moe_routed_lanes_row_slot_map : public test_case {
+    ggml_tensor * selected_experts {};
+    ggml_tensor * routing_weights {};
+
+    static constexpr int n_expert = 6;
+    static constexpr int n_slots  = 3;
+    static constexpr int n_rows   = 3;
+
+    std::string vars() override {
+        return "n_expert=6,n_slots=3,n_rows=3";
+    }
+
+    double max_err() override {
+        return 0.0;
+    }
+
+    std::vector<float> expected_metadata() const {
+        return test_moe_routed_lanes().expected_output();
+    }
+
+    std::vector<float> expected_map() const {
+        // row-major tensor_to_float order over result[slot,row]
+        return {
+            4, 0, 5,
+            2, 8, 1,
+            7, 6, 3,
+        };
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double diff = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            if (a[i] != b[i]) {
+                diff += 1.0 + std::fabs(a[i] - b[i]);
+            }
+        }
+
+        const std::vector<float> metadata = expected_metadata();
+        const std::vector<float> map      = expected_map();
+        const std::vector<float> * expected = nullptr;
+        if (n == metadata.size()) {
+            expected = &metadata;
+        } else if (n == map.size()) {
+            expected = &map;
+        }
+        if (expected) {
+            for (size_t i = 0; i < n; ++i) {
+                if (a[i] != (*expected)[i]) {
+                    diff += 1.0 + std::fabs(a[i] - (*expected)[i]);
+                }
+                if (b[i] != (*expected)[i]) {
+                    diff += 1.0 + std::fabs(b[i] - (*expected)[i]);
+                }
+            }
+        }
+        return diff;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        selected_experts = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_slots, n_rows);
+        ggml_set_name(selected_experts, "selected_experts");
+
+        routing_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_slots, n_rows);
+        ggml_set_name(routing_weights, "routing_weights");
+
+        ggml_tensor * lanes = ggml_moe_routed_lanes(ctx, selected_experts, routing_weights, n_expert);
+        ggml_set_name(lanes, "lanes");
+
+        ggml_tensor * out = ggml_moe_routed_lanes_row_slot_map(ctx, routing_weights, lanes);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t == selected_experts) {
+                const std::vector<int32_t> data = {
+                    2, 0, 2,
+                    1, 4, 0,
+                    3, 2, 1,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else if (t == routing_weights) {
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = 0.125f * (float) (i + 1);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_F32) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t), 0);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            }
+        }
+    }
+};
+
+struct test_moe_routed_lanes_expert_bounds : public test_case {
+    ggml_tensor * selected_experts {};
+    ggml_tensor * routing_weights {};
+
+    static constexpr int n_expert = 6;
+    static constexpr int n_slots  = 3;
+    static constexpr int n_rows   = 3;
+
+    std::string vars() override {
+        return "n_expert=6,n_slots=3,n_rows=3";
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_ROUTED_LANES_EXPERT_BOUNDS";
+    }
+
+    double max_err() override {
+        return 0.0;
+    }
+
+    std::vector<float> expected_bounds() const {
+        // result[start/count, expert]
+        return {
+            0, 2,
+            2, 2,
+            4, 3,
+            7, 1,
+            8, 1,
+            9, 0,
+        };
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double diff = 0.0;
+        const std::vector<float> expected = expected_bounds();
+        for (size_t i = 0; i < n; ++i) {
+            if (a[i] != b[i]) {
+                diff += 1.0 + std::fabs(a[i] - b[i]);
+            }
+            if (n == expected.size()) {
+                if (a[i] != expected[i]) {
+                    diff += 1.0 + std::fabs(a[i] - expected[i]);
+                }
+                if (b[i] != expected[i]) {
+                    diff += 1.0 + std::fabs(b[i] - expected[i]);
+                }
+            }
+        }
+        return diff;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        selected_experts = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_slots, n_rows);
+        ggml_set_name(selected_experts, "selected_experts");
+
+        routing_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_slots, n_rows);
+        ggml_set_name(routing_weights, "routing_weights");
+
+        ggml_tensor * lanes = ggml_moe_routed_lanes(ctx, selected_experts, routing_weights, n_expert);
+        ggml_set_name(lanes, "lanes");
+
+        ggml_tensor * out = ggml_moe_routed_lanes_expert_bounds(ctx, lanes);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t == selected_experts) {
+                const std::vector<int32_t> data = {
+                    2, 0, 2,
+                    1, 4, 0,
+                    3, 2, 1,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else if (t == routing_weights) {
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = 0.125f * (float) (i + 1);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_F32) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t), 0);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            }
+        }
+    }
+};
+
+struct test_moe_routed_lanes_projection_shadow : public test_case {
+    ggml_tensor * as {};
+    ggml_tensor * x {};
+    ggml_tensor * selected_experts {};
+    ggml_tensor * routing_weights {};
+
+    static constexpr int n_expert = 4;
+    static constexpr int n_slots  = 3;
+    static constexpr int n_rows   = 2;
+    static constexpr int n_in     = 4;
+    static constexpr int n_out    = 2;
+
+    std::string vars() override {
+        return "n_expert=4,n_slots=3,n_rows=2,n_in=4,n_out=2";
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_ROUTED_LANES_PROJECTION_SHADOW";
+    }
+
+    double max_err() override {
+        return 0.0;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double diff = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            if (a[i] != b[i]) {
+                diff += 1.0 + std::fabs(a[i] - b[i]);
+            }
+            if (a[i] != 0.0f) {
+                diff += 1.0 + std::fabs(a[i]);
+            }
+            if (b[i] != 0.0f) {
+                diff += 1.0 + std::fabs(b[i]);
+            }
+        }
+        return diff;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        as = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_in, n_out, n_expert);
+        ggml_set_name(as, "as");
+
+        x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_in, n_rows);
+        ggml_set_name(x, "x");
+
+        selected_experts = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_slots, n_rows);
+        ggml_set_name(selected_experts, "selected_experts");
+
+        routing_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_slots, n_rows);
+        ggml_set_name(routing_weights, "routing_weights");
+
+        ggml_tensor * lanes = ggml_moe_routed_lanes(ctx, selected_experts, routing_weights, n_expert);
+        ggml_set_name(lanes, "lanes");
+        ggml_tensor * bounds = ggml_moe_routed_lanes_expert_bounds(ctx, lanes);
+        ggml_set_name(bounds, "bounds");
+        ggml_tensor * compact_x = ggml_moe_routed_lanes_gather(ctx, x, lanes);
+        ggml_set_name(compact_x, "compact_x");
+
+        ggml_tensor * compact_x_3d = ggml_reshape_3d(ctx, compact_x, n_in, 1, n_slots*n_rows);
+        ggml_tensor * lane_experts = ggml_view_2d(ctx, lanes, 1, n_slots*n_rows, lanes->nb[1], 0);
+        ggml_set_name(lane_experts, "lane_experts");
+        ggml_tensor * ref = ggml_mul_mat_id(ctx, as, compact_x_3d, lane_experts);
+        ggml_set_name(ref, "ref_compact_projection");
+        ref = ggml_reshape_2d(ctx, ref, n_out, n_slots*n_rows);
+        ggml_set_name(ref, "ref_compact_projection_2d");
+
+        ggml_tensor * shadow = ggml_moe_routed_lanes_projection(ctx, as, compact_x, lanes, bounds);
+        ggml_set_name(shadow, "shadow_bounds_projection");
+
+        ggml_tensor * diff = ggml_sub(ctx, shadow, ref);
+        ggml_set_name(diff, "shadow_minus_ref");
+        return diff;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t == as) {
+                const std::vector<float> data = {
+                    // expert 0
+                    1.0f,  0.0f,  0.5f,  0.25f,
+                    0.0f,  1.0f, -0.5f,  0.75f,
+                    // expert 1
+                    2.0f, -1.0f,  0.0f,  0.5f,
+                    0.5f,  0.5f,  1.0f, -0.25f,
+                    // expert 2
+                   -1.0f,  0.25f, 0.75f, 1.0f,
+                    1.5f, -0.5f,  0.25f, 0.0f,
+                    // expert 3
+                    0.25f, 0.5f,  1.0f, -1.0f,
+                   -1.0f,  2.0f,  0.0f,  0.5f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t == x) {
+                const std::vector<float> data = {
+                    1.0f, 2.0f, 3.0f, 4.0f,
+                    5.0f, 6.0f, 7.0f, 8.0f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t == selected_experts) {
+                const std::vector<int32_t> data = {
+                    2, 0, 2,
+                    1, 3, 0,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else if (t == routing_weights) {
+                const std::vector<float> data = {
+                    0.25f, 0.5f, 0.75f,
+                    1.0f, 0.125f, 0.625f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_F32) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t), 0);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            }
+        }
+    }
+};
+
+struct test_moe_routed_lanes_q8_0_projection_shadow : public test_case {
+    ggml_tensor * as {};
+    ggml_tensor * x {};
+    ggml_tensor * selected_experts {};
+    ggml_tensor * routing_weights {};
+
+    static constexpr int n_expert = 5;
+    static constexpr int n_slots  = 4;
+    static constexpr int n_rows   = 2;
+    static constexpr int n_in     = 32;
+    static constexpr int n_out    = 8;
+
+    std::string vars() override {
+        return "type_w=Q8_0,n_expert=5,n_slots=4,n_rows=2,n_in=32,n_out=8";
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_ROUTED_LANES_Q8_0_PROJECTION_SHADOW";
+    }
+
+    double max_err() override {
+        return 1e-5;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double worst = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            worst = std::max(worst, (double) std::fabs(a[i]));
+            worst = std::max(worst, (double) std::fabs(b[i]));
+            worst = std::max(worst, (double) std::fabs(a[i] - b[i]));
+        }
+        return worst;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        as = ggml_new_tensor_3d(ctx, GGML_TYPE_Q8_0, n_in, n_out, n_expert);
+        ggml_set_name(as, "as_q8_0");
+
+        x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_in, n_rows);
+        ggml_set_name(x, "x");
+
+        selected_experts = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_slots, n_rows);
+        ggml_set_name(selected_experts, "selected_experts");
+
+        routing_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_slots, n_rows);
+        ggml_set_name(routing_weights, "routing_weights");
+
+        ggml_tensor * lanes = ggml_moe_routed_lanes(ctx, selected_experts, routing_weights, n_expert);
+        ggml_set_name(lanes, "lanes");
+        ggml_tensor * bounds = ggml_moe_routed_lanes_expert_bounds(ctx, lanes);
+        ggml_set_name(bounds, "bounds");
+        ggml_tensor * compact_x = ggml_moe_routed_lanes_gather(ctx, x, lanes);
+        ggml_set_name(compact_x, "compact_x");
+
+        ggml_tensor * compact_x_3d = ggml_reshape_3d(ctx, compact_x, n_in, 1, n_slots*n_rows);
+        ggml_tensor * lane_experts = ggml_view_2d(ctx, lanes, 1, n_slots*n_rows, lanes->nb[1], 0);
+        ggml_set_name(lane_experts, "lane_experts");
+        ggml_tensor * ref = ggml_mul_mat_id(ctx, as, compact_x_3d, lane_experts);
+        ggml_set_name(ref, "ref_q8_0_compact_projection");
+        ref = ggml_reshape_2d(ctx, ref, n_out, n_slots*n_rows);
+        ggml_set_name(ref, "ref_q8_0_compact_projection_2d");
+
+        ggml_tensor * shadow = ggml_moe_routed_lanes_projection(ctx, as, compact_x, lanes, bounds);
+        ggml_set_name(shadow, "shadow_q8_0_bounds_projection");
+
+        ggml_tensor * diff = ggml_sub(ctx, shadow, ref);
+        ggml_set_name(diff, "shadow_q8_0_minus_ref");
+        return diff;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t == as) {
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = 0.03125f * (float) ((int) ((i*13 + 7) % 17) - 8);
+                }
+                std::vector<uint8_t> dataq(ggml_row_size(t->type, ggml_nelements(t)));
+                const size_t blck_size = ggml_blck_size(t->type);
+                GGML_ASSERT(data.size() % blck_size == 0);
+                ggml_quantize_chunk(t->type, data.data(), dataq.data(), 0, data.size()/blck_size, blck_size, nullptr);
+                ggml_backend_tensor_set(t, dataq.data(), 0, dataq.size());
+            } else if (t == x) {
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = 0.015625f * (float) ((int) ((i*5 + 3) % 23) - 11);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t == selected_experts) {
+                const std::vector<int32_t> data = {
+                    2, 0, 2, 1,
+                    3, 1, 0, 0,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else if (t == routing_weights) {
+                const std::vector<float> data = {
+                    0.25f, 0.5f, 0.75f, 1.0f,
+                    0.125f, 0.625f, 0.375f, 0.875f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_F32) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t), 0);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            }
+        }
+    }
+};
+
+struct test_moe_routed_lanes_iq4_xs_projection_shadow : public test_case {
+    ggml_tensor * as {};
+    ggml_tensor * x {};
+    ggml_tensor * selected_experts {};
+    ggml_tensor * routing_weights {};
+
+    static constexpr int n_expert = 5;
+    static constexpr int n_slots  = 3;
+    static constexpr int n_rows   = 2;
+    static constexpr int n_in     = 256;
+    static constexpr int n_out    = 8;
+
+    std::string vars() override {
+        return "type_w=IQ4_XS,n_expert=5,n_slots=3,n_rows=2,n_in=256,n_out=8";
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_ROUTED_LANES_IQ4_XS_PROJECTION_SHADOW";
+    }
+
+    double max_err() override {
+        return 1e-4;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double worst = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            worst = std::max(worst, (double) std::fabs(a[i]));
+            worst = std::max(worst, (double) std::fabs(b[i]));
+            worst = std::max(worst, (double) std::fabs(a[i] - b[i]));
+        }
+        return worst;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        as = ggml_new_tensor_3d(ctx, GGML_TYPE_IQ4_XS, n_in, n_out, n_expert);
+        ggml_set_name(as, "as_iq4_xs");
+
+        x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_in, n_rows);
+        ggml_set_name(x, "x");
+
+        selected_experts = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_slots, n_rows);
+        ggml_set_name(selected_experts, "selected_experts");
+
+        routing_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_slots, n_rows);
+        ggml_set_name(routing_weights, "routing_weights");
+
+        ggml_tensor * lanes = ggml_moe_routed_lanes(ctx, selected_experts, routing_weights, n_expert);
+        ggml_set_name(lanes, "lanes");
+        ggml_tensor * bounds = ggml_moe_routed_lanes_expert_bounds(ctx, lanes);
+        ggml_set_name(bounds, "bounds");
+        ggml_tensor * compact_x = ggml_moe_routed_lanes_gather(ctx, x, lanes);
+        ggml_set_name(compact_x, "compact_x");
+
+        ggml_tensor * compact_x_3d = ggml_reshape_3d(ctx, compact_x, n_in, 1, n_slots*n_rows);
+        ggml_tensor * lane_experts = ggml_view_2d(ctx, lanes, 1, n_slots*n_rows, lanes->nb[1], 0);
+        ggml_set_name(lane_experts, "lane_experts");
+        ggml_tensor * ref = ggml_mul_mat_id(ctx, as, compact_x_3d, lane_experts);
+        ggml_set_name(ref, "ref_iq4_xs_compact_projection");
+        ref = ggml_reshape_2d(ctx, ref, n_out, n_slots*n_rows);
+        ggml_set_name(ref, "ref_iq4_xs_compact_projection_2d");
+
+        ggml_tensor * shadow = ggml_moe_routed_lanes_projection(ctx, as, compact_x, lanes, bounds);
+        ggml_set_name(shadow, "shadow_iq4_xs_bounds_projection");
+
+        ggml_tensor * diff = ggml_sub(ctx, shadow, ref);
+        ggml_set_name(diff, "shadow_iq4_xs_minus_ref");
+        return diff;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t == as) {
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = 0.03125f * (float) ((int) ((i*11 + 5) % 19) - 9);
+                }
+                std::vector<uint8_t> dataq(ggml_row_size(t->type, ggml_nelements(t)));
+                std::vector<float> imatrix(n_in, 1.0f);
+                const size_t blck_size = ggml_blck_size(t->type);
+                GGML_ASSERT(data.size() % blck_size == 0);
+                ggml_quantize_chunk(t->type, data.data(), dataq.data(), 0, data.size()/blck_size, blck_size, imatrix.data());
+                ggml_backend_tensor_set(t, dataq.data(), 0, dataq.size());
+            } else if (t == x) {
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = 0.015625f * (float) ((int) ((i*7 + 3) % 29) - 14);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t == selected_experts) {
+                const std::vector<int32_t> data = {
+                    2, 0, 2,
+                    1, 3, 0,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else if (t == routing_weights) {
+                const std::vector<float> data = {
+                    0.25f, 0.5f, 0.75f,
+                    1.0f, 0.125f, 0.625f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_F32) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t), 0);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            }
+        }
+    }
+};
+
+struct test_moe_routed_lanes_iq3_s_projection_shadow : public test_case {
+    ggml_tensor * as {};
+    ggml_tensor * x {};
+    ggml_tensor * selected_experts {};
+    ggml_tensor * routing_weights {};
+
+    static constexpr int n_expert = 5;
+    static constexpr int n_slots  = 2;
+    static constexpr int n_rows   = 2;
+    static constexpr int n_in     = 256;
+    static constexpr int n_out    = 8;
+
+    std::string vars() override {
+        return "type_w=IQ3_S,n_expert=5,n_slots=2,n_rows=2,n_in=256,n_out=8";
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_ROUTED_LANES_IQ3_S_PROJECTION_SHADOW";
+    }
+
+    double max_err() override {
+        return 1e-4;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double worst = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            worst = std::max(worst, (double) std::fabs(a[i]));
+            worst = std::max(worst, (double) std::fabs(b[i]));
+            worst = std::max(worst, (double) std::fabs(a[i] - b[i]));
+        }
+        return worst;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        as = ggml_new_tensor_3d(ctx, GGML_TYPE_IQ3_S, n_in, n_out, n_expert);
+        ggml_set_name(as, "as_iq3_s");
+
+        x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_in, n_rows);
+        ggml_set_name(x, "x");
+
+        selected_experts = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_slots, n_rows);
+        ggml_set_name(selected_experts, "selected_experts");
+
+        routing_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_slots, n_rows);
+        ggml_set_name(routing_weights, "routing_weights");
+
+        ggml_tensor * lanes = ggml_moe_routed_lanes(ctx, selected_experts, routing_weights, n_expert);
+        ggml_set_name(lanes, "lanes");
+        ggml_tensor * bounds = ggml_moe_routed_lanes_expert_bounds(ctx, lanes);
+        ggml_set_name(bounds, "bounds");
+        ggml_tensor * compact_x = ggml_moe_routed_lanes_gather(ctx, x, lanes);
+        ggml_set_name(compact_x, "compact_x");
+
+        ggml_tensor * compact_x_3d = ggml_reshape_3d(ctx, compact_x, n_in, 1, n_slots*n_rows);
+        ggml_tensor * lane_experts = ggml_view_2d(ctx, lanes, 1, n_slots*n_rows, lanes->nb[1], 0);
+        ggml_set_name(lane_experts, "lane_experts");
+        ggml_tensor * ref = ggml_mul_mat_id(ctx, as, compact_x_3d, lane_experts);
+        ggml_set_name(ref, "ref_iq3_s_compact_projection");
+        ref = ggml_reshape_2d(ctx, ref, n_out, n_slots*n_rows);
+        ggml_set_name(ref, "ref_iq3_s_compact_projection_2d");
+
+        ggml_tensor * shadow = ggml_moe_routed_lanes_projection(ctx, as, compact_x, lanes, bounds);
+        ggml_set_name(shadow, "shadow_iq3_s_bounds_projection");
+
+        ggml_tensor * diff = ggml_sub(ctx, shadow, ref);
+        ggml_set_name(diff, "shadow_iq3_s_minus_ref");
+        return diff;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t == as) {
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = 0.03125f * (float) ((int) ((i*17 + 1) % 23) - 11);
+                }
+                std::vector<uint8_t> dataq(ggml_row_size(t->type, ggml_nelements(t)));
+                std::vector<float> imatrix(n_in, 1.0f);
+                const size_t blck_size = ggml_blck_size(t->type);
+                GGML_ASSERT(data.size() % blck_size == 0);
+                ggml_quantize_chunk(t->type, data.data(), dataq.data(), 0, data.size()/blck_size, blck_size, imatrix.data());
+                ggml_backend_tensor_set(t, dataq.data(), 0, dataq.size());
+            } else if (t == x) {
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = 0.015625f * (float) ((int) ((i*9 + 4) % 31) - 15);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t == selected_experts) {
+                const std::vector<int32_t> data = {
+                    2, 0,
+                    1, 3,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else if (t == routing_weights) {
+                const std::vector<float> data = {
+                    0.25f, 0.5f,
+                    1.0f, 0.125f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_F32) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t), 0);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            }
+        }
+    }
+};
+
+
+struct test_moe_routed_lanes_quant_projection_expanded_shadow : public test_case {
+    ggml_tensor * as {};
+    ggml_tensor * x {};
+    ggml_tensor * selected_experts {};
+    ggml_tensor * routing_weights {};
+
+    const ggml_type type_w;
+    const int n_expert;
+    const int n_slots;
+    const int n_rows;
+    const int n_in;
+    const int n_out;
+    const std::vector<int32_t> selected_experts_data;
+    const std::string name;
+    const double max_abs_err;
+
+    test_moe_routed_lanes_quant_projection_expanded_shadow(
+            ggml_type type_w,
+            int n_expert,
+            int n_slots,
+            int n_rows,
+            int n_in,
+            int n_out,
+            std::vector<int32_t> selected_experts_data,
+            const std::string & name,
+            double max_abs_err = 1e-4)
+        : type_w(type_w),
+          n_expert(n_expert),
+          n_slots(n_slots),
+          n_rows(n_rows),
+          n_in(n_in),
+          n_out(n_out),
+          selected_experts_data(selected_experts_data),
+          name(name),
+          max_abs_err(max_abs_err) {
+        GGML_ASSERT((int) selected_experts_data.size() == n_slots*n_rows);
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_w, n_expert, n_slots, n_rows, n_in, n_out, name);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return name;
+    }
+
+    double max_err() override {
+        return max_abs_err;
+    }
+
+    double max_err(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        return max_abs_err;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double worst = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            worst = std::max(worst, (double) std::fabs(a[i]));
+            worst = std::max(worst, (double) std::fabs(b[i]));
+            worst = std::max(worst, (double) std::fabs(a[i] - b[i]));
+        }
+        return worst;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        as = ggml_new_tensor_3d(ctx, type_w, n_in, n_out, n_expert);
+        ggml_set_name(as, "as_quant_expanded");
+
+        x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_in, n_rows);
+        ggml_set_name(x, "x");
+
+        selected_experts = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_slots, n_rows);
+        ggml_set_name(selected_experts, "selected_experts");
+
+        routing_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_slots, n_rows);
+        ggml_set_name(routing_weights, "routing_weights");
+
+        ggml_tensor * lanes = ggml_moe_routed_lanes(ctx, selected_experts, routing_weights, n_expert);
+        ggml_set_name(lanes, "lanes");
+        ggml_tensor * bounds = ggml_moe_routed_lanes_expert_bounds(ctx, lanes);
+        ggml_set_name(bounds, "bounds");
+        ggml_tensor * compact_x = ggml_moe_routed_lanes_gather(ctx, x, lanes);
+        ggml_set_name(compact_x, "compact_x");
+
+        ggml_tensor * compact_x_3d = ggml_reshape_3d(ctx, compact_x, n_in, 1, n_slots*n_rows);
+        ggml_tensor * lane_experts = ggml_view_2d(ctx, lanes, 1, n_slots*n_rows, lanes->nb[1], 0);
+        ggml_set_name(lane_experts, "lane_experts");
+        ggml_tensor * ref = ggml_mul_mat_id(ctx, as, compact_x_3d, lane_experts);
+        ggml_set_name(ref, "ref_quant_expanded_compact_projection");
+        ref = ggml_reshape_2d(ctx, ref, n_out, n_slots*n_rows);
+        ggml_set_name(ref, "ref_quant_expanded_compact_projection_2d");
+
+        ggml_tensor * shadow = ggml_moe_routed_lanes_projection(ctx, as, compact_x, lanes, bounds);
+        ggml_set_name(shadow, "shadow_quant_expanded_bounds_projection");
+
+        ggml_tensor * diff = ggml_sub(ctx, shadow, ref);
+        ggml_set_name(diff, "shadow_quant_expanded_minus_ref");
+        return diff;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t == as) {
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = 0.03125f * (float) ((int) ((i*13 + 7) % 37) - 18);
+                }
+                std::vector<uint8_t> dataq(ggml_row_size(t->type, ggml_nelements(t)));
+                std::vector<float> imatrix(n_in, 1.0f);
+                const size_t blck_size = ggml_blck_size(t->type);
+                GGML_ASSERT(data.size() % blck_size == 0);
+                ggml_quantize_chunk(t->type, data.data(), dataq.data(), 0, data.size()/blck_size, blck_size,
+                        (type_w == GGML_TYPE_IQ3_S || type_w == GGML_TYPE_IQ4_XS) ? imatrix.data() : nullptr);
+                ggml_backend_tensor_set(t, dataq.data(), 0, dataq.size());
+            } else if (t == x) {
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = 0.015625f * (float) ((int) ((i*17 + 5) % 43) - 21);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t == selected_experts) {
+                ggml_backend_tensor_set(t, selected_experts_data.data(), 0, selected_experts_data.size() * sizeof(int32_t));
+            } else if (t == routing_weights) {
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = 0.03125f * (float) (((int) ((i*7 + 3) % 31)) + 1);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_F32) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t), 0);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            }
+        }
+    }
+};
+
+struct test_moe_routed_lanes_quant_projection_perf : public test_case {
+    ggml_tensor * as {};
+    ggml_tensor * x {};
+    ggml_tensor * selected_experts {};
+    ggml_tensor * routing_weights {};
+
+    const ggml_type type_w;
+    const int n_expert;
+    const int n_slots;
+    const int n_rows;
+    const int n_in;
+    const int n_out;
+    const bool routed_candidate;
+    const std::string shape_name;
+
+    test_moe_routed_lanes_quant_projection_perf(
+            ggml_type type_w,
+            int n_expert,
+            int n_slots,
+            int n_rows,
+            int n_in,
+            int n_out,
+            bool routed_candidate,
+            const std::string & shape_name)
+        : type_w(type_w),
+          n_expert(n_expert),
+          n_slots(n_slots),
+          n_rows(n_rows),
+          n_in(n_in),
+          n_out(n_out),
+          routed_candidate(routed_candidate),
+          shape_name(shape_name) {
+        GGML_ASSERT(type_w == GGML_TYPE_Q8_0 || type_w == GGML_TYPE_IQ4_XS || type_w == GGML_TYPE_IQ3_S);
+        GGML_ASSERT(n_expert > 0 && n_slots > 0 && n_rows > 0 && n_in > 0 && n_out > 0);
+        GGML_ASSERT(n_in % ggml_blck_size(type_w) == 0);
+        GGML_ASSERT(n_in % 32 == 0); // CUDA routed-lane quant projection quantizes activations as Q8_1 blocks.
+    }
+
+    static const char * type_tag(ggml_type type_w) {
+        switch (type_w) {
+            case GGML_TYPE_Q8_0:   return "Q8_0";
+            case GGML_TYPE_IQ4_XS: return "IQ4_XS";
+            case GGML_TYPE_IQ3_S:  return "IQ3_S";
+            default: GGML_ABORT("unsupported routed-lane quant projection perf type");
+        }
+    }
+
+    std::string vars() override {
+        return "type_w=" + var_to_str(type_w) +
+            ",n_expert=" + std::to_string(n_expert) +
+            ",n_slots=" + std::to_string(n_slots) +
+            ",n_rows=" + std::to_string(n_rows) +
+            ",n_lanes=" + std::to_string(n_slots*n_rows) +
+            ",n_in=" + std::to_string(n_in) +
+            ",n_out=" + std::to_string(n_out) +
+            ",shape=" + shape_name;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return std::string(routed_candidate ? "MOE_ROUTED_LANES_" : "MUL_MAT_ID_COMPACT_") + type_tag(type_w) + "_PROJECTION_PERF";
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2ULL*(uint64_t) n_in*(uint64_t) n_out*(uint64_t) n_slots*(uint64_t) n_rows;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        as = ggml_new_tensor_3d(ctx, type_w, n_in, n_out, n_expert);
+        ggml_set_name(as, routed_candidate ? "as_quant_routed_perf" : "as_quant_mul_mat_id_perf");
+
+        x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_in, n_rows);
+        ggml_set_name(x, "x");
+
+        selected_experts = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_slots, n_rows);
+        ggml_set_name(selected_experts, "selected_experts");
+
+        routing_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_slots, n_rows);
+        ggml_set_name(routing_weights, "routing_weights");
+
+        ggml_tensor * lanes = ggml_moe_routed_lanes(ctx, selected_experts, routing_weights, n_expert);
+        ggml_set_name(lanes, "lanes");
+        ggml_tensor * compact_x = ggml_moe_routed_lanes_gather(ctx, x, lanes);
+        ggml_set_name(compact_x, "compact_x");
+
+        if (routed_candidate) {
+            ggml_tensor * bounds = ggml_moe_routed_lanes_expert_bounds(ctx, lanes);
+            ggml_set_name(bounds, "bounds");
+            ggml_tensor * out = ggml_moe_routed_lanes_projection(ctx, as, compact_x, lanes, bounds);
+            ggml_set_name(out, "routed_lanes_quant_projection_perf");
+            return out;
+        }
+
+        ggml_tensor * compact_x_3d = ggml_reshape_3d(ctx, compact_x, n_in, 1, n_slots*n_rows);
+        ggml_set_name(compact_x_3d, "compact_x_3d");
+        ggml_tensor * lane_experts = ggml_view_2d(ctx, lanes, 1, n_slots*n_rows, lanes->nb[1], 0);
+        ggml_set_name(lane_experts, "lane_experts");
+        ggml_tensor * out = ggml_mul_mat_id(ctx, as, compact_x_3d, lane_experts);
+        ggml_set_name(out, "mul_mat_id_compact_quant_projection_perf");
+        return out;
+    }
+
+    std::vector<int32_t> selected_experts_pattern() const {
+        std::vector<int32_t> data((size_t) n_slots*n_rows);
+        for (int row = 0; row < n_rows; ++row) {
+            for (int slot = 0; slot < n_slots; ++slot) {
+                int expert;
+                switch (slot % 4) {
+                    case 0:  expert = 2; break;
+                    case 1:  expert = row*3; break;
+                    case 2:  expert = 2 + row + slot; break;
+                    default: expert = 1 + row; break;
+                }
+                data[(size_t) row*n_slots + slot] = expert % n_expert;
+            }
+        }
+        return data;
+    }
+
+    static void init_quant_weight(ggml_tensor * t, int n_in, int mul, int add, int mod, int center, float scale) {
+        std::vector<float> data(ggml_nelements(t));
+        for (size_t i = 0; i < data.size(); ++i) {
+            data[i] = scale * (float) ((int) ((i*(size_t) mul + (size_t) add) % (size_t) mod) - center);
+        }
+        std::vector<uint8_t> dataq(ggml_row_size(t->type, ggml_nelements(t)));
+        std::vector<float> imatrix(n_in, 1.0f);
+        const size_t blck_size = ggml_blck_size(t->type);
+        GGML_ASSERT(data.size() % blck_size == 0);
+        ggml_quantize_chunk(t->type, data.data(), dataq.data(), 0, data.size()/blck_size, blck_size,
+                ggml_quantize_requires_imatrix(t->type) ? imatrix.data() : nullptr);
+        ggml_backend_tensor_set(t, dataq.data(), 0, dataq.size());
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t == as) {
+                init_quant_weight(t, n_in, 13, 7, 37, 18, 1.0f/128.0f);
+            } else if (t == x) {
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = 0.015625f * (float) ((int) ((i*17 + 5) % 43) - 21);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t == selected_experts) {
+                const std::vector<int32_t> data = selected_experts_pattern();
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else if (t == routing_weights) {
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = 0.03125f * (float) (((int) ((i*7 + 3) % 31)) + 1);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_F32) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t), 0);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            }
+        }
+    }
+};
+
+struct test_moe_routed_lanes_unpack_slots : public test_case {
+    ggml_tensor * compact_x {};
+    ggml_tensor * selected_experts {};
+    ggml_tensor * routing_weights {};
+
+    static constexpr int n_expert = 6;
+    static constexpr int n_slots  = 3;
+    static constexpr int n_rows   = 3;
+    static constexpr int n_out    = 2;
+
+    std::string vars() override {
+        return "n_expert=6,n_slots=3,n_rows=3,n_out=2";
+    }
+
+    double max_err() override {
+        return 0.0;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<float> expected_unpack() const {
+        return {
+            5.0f, 50.0f,
+            1.0f, 10.0f,
+            6.0f, 60.0f,
+            3.0f, 30.0f,
+            9.0f, 90.0f,
+            2.0f, 20.0f,
+            8.0f, 80.0f,
+            7.0f, 70.0f,
+            4.0f, 40.0f,
+        };
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double diff = 0.0;
+        const std::vector<float> expected = expected_unpack();
+        for (size_t i = 0; i < n; ++i) {
+            if (a[i] != b[i]) {
+                diff += 1.0 + std::fabs(a[i] - b[i]);
+            }
+            if (n == expected.size()) {
+                if (a[i] != expected[i]) {
+                    diff += 1.0 + std::fabs(a[i] - expected[i]);
+                }
+                if (b[i] != expected[i]) {
+                    diff += 1.0 + std::fabs(b[i] - expected[i]);
+                }
+            }
+        }
+        return diff;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        compact_x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_out, n_slots*n_rows);
+        ggml_set_name(compact_x, "compact_x");
+
+        selected_experts = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_slots, n_rows);
+        ggml_set_name(selected_experts, "selected_experts");
+
+        routing_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_slots, n_rows);
+        ggml_set_name(routing_weights, "routing_weights");
+
+        ggml_tensor * lanes = ggml_moe_routed_lanes(ctx, selected_experts, routing_weights, n_expert);
+        ggml_set_name(lanes, "lanes");
+        ggml_tensor * row_slot_map = ggml_moe_routed_lanes_row_slot_map(ctx, routing_weights, lanes);
+        ggml_set_name(row_slot_map, "row_slot_map");
+
+        ggml_tensor * out = ggml_moe_routed_lanes_unpack_slots(ctx, compact_x, row_slot_map);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t == compact_x) {
+                const std::vector<float> data = {
+                    1.0f, 10.0f,
+                    2.0f, 20.0f,
+                    3.0f, 30.0f,
+                    4.0f, 40.0f,
+                    5.0f, 50.0f,
+                    6.0f, 60.0f,
+                    7.0f, 70.0f,
+                    8.0f, 80.0f,
+                    9.0f, 90.0f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t == selected_experts) {
+                const std::vector<int32_t> data = {
+                    2, 0, 2,
+                    1, 4, 0,
+                    3, 2, 1,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else if (t == routing_weights) {
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = 0.125f * (float) (i + 1);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_F32) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t), 0);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            }
+        }
+    }
+};
+
+struct test_moe_routed_lanes_pack_slots : public test_case {
+    ggml_tensor * slot_x {};
+    ggml_tensor * selected_experts {};
+    ggml_tensor * routing_weights {};
+
+    static constexpr int n_expert = 6;
+    static constexpr int n_slots  = 3;
+    static constexpr int n_rows   = 3;
+    static constexpr int n_in     = 2;
+
+    std::string vars() override {
+        return "n_expert=6,n_slots=3,n_rows=3,n_in=2";
+    }
+
+    double max_err() override {
+        return 0.0;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<float> expected_pack() const {
+        return {
+            1.0f, 10.0f,
+            2.0f, 20.0f,
+            3.0f, 30.0f,
+            4.0f, 40.0f,
+            5.0f, 50.0f,
+            6.0f, 60.0f,
+            7.0f, 70.0f,
+            8.0f, 80.0f,
+            9.0f, 90.0f,
+        };
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double diff = 0.0;
+        const std::vector<float> expected = expected_pack();
+        for (size_t i = 0; i < n; ++i) {
+            if (a[i] != b[i]) {
+                diff += 1.0 + std::fabs(a[i] - b[i]);
+            }
+            if (n == expected.size()) {
+                if (a[i] != expected[i]) {
+                    diff += 1.0 + std::fabs(a[i] - expected[i]);
+                }
+                if (b[i] != expected[i]) {
+                    diff += 1.0 + std::fabs(b[i] - expected[i]);
+                }
+            }
+        }
+        return diff;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        slot_x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_in, n_slots, n_rows);
+        ggml_set_name(slot_x, "slot_x");
+
+        selected_experts = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_slots, n_rows);
+        ggml_set_name(selected_experts, "selected_experts");
+
+        routing_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_slots, n_rows);
+        ggml_set_name(routing_weights, "routing_weights");
+
+        ggml_tensor * lanes = ggml_moe_routed_lanes(ctx, selected_experts, routing_weights, n_expert);
+        ggml_set_name(lanes, "lanes");
+        ggml_tensor * row_slot_map = ggml_moe_routed_lanes_row_slot_map(ctx, routing_weights, lanes);
+        ggml_set_name(row_slot_map, "row_slot_map");
+
+        ggml_tensor * out = ggml_moe_routed_lanes_pack_slots(ctx, slot_x, row_slot_map);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t == slot_x) {
+                const std::vector<float> data = {
+                    5.0f, 50.0f,
+                    1.0f, 10.0f,
+                    6.0f, 60.0f,
+                    3.0f, 30.0f,
+                    9.0f, 90.0f,
+                    2.0f, 20.0f,
+                    8.0f, 80.0f,
+                    7.0f, 70.0f,
+                    4.0f, 40.0f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t == selected_experts) {
+                const std::vector<int32_t> data = {
+                    2, 0, 2,
+                    1, 4, 0,
+                    3, 2, 1,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else if (t == routing_weights) {
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = 0.125f * (float) (i + 1);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_F32) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t), 0);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            }
+        }
+    }
+};
+
+struct test_moe_routed_lanes_slot_projection_shadow : public test_case {
+    ggml_tensor * as {};
+    ggml_tensor * x {};
+    ggml_tensor * selected_experts {};
+    ggml_tensor * routing_weights {};
+
+    static constexpr int n_expert = 3;
+    static constexpr int n_slots  = 2;
+    static constexpr int n_rows   = 2;
+    static constexpr int n_embd   = 2;
+    static constexpr int n_out    = 2;
+
+    std::string vars() override {
+        return "n_expert=3,n_slots=2,n_rows=2,n_embd=2,n_out=2";
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_ROUTED_LANES_SLOT_PROJECTION_SHADOW";
+    }
+
+    double max_err() override {
+        return 0.0;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double diff = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            if (a[i] != b[i]) {
+                diff += 1.0 + std::fabs(a[i] - b[i]);
+            }
+            if (a[i] != 0.0f) {
+                diff += 1.0 + std::fabs(a[i]);
+            }
+            if (b[i] != 0.0f) {
+                diff += 1.0 + std::fabs(b[i]);
+            }
+        }
+        return diff;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        as = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_out, n_expert);
+        ggml_set_name(as, "as");
+
+        x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_rows);
+        ggml_set_name(x, "x");
+
+        selected_experts = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_slots, n_rows);
+        ggml_set_name(selected_experts, "selected_experts");
+
+        routing_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_slots, n_rows);
+        ggml_set_name(routing_weights, "routing_weights");
+
+        ggml_tensor * x_slot = ggml_reshape_3d(ctx, x, n_embd, 1, n_rows);
+        ggml_tensor * direct = ggml_mul_mat_id(ctx, as, x_slot, selected_experts);
+        ggml_set_name(direct, "direct_slot_projection");
+
+        ggml_tensor * lanes = ggml_moe_routed_lanes(ctx, selected_experts, routing_weights, n_expert);
+        ggml_set_name(lanes, "lanes");
+        ggml_tensor * row_slot_map = ggml_moe_routed_lanes_row_slot_map(ctx, routing_weights, lanes);
+        ggml_set_name(row_slot_map, "row_slot_map");
+        ggml_tensor * compact_x = ggml_moe_routed_lanes_gather(ctx, x, lanes);
+        ggml_set_name(compact_x, "compact_x");
+        ggml_tensor * compact_x_3d = ggml_reshape_3d(ctx, compact_x, n_embd, 1, n_slots*n_rows);
+        ggml_tensor * lane_experts = ggml_view_2d(ctx, lanes, 1, n_slots*n_rows, lanes->nb[1], 0);
+        ggml_set_name(lane_experts, "lane_experts");
+        ggml_tensor * compact_proj = ggml_mul_mat_id(ctx, as, compact_x_3d, lane_experts);
+        ggml_set_name(compact_proj, "compact_projection");
+        ggml_tensor * compact_proj_2d = ggml_reshape_2d(ctx, compact_proj, n_out, n_slots*n_rows);
+        ggml_tensor * shadow = ggml_moe_routed_lanes_unpack_slots(ctx, compact_proj_2d, row_slot_map);
+        ggml_set_name(shadow, "shadow_slot_projection");
+
+        ggml_tensor * diff = ggml_sub(ctx, shadow, direct);
+        ggml_set_name(diff, "shadow_minus_direct");
+        return diff;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t == as) {
+                const std::vector<float> data = {
+                    1.0f, 0.0f, 0.0f, 1.0f,
+                    2.0f, 0.0f, 0.0f, 2.0f,
+                    1.0f, 1.0f, 1.0f, -1.0f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t == x) {
+                const std::vector<float> data = {
+                    1.0f, 10.0f,
+                    2.0f, 20.0f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t == selected_experts) {
+                const std::vector<int32_t> data = {
+                    2, 0,
+                    1, 2,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else if (t == routing_weights) {
+                const std::vector<float> data = {
+                    0.5f, 0.5f,
+                    0.5f, 0.5f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_F32) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t), 0);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            }
+        }
+    }
+};
+
+struct test_moe_routed_lanes_down_projection_shadow : public test_case {
+    ggml_tensor * as {};
+    ggml_tensor * slot_x {};
+    ggml_tensor * selected_experts {};
+    ggml_tensor * routing_weights {};
+
+    static constexpr int n_expert = 3;
+    static constexpr int n_slots  = 2;
+    static constexpr int n_rows   = 2;
+    static constexpr int n_in     = 2;
+    static constexpr int n_out    = 2;
+
+    std::string vars() override {
+        return "n_expert=3,n_slots=2,n_rows=2,n_in=2,n_out=2";
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_ROUTED_LANES_DOWN_PROJECTION_SHADOW";
+    }
+
+    double max_err() override {
+        return 0.0;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double diff = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            if (a[i] != b[i]) {
+                diff += 1.0 + std::fabs(a[i] - b[i]);
+            }
+            if (a[i] != 0.0f) {
+                diff += 1.0 + std::fabs(a[i]);
+            }
+            if (b[i] != 0.0f) {
+                diff += 1.0 + std::fabs(b[i]);
+            }
+        }
+        return diff;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        as = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_in, n_out, n_expert);
+        ggml_set_name(as, "as");
+
+        slot_x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_in, n_slots, n_rows);
+        ggml_set_name(slot_x, "slot_x");
+
+        selected_experts = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_slots, n_rows);
+        ggml_set_name(selected_experts, "selected_experts");
+
+        routing_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_slots, n_rows);
+        ggml_set_name(routing_weights, "routing_weights");
+
+        ggml_tensor * direct = ggml_mul_mat_id(ctx, as, slot_x, selected_experts);
+        ggml_set_name(direct, "direct_down_projection");
+
+        ggml_tensor * lanes = ggml_moe_routed_lanes(ctx, selected_experts, routing_weights, n_expert);
+        ggml_set_name(lanes, "lanes");
+        ggml_tensor * row_slot_map = ggml_moe_routed_lanes_row_slot_map(ctx, routing_weights, lanes);
+        ggml_set_name(row_slot_map, "row_slot_map");
+        ggml_tensor * compact_x = ggml_moe_routed_lanes_pack_slots(ctx, slot_x, row_slot_map);
+        ggml_set_name(compact_x, "compact_x");
+        ggml_tensor * compact_x_3d = ggml_reshape_3d(ctx, compact_x, n_in, 1, n_slots*n_rows);
+        ggml_tensor * lane_experts = ggml_view_2d(ctx, lanes, 1, n_slots*n_rows, lanes->nb[1], 0);
+        ggml_set_name(lane_experts, "lane_experts");
+        ggml_tensor * compact_proj = ggml_mul_mat_id(ctx, as, compact_x_3d, lane_experts);
+        ggml_set_name(compact_proj, "compact_down_projection");
+        ggml_tensor * compact_proj_2d = ggml_reshape_2d(ctx, compact_proj, n_out, n_slots*n_rows);
+        ggml_tensor * shadow = ggml_moe_routed_lanes_unpack_slots(ctx, compact_proj_2d, row_slot_map);
+        ggml_set_name(shadow, "shadow_down_projection");
+
+        ggml_tensor * diff = ggml_sub(ctx, shadow, direct);
+        ggml_set_name(diff, "shadow_minus_direct");
+        return diff;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t == as) {
+                const std::vector<float> data = {
+                    1.0f, 0.0f, 0.0f, 1.0f,
+                    2.0f, 0.0f, 0.0f, 2.0f,
+                    1.0f, 1.0f, 1.0f, -1.0f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t == slot_x) {
+                const std::vector<float> data = {
+                    1.0f, 10.0f,
+                    2.0f, 20.0f,
+                    3.0f, 30.0f,
+                    4.0f, 40.0f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t == selected_experts) {
+                const std::vector<int32_t> data = {
+                    2, 0,
+                    1, 2,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else if (t == routing_weights) {
+                const std::vector<float> data = {
+                    0.5f, 0.5f,
+                    0.5f, 0.5f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_F32) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t), 0);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            }
+        }
+    }
+};
+
+struct test_moe_routed_lanes_down_aggregation_shadow : public test_case {
+    ggml_tensor * as {};
+    ggml_tensor * scale {};
+    ggml_tensor * slot_x {};
+    ggml_tensor * selected_experts {};
+    ggml_tensor * routing_weights {};
+
+    static constexpr int n_expert = 3;
+    static constexpr int n_slots  = 2;
+    static constexpr int n_rows   = 2;
+    static constexpr int n_in     = 2;
+    static constexpr int n_out    = 2;
+
+    std::string vars() override {
+        return "n_expert=3,n_slots=2,n_rows=2,n_in=2,n_out=2,scaled=1";
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_ROUTED_LANES_DOWN_AGGREGATION_SHADOW";
+    }
+
+    double max_err() override {
+        return 0.0;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double diff = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            if (a[i] != b[i]) {
+                diff += 1.0 + std::fabs(a[i] - b[i]);
+            }
+            if (a[i] != 0.0f) {
+                diff += 1.0 + std::fabs(a[i]);
+            }
+            if (b[i] != 0.0f) {
+                diff += 1.0 + std::fabs(b[i]);
+            }
+        }
+        return diff;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        as = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_in, n_out, n_expert);
+        ggml_set_name(as, "as");
+
+        scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+        ggml_set_name(scale, "scale");
+
+        slot_x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_in, n_slots, n_rows);
+        ggml_set_name(slot_x, "slot_x");
+
+        selected_experts = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_slots, n_rows);
+        ggml_set_name(selected_experts, "selected_experts");
+
+        routing_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_slots, n_rows);
+        ggml_set_name(routing_weights, "routing_weights");
+
+        ggml_tensor * direct = ggml_mul_mat_id(ctx, as, slot_x, selected_experts);
+        ggml_set_name(direct, "direct_down_projection");
+        ggml_tensor * scale_slot = ggml_reshape_3d(ctx, scale, 1, n_expert, 1);
+        scale_slot = ggml_repeat_4d(ctx, scale_slot, 1, n_expert, n_rows, 1);
+        scale_slot = ggml_get_rows(ctx, scale_slot, selected_experts);
+        ggml_set_name(scale_slot, "scale_slot");
+        direct = ggml_mul(ctx, direct, scale_slot);
+        ggml_set_name(direct, "direct_down_scaled");
+        direct = ggml_mul(ctx, direct, routing_weights);
+        ggml_set_name(direct, "direct_down_weighted");
+        ggml_tensor * direct_slot0 = ggml_view_2d(ctx, direct, n_out, n_rows, direct->nb[2], 0*direct->nb[1]);
+        ggml_tensor * direct_slot1 = ggml_view_2d(ctx, direct, n_out, n_rows, direct->nb[2], 1*direct->nb[1]);
+        ggml_tensor * direct_out = ggml_add(ctx, direct_slot0, direct_slot1);
+        ggml_set_name(direct_out, "direct_moe_out");
+
+        ggml_tensor * lanes = ggml_moe_routed_lanes(ctx, selected_experts, routing_weights, n_expert);
+        ggml_set_name(lanes, "lanes");
+        ggml_tensor * row_slot_map = ggml_moe_routed_lanes_row_slot_map(ctx, routing_weights, lanes);
+        ggml_set_name(row_slot_map, "row_slot_map");
+        ggml_tensor * compact_x = ggml_moe_routed_lanes_pack_slots(ctx, slot_x, row_slot_map);
+        ggml_set_name(compact_x, "compact_x");
+        ggml_tensor * compact_x_3d = ggml_reshape_3d(ctx, compact_x, n_in, 1, n_slots*n_rows);
+        ggml_tensor * lane_experts = ggml_view_2d(ctx, lanes, 1, n_slots*n_rows, lanes->nb[1], 0);
+        ggml_set_name(lane_experts, "lane_experts");
+        ggml_tensor * compact_proj = ggml_mul_mat_id(ctx, as, compact_x_3d, lane_experts);
+        ggml_set_name(compact_proj, "compact_down_projection");
+        ggml_tensor * scale_compact = ggml_reshape_3d(ctx, scale, 1, n_expert, 1);
+        scale_compact = ggml_repeat_4d(ctx, scale_compact, 1, n_expert, n_slots*n_rows, 1);
+        scale_compact = ggml_get_rows(ctx, scale_compact, lane_experts);
+        ggml_set_name(scale_compact, "scale_compact");
+        compact_proj = ggml_mul(ctx, compact_proj, scale_compact);
+        ggml_set_name(compact_proj, "compact_down_scaled");
+        ggml_tensor * compact_proj_2d = ggml_reshape_2d(ctx, compact_proj, n_out, n_slots*n_rows);
+        ggml_tensor * shadow = ggml_moe_routed_lanes_scatter_reduce(ctx, compact_proj_2d, routing_weights, lanes);
+        ggml_set_name(shadow, "shadow_moe_out");
+
+        ggml_tensor * diff = ggml_sub(ctx, shadow, direct_out);
+        ggml_set_name(diff, "shadow_minus_direct");
+        return diff;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t == as) {
+                const std::vector<float> data = {
+                    1.0f, 0.0f, 0.0f, 1.0f,
+                    2.0f, 0.0f, 0.0f, 2.0f,
+                    1.0f, 1.0f, 1.0f, -1.0f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t == scale) {
+                const std::vector<float> data = {
+                    1.0f, 0.25f, -0.5f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t == slot_x) {
+                const std::vector<float> data = {
+                    1.0f, 10.0f,
+                    2.0f, 20.0f,
+                    3.0f, 30.0f,
+                    4.0f, 40.0f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t == selected_experts) {
+                const std::vector<int32_t> data = {
+                    2, 0,
+                    1, 2,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else if (t == routing_weights) {
+                const std::vector<float> data = {
+                    0.25f, 0.75f,
+                    -0.5f, 0.125f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_F32) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t), 0);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            }
+        }
+    }
+};
+
+struct test_moe_routed_lanes_full_branch_shadow : public test_case {
+    ggml_tensor * as_gate_up {};
+    ggml_tensor * as_down {};
+    ggml_tensor * scale_up {};
+    ggml_tensor * scale_down {};
+    ggml_tensor * x {};
+    ggml_tensor * selected_experts {};
+    ggml_tensor * routing_weights {};
+
+    static constexpr int n_expert = 3;
+    static constexpr int n_slots  = 2;
+    static constexpr int n_rows   = 2;
+    static constexpr int n_embd   = 2;
+    static constexpr int n_ff     = 2;
+    static constexpr int n_out    = 2;
+
+    std::string vars() override {
+        return "n_expert=3,n_slots=2,n_rows=2,n_embd=2,n_ff=2,n_out=2,scaled=1";
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_ROUTED_LANES_FULL_BRANCH_SHADOW";
+    }
+
+    double max_err() override {
+        return 0.0;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double diff = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            if (a[i] != b[i]) {
+                diff += 1.0 + std::fabs(a[i] - b[i]);
+            }
+            if (a[i] != 0.0f) {
+                diff += 1.0 + std::fabs(a[i]);
+            }
+            if (b[i] != 0.0f) {
+                diff += 1.0 + std::fabs(b[i]);
+            }
+        }
+        return diff;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        as_gate_up = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 2*n_ff, n_expert);
+        ggml_set_name(as_gate_up, "as_gate_up");
+
+        as_down = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_ff, n_out, n_expert);
+        ggml_set_name(as_down, "as_down");
+
+        scale_up = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+        ggml_set_name(scale_up, "scale_up");
+
+        scale_down = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+        ggml_set_name(scale_down, "scale_down");
+
+        x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_rows);
+        ggml_set_name(x, "x");
+
+        selected_experts = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_slots, n_rows);
+        ggml_set_name(selected_experts, "selected_experts");
+
+        routing_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_slots, n_rows);
+        ggml_set_name(routing_weights, "routing_weights");
+
+        ggml_tensor * x_slot = ggml_reshape_3d(ctx, x, n_embd, 1, n_rows);
+        ggml_tensor * direct_gate_up = ggml_mul_mat_id(ctx, as_gate_up, x_slot, selected_experts);
+        ggml_set_name(direct_gate_up, "direct_gate_up");
+        ggml_tensor * scale_up_slot = ggml_reshape_3d(ctx, scale_up, 1, n_expert, 1);
+        scale_up_slot = ggml_repeat_4d(ctx, scale_up_slot, 1, n_expert, n_rows, 1);
+        scale_up_slot = ggml_get_rows(ctx, scale_up_slot, selected_experts);
+        ggml_set_name(scale_up_slot, "scale_up_slot");
+        direct_gate_up = ggml_mul(ctx, direct_gate_up, scale_up_slot);
+        ggml_set_name(direct_gate_up, "direct_gate_up_scaled");
+        ggml_tensor * direct_gate = ggml_view_3d(ctx, direct_gate_up, n_ff, n_slots, n_rows,
+                direct_gate_up->nb[1], direct_gate_up->nb[2], 0);
+        ggml_tensor * direct_up = ggml_view_3d(ctx, direct_gate_up, n_ff, n_slots, n_rows,
+                direct_gate_up->nb[1], direct_gate_up->nb[2], n_ff*direct_gate_up->nb[0]);
+        ggml_tensor * direct_act = ggml_swiglu_split(ctx, direct_gate, direct_up);
+        ggml_set_name(direct_act, "direct_swiglu");
+        ggml_tensor * direct_down = ggml_mul_mat_id(ctx, as_down, direct_act, selected_experts);
+        ggml_set_name(direct_down, "direct_down_projection");
+        ggml_tensor * scale_down_slot = ggml_reshape_3d(ctx, scale_down, 1, n_expert, 1);
+        scale_down_slot = ggml_repeat_4d(ctx, scale_down_slot, 1, n_expert, n_rows, 1);
+        scale_down_slot = ggml_get_rows(ctx, scale_down_slot, selected_experts);
+        ggml_set_name(scale_down_slot, "scale_down_slot");
+        direct_down = ggml_mul(ctx, direct_down, scale_down_slot);
+        ggml_set_name(direct_down, "direct_down_scaled");
+        direct_down = ggml_mul(ctx, direct_down, routing_weights);
+        ggml_set_name(direct_down, "direct_down_weighted");
+        ggml_tensor * direct_slot0 = ggml_view_2d(ctx, direct_down, n_out, n_rows, direct_down->nb[2], 0*direct_down->nb[1]);
+        ggml_tensor * direct_slot1 = ggml_view_2d(ctx, direct_down, n_out, n_rows, direct_down->nb[2], 1*direct_down->nb[1]);
+        ggml_tensor * direct_out = ggml_add(ctx, direct_slot0, direct_slot1);
+        ggml_set_name(direct_out, "direct_moe_out");
+
+        ggml_tensor * lanes = ggml_moe_routed_lanes(ctx, selected_experts, routing_weights, n_expert);
+        ggml_set_name(lanes, "lanes");
+        ggml_tensor * row_slot_map = ggml_moe_routed_lanes_row_slot_map(ctx, routing_weights, lanes);
+        ggml_set_name(row_slot_map, "row_slot_map");
+        ggml_tensor * compact_x = ggml_moe_routed_lanes_gather(ctx, x, lanes);
+        ggml_set_name(compact_x, "compact_x");
+        ggml_tensor * compact_x_3d = ggml_reshape_3d(ctx, compact_x, n_embd, 1, n_slots*n_rows);
+        ggml_tensor * lane_experts = ggml_view_2d(ctx, lanes, 1, n_slots*n_rows, lanes->nb[1], 0);
+        ggml_set_name(lane_experts, "lane_experts");
+        ggml_tensor * compact_gate_up = ggml_mul_mat_id(ctx, as_gate_up, compact_x_3d, lane_experts);
+        ggml_set_name(compact_gate_up, "compact_gate_up");
+        ggml_tensor * scale_up_compact = ggml_reshape_3d(ctx, scale_up, 1, n_expert, 1);
+        scale_up_compact = ggml_repeat_4d(ctx, scale_up_compact, 1, n_expert, n_slots*n_rows, 1);
+        scale_up_compact = ggml_get_rows(ctx, scale_up_compact, lane_experts);
+        ggml_set_name(scale_up_compact, "scale_up_compact");
+        compact_gate_up = ggml_mul(ctx, compact_gate_up, scale_up_compact);
+        ggml_set_name(compact_gate_up, "compact_gate_up_scaled");
+        ggml_tensor * compact_gate = ggml_view_3d(ctx, compact_gate_up, n_ff, 1, n_slots*n_rows,
+                compact_gate_up->nb[1], compact_gate_up->nb[2], 0);
+        ggml_tensor * compact_up = ggml_view_3d(ctx, compact_gate_up, n_ff, 1, n_slots*n_rows,
+                compact_gate_up->nb[1], compact_gate_up->nb[2], n_ff*compact_gate_up->nb[0]);
+        ggml_tensor * compact_act = ggml_swiglu_split(ctx, compact_gate, compact_up);
+        ggml_set_name(compact_act, "compact_swiglu");
+        ggml_tensor * compact_down = ggml_mul_mat_id(ctx, as_down, compact_act, lane_experts);
+        ggml_set_name(compact_down, "compact_down_projection");
+        ggml_tensor * scale_down_compact = ggml_reshape_3d(ctx, scale_down, 1, n_expert, 1);
+        scale_down_compact = ggml_repeat_4d(ctx, scale_down_compact, 1, n_expert, n_slots*n_rows, 1);
+        scale_down_compact = ggml_get_rows(ctx, scale_down_compact, lane_experts);
+        ggml_set_name(scale_down_compact, "scale_down_compact");
+        compact_down = ggml_mul(ctx, compact_down, scale_down_compact);
+        ggml_set_name(compact_down, "compact_down_scaled");
+        ggml_tensor * compact_down_2d = ggml_reshape_2d(ctx, compact_down, n_out, n_slots*n_rows);
+        ggml_tensor * shadow = ggml_moe_routed_lanes_scatter_reduce(ctx, compact_down_2d, routing_weights, lanes);
+        ggml_set_name(shadow, "shadow_moe_out");
+
+        ggml_tensor * diff = ggml_sub(ctx, shadow, direct_out);
+        ggml_set_name(diff, "shadow_minus_direct");
+        return diff;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t == as_gate_up) {
+                const std::vector<float> data = {
+                    0.5f, -0.25f,  0.75f,  0.125f,
+                    0.25f,  0.5f, -0.125f, 0.625f,
+                    1.0f,  -0.5f,  0.25f, -0.75f,
+                    0.375f, 0.125f, 0.5f, -0.25f,
+                    -0.5f,  1.0f,  0.75f, -0.125f,
+                    0.25f, -0.375f, 0.625f, 0.5f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t == as_down) {
+                const std::vector<float> data = {
+                    1.0f, 0.0f, 0.0f, 1.0f,
+                    2.0f, 0.0f, 0.0f, 2.0f,
+                    1.0f, 1.0f, 1.0f, -1.0f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t == scale_up) {
+                const std::vector<float> data = {
+                    1.0f, 0.5f, -0.75f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t == scale_down) {
+                const std::vector<float> data = {
+                    1.0f, 0.25f, -0.5f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t == x) {
+                const std::vector<float> data = {
+                    1.0f, 10.0f,
+                    2.0f, 20.0f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t == selected_experts) {
+                const std::vector<int32_t> data = {
+                    2, 0,
+                    1, 2,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else if (t == routing_weights) {
+                const std::vector<float> data = {
+                    0.25f, 0.75f,
+                    -0.5f, 0.125f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_F32) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t), 0);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            }
+        }
+    }
+};
+
+struct test_moe_routed_lanes_quant_full_branch_shadow : public test_case {
+    ggml_tensor * as_gate_up {};
+    ggml_tensor * as_down {};
+    ggml_tensor * scale_up {};
+    ggml_tensor * scale_down {};
+    ggml_tensor * x {};
+    ggml_tensor * selected_experts {};
+    ggml_tensor * routing_weights {};
+
+    ggml_type type_w;
+
+    static constexpr int n_expert = 5;
+    static constexpr int n_slots  = 2;
+    static constexpr int n_rows   = 2;
+    static constexpr int n_embd   = 256;
+    static constexpr int n_ff     = 256;
+    static constexpr int n_out    = 8;
+
+    test_moe_routed_lanes_quant_full_branch_shadow(ggml_type type_w)
+        : type_w(type_w) {
+        GGML_ASSERT(type_w == GGML_TYPE_Q8_0 || type_w == GGML_TYPE_IQ4_XS || type_w == GGML_TYPE_IQ3_S);
+    }
+
+    std::string vars() override {
+        return "type_w=" + var_to_str(type_w) + ",n_expert=5,n_slots=2,n_rows=2,n_embd=256,n_ff=256,n_out=8,scaled=1";
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_ROUTED_LANES_QUANT_FULL_BRANCH_SHADOW";
+    }
+
+    double max_err() override {
+        return type_w == GGML_TYPE_Q8_0 ? 5e-4 : 5e-3;
+    }
+
+    double max_err(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        return max_err();
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double worst = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            worst = std::max(worst, (double) std::fabs(a[i]));
+            worst = std::max(worst, (double) std::fabs(b[i]));
+            worst = std::max(worst, (double) std::fabs(a[i] - b[i]));
+        }
+        return worst;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        as_gate_up = ggml_new_tensor_3d(ctx, type_w, n_embd, 2*n_ff, n_expert);
+        ggml_set_name(as_gate_up, "as_gate_up_quant");
+
+        as_down = ggml_new_tensor_3d(ctx, type_w, n_ff, n_out, n_expert);
+        ggml_set_name(as_down, "as_down_quant");
+
+        scale_up = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+        ggml_set_name(scale_up, "scale_up");
+        scale_down = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+        ggml_set_name(scale_down, "scale_down");
+
+        x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_rows);
+        ggml_set_name(x, "x");
+
+        selected_experts = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_slots, n_rows);
+        ggml_set_name(selected_experts, "selected_experts");
+
+        routing_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_slots, n_rows);
+        ggml_set_name(routing_weights, "routing_weights");
+
+        // Direct slot-major reference: standard quant MUL_MAT_ID gate/up, SwiGLU, quant MUL_MAT_ID down,
+        // then explicit top-k slot reduction in the original [slot,row] order.
+        ggml_tensor * x_slot = ggml_reshape_3d(ctx, x, n_embd, 1, n_rows);
+        ggml_tensor * direct_gate_up = ggml_mul_mat_id(ctx, as_gate_up, x_slot, selected_experts);
+        ggml_set_name(direct_gate_up, "direct_quant_gate_up");
+        ggml_tensor * scale_up_slot = ggml_reshape_3d(ctx, scale_up, 1, n_expert, 1);
+        scale_up_slot = ggml_repeat_4d(ctx, scale_up_slot, 1, n_expert, n_rows, 1);
+        scale_up_slot = ggml_get_rows(ctx, scale_up_slot, selected_experts);
+        ggml_set_name(scale_up_slot, "scale_up_slot");
+        direct_gate_up = ggml_mul(ctx, direct_gate_up, scale_up_slot);
+        ggml_set_name(direct_gate_up, "direct_quant_gate_up_scaled");
+        ggml_tensor * direct_gate = ggml_view_3d(ctx, direct_gate_up, n_ff, n_slots, n_rows,
+                direct_gate_up->nb[1], direct_gate_up->nb[2], 0);
+        ggml_tensor * direct_up = ggml_view_3d(ctx, direct_gate_up, n_ff, n_slots, n_rows,
+                direct_gate_up->nb[1], direct_gate_up->nb[2], n_ff*direct_gate_up->nb[0]);
+        ggml_tensor * direct_act = ggml_swiglu_split(ctx, direct_gate, direct_up);
+        ggml_set_name(direct_act, "direct_swiglu");
+        ggml_tensor * direct_down = ggml_mul_mat_id(ctx, as_down, direct_act, selected_experts);
+        ggml_set_name(direct_down, "direct_quant_down");
+        ggml_tensor * scale_down_slot = ggml_reshape_3d(ctx, scale_down, 1, n_expert, 1);
+        scale_down_slot = ggml_repeat_4d(ctx, scale_down_slot, 1, n_expert, n_rows, 1);
+        scale_down_slot = ggml_get_rows(ctx, scale_down_slot, selected_experts);
+        ggml_set_name(scale_down_slot, "scale_down_slot");
+        direct_down = ggml_mul(ctx, direct_down, scale_down_slot);
+        ggml_set_name(direct_down, "direct_quant_down_scaled");
+        direct_down = ggml_mul(ctx, direct_down, routing_weights);
+        ggml_set_name(direct_down, "direct_quant_down_weighted");
+        ggml_tensor * direct_slot0 = ggml_view_2d(ctx, direct_down, n_out, n_rows, direct_down->nb[2], 0*direct_down->nb[1]);
+        ggml_tensor * direct_slot1 = ggml_view_2d(ctx, direct_down, n_out, n_rows, direct_down->nb[2], 1*direct_down->nb[1]);
+        ggml_tensor * direct_out = ggml_add(ctx, direct_slot0, direct_slot1);
+        ggml_set_name(direct_out, "direct_moe_out");
+
+        // Routed-lane branch under test: compact lanes sorted by expert, quant routed-lane projection
+        // for gate/up and down, then scatter_reduce back to [row].
+        ggml_tensor * lanes = ggml_moe_routed_lanes(ctx, selected_experts, routing_weights, n_expert);
+        ggml_set_name(lanes, "lanes");
+        ggml_tensor * bounds = ggml_moe_routed_lanes_expert_bounds(ctx, lanes);
+        ggml_set_name(bounds, "bounds");
+        ggml_tensor * compact_x = ggml_moe_routed_lanes_gather(ctx, x, lanes);
+        ggml_set_name(compact_x, "compact_x");
+
+        ggml_tensor * compact_gate_up = ggml_moe_routed_lanes_projection(ctx, as_gate_up, compact_x, lanes, bounds);
+        ggml_set_name(compact_gate_up, "compact_quant_gate_up_projection");
+        ggml_tensor * lane_experts = ggml_view_2d(ctx, lanes, 1, n_slots*n_rows, lanes->nb[1], 0);
+        ggml_set_name(lane_experts, "lane_experts");
+        ggml_tensor * scale_up_compact = ggml_reshape_3d(ctx, scale_up, 1, n_expert, 1);
+        scale_up_compact = ggml_repeat_4d(ctx, scale_up_compact, 1, n_expert, n_slots*n_rows, 1);
+        scale_up_compact = ggml_get_rows(ctx, scale_up_compact, lane_experts);
+        scale_up_compact = ggml_reshape_2d(ctx, scale_up_compact, 1, n_slots*n_rows);
+        ggml_set_name(scale_up_compact, "scale_up_compact");
+        compact_gate_up = ggml_mul(ctx, compact_gate_up, scale_up_compact);
+        ggml_set_name(compact_gate_up, "compact_quant_gate_up_scaled");
+        ggml_tensor * compact_gate = ggml_view_2d(ctx, compact_gate_up, n_ff, n_slots*n_rows,
+                compact_gate_up->nb[1], 0);
+        ggml_tensor * compact_up = ggml_view_2d(ctx, compact_gate_up, n_ff, n_slots*n_rows,
+                compact_gate_up->nb[1], n_ff*compact_gate_up->nb[0]);
+        ggml_tensor * compact_act = ggml_swiglu_split(ctx, compact_gate, compact_up);
+        ggml_set_name(compact_act, "compact_swiglu");
+        ggml_tensor * compact_down = ggml_moe_routed_lanes_projection(ctx, as_down, compact_act, lanes, bounds);
+        ggml_set_name(compact_down, "compact_quant_down_projection");
+        ggml_tensor * scale_down_compact = ggml_reshape_3d(ctx, scale_down, 1, n_expert, 1);
+        scale_down_compact = ggml_repeat_4d(ctx, scale_down_compact, 1, n_expert, n_slots*n_rows, 1);
+        scale_down_compact = ggml_get_rows(ctx, scale_down_compact, lane_experts);
+        scale_down_compact = ggml_reshape_2d(ctx, scale_down_compact, 1, n_slots*n_rows);
+        ggml_set_name(scale_down_compact, "scale_down_compact");
+        compact_down = ggml_mul(ctx, compact_down, scale_down_compact);
+        ggml_set_name(compact_down, "compact_quant_down_scaled");
+        ggml_tensor * shadow = ggml_moe_routed_lanes_scatter_reduce(ctx, compact_down, routing_weights, lanes);
+        ggml_set_name(shadow, "shadow_moe_out");
+
+        ggml_tensor * diff = ggml_sub(ctx, shadow, direct_out);
+        ggml_set_name(diff, "quant_shadow_minus_direct");
+        return diff;
+    }
+
+    static void init_quant_weight(ggml_tensor * t, int mul, int add, int mod, int center, float scale) {
+        std::vector<float> data(ggml_nelements(t));
+        for (size_t i = 0; i < data.size(); ++i) {
+            data[i] = scale * (float) ((int) ((i*(size_t) mul + (size_t) add) % (size_t) mod) - center);
+        }
+        std::vector<uint8_t> dataq(ggml_row_size(t->type, ggml_nelements(t)));
+        std::vector<float> imatrix(t->ne[0], 1.0f);
+        const size_t blck_size = ggml_blck_size(t->type);
+        GGML_ASSERT(data.size() % blck_size == 0);
+        ggml_quantize_chunk(t->type, data.data(), dataq.data(), 0, data.size()/blck_size, blck_size,
+                ggml_quantize_requires_imatrix(t->type) ? imatrix.data() : nullptr);
+        ggml_backend_tensor_set(t, dataq.data(), 0, dataq.size());
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t == as_gate_up) {
+                init_quant_weight(t, 13, 7, 31, 15, 1.0f/128.0f);
+            } else if (t == as_down) {
+                init_quant_weight(t, 17, 3, 29, 14, 1.0f/96.0f);
+            } else if (t == scale_up) {
+                const std::vector<float> data = { 0.75f, 1.25f, -0.5f, 0.625f, 1.5f };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t == scale_down) {
+                const std::vector<float> data = { 1.125f, -0.25f, 0.5f, 1.75f, 0.875f };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t == x) {
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = (1.0f/64.0f) * (float) ((int) ((i*5 + 11) % 37) - 18);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t == selected_experts) {
+                const std::vector<int32_t> data = {
+                    2, 0,
+                    1, 3,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else if (t == routing_weights) {
+                const std::vector<float> data = {
+                    0.25f, 0.75f,
+                    -0.5f, 0.125f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_F32) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t), 0);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            }
+        }
+    }
+};
+
+struct test_moe_routed_lanes_gather : public test_case {
+    ggml_tensor * x {};
+    ggml_tensor * selected_experts {};
+    ggml_tensor * routing_weights {};
+
+    static constexpr int n_expert = 6;
+    static constexpr int n_slots  = 3;
+    static constexpr int n_rows   = 3;
+    static constexpr int n_embd   = 2;
+
+    std::string vars() override {
+        return "n_expert=6,n_slots=3,n_rows=3,n_embd=2";
+    }
+
+    double max_err() override {
+        return 0.0;
+    }
+
+    std::vector<float> expected_metadata() const {
+        return test_moe_routed_lanes().expected_output();
+    }
+
+    std::vector<float> expected_gather() const {
+        return {
+            10.0f, 100.0f,
+            20.0f, 200.0f,
+            20.0f, 200.0f,
+            30.0f, 300.0f,
+            10.0f, 100.0f,
+            10.0f, 100.0f,
+            30.0f, 300.0f,
+            30.0f, 300.0f,
+            20.0f, 200.0f,
+        };
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double diff = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            if (a[i] != b[i]) {
+                diff += 1.0 + std::fabs(a[i] - b[i]);
+            }
+        }
+
+        const std::vector<float> metadata = expected_metadata();
+        const std::vector<float> gather   = expected_gather();
+        const std::vector<float> * expected = nullptr;
+        if (n == metadata.size()) {
+            expected = &metadata;
+        } else if (n == gather.size()) {
+            expected = &gather;
+        }
+        if (expected) {
+            for (size_t i = 0; i < n; ++i) {
+                if (a[i] != (*expected)[i]) {
+                    diff += 1.0 + std::fabs(a[i] - (*expected)[i]);
+                }
+                if (b[i] != (*expected)[i]) {
+                    diff += 1.0 + std::fabs(b[i] - (*expected)[i]);
+                }
+            }
+        }
+        return diff;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_rows);
+        ggml_set_name(x, "x");
+
+        selected_experts = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_slots, n_rows);
+        ggml_set_name(selected_experts, "selected_experts");
+
+        routing_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_slots, n_rows);
+        ggml_set_name(routing_weights, "routing_weights");
+
+        ggml_tensor * lanes = ggml_moe_routed_lanes(ctx, selected_experts, routing_weights, n_expert);
+        ggml_set_name(lanes, "lanes");
+
+        ggml_tensor * out = ggml_moe_routed_lanes_gather(ctx, x, lanes);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t == x) {
+                const std::vector<float> data = {
+                    10.0f, 100.0f,
+                    20.0f, 200.0f,
+                    30.0f, 300.0f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t == selected_experts) {
+                const std::vector<int32_t> data = {
+                    2, 0, 2,
+                    1, 4, 0,
+                    3, 2, 1,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else if (t == routing_weights) {
+                const std::vector<float> data = {
+                    0.25f, 0.5f, 0.25f,
+                    0.25f, 0.5f, 0.25f,
+                    0.25f, 0.5f, 0.25f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_F32) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t), 0);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            }
+        }
+    }
+};
+
+struct test_moe_routed_lanes_scatter_reduce : public test_case {
+    ggml_tensor * compact_x {};
+    ggml_tensor * selected_experts {};
+    ggml_tensor * routing_weights {};
+
+    static constexpr int n_expert = 6;
+    static constexpr int n_slots  = 3;
+    static constexpr int n_rows   = 3;
+    static constexpr int n_embd   = 2;
+
+    std::string vars() override {
+        return "n_expert=6,n_slots=3,n_rows=3,n_embd=2";
+    }
+
+    double max_err() override {
+        return 0.0;
+    }
+
+    std::vector<float> expected_metadata() const {
+        return test_moe_routed_lanes().expected_output();
+    }
+
+    std::vector<float> expected_scatter() const {
+        return {
+            3.25f, 32.5f,
+            5.75f, 57.5f,
+            6.5f, 65.0f,
+        };
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double diff = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            if (a[i] != b[i]) {
+                diff += 1.0 + std::fabs(a[i] - b[i]);
+            }
+        }
+
+        const std::vector<float> metadata = expected_metadata();
+        const std::vector<float> scatter  = expected_scatter();
+        const std::vector<float> * expected = nullptr;
+        if (n == metadata.size()) {
+            expected = &metadata;
+        } else if (n == scatter.size()) {
+            expected = &scatter;
+        }
+        if (expected) {
+            for (size_t i = 0; i < n; ++i) {
+                if (a[i] != (*expected)[i]) {
+                    diff += 1.0 + std::fabs(a[i] - (*expected)[i]);
+                }
+                if (b[i] != (*expected)[i]) {
+                    diff += 1.0 + std::fabs(b[i] - (*expected)[i]);
+                }
+            }
+        }
+        return diff;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        compact_x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_slots*n_rows);
+        ggml_set_name(compact_x, "compact_x");
+
+        selected_experts = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_slots, n_rows);
+        ggml_set_name(selected_experts, "selected_experts");
+
+        routing_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_slots, n_rows);
+        ggml_set_name(routing_weights, "routing_weights");
+
+        ggml_tensor * lanes = ggml_moe_routed_lanes(ctx, selected_experts, routing_weights, n_expert);
+        ggml_set_name(lanes, "lanes");
+
+        ggml_tensor * out = ggml_moe_routed_lanes_scatter_reduce(ctx, compact_x, routing_weights, lanes);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t == compact_x) {
+                const std::vector<float> data = {
+                    1.0f, 10.0f,
+                    2.0f, 20.0f,
+                    3.0f, 30.0f,
+                    4.0f, 40.0f,
+                    5.0f, 50.0f,
+                    6.0f, 60.0f,
+                    7.0f, 70.0f,
+                    8.0f, 80.0f,
+                    9.0f, 90.0f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t == selected_experts) {
+                const std::vector<int32_t> data = {
+                    2, 0, 2,
+                    1, 4, 0,
+                    3, 2, 1,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else if (t == routing_weights) {
+                const std::vector<float> data = {
+                    0.25f, 0.5f, 0.25f,
+                    0.25f, 0.5f, 0.25f,
+                    0.25f, 0.5f, 0.25f,
+                };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_F32) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t), 0);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            }
+        }
+    }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -5805,6 +8116,69 @@ struct test_mul_mat_vec_fusion : public test_case {
         } else {
             init_mul_mat_id_tensors(ctx, n_mats);
         }
+    }
+
+    double max_nmse_err() override {
+        return 5e-3;
+    }
+};
+
+struct test_mul_mat_vec_merged_gate_up_fusion : public test_case {
+    const ggml_type type;
+    const ggml_glu_op glu_op;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int n_mats;
+    const int n_used;
+    const bool b;
+
+    test_mul_mat_vec_merged_gate_up_fusion(ggml_type type, ggml_glu_op op, int64_t m, int64_t n, int64_t k,
+            int n_mats = 16, int n_used = 8, bool b = true)
+        : type(type), glu_op(op), m(m), n(n), k(k), n_mats(n_mats), n_used(n_used), b(b) {
+        GGML_ASSERT(n_used <= n_mats);
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR8(type, glu_op, m, n, k, n_mats, n_used, b);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_VEC_FUSION";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate_up = ggml_new_tensor_3d(ctx, type, k, 2*n, n_mats);
+        ggml_set_name(gate_up, "blk.0.ffn_gate_up_exps.weight");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, m);
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, m, ids->nb[1], 0);
+        }
+
+        ggml_tensor * cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, b ? 1 : n_used, m);
+        ggml_set_name(cur, "cur");
+
+        ggml_tensor * ffn_gate_up = ggml_mul_mat_id(ctx, gate_up, cur, ids);
+        ggml_set_name(ffn_gate_up, "ffn_moe_gate_up");
+
+        ggml_tensor * ffn_gate = ggml_view_3d(ctx, ffn_gate_up, n, ffn_gate_up->ne[1], ffn_gate_up->ne[2],
+                ffn_gate_up->nb[1], ffn_gate_up->nb[2], 0);
+        ggml_set_name(ffn_gate, "ffn_moe_gate");
+        ggml_tensor * ffn_up = ggml_view_3d(ctx, ffn_gate_up, n, ffn_gate_up->ne[1], ffn_gate_up->ne[2],
+                ffn_gate_up->nb[1], ffn_gate_up->nb[2], n*ffn_gate_up->nb[0]);
+        ggml_set_name(ffn_up, "ffn_moe_up");
+
+        ggml_tensor * out = ggml_glu_split(ctx, ffn_gate, ffn_up, glu_op);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
     }
 
     double max_nmse_err() override {
@@ -8985,6 +11359,111 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // MoE gate/up fusion: cover small multi-token MUL_MAT_ID route-direct MMVQ paths.
+    // These shapes model decode/MTP verifier route buckets with top-k=8 and tokens<=4,
+    // i.e. routes <= LLAMA_MTP_MOE_SMALL_ROUTE_MAX_ROUTES default 32.
+    for (ggml_type type : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0}) {
+        for (bool b : {false, true}) {
+            for (bool with_bias : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 2, 32, 256,
+                    true, 16, 8, b, with_bias, true, {1, 1}));
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 4, 32, 256,
+                    true, 16, 8, b, with_bias, true, {1, 1}));
+            }
+        }
+    }
+    // Real-ish Qwen3.5-MoE gate/up dimensions: K=2048 -> rows=512, one token vector broadcast across top-k.
+    for (ggml_type type : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0}) {
+        for (bool with_bias : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 4, 512, 2048,
+                true, 16, 8, true, with_bias, true, {1, 1}));
+        }
+        // Real Qwen3.6-MoE uses one merged ffn_gate_up_exps matrix, then gate/up views and swiglu_split.
+        test_cases.emplace_back(new test_mul_mat_vec_merged_gate_up_fusion(type, GGML_GLU_OP_SWIGLU, 4, 512, 2048,
+            16, 8, true));
+    }
+    // Real-ish Qwen3.5-MoE down projection dimensions: K=512 -> rows=2048, per-route expert activations.
+    for (ggml_type type : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 16, 8, false, 2048, 4, 512));
+    }
+
+    // Q8_0 route-direct small-route dot4 canaries for the real MTP MoE shapes.
+    // Enable the route in CUDA/HIP with LLAMA_MTP_MMVQ_MOE_Q8_0_DOT4=1 while running
+    // these tests to force coverage of route=mmvq_moe_small_route_dot4_q8_0.
+    for (int m : {1, 3, 4}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, m, 1024, 2048,
+            true, 16, 8, true, false, true, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, 4, 1024, 2048,
+        true, 16, 8, true, true, true, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_vec_merged_gate_up_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, 4, 1024, 2048,
+        16, 8, true));
+    for (int m : {1, 3, 4}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 16, 8, false, 2048, m, 512));
+    }
+
+    test_cases.emplace_back(new test_moe_routed_lanes());
+    test_cases.emplace_back(new test_moe_routed_lanes_row_slot_map());
+    test_cases.emplace_back(new test_moe_routed_lanes_expert_bounds());
+    test_cases.emplace_back(new test_moe_routed_lanes_projection_shadow());
+    test_cases.emplace_back(new test_moe_routed_lanes_q8_0_projection_shadow());
+    test_cases.emplace_back(new test_moe_routed_lanes_iq4_xs_projection_shadow());
+    test_cases.emplace_back(new test_moe_routed_lanes_iq3_s_projection_shadow());
+    test_cases.emplace_back(new test_moe_routed_lanes_quant_projection_expanded_shadow(
+        GGML_TYPE_Q8_0, 8, 6, 3, 32, 16,
+        {
+            4, 4, 1, 4, 7, 4,
+            4, 2, 4, 4, 7, 3,
+            4, 4, 4, 6, 4, 4,
+        },
+        "MOE_ROUTED_LANES_Q8_0_PROJECTION_SKEW_EMPTY_SHADOW", 1e-3));
+    test_cases.emplace_back(new test_moe_routed_lanes_quant_projection_expanded_shadow(
+        GGML_TYPE_Q8_0, 7, 5, 3, 64, 16,
+        {
+            5, 2, 5, 0, 2,
+            5, 3, 2, 5, 1,
+            4, 5, 2, 5, 5,
+        },
+        "MOE_ROUTED_LANES_Q8_0_PROJECTION_LANE_ORDER_SHADOW", 1e-3));
+    test_cases.emplace_back(new test_moe_routed_lanes_quant_projection_expanded_shadow(
+        GGML_TYPE_Q8_0, 16, 8, 4, 512, 64,
+        {
+            0, 5,  9, 13, 1, 5,  9, 13,
+            2, 5, 10, 14, 3, 5, 10, 14,
+            4, 6, 11, 15, 4, 6, 11, 15,
+            7, 8, 12,  0, 7, 8, 12,  0,
+        },
+        "MOE_ROUTED_LANES_Q8_0_PROJECTION_DOWN_PROXY_SHADOW", 1e-3));
+    test_cases.emplace_back(new test_moe_routed_lanes_quant_projection_expanded_shadow(
+        GGML_TYPE_IQ4_XS, 16, 8, 4, 512, 16,
+        {
+            0, 5,  9, 13, 1, 5,  9, 13,
+            2, 5, 10, 14, 3, 5, 10, 14,
+            4, 6, 11, 15, 4, 6, 11, 15,
+            7, 8, 12,  0, 7, 8, 12,  0,
+        },
+        "MOE_ROUTED_LANES_IQ4_XS_PROJECTION_ROUTE_CAP_SAFE_SHADOW", 1e-3));
+    test_cases.emplace_back(new test_moe_routed_lanes_quant_projection_expanded_shadow(
+        GGML_TYPE_IQ3_S, 16, 8, 4, 512, 16,
+        {
+            0, 5,  9, 13, 1, 5,  9, 13,
+            2, 5, 10, 14, 3, 5, 10, 14,
+            4, 6, 11, 15, 4, 6, 11, 15,
+            7, 8, 12,  0, 7, 8, 12,  0,
+        },
+        "MOE_ROUTED_LANES_IQ3_S_PROJECTION_ROUTE_CAP_SAFE_SHADOW", 1e-3));
+    test_cases.emplace_back(new test_moe_routed_lanes_pack_slots());
+    test_cases.emplace_back(new test_moe_routed_lanes_unpack_slots());
+    test_cases.emplace_back(new test_moe_routed_lanes_gather());
+    test_cases.emplace_back(new test_moe_routed_lanes_scatter_reduce());
+    test_cases.emplace_back(new test_moe_routed_lanes_slot_projection_shadow());
+    test_cases.emplace_back(new test_moe_routed_lanes_down_projection_shadow());
+    test_cases.emplace_back(new test_moe_routed_lanes_down_aggregation_shadow());
+    test_cases.emplace_back(new test_moe_routed_lanes_full_branch_shadow());
+    for (ggml_type type_w : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S}) {
+        test_cases.emplace_back(new test_moe_routed_lanes_quant_full_branch_shadow(type_w));
+    }
+
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT}) {
         for (bool with_norm : {false, true}) {
             for (bool bias_probs : {false, true}) {
@@ -9194,6 +11673,43 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Qwen3.6-35B-A3B MTP decode reserves a MoE MUL_MAT_ID small bucket at n=65.
+    // Keep exact coverage for the routed quantized types used by that production shape.
+    for (ggml_type type_a : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, false, 768, 65, 2048));
+    }
+    // Small-route MoE gate/up fusion perf canary: Qwen3.5-MoE-like K/row scale, top-k=8, tokens=4.
+    for (ggml_type type_a : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0}) {
+        for (bool with_bias : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type_a, GGML_GLU_OP_SWIGLU, 4, 512, 2048,
+                true, 16, 8, true, with_bias, true, {1, 1}));
+        }
+    }
+    // Small-route MoE down projection perf canary: K=512 -> rows=2048, top-k=8, tokens=4.
+    for (ggml_type type_a : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 8, false, 2048, 4, 512));
+    }
+
+    auto add_moe_routed_lanes_quant_projection_perf_pair = [&test_cases](
+            ggml_type type_w, int n_expert, int n_slots, int n_rows, int n_in, int n_out, const char * shape_name) {
+        test_cases.emplace_back(new test_moe_routed_lanes_quant_projection_perf(
+                type_w, n_expert, n_slots, n_rows, n_in, n_out, true, shape_name));
+        test_cases.emplace_back(new test_moe_routed_lanes_quant_projection_perf(
+                type_w, n_expert, n_slots, n_rows, n_in, n_out, false, shape_name));
+    };
+
+    // Stage58 backend-only paired perf harness: explicit-bounds routed-lane quant projection candidate
+    // versus compact ggml_mul_mat_id baseline. These are microbench-only and do not change Qwen routing.
+    add_moe_routed_lanes_quant_projection_perf_pair(GGML_TYPE_Q8_0,   5, 4, 2,   32,    8, "tier0_q8_0_smoke");
+    add_moe_routed_lanes_quant_projection_perf_pair(GGML_TYPE_IQ4_XS, 5, 3, 2,  256,    8, "tier0_iq4_xs_smoke");
+    add_moe_routed_lanes_quant_projection_perf_pair(GGML_TYPE_IQ3_S,  5, 2, 2,  256,    8, "tier0_iq3_s_smoke");
+
+    for (ggml_type type_w : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S}) {
+        for (int n_rows : {1, 3, 4}) {
+            add_moe_routed_lanes_quant_projection_perf_pair(type_w, 128, 8, n_rows,  512, 4096, "tier1_gate_up_qwen_like");
+            add_moe_routed_lanes_quant_projection_perf_pair(type_w, 128, 8, n_rows, 2048,  512, "tier1_down_qwen_like");
+        }
+    }
 
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {

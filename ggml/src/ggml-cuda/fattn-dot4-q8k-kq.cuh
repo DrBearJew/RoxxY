@@ -1,12 +1,18 @@
 #pragma once
 
 #include "common.cuh"
+#include "fattn-packed16-common.cuh"
 
 #include <cstdlib>
 #include <cstring>
 
 struct ggml_backend_cuda_context;
 void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst);
+
+extern "C" {
+void llama_kv_cache_get_packed16_tensors(const void * k_view_data, struct ggml_tensor ** payload, struct ggml_tensor ** scales);
+void llama_kv_cache_get_packed16_shadow_k(const void * k_view_data, struct ggml_tensor ** shadow_k);
+}
 
 #ifdef GGML_USE_HIP
 
@@ -21,6 +27,11 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, struct ggml_t
 //   rocm_q8k_dot4_decode_mtp_draft            — MTP draft decode (any)
 //   rocm_q8k_dot4_decode_bn64_mtp_draft       — BN64 decode
 //   rocm_q8k_dot4_decode_splitk_mtp_draft     — split-K decode
+//   rocm_q8k_dot4_qtile4_gqa6_kvshared        — qtile4/GQA6 K+V shared full FA
+//   rocm_packed16_qtile4_gqa6_kvshared        — packed16 sidecar alias for qtile4/GQA6 K+V shared full FA
+// Env-gated auto policy (nq>=4, GQA6, I32 K, q4_0 V only):
+//   GGML_CUDA_ROCM_Q8K_DOT4_QTILE4_GQA6_KVSHARED_AUTO=1
+//   GGML_CUDA_ROCM_Q8K_DOT4_QTILE4_GQA6_KVSHARED_MIN_NQ=4 (default; use 2 only for isolation)
 static inline bool ggml_cuda_q8k_dot4_kq_route_required() {
     const char * required = getenv("GGML_CUDA_FA_ROUTE_REQUIRE");
     if (!required || required[0] == '\0' || strcmp(required, "any") == 0) {
@@ -32,7 +43,10 @@ static inline bool ggml_cuda_q8k_dot4_kq_route_required() {
         || strcmp(required, "rocm_q8k_dot4_recthist_mtp_verify") == 0
         || strcmp(required, "rocm_q8k_dot4_decode_mtp_draft") == 0
         || strcmp(required, "rocm_q8k_dot4_decode_bn64_mtp_draft") == 0
-        || strcmp(required, "rocm_q8k_dot4_decode_splitk_mtp_draft") == 0;
+        || strcmp(required, "rocm_q8k_dot4_decode_splitk_mtp_draft") == 0
+        || strcmp(required, "rocm_q8k_dot4_qtile4_gqa6_kvshared") == 0
+        || strcmp(required, "rocm_packed16_qtile4_gqa6_kvshared") == 0
+        || strcmp(required, "qtile4_gqa6_kvshared") == 0;
 }
 
 static inline bool ggml_cuda_q8k_dot4_kq_enabled() {
@@ -110,23 +124,6 @@ static inline bool ggml_cuda_q8k_dot4_kq_supported(const int cc, const ggml_tens
     return true;
 }
 
-static inline bool ggml_cuda_q8k_dot4_packed16_k_cache_enabled() {
-    // Default-enabled on HIP. Disable: GGML_CUDA_ROCM_PACKED16_DISABLE=1
-    {
-        const char * v = getenv("GGML_CUDA_ROCM_PACKED16_DISABLE");
-        if (v && atoi(v) != 0) return false;
-    }
-    {
-        const char * v = getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE");
-        if (v && atoi(v) == 0) return false;
-    }
-#ifdef GGML_USE_HIP
-    return true;
-#else
-    return false;
-#endif
-}
-
 // ── Instruction-aware DOT4 gate helpers ──────────────────────────
 
 static inline bool ggml_cuda_q8k_dot4_kq_env_enabled() {
@@ -142,7 +139,10 @@ static inline bool ggml_cuda_q8k_dot4_kq_route_for_instruction_ok(
     }
 
     // Broad routes accepted by all DOT4 instruction paths.
-    if (strcmp(required, "rocm_q8k_dot4_kq") == 0) {
+    if (strcmp(required, "rocm_q8k_dot4_kq") == 0 ||
+        strcmp(required, "rocm_q8k_dot4_qtile4_gqa6_kvshared") == 0 ||
+        strcmp(required, "rocm_packed16_qtile4_gqa6_kvshared") == 0 ||
+        strcmp(required, "qtile4_gqa6_kvshared") == 0) {
         return true;
     }
     if (ggml_cuda_q8k_dot4_kq_route_is_verify_contract(required) &&

@@ -7,6 +7,7 @@
 #include <ggml-backend.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -14,6 +15,8 @@
 #include <cstring>
 #include <sstream>
 #include <string>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <vector>
 
 extern "C" void llama_kv_cache_register_packed16(const void * k_view_data, ggml_tensor * payload, ggml_tensor * scales);
@@ -98,6 +101,26 @@ static bool finite_all(const std::vector<float> & a) {
     return true;
 }
 
+static std::vector<float> make_mask_f32(int nk, int nq) {
+    std::vector<float> mask((size_t) nk * nq, 0.0f);
+    const char * mode_env = getenv("PACKED16_DECODE_TEST_MASK");
+    const std::string mode = mode_env && mode_env[0] ? std::string(mode_env) : std::string("zero");
+    if (mode == "zero") {
+        return mask;
+    }
+    if (mode == "causal_tail") {
+        for (int q = 0; q < nq; ++q) {
+            const int last_visible_k = nk - nq + q;
+            for (int k = last_visible_k + 1; k < nk; ++k) {
+                mask[(size_t) k * nq + q] = -INFINITY;
+            }
+        }
+        return mask;
+    }
+    std::fprintf(stderr, "unknown PACKED16_DECODE_TEST_MASK=%s\n", mode.c_str());
+    std::abort();
+}
+
 struct run_result {
     bool ok = false;
     std::string err;
@@ -150,9 +173,109 @@ static run_result run_variant(
         char max_nq_buf[16];
         snprintf(max_nq_buf, sizeof(max_nq_buf), "%d", nq);
         setenv("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ", max_nq_buf, 1);
-    } else if (strcmp(variant, "small_verify_fa2") == 0) {
+    } else if (strcmp(variant, "small_verify_fa2") == 0 || strcmp(variant, "small_verify_fa2_tune") == 0) {
         setenv("GGML_CUDA_FA_ROUTE_REQUIRE", "rocm_packed16_small_verify_fa2", 1);
-        setenv("GGML_CUDA_ROCM_PACKED16_DECODE_IMPL", "small_verify_fa2", 1);
+        setenv("GGML_CUDA_ROCM_PACKED16_DECODE_IMPL", variant, 1);
+        char max_nq_buf[16];
+        snprintf(max_nq_buf, sizeof(max_nq_buf), "%d", nq);
+        setenv("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ", max_nq_buf, 1);
+    } else if (strcmp(variant, "packed16_fa2_vec") == 0) {
+        setenv("GGML_CUDA_FA_ROUTE_REQUIRE", "rocm_packed16_fa2_vec", 1);
+        setenv("GGML_CUDA_ROCM_PACKED16_FA2_VEC", "1", 1);
+        unsetenv("GGML_CUDA_ROCM_PACKED16_DECODE_IMPL");
+        char max_nq_buf[16];
+        snprintf(max_nq_buf, sizeof(max_nq_buf), "%d", nq);
+        setenv("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ", max_nq_buf, 1);
+    } else if (strcmp(variant, "packed16_fa2") == 0) {
+        setenv("GGML_CUDA_FA_ROUTE_REQUIRE", "rocm_packed16_fa2", 1);
+        setenv("GGML_CUDA_ROCM_PACKED16_DECODE_IMPL", "packed16_fa2", 1);
+        char max_nq_buf[16];
+        snprintf(max_nq_buf, sizeof(max_nq_buf), "%d", nq);
+        setenv("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ", max_nq_buf, 1);
+    } else if (strcmp(variant, "small_verify_fa2_hybrid_tune") == 0) {
+        setenv("GGML_CUDA_FA_ROUTE_REQUIRE", "rocm_packed16_small_verify_fa2_hybrid", 1);
+        setenv("GGML_CUDA_ROCM_PACKED16_DECODE_IMPL", variant, 1);
+        char max_nq_buf[16];
+        snprintf(max_nq_buf, sizeof(max_nq_buf), "%d", nq);
+        setenv("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ", max_nq_buf, 1);
+    } else if (strcmp(variant, "small_verify_fa2_sparsev_tune") == 0) {
+        setenv("GGML_CUDA_FA_ROUTE_REQUIRE", "rocm_packed16_small_verify_fa2_sparsev", 1);
+        setenv("GGML_CUDA_ROCM_PACKED16_DECODE_IMPL", variant, 1);
+        char max_nq_buf[16];
+        snprintf(max_nq_buf, sizeof(max_nq_buf), "%d", nq);
+        setenv("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ", max_nq_buf, 1);
+    } else if (strcmp(variant, "small_verify_fa2_pv_dot4_onthefly_tune") == 0) {
+        setenv("GGML_CUDA_FA_ROUTE_REQUIRE", "rocm_packed16_small_verify_fa2_pv_dot4_onthefly", 1);
+        setenv("GGML_CUDA_ROCM_PACKED16_DECODE_IMPL", variant, 1);
+        char max_nq_buf[16];
+        snprintf(max_nq_buf, sizeof(max_nq_buf), "%d", nq);
+        setenv("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ", max_nq_buf, 1);
+    } else if (strcmp(variant, "small_verify_fa2_pv_dot4_lds_a_tune") == 0) {
+        setenv("GGML_CUDA_FA_ROUTE_REQUIRE", "rocm_packed16_small_verify_fa2_pv_dot4_lds_a", 1);
+        setenv("GGML_CUDA_ROCM_PACKED16_DECODE_IMPL", variant, 1);
+        char max_nq_buf[16];
+        snprintf(max_nq_buf, sizeof(max_nq_buf), "%d", nq);
+        setenv("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ", max_nq_buf, 1);
+    } else if (strcmp(variant, "small_verify_fa2_fusedpv_tune") == 0) {
+        setenv("GGML_CUDA_FA_ROUTE_REQUIRE", "rocm_packed16_small_verify_fa2_fusedpv", 1);
+        setenv("GGML_CUDA_ROCM_PACKED16_DECODE_IMPL", variant, 1);
+        char max_nq_buf[16];
+        snprintf(max_nq_buf, sizeof(max_nq_buf), "%d", nq);
+        setenv("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ", max_nq_buf, 1);
+    } else if (strcmp(variant, "small_verify_fa2_pvwmma_tune") == 0) {
+        setenv("GGML_CUDA_FA_ROUTE_REQUIRE", "rocm_packed16_small_verify_fa2_pvwmma", 1);
+        setenv("GGML_CUDA_ROCM_PACKED16_DECODE_IMPL", variant, 1);
+        char max_nq_buf[16];
+        snprintf(max_nq_buf, sizeof(max_nq_buf), "%d", nq);
+        setenv("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ", max_nq_buf, 1);
+    } else if (strcmp(variant, "small_verify_fa3_tune") == 0) {
+        setenv("GGML_CUDA_FA_ROUTE_REQUIRE", "rocm_packed16_small_verify_fa3", 1);
+        setenv("GGML_CUDA_ROCM_PACKED16_DECODE_IMPL", variant, 1);
+        char max_nq_buf[16];
+        snprintf(max_nq_buf, sizeof(max_nq_buf), "%d", nq);
+        setenv("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ", max_nq_buf, 1);
+    } else if (strcmp(variant, "small_verify_fa4") == 0 || strcmp(variant, "small_verify_fa4_tune") == 0) {
+        setenv("GGML_CUDA_FA_ROUTE_REQUIRE", "rocm_packed16_small_verify_fa4", 1);
+        setenv("GGML_CUDA_ROCM_PACKED16_DECODE_IMPL", variant, 1);
+        char max_nq_buf[16];
+        snprintf(max_nq_buf, sizeof(max_nq_buf), "%d", nq);
+        setenv("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ", max_nq_buf, 1);
+    } else if (strcmp(variant, "small_verify_fa4_pvwmma") == 0 || strcmp(variant, "small_verify_fa4_pvwmma_tune") == 0) {
+        setenv("GGML_CUDA_FA_ROUTE_REQUIRE", "rocm_packed16_small_verify_fa4_pvwmma", 1);
+        setenv("GGML_CUDA_ROCM_PACKED16_DECODE_IMPL", variant, 1);
+        char max_nq_buf[16];
+        snprintf(max_nq_buf, sizeof(max_nq_buf), "%d", nq);
+        setenv("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ", max_nq_buf, 1);
+    } else if (strcmp(variant, "bm_dot4_pages") == 0 || strcmp(variant, "bm_dot4_pages_tune") == 0) {
+        setenv("GGML_CUDA_FA_ROUTE_REQUIRE", "rocm_packed16_bm_dot4_pages", 1);
+        setenv("GGML_CUDA_ROCM_PACKED16_DECODE_IMPL", variant, 1);
+        char max_nq_buf[16];
+        snprintf(max_nq_buf, sizeof(max_nq_buf), "%d", nq);
+        setenv("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ", max_nq_buf, 1);
+    } else if (strcmp(variant, "bm_dot4_pages_pvwmma") == 0) {
+        setenv("GGML_CUDA_FA_ROUTE_REQUIRE", "rocm_packed16_bm_dot4_pages_pvwmma", 1);
+        setenv("GGML_CUDA_ROCM_PACKED16_DECODE_IMPL", "bm_dot4_pages_pvwmma", 1);
+        char max_nq_buf[16];
+        snprintf(max_nq_buf, sizeof(max_nq_buf), "%d", nq);
+        setenv("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ", max_nq_buf, 1);
+    } else if (strcmp(variant, "bm_dot4_pages_pint8pv") == 0) {
+        setenv("GGML_CUDA_FA_ROUTE_REQUIRE", "rocm_packed16_bm_dot4_pages_pint8pv", 1);
+        setenv("GGML_CUDA_ROCM_PACKED16_DECODE_IMPL", "bm_dot4_pages_pint8pv", 1);
+        char max_nq_buf[16];
+        snprintf(max_nq_buf, sizeof(max_nq_buf), "%d", nq);
+        setenv("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ", max_nq_buf, 1);
+    } else if (strcmp(variant, "bm_dot4_pages_pint8pv_dot4") == 0) {
+        setenv("GGML_CUDA_FA_ROUTE_REQUIRE", "rocm_packed16_bm_dot4_pages_pint8pv_dot4", 1);
+        setenv("GGML_CUDA_ROCM_PACKED16_DECODE_IMPL", "bm_dot4_pages_pint8pv_dot4", 1);
+        char max_nq_buf[16];
+        snprintf(max_nq_buf, sizeof(max_nq_buf), "%d", nq);
+        setenv("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ", max_nq_buf, 1);
+    } else if (strcmp(variant, "bm_dot4_pages_intflash_vfrag_dot4") == 0) {
+        setenv("GGML_CUDA_FA_ROUTE_REQUIRE", "rocm_packed16_bm_dot4_pages_intflash_vfrag_dot4", 1);
+        setenv("GGML_CUDA_ROCM_PACKED16_DECODE_IMPL", "bm_dot4_pages_intflash_vfrag_dot4", 1);
+    } else if (strcmp(variant, "bm_dot4_pages_intflash_vfrag_wmma") == 0) {
+        setenv("GGML_CUDA_FA_ROUTE_REQUIRE", "rocm_packed16_bm_dot4_pages_intflash_vfrag_wmma", 1);
+        setenv("GGML_CUDA_ROCM_PACKED16_DECODE_IMPL", "bm_dot4_pages_intflash_vfrag_wmma", 1);
         char max_nq_buf[16];
         snprintf(max_nq_buf, sizeof(max_nq_buf), "%d", nq);
         setenv("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ", max_nq_buf, 1);
@@ -189,7 +312,7 @@ static run_result run_variant(
     ggml_set_name(P, "decode_K_payload");
     ggml_set_name(S, "decode_K_scales");
 
-    std::vector<float> mask_f32((size_t) nk * nq, 0.0f);
+    std::vector<float> mask_f32 = make_mask_f32(nk, nq);
     std::vector<uint16_t> mask_f16(mask_f32.size());
     ggml_fp32_to_fp16_row(mask_f32.data(), (ggml_fp16_t *) mask_f16.data(), (int64_t) mask_f16.size());
 
@@ -255,6 +378,103 @@ static run_result run_variant(
     return rr;
 }
 
+static bool mkdir_p(const std::string & path) {
+    if (path.empty()) {
+        return false;
+    }
+    for (size_t i = 1; i <= path.size(); ++i) {
+        if (i == path.size() || path[i] == '/') {
+            const std::string part = path.substr(0, i);
+            if (part.empty()) {
+                continue;
+            }
+            if (mkdir(part.c_str(), 0755) != 0 && errno != EEXIST) {
+                std::fprintf(stderr, "failed to create directory %s: errno=%d\n", part.c_str(), errno);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool write_binary_file(const std::string & path, const void * data, size_t bytes) {
+    FILE * f = std::fopen(path.c_str(), "wb");
+    if (!f) {
+        std::fprintf(stderr, "failed to open %s for write: errno=%d\n", path.c_str(), errno);
+        return false;
+    }
+    const size_t written = bytes == 0 ? 0 : std::fwrite(data, 1, bytes, f);
+    const bool ok = written == bytes && std::fclose(f) == 0;
+    if (!ok) {
+        std::fprintf(stderr, "failed to write %s: wrote=%zu expected=%zu errno=%d\n", path.c_str(), written, bytes, errno);
+    }
+    return ok;
+}
+
+static bool push_unique(std::vector<std::string> & values, const std::string & value) {
+    if (std::find(values.begin(), values.end(), value) != values.end()) {
+        return false;
+    }
+    values.push_back(value);
+    return true;
+}
+
+static bool write_fixture_meta(
+        const std::string & dir,
+        int nq,
+        int nk,
+        int n_heads_q,
+        int n_heads_k,
+        int gqa,
+        const std::vector<std::string> & outputs) {
+    constexpr int D = 256;
+    const float sm_scale = 1.0f / std::sqrt((float) D);
+    const std::string path = dir + "/meta.json";
+    FILE * f = std::fopen(path.c_str(), "wb");
+    if (!f) {
+        std::fprintf(stderr, "failed to open %s for write: errno=%d\n", path.c_str(), errno);
+        return false;
+    }
+    std::fprintf(f,
+        "{\n"
+        "  \"format\": \"packed16_decode_fixture_v1\",\n"
+        "  \"batch\": 1,\n"
+        "  \"nq\": %d,\n"
+        "  \"nk\": %d,\n"
+        "  \"hq\": %d,\n"
+        "  \"hk\": %d,\n"
+        "  \"gqa\": %d,\n"
+        "  \"d\": %d,\n"
+        "  \"scale\": %.9g,\n"
+        "  \"layout\": {\n"
+        "    \"q_f32\": \"[batch,hq,nq,d]\",\n"
+        "    \"k_payload_i32\": \"[batch,hk,nk,d/4] int32 packed i8x4\",\n"
+        "    \"k_scales_f16\": \"[batch,hk,nk,d/32]\",\n"
+        "    \"v_q4_0\": \"[batch,hk,nk,d/32] block_q4_0 raw: f16 delta + 16 qs bytes\",\n"
+        "    \"mask_f16\": \"[nk,nq] additive mask\",\n"
+        "    \"outputs\": \"[batch,nq,hq,d] float32\"\n"
+        "  },\n"
+        "  \"files\": {\n"
+        "    \"q_f32\": \"q_f32.bin\",\n"
+        "    \"k_payload_i32\": \"k_payload_i32.bin\",\n"
+        "    \"k_scales_f16\": \"k_scales_f16.bin\",\n"
+        "    \"v_q4_0\": \"v_q4_0.bin\",\n"
+        "    \"mask_f16\": \"mask_f16.bin\"\n"
+        "  },\n"
+        "  \"outputs\": {\n",
+        nq, nk, n_heads_q, n_heads_k, gqa, D, (double) sm_scale);
+    for (size_t i = 0; i < outputs.size(); ++i) {
+        std::fprintf(f, "    \"%s\": \"out_%s.f32\"%s\n",
+                outputs[i].c_str(), outputs[i].c_str(), i + 1 < outputs.size() ? "," : "");
+    }
+    std::fprintf(f, "  }\n}\n");
+    const bool ok = std::fclose(f) == 0;
+    if (ok) {
+        std::fprintf(stderr, "packed16 fixture dumped: %s\n", dir.c_str());
+    }
+    return ok;
+}
+
 int main() {
     constexpr int D = 256;
     const int nq = getenv("PACKED16_DECODE_TEST_NQ") ? atoi(getenv("PACKED16_DECODE_TEST_NQ")) : 1;
@@ -267,12 +487,15 @@ int main() {
     const int repeats = getenv("PACKED16_DECODE_TEST_REPEAT") ? std::max(1, atoi(getenv("PACKED16_DECODE_TEST_REPEAT"))) : 1;
     std::printf("packed16 decode variant harness: nq=%d nk=%d hq=%d hk=%d gqa=%d warmup=%d repeat=%d\n", nq, nk, n_heads_q, n_heads_k, gqa, warmup, repeats);
 
+    const float q_scale = getenv("PACKED16_DECODE_TEST_Q_SCALE") ? atof(getenv("PACKED16_DECODE_TEST_Q_SCALE")) : 0.75f;
+    const float k_scale = getenv("PACKED16_DECODE_TEST_K_SCALE") ? atof(getenv("PACKED16_DECODE_TEST_K_SCALE")) : 0.75f;
+    const float v_scale = getenv("PACKED16_DECODE_TEST_V_SCALE") ? atof(getenv("PACKED16_DECODE_TEST_V_SCALE")) : 0.75f;
     std::vector<float> Q((size_t) D * nq * n_heads_q);
     std::vector<uint16_t> K((size_t) D * nk * n_heads_k);
     std::vector<float> V_f32((size_t) D * nk * n_heads_k);
-    fill_f32(Q, 0.75f, 123);
-    fill_f16(K, 0.75f, 124);
-    fill_f32(V_f32, 0.75f, 125);
+    fill_f32(Q, q_scale, 123);
+    fill_f16(K, k_scale, 124);
+    fill_f32(V_f32, v_scale, 125);
     std::vector<int> K_payload;
     std::vector<uint16_t> K_scales;
     make_packed16_from_f16(K, nk, n_heads_k, K_payload, K_scales);
@@ -287,13 +510,37 @@ int main() {
             if (!item.empty()) variants.push_back(item);
         }
     } else {
-        variants = {"scalar", "gqa_scalar", "waveqk", "waveqk_q4pair", "pvwmma", "wmma_full", "dsplit", "splitk", "small_verify", "small_verify_splitk", "small_verify_batched_splitk", "small_verify_fa2", "logits_debug"};
+        variants = {"scalar", "gqa_scalar", "waveqk", "waveqk_q4pair", "pvwmma", "wmma_full", "dsplit", "splitk", "small_verify", "small_verify_splitk", "small_verify_batched_splitk", "small_verify_fa2", "packed16_fa2", "packed16_fa2_vec", "small_verify_fa2_tune", "small_verify_fa2_hybrid_tune", "small_verify_fa2_sparsev_tune", "small_verify_fa2_pv_dot4_onthefly_tune", "small_verify_fa2_pv_dot4_lds_a_tune", "small_verify_fa2_fusedpv_tune", "small_verify_fa2_pvwmma_tune", "small_verify_fa3_tune", "small_verify_fa4", "small_verify_fa4_pvwmma", "bm_dot4_pages", "bm_dot4_pages_pvwmma", "bm_dot4_pages_pint8pv", "bm_dot4_pages_pint8pv_dot4", "bm_dot4_pages_intflash_vfrag_dot4", "bm_dot4_pages_intflash_vfrag_wmma", "logits_debug"};
     }
 
     run_result scalar = run_variant("scalar", nq, nk, n_heads_q, n_heads_k, Q, K_payload, K_scales, V_q4);
     if (!scalar.ok || !finite_all(scalar.out)) {
         std::fprintf(stderr, "scalar baseline failed: %s finite=%d\n", scalar.err.c_str(), scalar.ok ? (int) finite_all(scalar.out) : 0);
         return 2;
+    }
+
+    const char * dump_dir_env = getenv("PACKED16_DECODE_TEST_DUMP_DIR");
+    const bool dump_enabled = dump_dir_env && dump_dir_env[0];
+    std::string dump_dir = dump_enabled ? std::string(dump_dir_env) : std::string();
+    std::vector<std::string> dumped_outputs;
+    if (dump_enabled) {
+        if (!mkdir_p(dump_dir)) {
+            return 3;
+        }
+        std::vector<float> mask_f32 = make_mask_f32(nk, nq);
+        std::vector<uint16_t> mask_f16(mask_f32.size());
+        ggml_fp32_to_fp16_row(mask_f32.data(), (ggml_fp16_t *) mask_f16.data(), (int64_t) mask_f16.size());
+        bool dump_ok = true;
+        dump_ok &= write_binary_file(dump_dir + "/q_f32.bin", Q.data(), Q.size() * sizeof(Q[0]));
+        dump_ok &= write_binary_file(dump_dir + "/k_payload_i32.bin", K_payload.data(), K_payload.size() * sizeof(K_payload[0]));
+        dump_ok &= write_binary_file(dump_dir + "/k_scales_f16.bin", K_scales.data(), K_scales.size() * sizeof(K_scales[0]));
+        dump_ok &= write_binary_file(dump_dir + "/v_q4_0.bin", V_q4.data(), V_q4.size() * sizeof(V_q4[0]));
+        dump_ok &= write_binary_file(dump_dir + "/mask_f16.bin", mask_f16.data(), mask_f16.size() * sizeof(mask_f16[0]));
+        dump_ok &= write_binary_file(dump_dir + "/out_scalar.f32", scalar.out.data(), scalar.out.size() * sizeof(scalar.out[0]));
+        push_unique(dumped_outputs, "scalar");
+        if (!dump_ok) {
+            return 3;
+        }
     }
 
     bool all_ok = true;
@@ -310,7 +557,20 @@ int main() {
         const bool finite = finite_all(r.out);
         const bool pass = finite && max_abs < 2.5e-2f && rms < 5.0e-3f;
         std::printf("variant=%-14s max_abs=%.8g rms=%.8g finite=%d compute_ms=%.6f repeat=%d RESULT=%s\n", v, max_abs, rms, (int) finite, r.compute_ms, r.repeats, pass ? "PASS" : "FAIL");
+        if (dump_enabled) {
+            const std::string name(v);
+            const std::string path = dump_dir + "/out_" + name + ".f32";
+            if (!write_binary_file(path, r.out.data(), r.out.size() * sizeof(r.out[0]))) {
+                all_ok = false;
+            } else {
+                push_unique(dumped_outputs, name);
+            }
+        }
         if (!pass) all_ok = false;
+    }
+
+    if (dump_enabled && !write_fixture_meta(dump_dir, nq, nk, n_heads_q, n_heads_k, gqa, dumped_outputs)) {
+        all_ok = false;
     }
 
     return all_ok ? 0 : 1;

@@ -22,6 +22,22 @@
 
 // dedup helpers
 
+static bool llm_graph_mtp_fa_enabled_default() {
+    const char * disable = getenv("LLAMA_MTP_DISABLE_FA");
+    if (disable && atoi(disable) != 0) {
+        return false;
+    }
+    disable = getenv("GGML_CUDA_ROCM_MTP_DISABLE_FA");
+    if (disable && atoi(disable) != 0) {
+        return false;
+    }
+    const char * enable = getenv("LLAMA_MTP_ENABLE_FA");
+    if (enable) {
+        return atoi(enable) != 0;
+    }
+    return true;
+}
+
 static ggml_tensor * build_attn_inp_kq_mask(
         ggml_context * ctx,
         const llama_kv_cache_context * mctx,
@@ -929,6 +945,10 @@ void llm_graph_result::reset() {
     t_sampled_probs.clear();
     t_sampled_logits.clear();
     t_candidates.clear();
+    t_mtp_target_top1_full_all = nullptr;
+    t_mtp_target_top1_fused_all = nullptr;
+    t_mtp_target_top1_full.clear();
+    t_mtp_target_top1_fused.clear();
 
     params = {};
 
@@ -985,6 +1005,22 @@ void llm_graph_result::set_outputs() {
         }
     }
     for (auto & [seq_id, t] : t_candidates) {
+        if (t != nullptr) {
+            ggml_set_output(t);
+        }
+    }
+    if (t_mtp_target_top1_full_all != nullptr) {
+        ggml_set_output(t_mtp_target_top1_full_all);
+    }
+    if (t_mtp_target_top1_fused_all != nullptr) {
+        ggml_set_output(t_mtp_target_top1_fused_all);
+    }
+    for (auto & [seq_id, t] : t_mtp_target_top1_full) {
+        if (t != nullptr) {
+            ggml_set_output(t);
+        }
+    }
+    for (auto & [seq_id, t] : t_mtp_target_top1_fused) {
         if (t != nullptr) {
             ggml_set_output(t);
         }
@@ -1623,6 +1659,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(weights, "ffn_moe_weights_scaled", il);
     }
 
+    cb(weights, "ffn_moe_weights_final", il);
+
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
@@ -2082,10 +2120,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     // Exception: MTP defaults to the upstream non-FA path for production safety;
     // enable MTP FA explicitly with LLAMA_MTP_ENABLE_FA=1 for debug/route work.
     const bool k_is_packed16_i32 = k->type == GGML_TYPE_I32;
-    const bool mtp_fa_allowed = gtype != LLM_GRAPH_TYPE_DECODER_MTP ||
-        (getenv("LLAMA_MTP_ENABLE_FA") && atoi(getenv("LLAMA_MTP_ENABLE_FA")) != 0);
+    const bool mtp_fa_allowed = gtype != LLM_GRAPH_TYPE_DECODER_MTP || llm_graph_mtp_fa_enabled_default();
     GGML_ASSERT((gtype != LLM_GRAPH_TYPE_DECODER_MTP || mtp_fa_allowed || !k_is_packed16_i32) &&
-        "MTP non-FA path cannot consume packed16 I32 K; disable packed16 or set LLAMA_MTP_ENABLE_FA=1 for debugging");
+        "MTP non-FA path cannot consume packed16 I32 K; unset LLAMA_MTP_DISABLE_FA or disable packed16");
     const bool use_flash_attn = mtp_fa_allowed && (cparams.flash_attn || k_is_packed16_i32) && kq_b == nullptr;
     // split the batch into streams if needed
     const auto n_stream = k_is_tbq ? k->ne[2] : (v_is_tbq ? v->ne[2] : k->ne[3]);
@@ -2218,11 +2255,57 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             ggml_fattn_instruction inst = GGML_FATTN_INST_NONE;
             const char * inst_reason = "upstream_like_none";
 
-            if (const char * mtp_f16k_q4v_vec = getenv("GGML_CUDA_ROCM_MTP_F16K_Q4V_VEC")) {
-                if (atoi(mtp_f16k_q4v_vec) != 0 && ubatch.n_tokens == 1 && n_outputs > 0) {
-                    inst = GGML_FATTN_INST_MTP_DRAFT_DECODE_QK;
-                    inst_reason = "auto_mtp_f16k_q4v_decode";
+            const bool scalar_mtp_decode_shape = ubatch.n_tokens == 1 && n_outputs > 0;
+            const bool real_mtp_token_decode =
+                ubatch.token != nullptr && ubatch.embd != nullptr &&
+                scalar_mtp_decode_shape;
+            const bool packed16_mtp_disabled = []() {
+                const char * disable = getenv("LLAMA_MTP_DISABLE_PACKED16_FA");
+                return disable && atoi(disable) != 0;
+            }();
+            const bool packed16_mtp_draft_decode =
+                real_mtp_token_decode && !packed16_mtp_disabled &&
+                q->ne[0] == 256 && v_for_fa->ne[0] == 256 &&
+                k->type == GGML_TYPE_I32 && v_for_fa->type == GGML_TYPE_Q4_0;
+
+            if (packed16_mtp_draft_decode) {
+                // Persistent packed16 source-K MTP draft decode, when present,
+                // is a real scalar token-mode decode carrying inp->h. Multi-token
+                // MTP catch-up/verify stays upstream-like unless explicitly forced
+                // below.
+                inst = GGML_FATTN_INST_MTP_DRAFT_DECODE_QK;
+                inst_reason = "auto_packed16_mtp_draft_decode";
+            }
+
+            const char * mtp_f16k_q4v_vec_env = getenv("GGML_CUDA_ROCM_MTP_F16K_Q4V_VEC");
+            const bool mtp_f16k_q4v_vec_forced = mtp_f16k_q4v_vec_env && atoi(mtp_f16k_q4v_vec_env) != 0;
+            const bool mtp_f16k_q4v_vec_disabled = []() {
+                const char * legacy = getenv("GGML_CUDA_ROCM_MTP_F16K_Q4V_VEC");
+                if (legacy && atoi(legacy) == 0) {
+                    return true;
                 }
+                const char * disable = getenv("GGML_CUDA_ROCM_MTP_F16K_Q4V_VEC_DISABLE");
+                if (disable && atoi(disable) != 0) {
+                    return true;
+                }
+                disable = getenv("LLAMA_MTP_DISABLE_F16K_Q4V_VEC");
+                return disable && atoi(disable) != 0;
+            }();
+            const bool f16k_q4v_mtp_draft_decode =
+                real_mtp_token_decode && !mtp_f16k_q4v_vec_disabled &&
+                q->ne[0] == 256 && v_for_fa->ne[0] == 256 &&
+                k->type == GGML_TYPE_F16 && v_for_fa->type == GGML_TYPE_Q4_0 &&
+                k->ne[1] > 0 && (k->ne[1] % 256) == 0;
+
+            if (f16k_q4v_mtp_draft_decode || (mtp_f16k_q4v_vec_forced && scalar_mtp_decode_shape)) {
+                // Real MTP draft attention uses the assistant/source KV cache.
+                // In current live Qwen-MTP, that source K is exact f16 while V is
+                // q4_0; selecting the semantic draft-decode instruction lets CUDA
+                // use the exact f16K/q4V vector lane instead of the upstream-like
+                // producer policy. This does not enable the lossy f16→packed16
+                // DOT4 adapter.
+                inst = GGML_FATTN_INST_MTP_DRAFT_DECODE_QK;
+                inst_reason = f16k_q4v_mtp_draft_decode ? "auto_mtp_f16k_q4v_decode" : "forced_mtp_f16k_q4v_decode";
             }
 
             if (const char * force = getenv("LLAMA_MTP_FA_INST")) {
@@ -2245,8 +2328,19 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
             // Hard guards for impossible/ambiguous optimized MTP instructions.
             GGML_ASSERT(inst != GGML_FATTN_INST_MTP_VERIFY_QK || (ubatch.n_tokens > 1 && n_outputs > 0));
-            GGML_ASSERT(inst != GGML_FATTN_INST_MTP_DRAFT_DECODE_QK || (ubatch.n_tokens == 1 && n_outputs > 0));
+            GGML_ASSERT(inst != GGML_FATTN_INST_MTP_DRAFT_DECODE_QK || scalar_mtp_decode_shape);
             GGML_ASSERT(inst != GGML_FATTN_INST_MTP_DRAFT || ubatch.n_tokens > 1);
+
+            if (getenv("LLAMA_MTP_FA_ROUTE")) {
+                fprintf(stderr,
+                    "MTP_FA_ROUTE: graph_inst=%d reason=%s token=%d embd=%d n_tokens=%u n_outputs=%d Q=%s K=%s V=%s q_d=%lld k_n=%lld v_d=%lld\n",
+                    (int) inst, inst_reason,
+                    ubatch.token != nullptr ? 1 : 0,
+                    ubatch.embd  != nullptr ? 1 : 0,
+                    ubatch.n_tokens, n_outputs,
+                    ggml_type_name(q->type), ggml_type_name(k->type), ggml_type_name(v_for_fa->type),
+                    (long long) q->ne[0], (long long) k->ne[1], (long long) v_for_fa->ne[0]);
+            }
 
             ggml_flash_attn_ext_set_instruction(cur, inst);
         }
@@ -2445,9 +2539,8 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
 
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
 
-    if (gtype == LLM_GRAPH_TYPE_DECODER_MTP &&
-        !(getenv("LLAMA_MTP_ENABLE_FA") && atoi(getenv("LLAMA_MTP_ENABLE_FA")) != 0)) {
-        // MTP uses the upstream non-FA path by default; keep the mask F32 too.
+    if (gtype == LLM_GRAPH_TYPE_DECODER_MTP && !llm_graph_mtp_fa_enabled_default()) {
+        // Explicit opt-out only: keep the mask F32 for non-FA MTP.
         inp->self_kq_mask_cnv = inp->self_kq_mask;
     }
 
@@ -2501,10 +2594,9 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
 
-    const bool mtp_fa_allowed = gtype != LLM_GRAPH_TYPE_DECODER_MTP ||
-        (getenv("LLAMA_MTP_ENABLE_FA") && atoi(getenv("LLAMA_MTP_ENABLE_FA")) != 0);
+    const bool mtp_fa_allowed = gtype != LLM_GRAPH_TYPE_DECODER_MTP || llm_graph_mtp_fa_enabled_default();
     GGML_ASSERT((gtype != LLM_GRAPH_TYPE_DECODER_MTP || mtp_fa_allowed || k->type != GGML_TYPE_I32) &&
-        "MTP non-FA path cannot consume packed16 I32 K; disable packed16 or set LLAMA_MTP_ENABLE_FA=1 for debugging");
+        "MTP non-FA path cannot consume packed16 I32 K; unset LLAMA_MTP_DISABLE_FA or disable packed16");
     const bool use_fa =
         mtp_fa_allowed && (cparams.flash_attn || k->type == GGML_TYPE_I32) &&
         kq_b == nullptr;
@@ -2693,10 +2785,9 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
 
-    const bool mtp_fa_allowed = gtype != LLM_GRAPH_TYPE_DECODER_MTP ||
-        (getenv("LLAMA_MTP_ENABLE_FA") && atoi(getenv("LLAMA_MTP_ENABLE_FA")) != 0);
+    const bool mtp_fa_allowed = gtype != LLM_GRAPH_TYPE_DECODER_MTP || llm_graph_mtp_fa_enabled_default();
     GGML_ASSERT((gtype != LLM_GRAPH_TYPE_DECODER_MTP || mtp_fa_allowed || k->type != GGML_TYPE_I32) &&
-        "MTP non-FA path cannot consume packed16 I32 K; disable packed16 or set LLAMA_MTP_ENABLE_FA=1 for debugging");
+        "MTP non-FA path cannot consume packed16 I32 K; unset LLAMA_MTP_DISABLE_FA or disable packed16");
     const bool use_fa =
         mtp_fa_allowed && (kq_b == nullptr) &&
         (cparams.flash_attn || k->type == GGML_TYPE_I32);
@@ -2795,10 +2886,9 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = src_cur->get_k(ctx0, il_src);
 
-    const bool mtp_fa_allowed = gtype != LLM_GRAPH_TYPE_DECODER_MTP ||
-        (getenv("LLAMA_MTP_ENABLE_FA") && atoi(getenv("LLAMA_MTP_ENABLE_FA")) != 0);
+    const bool mtp_fa_allowed = gtype != LLM_GRAPH_TYPE_DECODER_MTP || llm_graph_mtp_fa_enabled_default();
     GGML_ASSERT((gtype != LLM_GRAPH_TYPE_DECODER_MTP || mtp_fa_allowed || k->type != GGML_TYPE_I32) &&
-        "MTP non-FA path cannot consume packed16 I32 K; disable packed16 or set LLAMA_MTP_ENABLE_FA=1 for debugging");
+        "MTP non-FA path cannot consume packed16 I32 K; unset LLAMA_MTP_DISABLE_FA or disable packed16");
     const bool use_fa =
         mtp_fa_allowed && (kq_b == nullptr) &&
         (cparams.flash_attn || k->type == GGML_TYPE_I32);

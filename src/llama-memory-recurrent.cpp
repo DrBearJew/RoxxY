@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -15,13 +17,68 @@
 
 namespace {
 
-void llama_copy_tensor_row(ggml_tensor * tensor, size_t row_size, uint32_t dst_row, uint32_t src_row, std::vector<uint8_t> & tmp) {
+bool llama_rs_cell_trace_enabled() {
+    const char * env = getenv("LLAMA_MTP_RS_CELL_TRACE");
+    return env != nullptr && atoi(env) != 0;
+}
+
+bool llama_rs_commit_layer_trace_enabled() {
+    const char * env = getenv("LLAMA_MTP_RS_COMMIT_LAYER_TRACE");
+    return env != nullptr && atoi(env) != 0;
+}
+
+int llama_rs_commit_trace_layer_filter() {
+    const char * env = getenv("LLAMA_MTP_RS_COMMIT_TRACE_LAYER");
+    if (env == nullptr || env[0] == '\0') {
+        return -1;
+    }
+    char * end = nullptr;
+    const long v = strtol(env, &end, 10);
+    return end != env ? (int) v : -1;
+}
+
+uint64_t llama_rs_fnv1a64(const uint8_t * data, size_t size) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < size; ++i) {
+        h ^= data[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+uint64_t llama_tensor_row_hash(ggml_tensor * tensor, size_t row_size, uint32_t row, std::vector<uint8_t> & tmp) {
+    if (tensor == nullptr) {
+        return 0;
+    }
+    tmp.resize(row_size);
+    ggml_backend_tensor_get(tensor, tmp.data(), (size_t) row * tensor->nb[1], row_size);
+    return llama_rs_fnv1a64(tmp.data(), tmp.size());
+}
+
+void llama_copy_tensor_row(ggml_tensor * tensor, size_t row_size, uint32_t dst_row, uint32_t src_row, std::vector<uint8_t> & tmp, ggml_context * view_ctx) {
     if (tensor == nullptr || dst_row == src_row) {
         return;
     }
 
     const size_t dst_offset = (size_t) dst_row * tensor->nb[1];
     const size_t src_offset = (size_t) src_row * tensor->nb[1];
+
+    if (view_ctx != nullptr && tensor->buffer != nullptr) {
+        ggml_reset(view_ctx);
+
+        // Prefer an in-backend row copy. The host get/set fallback below is
+        // correct, but it turns recurrent rollback materialization into a
+        // GPU-host-GPU synchronization point on offloaded recurrent caches.
+        const int64_t n = row_size / ggml_element_size(tensor);
+        ggml_tensor * src = ggml_view_1d(view_ctx, tensor, n, src_offset);
+        ggml_tensor * dst = ggml_view_1d(view_ctx, tensor, n, dst_offset);
+        if (src != nullptr && dst != nullptr &&
+                ggml_backend_view_init(src) == GGML_STATUS_SUCCESS &&
+                ggml_backend_view_init(dst) == GGML_STATUS_SUCCESS) {
+            ggml_backend_tensor_copy(src, dst);
+            return;
+        }
+    }
 
     tmp.resize(row_size);
     ggml_backend_tensor_get(tensor, tmp.data(), src_offset, row_size);
@@ -194,6 +251,9 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 if (rollback >= 1 && rollback_total <= (llama_pos) n_rs_seq) {
                     set_rs_idx(seq_id, (uint32_t) rollback_total);
                     cell.pos = p0 - 1;
+                    if (const char * env = getenv("LLAMA_MTP_RS_COMMIT_IMMEDIATE"); env && atoi(env) != 0) {
+                        return commit_pending_rs_rollback(seq_id);
+                    }
                     return true;
                 }
                 return false;
@@ -407,6 +467,98 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     rs_idx[seq_id] = (idx > n_rs_seq) ? n_rs_seq : idx;
 }
 
+bool llama_memory_recurrent::commit_pending_rs_rollback(llama_seq_id seq_id) {
+    if (n_rs_seq == 0) {
+        return true;
+    }
+    if (seq_id < 0 || (size_t) seq_id >= rs_idx.size() || (uint32_t) seq_id >= cells.size()) {
+        return false;
+    }
+
+    const uint32_t idx = rs_idx[(size_t) seq_id];
+    if (idx == 0) {
+        return true;
+    }
+    if (idx > n_rs_seq) {
+        return false;
+    }
+
+    const int32_t tail_id = cells[(uint32_t) seq_id].tail;
+    if (tail_id < 0 || (uint32_t) tail_id >= size) {
+        return false;
+    }
+
+    const auto & cell = cells[(uint32_t) tail_id];
+    if (!cell.has_seq_id(seq_id)) {
+        return false;
+    }
+
+    for (const llama_seq_id id : cell.seq_id) {
+        if (id < 0 || (size_t) id >= rs_idx.size()) {
+            continue;
+        }
+        const uint32_t alias_idx = rs_idx[(size_t) id];
+        if (alias_idx != 0 && alias_idx != idx) {
+            GGML_ABORT("cannot commit recurrent rollback row with divergent rollback indices in a shared cell");
+        }
+    }
+
+    const uint32_t dst_row = (uint32_t) tail_id;
+    const uint32_t src_row = idx * size + dst_row;
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr view_ctx(ggml_init(params));
+
+    std::vector<uint8_t> tmp;
+    std::vector<uint8_t> hash_tmp;
+    const bool layer_trace = llama_rs_commit_layer_trace_enabled();
+    const int  layer_filter = layer_trace ? llama_rs_commit_trace_layer_filter() : -1;
+    auto commit_layer_row = [&](ggml_tensor * tensor, char kind, size_t il) {
+        if (tensor == nullptr) {
+            return;
+        }
+        const size_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
+        const bool trace_this = layer_trace && (layer_filter < 0 || layer_filter == (int) il);
+        const uint64_t src_hash_before = trace_this ? llama_tensor_row_hash(tensor, row_size, src_row, hash_tmp) : 0;
+        const uint64_t dst_hash_before = trace_this ? llama_tensor_row_hash(tensor, row_size, dst_row, hash_tmp) : 0;
+        llama_copy_tensor_row(tensor, row_size, dst_row, src_row, tmp, view_ctx.get());
+        if (trace_this) {
+            const uint64_t dst_hash_after = llama_tensor_row_hash(tensor, row_size, dst_row, hash_tmp);
+            fprintf(stderr,
+                    "LLAMA_RS_COMMIT_LAYER_TRACE: seq_id=%d kind=%c layer=%zu tail=%d idx=%u src_row=%u dst_row=%u row_size=%zu src_hash_before=%016" PRIx64 " dst_hash_before=%016" PRIx64 " dst_hash_after=%016" PRIx64 " match_after=%d\n",
+                    (int) seq_id, kind, il, tail_id, idx, src_row, dst_row, row_size,
+                    src_hash_before, dst_hash_before, dst_hash_after,
+                    src_hash_before == dst_hash_after ? 1 : 0);
+        }
+    };
+
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        commit_layer_row(r_l[il], 'r', il);
+    }
+
+    for (size_t il = 0; il < s_l.size(); ++il) {
+        commit_layer_row(s_l[il], 's', il);
+    }
+
+    for (const llama_seq_id id : cell.seq_id) {
+        if (id >= 0 && (size_t) id < rs_idx.size() && rs_idx[(size_t) id] == idx) {
+            rs_idx[(size_t) id] = 0;
+        }
+    }
+
+    if (const char * env = getenv("LLAMA_MTP_RS_COMMIT_TRACE"); env && atoi(env) != 0) {
+        fprintf(stderr,
+                "LLAMA_RS_COMMIT_TRACE: seq_id=%d tail=%d idx=%u src_row=%u dst_row=%u aliases=%zu\n",
+                (int) seq_id, tail_id, idx, src_row, dst_row, cell.seq_id.size());
+    }
+
+    return true;
+}
+
 uint32_t llama_memory_recurrent::get_cell_rs_idx(uint32_t cell_id, llama_seq_id seq_id) const {
     if (n_rs_seq == 0 || cell_id >= cells.size()) {
         return 0;
@@ -477,6 +629,13 @@ void llama_memory_recurrent::materialize_pending_rs_rollback(
 
     LLAMA_LOG_DEBUG("%s: materializing %zu pending recurrent rollback rows before state write\n", __func__, pending.size());
 
+    ggml_init_params params = {
+        /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr view_ctx(ggml_init(params));
+
     std::vector<uint8_t> tmp;
     for (const auto & [cell_id, idx] : pending) {
         const uint32_t src_row = idx * size + cell_id;
@@ -486,7 +645,7 @@ void llama_memory_recurrent::materialize_pending_rs_rollback(
                 continue;
             }
             const size_t row_size = ggml_row_size(r->type, r->ne[0]);
-            llama_copy_tensor_row(r, row_size, cell_id, src_row, tmp);
+            llama_copy_tensor_row(r, row_size, cell_id, src_row, tmp, view_ctx.get());
         }
 
         for (auto * s : s_l) {
@@ -494,7 +653,7 @@ void llama_memory_recurrent::materialize_pending_rs_rollback(
                 continue;
             }
             const size_t row_size = ggml_row_size(s->type, s->ne[0]);
-            llama_copy_tensor_row(s, row_size, cell_id, src_row, tmp);
+            llama_copy_tensor_row(s, row_size, cell_id, src_row, tmp, view_ctx.get());
         }
     }
 }
@@ -867,6 +1026,34 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
         cell_count_check += range.second - range.first;
     }
     GGML_ASSERT(cell_count == cell_count_check);
+
+    if (llama_rs_cell_trace_enabled()) {
+        const uint32_t seq_rs_idx = (seq_id >= 0 && (size_t) seq_id < rs_idx.size()) ? rs_idx[(size_t) seq_id] : 0;
+        fprintf(stderr, "LLAMA_RS_CELL_TRACE: op=state_write seq_id=%d flags=%u head=%u used=%u n_rs_seq=%u seq_rs_idx=%u cell_count=%u ranges=[",
+                (int) seq_id, (unsigned) flags, head, used, n_rs_seq, seq_rs_idx, cell_count);
+        for (size_t ir = 0; ir < cell_ranges.size(); ++ir) {
+            fprintf(stderr, "%s%u-%u", ir == 0 ? "" : ",", cell_ranges[ir].first, cell_ranges[ir].second);
+        }
+        fprintf(stderr, "] cells=[");
+        bool first_cell = true;
+        for (const auto & range : cell_ranges) {
+            for (uint32_t i = range.first; i < range.second; ++i) {
+                const auto & cell = cells[i];
+                fprintf(stderr, "%s%u:pos=%d:src=%d:src0=%d:tail=%d:seqs=", first_cell ? "" : ",", i, (int) cell.pos, cell.src, cell.src0, cell.tail);
+                if (cell.seq_id.empty()) {
+                    fprintf(stderr, "-");
+                } else {
+                    bool first_seq = true;
+                    for (const llama_seq_id id : cell.seq_id) {
+                        fprintf(stderr, "%s%d", first_seq ? "" : "/", (int) id);
+                        first_seq = false;
+                    }
+                }
+                first_cell = false;
+            }
+        }
+        fprintf(stderr, "]\n");
+    }
 
     materialize_pending_rs_rollback(cell_ranges, seq_id);
 
@@ -1304,13 +1491,19 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
     }
 
     uint32_t idx = 0;
+    llama_seq_id seq = -1;
     if (!mem->cells[cell_idx].seq_id.empty()) {
-        const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
+        seq = *mem->cells[cell_idx].seq_id.begin();
         if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
             idx = mem->rs_idx[seq];
             // reset rollback idx
             mem->rs_idx[seq] = 0;
         }
     }
-    return (int32_t)(idx * mem->size) + src0;
+    const int32_t result = (int32_t)(idx * mem->size) + src0;
+    if (llama_rs_cell_trace_enabled()) {
+        fprintf(stderr, "LLAMA_RS_CELL_TRACE: op=s_copy i=%d cell_idx=%u seq=%d idx=%u src0=%d result=%d head=%u n=%u size=%u\n",
+                i, cell_idx, (int) seq, idx, src0, result, mem->head, mem->n, mem->size);
+    }
+    return result;
 }

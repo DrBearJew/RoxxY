@@ -263,6 +263,7 @@ int main(int argc, char ** argv) {
             SRV_INF("%s: cleaning up before exit...\n", __func__);
             ctx_http.stop();
             ctx_server.terminate();
+            ctx_server.unload_model();
             llama_backend_free();
         };
 

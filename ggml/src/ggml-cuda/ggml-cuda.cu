@@ -2492,6 +2492,286 @@ static void ggml_cuda_mul_mat_batched_cublas(ggml_backend_cuda_context & ctx, co
     }
 }
 
+static bool ggml_cuda_env_flag_enabled(const char * name) {
+    const char * env = getenv(name);
+    return env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0 && strcmp(env, "off") != 0 && strcmp(env, "false") != 0;
+}
+
+static bool ggml_cuda_mtp_dense_ffn_serial_columns_active() {
+    if (!ggml_cuda_env_flag_enabled("LLAMA_MTP_DENSE_FFN_SERIAL_COLUMNS")) {
+        return false;
+    }
+    return ggml_cuda_env_flag_enabled("LLAMA_MTP_MMVQ_SERIAL_COLUMNS_GLOBAL") ||
+           ggml_cuda_env_flag_enabled("LLAMA_MTP_MMVQ_SERIAL_COLUMNS_ACTIVE");
+}
+
+static int64_t ggml_cuda_env_i64(const char * name, int64_t def) {
+    const char * env = getenv(name);
+    if (env == nullptr || env[0] == '\0') {
+        return def;
+    }
+    char * end = nullptr;
+    const long long value = strtoll(env, &end, 10);
+    return end != env ? (int64_t) value : def;
+}
+
+static bool ggml_cuda_mtp_router_mmvf_active() {
+    return ggml_cuda_env_flag_enabled("LLAMA_MTP_ROWEQ_ROUTER_MMVF_ACTIVE") ||
+           ggml_cuda_env_flag_enabled("LLAMA_MTP_PREFIX_ROWEQ_ROUTER_MMVF") ||
+           ggml_cuda_env_flag_enabled("LLAMA_MTP_PREFIX_ROWEQ_STAGE42_ROUTER_TOPK");
+}
+
+static bool ggml_cuda_mtp_router_mmvf_log_enabled() {
+    return ggml_cuda_env_flag_enabled("LLAMA_MTP_ROWEQ_ROUTER_MMVF_LOG") ||
+           ggml_cuda_env_flag_enabled("LLAMA_MTP_PREFIX_ROWEQ_ROUTER_MMVF_LOG") ||
+           ggml_cuda_env_flag_enabled("LLAMA_MTP_PREFIX_ROWEQ_LAYER_FFN_BATCH_LOG");
+}
+
+static int64_t ggml_cuda_mtp_router_mmvf_max_cols() {
+    int64_t max_cols = ggml_cuda_env_i64("LLAMA_MTP_ROWEQ_ROUTER_MMVF_MAX_COLS", 4);
+    if (max_cols <= 0) {
+        max_cols = 1;
+    }
+    if (max_cols > MMVF_MAX_BATCH_SIZE) {
+        max_cols = MMVF_MAX_BATCH_SIZE;
+    }
+    return max_cols;
+}
+
+static bool ggml_cuda_mtp_router_mmvf_name_allowed(const ggml_tensor * src0) {
+    if (src0 == nullptr || src0->name[0] == '\0') {
+        return false;
+    }
+
+    const char * filter = getenv("LLAMA_MTP_ROWEQ_ROUTER_MMVF_FILTER");
+    if (filter == nullptr || filter[0] == '\0') {
+        filter = ".ffn_gate_inp.weight";
+    }
+    if (strcmp(filter, "*") == 0 || strcmp(filter, "all") == 0) {
+        return true;
+    }
+
+    const char * cur = filter;
+    while (*cur != '\0') {
+        const char * comma = strchr(cur, ',');
+        const size_t len = comma != nullptr ? (size_t) (comma - cur) : strlen(cur);
+        if (len > 0) {
+            const std::string needle(cur, len);
+            if (strstr(src0->name, needle.c_str()) != nullptr) {
+                return true;
+            }
+        }
+        if (comma == nullptr) {
+            break;
+        }
+        cur = comma + 1;
+    }
+    return false;
+}
+
+static bool ggml_cuda_mtp_router_mmvf_applies(
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * dst,
+        const bool split) {
+    if (!ggml_cuda_mtp_router_mmvf_active() || split || src0 == nullptr || src1 == nullptr || dst == nullptr) {
+        return false;
+    }
+    if (!(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16)) {
+        return false;
+    }
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (src1->ne[1] <= 1 || src1->ne[1] > ggml_cuda_mtp_router_mmvf_max_cols()) {
+        return false;
+    }
+    if (ggml_is_transposed(src0) || ggml_is_transposed(src1)) {
+        return false;
+    }
+    return ggml_cuda_mtp_router_mmvf_name_allowed(src0);
+}
+
+static void ggml_cuda_mtp_router_mmvf_log(const char * site, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    if (!ggml_cuda_mtp_router_mmvf_log_enabled()) {
+        return;
+    }
+    static std::atomic<int> count{0};
+    const int idx = count.fetch_add(1, std::memory_order_relaxed);
+    if (idx < 256) {
+        GGML_LOG_INFO(
+                "%s: mtp_weight_route route=router_mmvf_serial_columns tensor=%s status=selected type=%s ncols_x=%lld nrows_x=%lld ncols_dst=%lld dst_rows=%lld\n",
+                site ? site : "-",
+                src0 ? src0->name : "-",
+                src0 ? ggml_type_name(src0->type) : "-",
+                src1 ? (long long) src1->ne[0] : 0LL,
+                src0 ? (long long) src0->ne[1] : 0LL,
+                src1 ? (long long) src1->ne[1] : 0LL,
+                dst  ? (long long) dst->ne[0]  : 0LL);
+    }
+}
+
+static bool ggml_cuda_mtp_force_ffn_up_mmq_enabled() {
+    static const bool enabled = ggml_cuda_env_flag_enabled("LLAMA_MTP_FORCE_FFN_UP_MMQ");
+    return enabled;
+}
+
+static bool ggml_cuda_mtp_force_small_mmq_enabled() {
+    static const bool enabled = []() {
+        return ggml_cuda_mtp_force_ffn_up_mmq_enabled() ||
+               ggml_cuda_env_flag_enabled("LLAMA_MTP_FORCE_SMALL_MMQ") ||
+               ggml_cuda_env_flag_enabled("LLAMA_MTP_VERIFY_FORCE_MMQ");
+    }();
+    return enabled;
+}
+
+static bool ggml_cuda_mtp_force_small_mmq_log_enabled() {
+    static const bool enabled = ggml_cuda_env_flag_enabled("LLAMA_MTP_FORCE_SMALL_MMQ_LOG");
+    return enabled;
+}
+
+static bool ggml_cuda_mtp_force_small_mmq_type_allowed(const ggml_type type) {
+    if (type == GGML_TYPE_Q4_K) {
+        return true;
+    }
+    // Q6_K MMQ was slower than MMVQ in the 27B n512 profile; keep it explicit.
+    return type == GGML_TYPE_Q6_K && ggml_cuda_env_flag_enabled("LLAMA_MTP_FORCE_SMALL_MMQ_Q6");
+}
+
+static bool ggml_cuda_mtp_force_small_mmq_name_allowed(const ggml_tensor * src0) {
+    if (src0 == nullptr || src0->name[0] == '\0') {
+        return false;
+    }
+
+    if (ggml_cuda_mtp_force_ffn_up_mmq_enabled() && strstr(src0->name, ".ffn_up.weight") != nullptr) {
+        return true;
+    }
+
+    const char * filter = getenv("LLAMA_MTP_FORCE_SMALL_MMQ_FILTER");
+    if (filter != nullptr && filter[0] != '\0') {
+        return strstr(src0->name, filter) != nullptr;
+    }
+
+    // Avoid the broad all-Q4_K force as the default opt-in shape; it was slower
+    // on 27B n512 unless constrained to the FFN-up projection.
+    return ggml_cuda_env_flag_enabled("LLAMA_MTP_FORCE_SMALL_MMQ_ALL");
+}
+
+static bool ggml_cuda_mtp_force_small_mmq_applies(
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * dst,
+        const int64_t ncols,
+        const int cc) {
+    return ggml_cuda_mtp_force_small_mmq_enabled() &&
+           GGML_CUDA_CC_IS_RDNA3(cc) &&
+           src0 != nullptr && src1 != nullptr && dst != nullptr &&
+           ggml_cuda_mtp_force_small_mmq_type_allowed(src0->type) &&
+           src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+           ncols > 0 && ncols <= MMVQ_MAX_BATCH_SIZE &&
+           ggml_cuda_mtp_force_small_mmq_name_allowed(src0);
+}
+
+static void ggml_cuda_mtp_force_small_mmq_log(
+        const char * site,
+        const ggml_tensor * src0,
+        const int64_t ncols,
+        const bool ids) {
+    if (!ggml_cuda_mtp_force_small_mmq_log_enabled()) {
+        return;
+    }
+
+    static std::atomic<int> count{0};
+    const int idx = count.fetch_add(1, std::memory_order_relaxed);
+    if (idx < 64) {
+        GGML_LOG_INFO("%s: mtp_force_small_mmq tensor=%s type=%s ncols=%lld ids=%d\n",
+                site ? site : "-", src0 ? src0->name : "-", src0 ? ggml_type_name(src0->type) : "-",
+                (long long) ncols, ids ? 1 : 0);
+    }
+}
+
+static int64_t ggml_cuda_mtp_moe_small_route_max_routes() {
+    const char * env = getenv("LLAMA_MTP_MOE_SMALL_ROUTE_MAX_ROUTES");
+    if (env == nullptr || env[0] == '\0') {
+        return 32;
+    }
+
+    char * end = nullptr;
+    const long long v = strtoll(env, &end, 10);
+    return end != env && v >= 0 ? (int64_t) v : 32;
+}
+
+static bool ggml_cuda_mtp_moe_route_policy_log_enabled() {
+    return ggml_cuda_env_flag_enabled("LLAMA_MTP_MOE_ROUTE_POLICY_LOG") ||
+           ggml_cuda_mtp_force_small_mmq_log_enabled();
+}
+
+static bool ggml_cuda_mtp_moe_small_route_gemv_preferred(const int64_t n_tokens, const int64_t n_expert_used) {
+    if (n_tokens <= 0 || n_expert_used <= 0) {
+        return false;
+    }
+
+    const int64_t max_routes = ggml_cuda_mtp_moe_small_route_max_routes();
+    return max_routes > 0 && n_tokens <= MMVQ_MAX_BATCH_SIZE && n_tokens*n_expert_used <= max_routes;
+}
+
+static void ggml_cuda_mtp_moe_route_policy_log(
+        const char * site,
+        const ggml_tensor * src0,
+        const int64_t n_tokens,
+        const int64_t n_expert_used,
+        const int64_t mmvq_mmid_max,
+        const bool small_route_gemv_preferred,
+        const bool force_mmq_requested,
+        const char * selected) {
+    if (!ggml_cuda_mtp_moe_route_policy_log_enabled()) {
+        return;
+    }
+
+    static std::atomic<int> count{0};
+    const int idx = count.fetch_add(1, std::memory_order_relaxed);
+    if (idx < 128) {
+        GGML_LOG_INFO(
+                "%s: mtp_moe_route_policy tensor=%s type=%s tokens=%lld topk=%lld routes=%lld mmvq_cap=%lld small_route_gemv=%d force_mmq_requested=%d selected=%s\n",
+                site ? site : "-", src0 ? src0->name : "-", src0 ? ggml_type_name(src0->type) : "-",
+                (long long) n_tokens, (long long) n_expert_used, (long long) (n_tokens*n_expert_used),
+                (long long) mmvq_mmid_max, small_route_gemv_preferred ? 1 : 0, force_mmq_requested ? 1 : 0,
+                selected ? selected : "-");
+    }
+}
+
+static bool ggml_cuda_mtp_dense_ffn_weight_name_matches(const ggml_tensor * tensor, const char * suffix) {
+    if (tensor == nullptr || tensor->name[0] == '\0' || suffix == nullptr) {
+        return false;
+    }
+    return strstr(tensor->name, suffix) != nullptr;
+}
+
+static bool ggml_cuda_mtp_dense_ffn_serial_columns_disable_glu_fusion(const ggml_tensor * ffn_up, const ggml_tensor * ffn_gate) {
+    if (!ggml_cuda_mtp_dense_ffn_serial_columns_active() || ffn_up == nullptr || ffn_gate == nullptr) {
+        return false;
+    }
+    if (ffn_up->op != GGML_OP_MUL_MAT || ffn_gate->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+
+    const ggml_tensor * up_weight   = ffn_up->src[0];
+    const ggml_tensor * gate_weight = ffn_gate->src[0];
+    return ggml_cuda_mtp_dense_ffn_weight_name_matches(up_weight,   ".ffn_up.weight") &&
+           ggml_cuda_mtp_dense_ffn_weight_name_matches(gate_weight, ".ffn_gate.weight");
+}
+
+static bool ggml_cuda_mtp_dense_ffn_serial_columns_disable_mm_vec_fusion(const ggml_tensor * tensor) {
+    if (!ggml_cuda_mtp_dense_ffn_serial_columns_active() || tensor == nullptr || tensor->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+
+    const ggml_tensor * weight = tensor->src[0];
+    return ggml_cuda_mtp_dense_ffn_weight_name_matches(weight, ".ffn_up.weight") ||
+           ggml_cuda_mtp_dense_ffn_weight_name_matches(weight, ".ffn_gate.weight") ||
+           ggml_cuda_mtp_dense_ffn_weight_name_matches(weight, ".ffn_down.weight");
+}
+
 static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_gate,
                                           const ggml_tensor * glu,
@@ -2509,6 +2789,10 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     GGML_ASSERT(ffn_up && ffn_gate && glu);
 
     if (!is_mul_mat && !is_mul_mat_id) {
+        return false;
+    }
+
+    if (ggml_cuda_mtp_dense_ffn_serial_columns_disable_glu_fusion(ffn_up, ffn_gate)) {
         return false;
     }
 
@@ -2614,7 +2898,79 @@ static bool ggml_cuda_mtp_q8_dot4_mmvq_should_fuse_glu(const ggml_tensor * tenso
     return src0 && src0->type == GGML_TYPE_Q8_0 && ggml_cuda_mtp_q8_dot4_mmvq_fuse_glu_name_allowed(src0->name);
 }
 
+static bool ggml_cuda_mtp_moe_merged_gateup_fusion_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("LLAMA_MTP_MOE_MERGED_GATEUP_FUSION");
+        return env != nullptr && env[0] != '\0' && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_cuda_mtp_moe_merged_gateup_fusion_log_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("LLAMA_MTP_MOE_MERGED_GATEUP_FUSION_LOG");
+        return env != nullptr && env[0] != '\0' && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_cuda_should_fuse_merged_moe_gate_up(const ggml_tensor * mm_node,
+                                                     const ggml_tensor * gate_view,
+                                                     const ggml_tensor * up_view,
+                                                     const ggml_tensor * glu,
+                                                     uint32_t * split_rows) {
+    if (!ggml_cuda_mtp_moe_merged_gateup_fusion_enabled()) {
+        return false;
+    }
+    if (mm_node == nullptr || gate_view == nullptr || up_view == nullptr || glu == nullptr || split_rows == nullptr) {
+        return false;
+    }
+    if (mm_node->op != GGML_OP_MUL_MAT_ID || gate_view->op != GGML_OP_VIEW || up_view->op != GGML_OP_VIEW || glu->op != GGML_OP_GLU) {
+        return false;
+    }
+    if (mm_node->src[0] == nullptr || strstr(mm_node->src[0]->name, ".ffn_gate_up_exps.weight") == nullptr) {
+        return false;
+    }
+    if (mm_node->src[2] == nullptr || gate_view->view_src != mm_node || up_view->view_src != mm_node) {
+        return false;
+    }
+    if (glu->src[0] != gate_view || glu->src[1] != up_view) {
+        return false;
+    }
+    static constexpr std::array<ggml_glu_op, 3> valid_glu_ops = { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_OAI };
+    if (std::find(valid_glu_ops.begin(), valid_glu_ops.end(), ggml_get_glu_op(glu)) == valid_glu_ops.end()) {
+        return false;
+    }
+    if (const bool swapped = ggml_get_op_params_i32(glu, 1); swapped) {
+        return false;
+    }
+    if (!ggml_are_same_shape(gate_view, up_view) || !ggml_are_same_stride(gate_view, up_view)) {
+        return false;
+    }
+    if (gate_view->type != GGML_TYPE_F32 || up_view->type != GGML_TYPE_F32 || mm_node->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (gate_view->ne[0] <= 0 || gate_view->ne[0] > UINT32_MAX || mm_node->ne[0] != 2*gate_view->ne[0]) {
+        return false;
+    }
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        if (gate_view->ne[d] != mm_node->ne[d] || up_view->ne[d] != mm_node->ne[d]) {
+            return false;
+        }
+    }
+    if (gate_view->view_offs != 0 || up_view->view_offs != gate_view->ne[0]*mm_node->nb[0]) {
+        return false;
+    }
+
+    *split_rows = (uint32_t) gate_view->ne[0];
+    return true;
+}
+
 static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
+    if (ggml_cuda_mtp_dense_ffn_serial_columns_disable_mm_vec_fusion(tensor)) {
+        return false;
+    }
+
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
@@ -2650,6 +3006,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
 }
 
 static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+    if (ggml_cuda_mtp_dense_ffn_serial_columns_disable_mm_vec_fusion(tensor)) {
+        return false;
+    }
+
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
@@ -2667,6 +3027,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
         return false;
     }
 
+    if (use_mul_mat_vec_q && ggml_cuda_mtp_force_small_mmq_applies(src0, src1, dst, dst->ne[1], cc)) {
+        ggml_cuda_mtp_force_small_mmq_log(__func__, src0, dst->ne[1], tensor->op == GGML_OP_MUL_MAT_ID);
+        return false;
+    }
+
     const bool mtp_fuse_glu_n1_4 = ggml_cuda_mtp_q8_dot4_mmvq_should_fuse_glu(tensor);
     if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
         const bool allow_glu = mtp_fuse_glu_n1_4 && dst->ne[1] >= 2 && dst->ne[1] <= 4;
@@ -2676,7 +3041,13 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     }
 
     if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] != 1) {
-        return false;
+        const ggml_tensor * ids = tensor->src[2];
+        const bool small_route_gemv_preferred = ids != nullptr && ggml_cuda_mtp_moe_small_route_gemv_preferred(dst->ne[2], ids->ne[0]);
+        if (!small_route_gemv_preferred) {
+            return false;
+        }
+        ggml_cuda_mtp_moe_route_policy_log(__func__, src0, dst->ne[2], ids->ne[0], get_mmvq_mmid_max_batch(src0->type, cc),
+                true, false, "mmvq_moe_small_route_fused_gateup_candidate");
     }
 
 
@@ -2701,6 +3072,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD) {
         GGML_ASSERT(!split);
+        return;
+    }
+
+    if (ggml_cuda_mtp_router_mmvf_applies(src0, src1, dst, split)) {
+        ggml_cuda_mtp_router_mmvf_log(__func__, src0, src1, dst);
+        ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
         return;
     }
 
@@ -2745,6 +3122,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         use_mul_mat_f           = use_mul_mat_f             && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
         use_mul_mat_vec_f       = use_mul_mat_vec_f         && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
         any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16   || !fast_fp16_hardware_available(cc);
+    }
+
+    const int route_cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (use_mul_mat_vec_q && use_mul_mat_q && ggml_cuda_mtp_force_small_mmq_applies(src0, src1, dst, src1->ne[1], route_cc)) {
+        ggml_cuda_mtp_force_small_mmq_log(__func__, src0, src1->ne[1], false);
+        use_mul_mat_vec_q = false;
     }
 
     // debug helpers
@@ -2802,15 +3185,34 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
+        const int64_t n_expert_used_for_policy = ids->ne[0];
+        const bool small_route_gemv_preferred = ggml_cuda_mtp_moe_small_route_gemv_preferred(ne2, n_expert_used_for_policy);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
-                if (ne2 <= mmvq_mmid_max) {
+                const bool force_small_mmq_requested = ggml_cuda_mtp_force_small_mmq_applies(src0, src1, dst, ne2, cc) &&
+                                                       ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02);
+                const bool force_small_mmq = force_small_mmq_requested && !small_route_gemv_preferred;
+                if (!force_small_mmq && ne2 <= mmvq_mmid_max) {
+                    ggml_cuda_mtp_moe_route_policy_log(__func__, src0, ne2, n_expert_used_for_policy, mmvq_mmid_max,
+                            small_route_gemv_preferred, force_small_mmq_requested,
+                            small_route_gemv_preferred ? "mmvq_moe_small_route_gemv" : "mmvq_moe_type_cap");
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
                 }
+                if (force_small_mmq) {
+                    ggml_cuda_mtp_force_small_mmq_log(__func__, src0, ne2, true);
+                } else if (force_small_mmq_requested) {
+                    ggml_cuda_mtp_moe_route_policy_log(__func__, src0, ne2, n_expert_used_for_policy, mmvq_mmid_max,
+                            small_route_gemv_preferred, true, "blocked_force_mmq_small_route");
+                } else if (small_route_gemv_preferred) {
+                    ggml_cuda_mtp_moe_route_policy_log(__func__, src0, ne2, n_expert_used_for_policy, mmvq_mmid_max,
+                            true, false, "mmvq_type_cap_fallback");
+                }
             } else {
                 if (GGML_CUDA_CC_IS_AMD(cc)) {
+                    ggml_cuda_mtp_moe_route_policy_log(__func__, src0, ne2, n_expert_used_for_policy, MMVF_MAX_BATCH_SIZE,
+                            small_route_gemv_preferred, false, "mmvf_moe_small_route_gemv");
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                     return;
                 }
@@ -2818,6 +3220,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+            ggml_cuda_mtp_moe_route_policy_log(__func__, src0, ne2, n_expert_used_for_policy, get_mmvq_mmid_max_batch(src0->type, cc),
+                    small_route_gemv_preferred, false, "mmq_grouped_moe");
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
@@ -3234,6 +3638,36 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_TOP_K:
             ggml_cuda_op_top_k(ctx, dst);
+            break;
+        case GGML_OP_LM_HEAD_TOP_K:
+            ggml_cuda_op_lm_head_top_k(ctx, dst);
+            break;
+        case GGML_OP_ROUTER_TOPK_WEIGHTS:
+            ggml_cuda_op_router_topk_weights(ctx, dst);
+            break;
+        case GGML_OP_MOE_ROUTED_LANES:
+            ggml_cuda_op_moe_routed_lanes(ctx, dst);
+            break;
+        case GGML_OP_MOE_ROUTED_LANES_ROW_SLOT_MAP:
+            ggml_cuda_op_moe_routed_lanes_row_slot_map(ctx, dst);
+            break;
+        case GGML_OP_MOE_ROUTED_LANES_EXPERT_BOUNDS:
+            ggml_cuda_op_moe_routed_lanes_expert_bounds(ctx, dst);
+            break;
+        case GGML_OP_MOE_ROUTED_LANES_PROJECTION:
+            ggml_cuda_op_moe_routed_lanes_projection(ctx, dst);
+            break;
+        case GGML_OP_MOE_ROUTED_LANES_PACK_SLOTS:
+            ggml_cuda_op_moe_routed_lanes_pack_slots(ctx, dst);
+            break;
+        case GGML_OP_MOE_ROUTED_LANES_UNPACK_SLOTS:
+            ggml_cuda_op_moe_routed_lanes_unpack_slots(ctx, dst);
+            break;
+        case GGML_OP_MOE_ROUTED_LANES_GATHER:
+            ggml_cuda_op_moe_routed_lanes_gather(ctx, dst);
+            break;
+        case GGML_OP_MOE_ROUTED_LANES_SCATTER_REDUCE:
+            ggml_cuda_op_moe_routed_lanes_scatter_reduce(ctx, dst);
             break;
         case GGML_OP_ARGSORT:
             ggml_cuda_op_argsort(ctx, dst);
@@ -4008,6 +4442,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+    static const bool merged_gateup_fusion_enabled = ggml_cuda_mtp_moe_merged_gateup_fusion_enabled();
 
     //topk-moe
     if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
@@ -4126,6 +4561,50 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     bool fused_mul_mat_vec = false;
     int  fused_node_count  = 0;
+
+    // merged MoE gate_up + split views + GLU, e.g. Qwen3.x MoE ffn_gate_up_exps.
+    if (merged_gateup_fusion_enabled && ggml_cuda_mtp_moe_merged_gateup_fusion_log_enabled() &&
+            node->op == GGML_OP_MUL_MAT_ID && node->src[0] != nullptr &&
+            strstr(node->src[0]->name, ".ffn_gate_up_exps.weight") != nullptr) {
+        static std::atomic<int> probe_count{0};
+        const int probe_idx = probe_count.fetch_add(1, std::memory_order_relaxed);
+        if (probe_idx < 16) {
+            for (int d = 0; d < 8 && i + d < cgraph->n_nodes; ++d) {
+                const ggml_tensor * n = cgraph->nodes[i + d];
+                GGML_LOG_INFO("%s: merged_gateup_probe base=%d delta=%d op=%s name=%s src0=%s src1=%s view_src=%s ne=[%lld,%lld,%lld,%lld]\n",
+                        __func__, i, d, ggml_op_name(n->op), n->name,
+                        n->src[0] ? n->src[0]->name : "-", n->src[1] ? n->src[1]->name : "-",
+                        n->view_src ? n->view_src->name : "-",
+                        (long long) n->ne[0], (long long) n->ne[1], (long long) n->ne[2], (long long) n->ne[3]);
+            }
+        }
+    }
+    if (merged_gateup_fusion_enabled &&
+            node->op == GGML_OP_MUL_MAT_ID && i + 3 < cgraph->n_nodes &&
+            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_GLU }, { i + 3 })) {
+        ggml_tensor * mm_node   = cgraph->nodes[i];
+        ggml_tensor * gate_view = cgraph->nodes[i + 1];
+        ggml_tensor * up_view   = cgraph->nodes[i + 2];
+        ggml_tensor * glu       = cgraph->nodes[i + 3];
+
+        uint32_t gate_up_split = 0;
+        int out_nodes[] = { i + 3 };
+        if (ggml_cuda_should_fuse_merged_moe_gate_up(mm_node, gate_view, up_view, glu, &gate_up_split) &&
+                ggml_cuda_should_fuse_mul_mat_vec_q(mm_node) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, out_nodes, 1)) {
+            const ggml_tensor * gate_up_weight = mm_node->src[0];
+            ggml_tensor up_weight = *gate_up_weight;
+            up_weight.ne[1] = gate_up_split;
+            up_weight.data  = (char *) gate_up_weight->data + (size_t) gate_up_split * gate_up_weight->nb[1];
+
+            ggml_cuda_mm_fusion_args_host fusion_data{};
+            fusion_data.gate   = gate_up_weight;
+            fusion_data.glu_op = ggml_get_glu_op(glu);
+
+            ggml_cuda_mul_mat_vec_q(*cuda_ctx, &up_weight, mm_node->src[1], mm_node->src[2], glu, &fusion_data);
+            return 3;
+        }
+    }
 
     // gate + glu + up
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
@@ -5562,6 +6041,208 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SUM:
             return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_TOP_K:
+#ifndef GGML_CUDA_USE_CUB
+            return op->src[0]->ne[0] <= 1024 ||
+                (op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I32 &&
+                 ggml_is_contiguous_rows(op->src[0]) && op->ne[0] <= 16);
+#else
+            return true;
+#endif
+        case GGML_OP_LM_HEAD_TOP_K: {
+            if (!op->src[0] || !op->src[1]) {
+                return false;
+            }
+            const ggml_type src0_type = op->src[0]->type;
+            const bool src0_supported = src0_type == GGML_TYPE_Q6_K || src0_type == GGML_TYPE_Q8_0;
+            const int64_t src0_qk = src0_type == GGML_TYPE_Q8_0 ? QK8_0 : QK_K;
+            return src0_supported &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_I32 &&
+                op->ne[0] == 1 &&
+                op->src[0]->ne[0] == op->src[1]->ne[0] &&
+                op->src[0]->ne[0] % src0_qk == 0 &&
+                ggml_is_contiguous_rows(op->src[1]);
+        }
+        case GGML_OP_ROUTER_TOPK_WEIGHTS: {
+            if (!op->src[0]) {
+                return false;
+            }
+            const int k = ggml_get_op_params_i32(op, 0);
+            const int n_groups = ggml_get_op_params_i32(op, 1);
+            const int n_group_used = ggml_get_op_params_i32(op, 2);
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_F32 &&
+                k > 0 && k <= 16 &&
+                n_groups >= 1 && n_groups <= 64 &&
+                n_group_used >= 0 && n_group_used <= n_groups &&
+                op->src[0]->ne[0] > 0 && op->src[0]->ne[0] <= 512 &&
+                op->src[0]->ne[1] > 0 && op->src[0]->ne[1] <= 4 &&
+                op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&
+                op->ne[0] == 2*k &&
+                op->ne[1] == op->src[0]->ne[1] &&
+                op->ne[2] == 1 && op->ne[3] == 1 &&
+                ggml_is_contiguous_rows(op->src[0]);
+        }
+        case GGML_OP_MOE_ROUTED_LANES: {
+            if (!op->src[0] || !op->src[1]) {
+                return false;
+            }
+            const int n_expert = ggml_get_op_params_i32(op, 0);
+            const int64_t n_slots = op->src[0]->ne[0];
+            const int64_t n_rows  = op->src[0]->ne[1];
+            const int64_t n_lanes = n_slots*n_rows;
+            return op->src[0]->type == GGML_TYPE_I32 &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_I32 &&
+                n_expert > 0 && n_expert <= 4096 &&
+                n_slots > 0 && n_slots <= 16 &&
+                n_rows > 0 && n_rows <= 64 &&
+                op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&
+                op->src[1]->ne[0] == 1 &&
+                op->src[1]->ne[1] == n_slots &&
+                op->src[1]->ne[2] == n_rows &&
+                op->ne[0] == 4 && op->ne[1] == n_lanes + n_expert &&
+                op->ne[2] == 1 && op->ne[3] == 1;
+        }
+        case GGML_OP_MOE_ROUTED_LANES_ROW_SLOT_MAP: {
+            if (!op->src[0] || !op->src[1]) {
+                return false;
+            }
+            const int n_expert = ggml_get_op_params_i32(op->src[1], 0);
+            const int64_t n_slots = op->src[0]->ne[1];
+            const int64_t n_rows  = op->src[0]->ne[2];
+            const int64_t n_lanes = n_slots*n_rows;
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_I32 &&
+                op->type == GGML_TYPE_I32 &&
+                n_expert > 0 && n_expert <= 4096 &&
+                n_slots > 0 && n_slots <= 16 &&
+                n_rows > 0 && n_rows <= 64 &&
+                op->src[0]->ne[0] == 1 &&
+                op->src[1]->ne[0] == 4 && op->src[1]->ne[1] == n_lanes + n_expert &&
+                op->ne[0] == n_slots && op->ne[1] == n_rows &&
+                op->ne[2] == 1 && op->ne[3] == 1;
+        }
+        case GGML_OP_MOE_ROUTED_LANES_EXPERT_BOUNDS: {
+            if (!op->src[0]) {
+                return false;
+            }
+            const int n_expert = ggml_get_op_params_i32(op->src[0], 0);
+            const int64_t n_lanes = op->src[0]->ne[1] - n_expert;
+            return op->src[0]->type == GGML_TYPE_I32 &&
+                op->type == GGML_TYPE_I32 &&
+                n_expert > 0 && n_expert <= 4096 &&
+                n_lanes > 0 &&
+                op->src[0]->ne[0] == 4 && op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&
+                op->ne[0] == 2 && op->ne[1] == n_expert && op->ne[2] == 1 && op->ne[3] == 1;
+        }
+        case GGML_OP_MOE_ROUTED_LANES_PROJECTION: {
+            if (!op->src[0] || !op->src[1] || !op->src[2] || !op->src[3]) {
+                return false;
+            }
+            const int n_expert = ggml_get_op_params_i32(op->src[2], 0);
+            const int64_t n_in    = op->src[1]->ne[0];
+            const int64_t n_lanes = op->src[1]->ne[1];
+            const int64_t n_out   = op->src[0]->ne[1];
+            const bool weights_supported = op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_Q8_0 || op->src[0]->type == GGML_TYPE_IQ4_XS || op->src[0]->type == GGML_TYPE_IQ3_S;
+            const bool weights_quant = op->src[0]->type != GGML_TYPE_F32;
+            const bool weights_block_ok = !weights_quant || (op->src[0]->ne[0] % ggml_blck_size(op->src[0]->type) == 0);
+            const bool compact_stride_ok = op->src[1]->nb[0] == (int64_t) ggml_type_size(GGML_TYPE_F32) &&
+                (!weights_quant || (op->src[1]->nb[1] % (4*(int64_t) ggml_type_size(GGML_TYPE_F32)) == 0));
+            const bool quant_grid_ok = !weights_quant || (n_lanes > 0 && n_out > 0 && n_lanes <= INT_MAX && n_out <= INT_MAX && n_lanes <= INT_MAX / n_out);
+            return weights_supported &&
+                weights_block_ok &&
+                compact_stride_ok &&
+                quant_grid_ok &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_I32 &&
+                op->src[3]->type == GGML_TYPE_I32 &&
+                op->type == GGML_TYPE_F32 &&
+                n_expert > 0 && n_expert <= 4096 &&
+                n_in > 0 && n_out > 0 && n_lanes > 0 &&
+                op->src[0]->ne[0] == n_in && op->src[0]->ne[2] == n_expert && op->src[0]->ne[3] == 1 &&
+                op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
+                op->src[2]->ne[0] == 4 && op->src[2]->ne[1] == n_lanes + n_expert && op->src[2]->ne[2] == 1 && op->src[2]->ne[3] == 1 &&
+                op->src[3]->ne[0] == 2 && op->src[3]->ne[1] == n_expert && op->src[3]->ne[2] == 1 && op->src[3]->ne[3] == 1 &&
+                op->ne[0] == n_out && op->ne[1] == n_lanes && op->ne[2] == 1 && op->ne[3] == 1;
+        }
+        case GGML_OP_MOE_ROUTED_LANES_PACK_SLOTS: {
+            if (!op->src[0] || !op->src[1]) {
+                return false;
+            }
+            const int64_t n_in    = op->src[0]->ne[0];
+            const int64_t n_slots = op->src[1]->ne[0];
+            const int64_t n_rows  = op->src[1]->ne[1];
+            const int64_t n_lanes = n_slots*n_rows;
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_I32 &&
+                op->type == GGML_TYPE_F32 &&
+                n_in > 0 &&
+                n_slots > 0 && n_slots <= 16 &&
+                n_rows > 0 && n_rows <= 64 &&
+                op->src[0]->ne[1] == n_slots && op->src[0]->ne[2] == n_rows && op->src[0]->ne[3] == 1 &&
+                op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
+                op->ne[0] == n_in && op->ne[1] == n_lanes && op->ne[2] == 1 && op->ne[3] == 1;
+        }
+        case GGML_OP_MOE_ROUTED_LANES_UNPACK_SLOTS: {
+            if (!op->src[0] || !op->src[1]) {
+                return false;
+            }
+            const int64_t n_out   = op->src[0]->ne[0];
+            const int64_t n_lanes = op->src[0]->ne[1];
+            const int64_t n_slots = op->src[1]->ne[0];
+            const int64_t n_rows  = op->src[1]->ne[1];
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_I32 &&
+                op->type == GGML_TYPE_F32 &&
+                n_out > 0 &&
+                n_slots > 0 && n_slots <= 16 &&
+                n_rows > 0 && n_rows <= 64 &&
+                n_lanes == n_slots*n_rows &&
+                op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&
+                op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
+                op->ne[0] == n_out && op->ne[1] == n_slots && op->ne[2] == n_rows && op->ne[3] == 1;
+        }
+        case GGML_OP_MOE_ROUTED_LANES_GATHER: {
+            if (!op->src[0] || !op->src[1]) {
+                return false;
+            }
+            const int n_expert = ggml_get_op_params_i32(op->src[1], 0);
+            const int64_t n_lanes = op->src[1]->ne[1] - n_expert;
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_I32 &&
+                op->type == GGML_TYPE_F32 &&
+                n_expert > 0 && n_expert <= 4096 &&
+                n_lanes > 0 &&
+                op->src[0]->ne[0] > 0 && op->src[0]->ne[1] > 0 &&
+                op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&
+                op->src[1]->ne[0] == 4 &&
+                op->ne[0] == op->src[0]->ne[0] && op->ne[1] == n_lanes &&
+                op->ne[2] == 1 && op->ne[3] == 1;
+        }
+        case GGML_OP_MOE_ROUTED_LANES_SCATTER_REDUCE: {
+            if (!op->src[0] || !op->src[1] || !op->src[2]) {
+                return false;
+            }
+            const int n_expert = ggml_get_op_params_i32(op->src[2], 0);
+            const int64_t n_slots = op->src[1]->ne[1];
+            const int64_t n_rows  = op->src[1]->ne[2];
+            const int64_t n_lanes = n_slots*n_rows;
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_I32 &&
+                op->type == GGML_TYPE_F32 &&
+                n_expert > 0 && n_expert <= 4096 &&
+                n_slots > 0 && n_slots <= 16 &&
+                n_rows > 0 && n_rows <= 64 &&
+                op->src[0]->ne[0] > 0 && op->src[0]->ne[1] == n_lanes &&
+                op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&
+                op->src[1]->ne[0] == 1 &&
+                op->src[2]->ne[0] == 4 && op->src[2]->ne[1] == n_lanes + n_expert &&
+                op->ne[0] == op->src[0]->ne[0] && op->ne[1] == n_rows &&
+                op->ne[2] == 1 && op->ne[3] == 1;
+        }
+
         case GGML_OP_ARGSORT:
 #ifndef GGML_CUDA_USE_CUB
             return op->src[0]->ne[0] <= 1024;
@@ -5787,8 +6468,46 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+static void ggml_backend_cuda_reset_devices() {
+    const auto & info = ggml_cuda_info();
+
+    for (int id = 0; id < info.device_count; ++id) {
+        cudaError_t err = cudaSetDevice(id);
+        if (err != cudaSuccess) {
+            GGML_LOG_WARN("%s reset[%d]: cudaSetDevice failed: err=%d (%s)\n",
+                    GGML_CUDA_NAME, id, (int) err, cudaGetErrorString(err));
+            (void) cudaGetLastError();
+            continue;
+        }
+
+        err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) {
+            GGML_LOG_WARN("%s reset[%d]: cudaDeviceSynchronize failed: err=%d (%s)\n",
+                    GGML_CUDA_NAME, id, (int) err, cudaGetErrorString(err));
+            (void) cudaGetLastError();
+        }
+
+#if defined(GGML_USE_HIP)
+        err = hipDeviceReset();
+#else
+        err = cudaDeviceReset();
+#endif
+        if (err != cudaSuccess) {
+            GGML_LOG_WARN("%s reset[%d]: device reset failed: err=%d (%s)\n",
+                    GGML_CUDA_NAME, id, (int) err, cudaGetErrorString(err));
+            (void) cudaGetLastError();
+            continue;
+        }
+
+        GGML_LOG_INFO("%s reset[%d]: device context reset on backend shutdown\n", GGML_CUDA_NAME, id);
+    }
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_reset_devices") == 0) {
+        return (void *)ggml_backend_cuda_reset_devices;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

@@ -458,7 +458,9 @@ extern "C" {
 #endif
 struct ggml_tensor;
 void llama_kv_cache_register_packed16(const void * k_view_data, struct ggml_tensor * payload, struct ggml_tensor * scales);
+void llama_kv_cache_register_packed16_shadow(const void * k_view_data, struct ggml_tensor * payload, struct ggml_tensor * scales, struct ggml_tensor * shadow_k);
 void llama_kv_cache_get_packed16_tensors(const void * k_view_data, struct ggml_tensor ** payload, struct ggml_tensor ** scales);
+void llama_kv_cache_get_packed16_shadow_k(const void * k_view_data, struct ggml_tensor ** shadow_k);
 #ifdef __cplusplus
 }
 #endif

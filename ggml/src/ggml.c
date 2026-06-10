@@ -1102,6 +1102,16 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "TIMESTEP_EMBEDDING",
     "ARGSORT",
     "TOP_K",
+    "LM_HEAD_TOP_K",
+    "ROUTER_TOPK_WEIGHTS",
+    "MOE_ROUTED_LANES",
+    "MOE_ROUTED_LANES_ROW_SLOT_MAP",
+    "MOE_ROUTED_LANES_EXPERT_BOUNDS",
+    "MOE_ROUTED_LANES_PROJECTION",
+    "MOE_ROUTED_LANES_PACK_SLOTS",
+    "MOE_ROUTED_LANES_UNPACK_SLOTS",
+    "MOE_ROUTED_LANES_GATHER",
+    "MOE_ROUTED_LANES_SCATTER_REDUCE",
     "LEAKY_RELU",
     "TRI",
     "FILL",
@@ -1137,7 +1147,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "PACK_K_PACKED16",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1213,6 +1223,16 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "timestep_embedding(timesteps, dim, max_period)",
     "argsort(x)",
     "top_k(x)",
+    "lm_head_top_k(W,x)",
+    "router_topk_weights(logits)",
+    "moe_routed_lanes(selected, weights)",
+    "moe_routed_lanes_row_slot_map(weights, lanes)",
+    "moe_routed_lanes_expert_bounds(lanes)",
+    "moe_routed_lanes_projection(weights, compact, lanes, bounds)",
+    "moe_routed_lanes_pack_slots(slot_x, row_slot_map)",
+    "moe_routed_lanes_unpack_slots(compact, row_slot_map)",
+    "moe_routed_lanes_gather(x, lanes)",
+    "moe_routed_lanes_scatter_reduce(compact, weights, lanes)",
     "leaky_relu(x)",
     "tri(x)",
     "fill(x, c)",
@@ -1247,7 +1267,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5409,6 +5429,268 @@ struct ggml_tensor * ggml_top_k(
     return result;
 }
 
+// ggml_lm_head_top_k
+
+struct ggml_tensor * ggml_lm_head_top_k(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        int                   k) {
+    GGML_ASSERT(k > 0);
+    GGML_ASSERT(a->ne[0] == b->ne[0]);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, k, b->ne[1], b->ne[2], b->ne[3]);
+
+    result->op     = GGML_OP_LM_HEAD_TOP_K;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
+}
+
+// ggml_router_topk_weights
+
+struct ggml_tensor * ggml_router_topk_weights(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * logits,
+        int                   k,
+        int                   n_expert_groups,
+        int                   n_group_used,
+        float                 expert_weights_scale) {
+    GGML_ASSERT(logits->type == GGML_TYPE_F32);
+    GGML_ASSERT(k > 0 && k <= logits->ne[0]);
+    GGML_ASSERT(n_expert_groups >= 1);
+    GGML_ASSERT(n_group_used >= 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2*k, logits->ne[1], logits->ne[2], logits->ne[3]);
+
+    result->op     = GGML_OP_ROUTER_TOPK_WEIGHTS;
+    result->src[0] = logits;
+
+    ggml_set_op_params_i32(result, 0, k);
+    ggml_set_op_params_i32(result, 1, n_expert_groups);
+    ggml_set_op_params_i32(result, 2, n_group_used);
+    ggml_set_op_params_f32(result, 3, expert_weights_scale);
+
+    return result;
+}
+
+// ggml_moe_routed_lanes
+
+struct ggml_tensor * ggml_moe_routed_lanes(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * selected_experts,
+        struct ggml_tensor  * routing_weights,
+        int                   n_expert) {
+    GGML_ASSERT(selected_experts->type == GGML_TYPE_I32);
+    GGML_ASSERT(routing_weights->type  == GGML_TYPE_F32);
+    GGML_ASSERT(n_expert > 0);
+    GGML_ASSERT(selected_experts->ne[0] > 0 && selected_experts->ne[1] > 0);
+    GGML_ASSERT(selected_experts->ne[2] == 1 && selected_experts->ne[3] == 1);
+    GGML_ASSERT(routing_weights->ne[0] == 1);
+    GGML_ASSERT(routing_weights->ne[1] == selected_experts->ne[0]);
+    GGML_ASSERT(routing_weights->ne[2] == selected_experts->ne[1]);
+
+    const int64_t n_lanes = selected_experts->ne[0] * selected_experts->ne[1];
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, n_lanes + n_expert);
+
+    result->op     = GGML_OP_MOE_ROUTED_LANES;
+    result->src[0] = selected_experts;
+    result->src[1] = routing_weights;
+
+    ggml_set_op_params_i32(result, 0, n_expert);
+
+    return result;
+}
+
+// ggml_moe_routed_lanes_row_slot_map
+
+struct ggml_tensor * ggml_moe_routed_lanes_row_slot_map(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * routing_weights,
+        struct ggml_tensor  * lanes) {
+    GGML_ASSERT(routing_weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(lanes->type == GGML_TYPE_I32);
+    GGML_ASSERT(routing_weights->ne[0] == 1);
+    GGML_ASSERT(routing_weights->ne[1] > 0 && routing_weights->ne[2] > 0);
+    GGML_ASSERT(lanes->ne[0] == 4);
+
+    const int n_expert = ggml_get_op_params_i32(lanes, 0);
+    GGML_ASSERT(n_expert > 0);
+    const int64_t n_lanes = routing_weights->ne[1] * routing_weights->ne[2];
+    GGML_ASSERT(lanes->ne[1] == n_lanes + n_expert);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, routing_weights->ne[1], routing_weights->ne[2]);
+
+    result->op     = GGML_OP_MOE_ROUTED_LANES_ROW_SLOT_MAP;
+    result->src[0] = routing_weights;
+    result->src[1] = lanes;
+
+    return result;
+}
+
+// ggml_moe_routed_lanes_expert_bounds
+
+struct ggml_tensor * ggml_moe_routed_lanes_expert_bounds(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * lanes) {
+    GGML_ASSERT(lanes->type == GGML_TYPE_I32);
+    GGML_ASSERT(lanes->ne[0] == 4 && lanes->ne[1] > 0);
+
+    const int n_expert = ggml_get_op_params_i32(lanes, 0);
+    GGML_ASSERT(n_expert > 0 && lanes->ne[1] > n_expert);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, n_expert);
+
+    result->op     = GGML_OP_MOE_ROUTED_LANES_EXPERT_BOUNDS;
+    result->src[0] = lanes;
+
+    return result;
+}
+
+// ggml_moe_routed_lanes_projection
+
+struct ggml_tensor * ggml_moe_routed_lanes_projection(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * compact_x,
+        struct ggml_tensor  * lanes,
+        struct ggml_tensor  * expert_bounds) {
+    GGML_ASSERT(weights->type == GGML_TYPE_F32 || weights->type == GGML_TYPE_Q8_0 || weights->type == GGML_TYPE_IQ4_XS || weights->type == GGML_TYPE_IQ3_S);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32 || weights->ne[0] % ggml_blck_size(weights->type) == 0);
+    GGML_ASSERT(compact_x->type == GGML_TYPE_F32);
+    GGML_ASSERT(lanes->type == GGML_TYPE_I32);
+    GGML_ASSERT(expert_bounds->type == GGML_TYPE_I32);
+    GGML_ASSERT(weights->ne[0] > 0 && weights->ne[1] > 0 && weights->ne[2] > 0);
+    GGML_ASSERT(weights->ne[3] == 1);
+    GGML_ASSERT(compact_x->ne[0] == weights->ne[0]);
+    GGML_ASSERT(compact_x->ne[1] > 0 && compact_x->ne[2] == 1 && compact_x->ne[3] == 1);
+    GGML_ASSERT(lanes->ne[0] == 4);
+
+    const int n_expert = ggml_get_op_params_i32(lanes, 0);
+    GGML_ASSERT(n_expert > 0);
+    GGML_ASSERT(weights->ne[2] == n_expert);
+    GGML_ASSERT(expert_bounds->ne[0] == 2 && expert_bounds->ne[1] == n_expert);
+    GGML_ASSERT(expert_bounds->ne[2] == 1 && expert_bounds->ne[3] == 1);
+    GGML_ASSERT(lanes->ne[1] == compact_x->ne[1] + n_expert);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, weights->ne[1], compact_x->ne[1]);
+
+    result->op     = GGML_OP_MOE_ROUTED_LANES_PROJECTION;
+    result->src[0] = weights;
+    result->src[1] = compact_x;
+    result->src[2] = lanes;
+    result->src[3] = expert_bounds;
+
+    return result;
+}
+
+// ggml_moe_routed_lanes_pack_slots
+
+struct ggml_tensor * ggml_moe_routed_lanes_pack_slots(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * slot_x,
+        struct ggml_tensor  * row_slot_to_lane) {
+    GGML_ASSERT(slot_x->type == GGML_TYPE_F32);
+    GGML_ASSERT(row_slot_to_lane->type == GGML_TYPE_I32);
+    GGML_ASSERT(slot_x->ne[0] > 0 && slot_x->ne[1] > 0 && slot_x->ne[2] > 0);
+    GGML_ASSERT(slot_x->ne[3] == 1);
+    GGML_ASSERT(row_slot_to_lane->ne[0] > 0 && row_slot_to_lane->ne[1] > 0);
+    GGML_ASSERT(row_slot_to_lane->ne[2] == 1 && row_slot_to_lane->ne[3] == 1);
+    GGML_ASSERT(slot_x->ne[1] == row_slot_to_lane->ne[0]);
+    GGML_ASSERT(slot_x->ne[2] == row_slot_to_lane->ne[1]);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+            slot_x->ne[0], row_slot_to_lane->ne[0] * row_slot_to_lane->ne[1]);
+
+    result->op     = GGML_OP_MOE_ROUTED_LANES_PACK_SLOTS;
+    result->src[0] = slot_x;
+    result->src[1] = row_slot_to_lane;
+
+    return result;
+}
+
+// ggml_moe_routed_lanes_unpack_slots
+
+struct ggml_tensor * ggml_moe_routed_lanes_unpack_slots(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * compact_x,
+        struct ggml_tensor  * row_slot_to_lane) {
+    GGML_ASSERT(compact_x->type == GGML_TYPE_F32);
+    GGML_ASSERT(row_slot_to_lane->type == GGML_TYPE_I32);
+    GGML_ASSERT(compact_x->ne[0] > 0 && compact_x->ne[1] > 0);
+    GGML_ASSERT(compact_x->ne[2] == 1 && compact_x->ne[3] == 1);
+    GGML_ASSERT(row_slot_to_lane->ne[0] > 0 && row_slot_to_lane->ne[1] > 0);
+    GGML_ASSERT(row_slot_to_lane->ne[2] == 1 && row_slot_to_lane->ne[3] == 1);
+    GGML_ASSERT(compact_x->ne[1] == row_slot_to_lane->ne[0] * row_slot_to_lane->ne[1]);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
+            compact_x->ne[0], row_slot_to_lane->ne[0], row_slot_to_lane->ne[1]);
+
+    result->op     = GGML_OP_MOE_ROUTED_LANES_UNPACK_SLOTS;
+    result->src[0] = compact_x;
+    result->src[1] = row_slot_to_lane;
+
+    return result;
+}
+
+// ggml_moe_routed_lanes_gather
+
+struct ggml_tensor * ggml_moe_routed_lanes_gather(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * lanes) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(lanes->type == GGML_TYPE_I32);
+    GGML_ASSERT(x->ne[0] > 0 && x->ne[1] > 0);
+    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(lanes->ne[0] == 4 && lanes->ne[1] > 0);
+
+    const int n_expert = ggml_get_op_params_i32(lanes, 0);
+    GGML_ASSERT(n_expert > 0 && lanes->ne[1] > n_expert);
+    const int64_t n_lanes = lanes->ne[1] - n_expert;
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x->ne[0], n_lanes);
+
+    result->op     = GGML_OP_MOE_ROUTED_LANES_GATHER;
+    result->src[0] = x;
+    result->src[1] = lanes;
+
+    return result;
+}
+
+// ggml_moe_routed_lanes_scatter_reduce
+
+struct ggml_tensor * ggml_moe_routed_lanes_scatter_reduce(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * compact_x,
+        struct ggml_tensor  * routing_weights,
+        struct ggml_tensor  * lanes) {
+    GGML_ASSERT(compact_x->type == GGML_TYPE_F32);
+    GGML_ASSERT(routing_weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(lanes->type == GGML_TYPE_I32);
+    GGML_ASSERT(compact_x->ne[0] > 0 && compact_x->ne[1] > 0);
+    GGML_ASSERT(compact_x->ne[2] == 1 && compact_x->ne[3] == 1);
+    GGML_ASSERT(routing_weights->ne[0] == 1);
+    GGML_ASSERT(routing_weights->ne[1] > 0 && routing_weights->ne[2] > 0);
+    GGML_ASSERT(lanes->ne[0] == 4);
+
+    const int n_expert = ggml_get_op_params_i32(lanes, 0);
+    GGML_ASSERT(n_expert > 0 && lanes->ne[1] > n_expert);
+    const int64_t n_lanes = routing_weights->ne[1] * routing_weights->ne[2];
+    GGML_ASSERT(compact_x->ne[1] == n_lanes);
+    GGML_ASSERT(lanes->ne[1] == n_lanes + n_expert);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, compact_x->ne[0], routing_weights->ne[2]);
+
+    result->op     = GGML_OP_MOE_ROUTED_LANES_SCATTER_REDUCE;
+    result->src[0] = compact_x;
+    result->src[1] = routing_weights;
+    result->src[2] = lanes;
+
+    return result;
+}
+
 // ggml_arange
 
 struct ggml_tensor * ggml_arange(
@@ -6314,7 +6596,7 @@ struct ggml_tensor * ggml_solve_tri(
 
 // ggml_gated_delta_net
 
-struct ggml_tensor * ggml_gated_delta_net(
+static struct ggml_tensor * ggml_gated_delta_net_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
@@ -6322,7 +6604,8 @@ struct ggml_tensor * ggml_gated_delta_net(
         struct ggml_tensor  * g,
         struct ggml_tensor  * beta,
         struct ggml_tensor  * state,
-        bool                  keep_intermediates) {
+        bool                  keep_intermediates,
+        bool                  state_only) {
     GGML_ASSERT(ggml_is_contiguous_rows(q));
     GGML_ASSERT(ggml_is_contiguous_rows(k));
     GGML_ASSERT(ggml_is_contiguous_rows(v));
@@ -6351,6 +6634,14 @@ struct ggml_tensor * ggml_gated_delta_net(
     GGML_ASSERT(state->ne[2] == n_seqs);
     GGML_ASSERT(state->ne[3] == 1);
     const int64_t K = state->ne[1];
+    if (state_only) {
+        // The state-only variant is currently only validated for the final
+        // state view used by qwen35moe prefix reconstruction.  Do not expose
+        // skipped attention-prefix writes to keep-intermediate/K>1 callers
+        // without adding backend coverage for that contract first.
+        GGML_ASSERT(!keep_intermediates);
+        GGML_ASSERT(K == 1);
+    }
     const int64_t state_rows = K * S_v * n_seqs;
     const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + state_rows, 1, 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
@@ -6363,10 +6654,34 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[4] = beta;
     result->src[5] = state;
 
-    int32_t flag = keep_intermediates ? 1 : 0;
-    ggml_set_op_params(result, &flag, sizeof(flag));
+    int32_t flags[2] = { keep_intermediates ? 1 : 0, state_only ? 1 : 0 };
+    ggml_set_op_params(result, flags, sizeof(flags));
 
     return result;
+}
+
+struct ggml_tensor * ggml_gated_delta_net(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        bool                  keep_intermediates) {
+    return ggml_gated_delta_net_impl(ctx, q, k, v, g, beta, state, keep_intermediates, false);
+}
+
+struct ggml_tensor * ggml_gated_delta_net_state_only(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        bool                  keep_intermediates) {
+    return ggml_gated_delta_net_impl(ctx, q, k, v, g, beta, state, keep_intermediates, true);
 }
 
 ////////////////////////////////////////////////////////////////////////////////

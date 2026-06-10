@@ -14,6 +14,59 @@ values, while f16 scales remain separate.
 
 ---
 
+## Start here: smart MTP MMVQ policy wrapper
+
+For MTP decode experiments, do **not** hand-copy a pile of
+`LLAMA_MTP_MMVQ_*` route knobs into every launch command. Use the wrapper on top
+of the normal command instead:
+
+```bash
+scripts/mtp-mmvq-interleaved-auto.py \
+  --model /path/to/model.gguf \
+  --explain \
+  -- ./build-rocm/bin/llama-server \
+    --device ROCm0 \
+    --model /path/to/model.gguf \
+    --flash-attn on \
+    --cache-type-v q4_0 \
+    --ctx-size 40960 --parallel 1
+```
+
+The wrapper clears stale low-level MMVQ env vars, fingerprints the GGUF, and
+then applies only a measured/cached policy. Unknown models stay on the safe
+baseline unless a policy is explicitly forced or cached by the user.
+
+Useful modes:
+
+```bash
+# Show the policy as shell exports/unsets, without running anything.
+scripts/mtp-mmvq-interleaved-auto.py --model /path/to/model.gguf --shell
+
+# Show the selected policy and fingerprint as JSON.
+scripts/mtp-mmvq-interleaved-auto.py --model /path/to/model.gguf --json
+
+# Force a developer-tested policy and cache it for this exact GGUF fingerprint.
+scripts/mtp-mmvq-interleaved-auto.py \
+  --model /path/to/model.gguf \
+  --policy q6k-nw4 \
+  --trust-policy \
+  --shell
+```
+
+Built-in measured policies currently include:
+
+| Policy | Intended GGUF/layout | Notes |
+|---|---|---|
+| `q4q6-27b-fast` | Qwen3.6 27B `Q4_K_M` MTP layout | Enables Q4_K + Q6_K interleaved-act and Q4_K `nwarps=2`. |
+| `q6k-nw4` | Qwen3.6 27B Heretic/native MTP `i1-Q6_K` layout | Enables Q6_K interleaved-act with `nwarps=4`; default Q6 `nwarps=1/2` were rejected. |
+| `coverage` | Developer route-smoke only | Enables Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 coverage; not a fastest-known preset. |
+
+This keeps arbitrary user GGUFs safe: known/cached layouts get the measured
+fast path, while unknown layouts do not silently enable experimental MMVQ
+routes.
+
+---
+
 ## PROPER STARTING OPTIONS — I32 packed16 FlashAttention
 
 For this branch's RDNA3 FlashAttention work, **K is the packed16/I32 route**.

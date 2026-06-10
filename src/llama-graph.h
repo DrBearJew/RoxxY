@@ -34,6 +34,14 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_ENCODER,
     LLM_GRAPH_TYPE_DECODER,
     LLM_GRAPH_TYPE_DECODER_MTP,
+    // Reserved for exact MTP target verification: one prefix verifier call with
+    // token-major, serial-equivalent memory/state dependencies. This must not
+    // alias the normal decoder graph or the MTP draft-head graph.
+    LLM_GRAPH_TYPE_DECODER_PREFIX_VERIFY,
+    // Post-sampler recurrent-state commit reconstruction for accepted MTP prefix
+    // rows. This graph is logits-free and copies only the final accepted R/S row
+    // to the rollback slot selected by mtp_prefix_commit_slot.
+    LLM_GRAPH_TYPE_DECODER_PREFIX_COMMIT,
 };
 
 enum llm_ffn_op_type {
@@ -623,6 +631,18 @@ struct llm_graph_params {
 
     uint32_t n_outputs;
 
+    int32_t mtp_prefix_commit_slot = -1;
+    int32_t mtp_prefix_accepted_commit_verify_slots = 0;
+    bool    mtp_prefix_batch_output_head = false;
+    // Stage3 exact-verifier experiment: keep recurrent/attention state writes
+    // serial-equivalent, then batch only the final state-free verifier tail.
+    bool    mtp_prefix_exact_tail_batch = false;
+    // Stage4 exact-verifier experiment: keep every state-writing attention
+    // frontier token-major, but batch per-layer FFN/MoE only while the
+    // backend is in row-equivalent serial-column mode. This is graph-
+    // topology-affecting and must participate in graph reuse checks.
+    bool    mtp_prefix_roweq_layer_ffn_batch = false;
+
     llm_graph_cb cb;
 
     llm_graph_result * res;
@@ -661,6 +681,26 @@ struct llm_graph_params {
         }
 
         if (n_outputs != other.n_outputs) {
+            return false;
+        }
+
+        if (mtp_prefix_commit_slot != other.mtp_prefix_commit_slot) {
+            return false;
+        }
+
+        if (mtp_prefix_accepted_commit_verify_slots != other.mtp_prefix_accepted_commit_verify_slots) {
+            return false;
+        }
+
+        if (mtp_prefix_batch_output_head != other.mtp_prefix_batch_output_head) {
+            return false;
+        }
+
+        if (mtp_prefix_exact_tail_batch != other.mtp_prefix_exact_tail_batch) {
+            return false;
+        }
+
+        if (mtp_prefix_roweq_layer_ffn_batch != other.mtp_prefix_roweq_layer_ffn_batch) {
             return false;
         }
 
@@ -743,6 +783,14 @@ public:
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
     std::map<llama_seq_id, ggml_tensor*> t_sampled;
     std::map<llama_seq_id, ggml_tensor*> t_sampled_probs;
+
+    // Optional MTP target LM-head shadow verification outputs. These are never
+    // consumed for sampling; they compare a fused output.weight top1 candidate
+    // against top1 derived from the full logits graph.
+    ggml_tensor * t_mtp_target_top1_full_all  = nullptr;
+    ggml_tensor * t_mtp_target_top1_fused_all = nullptr;
+    std::map<llama_seq_id, ggml_tensor*> t_mtp_target_top1_full;
+    std::map<llama_seq_id, ggml_tensor*> t_mtp_target_top1_fused;
 
     std::vector<llm_graph_input_ptr> inputs;
 

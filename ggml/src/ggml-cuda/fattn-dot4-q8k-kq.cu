@@ -8,24 +8,41 @@
 #include <unordered_set>
 
 // Packed16 K cache tensor registry (shared with llama-kv-cache)
+struct packed16_registry_entry {
+    ggml_tensor * payload  = nullptr;
+    ggml_tensor * scales   = nullptr;
+    ggml_tensor * shadow_k = nullptr;
+};
+
 static std::mutex s_packed16_mutex;
-static std::unordered_map<const void *, std::pair<ggml_tensor *, ggml_tensor *>> s_packed16_registry;
+static std::unordered_map<const void *, packed16_registry_entry> s_packed16_registry;
 
 extern "C" {
 void llama_kv_cache_register_packed16(const void * k_view_data, ggml_tensor * payload, ggml_tensor * scales) {
     std::lock_guard<std::mutex> lock(s_packed16_mutex);
-    s_packed16_registry[k_view_data] = {payload, scales};
+    packed16_registry_entry & entry = s_packed16_registry[k_view_data];
+    entry.payload = payload;
+    entry.scales  = scales;
+}
+void llama_kv_cache_register_packed16_shadow(const void * k_view_data, ggml_tensor * payload, ggml_tensor * scales, ggml_tensor * shadow_k) {
+    std::lock_guard<std::mutex> lock(s_packed16_mutex);
+    s_packed16_registry[k_view_data] = {payload, scales, shadow_k};
 }
 void llama_kv_cache_get_packed16_tensors(const void * k_view_data, ggml_tensor ** payload, ggml_tensor ** scales) {
     std::lock_guard<std::mutex> lock(s_packed16_mutex);
     auto it = s_packed16_registry.find(k_view_data);
     if (it != s_packed16_registry.end()) {
-        *payload = it->second.first;
-        *scales  = it->second.second;
+        *payload = it->second.payload;
+        *scales  = it->second.scales;
     } else {
         *payload = nullptr;
         *scales  = nullptr;
     }
+}
+void llama_kv_cache_get_packed16_shadow_k(const void * k_view_data, ggml_tensor ** shadow_k) {
+    std::lock_guard<std::mutex> lock(s_packed16_mutex);
+    auto it = s_packed16_registry.find(k_view_data);
+    *shadow_k = it != s_packed16_registry.end() ? it->second.shadow_k : nullptr;
 }
 }
 
@@ -45,9 +62,55 @@ static inline bool ggml_cuda_q8k_dot4_kq_env_enabled(const char * name) {
     return env && atoi(env) != 0;
 }
 
+static inline bool ggml_cuda_q8k_dot4_kq_env_disabled(const char * name) {
+    const char * env = getenv(name);
+    return env && atoi(env) == 0;
+}
+
 static inline int ggml_cuda_q8k_dot4_kq_env_int(const char * name, int fallback) {
     const char * env = getenv(name);
     return env ? atoi(env) : fallback;
+}
+
+static inline float ggml_cuda_q8k_dot4_kq_env_float(const char * name, float fallback) {
+    const char * env = getenv(name);
+    return env ? strtof(env, nullptr) : fallback;
+}
+
+// Packed16 K quality knobs for acceptance/drift experiments. Defaults preserve
+// existing behavior: transient local f16 K packing keeps maxabs, persistent
+// indexed K-cache packing keeps the current one-step MSE scale.
+//   GGML_CUDA_ROCM_PACKED16_K_SCALE_MODE=maxabs|mse|0|1
+//   GGML_CUDA_ROCM_PACKED16_K_SCALE_MUL=<positive float>
+// LLAMA_MTP_* aliases are accepted for MTP-specific sweeps.
+static inline int ggml_cuda_q8k_dot4_packed16_k_scale_mode(int fallback) {
+    const char * env = getenv("GGML_CUDA_ROCM_PACKED16_K_SCALE_MODE");
+    if (!env) {
+        env = getenv("LLAMA_MTP_PACKED16_K_SCALE_MODE");
+    }
+    if (!env || env[0] == '\0') {
+        return fallback;
+    }
+    const std::string mode(env);
+    if (mode == "maxabs" || mode == "amax" || mode == "0") {
+        return 0;
+    }
+    if (mode == "mse" || mode == "mse1" || mode == "1") {
+        return 1;
+    }
+    return fallback;
+}
+
+static inline float ggml_cuda_q8k_dot4_packed16_k_scale_mul() {
+    const char * env = getenv("GGML_CUDA_ROCM_PACKED16_K_SCALE_MUL");
+    if (!env) {
+        env = getenv("LLAMA_MTP_PACKED16_K_SCALE_MUL");
+    }
+    if (!env || env[0] == '\0') {
+        return 1.0f;
+    }
+    const float v = strtof(env, nullptr);
+    return (v > 0.0f && v < 100.0f) ? v : 1.0f;
 }
 
 static inline const char * ggml_cuda_q8k_dot4_k_physical_name(const ggml_tensor * K) {
@@ -136,6 +199,155 @@ static inline float ggml_cuda_q8k_dot4_kq_event_elapsed_ms(hipEvent_t start, hip
     float ms = 0.0f;
     CUDA_CHECK(hipEventElapsedTime(&ms, start, stop));
     return ms;
+}
+
+struct ggml_cuda_q8k_dot4_packed16_attn_profile_bucket {
+    unsigned long long calls = 0;
+    double stage1_ms = 0.0;
+    double reduce_ms = 0.0;
+    double total_ms = 0.0;
+};
+
+static std::mutex s_packed16_attn_profile_mutex;
+static ggml_cuda_q8k_dot4_packed16_attn_profile_bucket s_packed16_attn_profile_by_nq[9];
+static unsigned long long s_packed16_attn_profile_call_counter = 0;
+static bool s_packed16_attn_profile_capture_warned = false;
+
+static inline bool ggml_cuda_q8k_dot4_packed16_attn_profile_enabled() {
+    return ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_PACKED16_ATTN_PROFILE");
+}
+
+static inline bool ggml_cuda_q8k_dot4_packed16_attn_profile_begin(
+        hipStream_t stream,
+        unsigned long long * call,
+        hipEvent_t * start,
+        hipEvent_t * after_stage1,
+        hipEvent_t * after_reduce) {
+    *call = 0;
+    *start = nullptr;
+    *after_stage1 = nullptr;
+    *after_reduce = nullptr;
+
+    if (!ggml_cuda_q8k_dot4_packed16_attn_profile_enabled()) {
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(s_packed16_attn_profile_mutex);
+        *call = ++s_packed16_attn_profile_call_counter;
+    }
+
+    int every = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_PACKED16_ATTN_PROFILE_EVERY", 1);
+    if (every < 1) {
+        every = 1;
+    }
+    if ((*call % (unsigned long long) every) != 0ull) {
+        return false;
+    }
+
+    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+    const hipError_t capture_err = hipStreamIsCapturing(stream, &capture_status);
+    if (capture_err == hipSuccess && capture_status != hipStreamCaptureStatusNone) {
+        std::lock_guard<std::mutex> lock(s_packed16_attn_profile_mutex);
+        if (!s_packed16_attn_profile_capture_warned) {
+            s_packed16_attn_profile_capture_warned = true;
+            fprintf(stderr, "PACKED16_ATTN_PROFILE skipped during graph capture\n");
+        }
+        return false;
+    }
+
+    CUDA_CHECK(hipEventCreate(start));
+    CUDA_CHECK(hipEventCreate(after_stage1));
+    CUDA_CHECK(hipEventCreate(after_reduce));
+    CUDA_CHECK(hipEventRecord(*start, stream));
+    return true;
+}
+
+static inline void ggml_cuda_q8k_dot4_packed16_attn_profile_skip(
+        const char * impl,
+        const int nq,
+        const int nk,
+        const int n_heads_q,
+        const int n_heads_k,
+        const int gqa_ratio,
+        const int batch,
+        const int split_size,
+        const int n_splits,
+        const int bn,
+        const int gh_max,
+        const int nq_max,
+        const int smem_bytes,
+        const unsigned long long call) {
+    fprintf(stderr,
+            "PACKED16_ATTN_PROFILE_SKIP call=%llu impl=%s reason=untimed_or_graph_capture "
+            "nq=%d nk=%d hq=%d hk=%d gqa=%d batch=%d split_size=%d n_splits=%d "
+            "bn=%d gh_max=%d nq_max=%d smem=%d\n",
+            call, impl ? impl : "unknown", nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch,
+            split_size, n_splits, bn, gh_max, nq_max, smem_bytes);
+}
+
+static inline void ggml_cuda_q8k_dot4_packed16_attn_profile_finish(
+        const char * impl,
+        const int nq,
+        const int nk,
+        const int n_heads_q,
+        const int n_heads_k,
+        const int gqa_ratio,
+        const int batch,
+        const int split_size,
+        const int n_splits,
+        const int bn,
+        const int gh_max,
+        const int nq_max,
+        const int smem_bytes,
+        const unsigned long long call,
+        hipEvent_t start,
+        hipEvent_t after_stage1,
+        hipEvent_t after_reduce) {
+    CUDA_CHECK(hipEventSynchronize(after_reduce));
+
+    float stage1_ms = 0.0f;
+    float reduce_ms = 0.0f;
+    float total_ms = 0.0f;
+    CUDA_CHECK(hipEventElapsedTime(&stage1_ms, start, after_stage1));
+    CUDA_CHECK(hipEventElapsedTime(&reduce_ms, after_stage1, after_reduce));
+    CUDA_CHECK(hipEventElapsedTime(&total_ms, start, after_reduce));
+
+    unsigned long long calls_nq = 0;
+    unsigned long long calls_total = 0;
+    double avg_stage1_nq = 0.0;
+    double avg_reduce_nq = 0.0;
+    double avg_total_nq = 0.0;
+    {
+        std::lock_guard<std::mutex> lock(s_packed16_attn_profile_mutex);
+        const int bucket = (nq >= 0 && nq < 8) ? nq : 8;
+        auto & b = s_packed16_attn_profile_by_nq[bucket];
+        b.calls++;
+        b.stage1_ms += stage1_ms;
+        b.reduce_ms += reduce_ms;
+        b.total_ms += total_ms;
+        calls_nq = b.calls;
+        avg_stage1_nq = b.stage1_ms / (double) b.calls;
+        avg_reduce_nq = b.reduce_ms / (double) b.calls;
+        avg_total_nq = b.total_ms / (double) b.calls;
+        for (const auto & bucket_stats : s_packed16_attn_profile_by_nq) {
+            calls_total += bucket_stats.calls;
+        }
+    }
+
+    fprintf(stderr,
+            "PACKED16_ATTN_PROFILE call=%llu impl=%s nq=%d nk=%d hq=%d hk=%d gqa=%d batch=%d "
+            "split_size=%d n_splits=%d bn=%d gh_max=%d nq_max=%d smem=%d "
+            "stage1_ms=%.4f reduce_ms=%.4f total_ms=%.4f "
+            "calls_nq=%llu calls_total=%llu avg_stage1_nq_ms=%.4f avg_reduce_nq_ms=%.4f avg_total_nq_ms=%.4f\n",
+            call, impl ? impl : "unknown", nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch,
+            split_size, n_splits, bn, gh_max, nq_max, smem_bytes,
+            stage1_ms, reduce_ms, total_ms,
+            calls_nq, calls_total, avg_stage1_nq, avg_reduce_nq, avg_total_nq);
+
+    CUDA_CHECK(hipEventDestroy(start));
+    CUDA_CHECK(hipEventDestroy(after_stage1));
+    CUDA_CHECK(hipEventDestroy(after_reduce));
 }
 
 static __device__ __forceinline__ int ggml_cuda_q8k_dot4_i8_i8(const int a, const int b, const int c) {
@@ -247,7 +459,9 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_quant_k_pack
         int64_t nb03,
         int nk,
         int n_heads_k,
-        int batch) {
+        int batch,
+        int scale_mode,
+        float scale_mul) {
     const int tid = threadIdx.x;
     const int k = blockIdx.x;
     const int hk = blockIdx.y;
@@ -266,7 +480,25 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_quant_k_pack
     for (int mask = 16; mask > 0; mask >>= 1) {
         amax = fmaxf(amax, __shfl_xor(amax, mask, 32));
     }
-    const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+    const float scale0 = amax > 0.0f ? amax / 127.0f : 1.0f;
+    const int qi0 = max(-128, min(127, int(lrintf(x / scale0))));
+
+    float scale = scale0;
+    if (scale_mode != 0) {
+        const float xi = (float) qi0;
+        float num = x * xi;
+        float den = xi * xi;
+#pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            num += __shfl_xor(num, mask, 32);
+            den += __shfl_xor(den, mask, 32);
+        }
+        scale = (den > 0.0f) ? (num / den) : scale0;
+    }
+    scale *= scale_mul;
+    if (!(scale > 0.0f)) {
+        scale = scale0;
+    }
     const int qi = max(-128, min(127, int(lrintf(x / scale))));
 
     const size_t row = ((size_t(b) * n_heads_k + hk) * (size_t)nk + k);
@@ -291,7 +523,9 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_quant_k_pack
         int nk_cur,
         int n_heads_k,
         int batch,
-        int kv_size) {
+        int kv_size,
+        int scale_mode,
+        float scale_mul) {
     const int tid = threadIdx.x;
     const int k_local = blockIdx.x;
     const int hk = blockIdx.y;
@@ -325,16 +559,23 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_quant_k_pack
     const float scale0 = amax > 0.0f ? amax / 127.0f : 1.0f;
     const int qi0 = max(-128, min(127, int(lrintf(x / scale0))));
 
-    // Pass 2: MSE-optimal scale = sum(x * qi) / sum(qi^2)
-    const float xi = (float) qi0;
-    float num = x * xi;
-    float den = xi * xi;
+    // Optional pass 2: MSE-optimal scale = sum(x * qi) / sum(qi^2).
+    float scale = scale0;
+    if (scale_mode != 0) {
+        const float xi = (float) qi0;
+        float num = x * xi;
+        float den = xi * xi;
 #pragma unroll
-    for (int mask = 16; mask > 0; mask >>= 1) {
-        num += __shfl_xor(num, mask, 32);
-        den += __shfl_xor(den, mask, 32);
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            num += __shfl_xor(num, mask, 32);
+            den += __shfl_xor(den, mask, 32);
+        }
+        scale = (den > 0.0f) ? (num / den) : scale0;
     }
-    const float scale = (den > 0.0f) ? (num / den) : scale0;
+    scale *= scale_mul;
+    if (!(scale > 0.0f)) {
+        scale = scale0;
+    }
     const int qi = max(-128, min(127, int(lrintf(x / scale))));
 
     // Fixed kv_size head stride — row = head * kv_size + cell
@@ -1427,6 +1668,236 @@ for (int v_idx = tid; v_idx < GGML_CUDA_Q8K_DOT4_KQ_PAR_TILE_K * GGML_CUDA_Q8K_D
     }
 }
 
+static __global__ __launch_bounds__(512, 1) void ggml_cuda_q8k_dot4_grouped_gqa6_qtile4_kvshared_fattn_q4_0_kernel(
+        const int   * __restrict__ q_payload,
+        const float * __restrict__ q_scales,
+        const int   * __restrict__ k_payload,
+        const half  * __restrict__ k_scales,
+        const char  * __restrict__ V,
+        const char  * __restrict__ mask,
+        float       * __restrict__ dst,
+        float scale,
+        int64_t nb20,
+        int64_t nb21,
+        int64_t nb22,
+        int64_t nb23,
+        int64_t nb30,
+        int64_t nb31,
+        int64_t nb33,
+        int64_t ne33,
+        int nq,
+        int nk,
+        int n_heads_q,
+        int n_heads_k,
+        int batch) {
+    const int tid = threadIdx.x;
+    const int q_base_row = blockIdx.x * 4;
+    const int hk = blockIdx.y;
+    const int b = blockIdx.z;
+    const int q_pair_lane = tid >> 8;
+    const int h = (tid >> 5) & 7;
+    const int lane = tid & 31;
+    const int dim = tid & 255;
+    const int hq_base = hk * GGML_CUDA_Q8K_DOT4_KQ_GQA6;
+    __shared__ float kq_sums[4][GGML_CUDA_Q8K_DOT4_KQ_GQA6][GGML_CUDA_Q8K_DOT4_KQ_PAR_TILE_K];
+    __shared__ float probs_shared[4][GGML_CUDA_Q8K_DOT4_KQ_GQA6][GGML_CUDA_Q8K_DOT4_KQ_PAR_TILE_K];
+    __shared__ float row_max_shared[4][GGML_CUDA_Q8K_DOT4_KQ_GQA6];
+    __shared__ float denom_shared[4][GGML_CUDA_Q8K_DOT4_KQ_GQA6];
+    __shared__ float old_scale_shared[4][GGML_CUDA_Q8K_DOT4_KQ_GQA6];
+    __shared__ int q_tile_payload[4][GGML_CUDA_Q8K_DOT4_KQ_GQA6][GGML_CUDA_Q8K_DOT4_KQ_D / 4];
+    __shared__ float q_tile_scales[4][GGML_CUDA_Q8K_DOT4_KQ_GQA6][GGML_CUDA_Q8K_DOT4_KQ_BLOCKS];
+    __shared__ int k_tile_payload[GGML_CUDA_Q8K_DOT4_KQ_PAR_TILE_K][GGML_CUDA_Q8K_DOT4_KQ_D / 4];
+    __shared__ half k_tile_scales[GGML_CUDA_Q8K_DOT4_KQ_PAR_TILE_K][GGML_CUDA_Q8K_DOT4_KQ_BLOCKS];
+    __shared__ float v_tile[GGML_CUDA_Q8K_DOT4_KQ_PAR_TILE_K][GGML_CUDA_Q8K_DOT4_KQ_D];
+    if (hk >= n_heads_k || b >= batch) {
+        return;
+    }
+
+    const char * v_head = V + int64_t(b) * nb23 + int64_t(hk) * nb22;
+
+    // qtile4/GQA6 contract: one CTA owns four query rows and six Q heads that
+    // share the same KV head. Hoist Q once per CTA so every K tile reuses it.
+    for (int off = tid; off < 4 * GGML_CUDA_Q8K_DOT4_KQ_GQA6 * (GGML_CUDA_Q8K_DOT4_KQ_D / 4); off += blockDim.x) {
+        const int col = off % (GGML_CUDA_Q8K_DOT4_KQ_D / 4);
+        const int tmp = off / (GGML_CUDA_Q8K_DOT4_KQ_D / 4);
+        const int hh = tmp % GGML_CUDA_Q8K_DOT4_KQ_GQA6;
+        const int qr = tmp / GGML_CUDA_Q8K_DOT4_KQ_GQA6;
+        const int q_row = q_base_row + qr;
+        const int hq = hq_base + hh;
+        if (q_row < nq && hq < n_heads_q) {
+            const size_t q_base = ((size_t(b) * n_heads_q + hq) * (size_t)nq + q_row);
+            q_tile_payload[qr][hh][col] = q_payload[q_base * (GGML_CUDA_Q8K_DOT4_KQ_D / 4) + col];
+        } else {
+            q_tile_payload[qr][hh][col] = 0;
+        }
+    }
+    for (int off = tid; off < 4 * GGML_CUDA_Q8K_DOT4_KQ_GQA6 * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS; off += blockDim.x) {
+        const int qb = off % GGML_CUDA_Q8K_DOT4_KQ_BLOCKS;
+        const int tmp = off / GGML_CUDA_Q8K_DOT4_KQ_BLOCKS;
+        const int hh = tmp % GGML_CUDA_Q8K_DOT4_KQ_GQA6;
+        const int qr = tmp / GGML_CUDA_Q8K_DOT4_KQ_GQA6;
+        const int q_row = q_base_row + qr;
+        const int hq = hq_base + hh;
+        if (q_row < nq && hq < n_heads_q) {
+            const size_t q_base = ((size_t(b) * n_heads_q + hq) * (size_t)nq + q_row);
+            q_tile_scales[qr][hh][qb] = q_scales[q_base * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS + qb];
+        } else {
+            q_tile_scales[qr][hh][qb] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    float out[2][GGML_CUDA_Q8K_DOT4_KQ_GQA6];
+#pragma unroll
+    for (int phase = 0; phase < 2; ++phase) {
+#pragma unroll
+        for (int hh = 0; hh < GGML_CUDA_Q8K_DOT4_KQ_GQA6; ++hh) {
+            out[phase][hh] = 0.0f;
+        }
+    }
+    if (tid < 4 * GGML_CUDA_Q8K_DOT4_KQ_GQA6) {
+        const int qr = tid / GGML_CUDA_Q8K_DOT4_KQ_GQA6;
+        const int hh = tid % GGML_CUDA_Q8K_DOT4_KQ_GQA6;
+        row_max_shared[qr][hh] = -FLT_MAX;
+        denom_shared[qr][hh] = 0.0f;
+        old_scale_shared[qr][hh] = 0.0f;
+    }
+    __syncthreads();
+
+    for (int k0 = 0; k0 < nk; k0 += GGML_CUDA_Q8K_DOT4_KQ_PAR_TILE_K) {
+        const int tile_n = min(GGML_CUDA_Q8K_DOT4_KQ_PAR_TILE_K, nk - k0);
+
+        // Hoist the packed16/I32 K tile and F16 scales once per CTA. The 4x6
+        // QK products below all reuse this same KV-head tile.
+        for (int off = tid; off < GGML_CUDA_Q8K_DOT4_KQ_PAR_TILE_K * (GGML_CUDA_Q8K_DOT4_KQ_D / 4); off += blockDim.x) {
+            const int col = off % (GGML_CUDA_Q8K_DOT4_KQ_D / 4);
+            const int kk = off / (GGML_CUDA_Q8K_DOT4_KQ_D / 4);
+            if (kk < tile_n) {
+                const size_t k_base = ((size_t(b) * n_heads_k + hk) * (size_t)nk + k0 + kk);
+                k_tile_payload[kk][col] = k_payload[k_base * (GGML_CUDA_Q8K_DOT4_KQ_D / 4) + col];
+            } else {
+                k_tile_payload[kk][col] = 0;
+            }
+        }
+        for (int off = tid; off < GGML_CUDA_Q8K_DOT4_KQ_PAR_TILE_K * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS; off += blockDim.x) {
+            const int qb = off % GGML_CUDA_Q8K_DOT4_KQ_BLOCKS;
+            const int kk = off / GGML_CUDA_Q8K_DOT4_KQ_BLOCKS;
+            if (kk < tile_n) {
+                const size_t k_base = ((size_t(b) * n_heads_k + hk) * (size_t)nk + k0 + kk);
+                k_tile_scales[kk][qb] = k_scales[k_base * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS + qb];
+            } else {
+                k_tile_scales[kk][qb] = __float2half(0.0f);
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int phase = 0; phase < 2; ++phase) {
+            const int q_lane = phase * 2 + q_pair_lane;
+            const int q_row = q_base_row + q_lane;
+            if (q_row < nq && h < GGML_CUDA_Q8K_DOT4_KQ_GQA6) {
+                const int * q_row_payload = q_tile_payload[q_lane][h];
+                const float * q_row_scales = q_tile_scales[q_lane][h];
+#pragma unroll
+                for (int kk = 0; kk < GGML_CUDA_Q8K_DOT4_KQ_PAR_TILE_K; ++kk) {
+                    float partial = 0.0f;
+                    if (kk < tile_n) {
+                        const int * k_row_payload = k_tile_payload[kk];
+                        const half * k_row_scales = k_tile_scales[kk];
+#pragma unroll
+                        for (int i = 0; i < 2; ++i) {
+                            const int idx = lane + i * 32;
+                            const int qb = idx / (QK8_0 / 4);
+                            const int acc = ggml_cuda_q8k_dot4_i8_i8(q_row_payload[idx], k_row_payload[idx], 0);
+                            partial += float(acc) * q_row_scales[qb] * __half2float(k_row_scales[qb]);
+                        }
+                    }
+#pragma unroll
+                    for (int offset = 16; offset > 0; offset >>= 1) {
+                        partial += __shfl_down(partial, offset, 32);
+                    }
+                    if (lane == 0) {
+                        kq_sums[q_lane][h][kk] = kk < tile_n ? partial : -INFINITY;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+
+        if (tid < 4 * GGML_CUDA_Q8K_DOT4_KQ_GQA6) {
+            const int qr = tid / GGML_CUDA_Q8K_DOT4_KQ_GQA6;
+            const int hh = tid % GGML_CUDA_Q8K_DOT4_KQ_GQA6;
+            const int qr_row = q_base_row + qr;
+            if (qr_row < nq) {
+                float tile_max = -FLT_MAX;
+#pragma unroll
+                for (int kk = 0; kk < GGML_CUDA_Q8K_DOT4_KQ_PAR_TILE_K; ++kk) {
+                    const float s = kk < tile_n ? kq_sums[qr][hh][kk] * scale + ggml_cuda_q8k_dot4_mask_value(mask, nb30, nb31, nb33, ne33, qr_row, k0 + kk, b) : -INFINITY;
+                    kq_sums[qr][hh][kk] = s;
+                    tile_max = fmaxf(tile_max, s);
+                }
+                const float next_max = fmaxf(row_max_shared[qr][hh], tile_max);
+                old_scale_shared[qr][hh] = denom_shared[qr][hh] > 0.0f ? expf(row_max_shared[qr][hh] - next_max) : 0.0f;
+                float tile_sum = 0.0f;
+#pragma unroll
+                for (int kk = 0; kk < GGML_CUDA_Q8K_DOT4_KQ_PAR_TILE_K; ++kk) {
+                    const float p = kk < tile_n ? expf(kq_sums[qr][hh][kk] - next_max) : 0.0f;
+                    probs_shared[qr][hh][kk] = p;
+                    tile_sum += p;
+                }
+                denom_shared[qr][hh] = denom_shared[qr][hh] * old_scale_shared[qr][hh] + tile_sum;
+                row_max_shared[qr][hh] = next_max;
+            }
+        }
+        __syncthreads();
+
+        for (int v_idx = tid; v_idx < GGML_CUDA_Q8K_DOT4_KQ_PAR_TILE_K * GGML_CUDA_Q8K_DOT4_KQ_D; v_idx += blockDim.x) {
+            const int kk = v_idx / GGML_CUDA_Q8K_DOT4_KQ_D;
+            const int v_dim = v_idx - kk * GGML_CUDA_Q8K_DOT4_KQ_D;
+            if (kk < tile_n) {
+                v_tile[kk][v_dim] = ggml_cuda_q8k_dot4_dequant_q4_0(v_head + int64_t(k0 + kk) * nb21, nb20, v_dim);
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int phase = 0; phase < 2; ++phase) {
+            const int q_lane = phase * 2 + q_pair_lane;
+            const int q_row = q_base_row + q_lane;
+#pragma unroll
+            for (int hh = 0; hh < GGML_CUDA_Q8K_DOT4_KQ_GQA6; ++hh) {
+                if (q_row < nq) {
+                    out[phase][hh] *= old_scale_shared[q_lane][hh];
+                }
+            }
+#pragma unroll
+            for (int kk = 0; kk < GGML_CUDA_Q8K_DOT4_KQ_PAR_TILE_K; ++kk) {
+                if (q_row < nq && kk < tile_n) {
+                    const float v = v_tile[kk][dim];
+#pragma unroll
+                    for (int hh = 0; hh < GGML_CUDA_Q8K_DOT4_KQ_GQA6; ++hh) {
+                        out[phase][hh] += probs_shared[q_lane][hh][kk] * v;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int phase = 0; phase < 2; ++phase) {
+        const int q_lane = phase * 2 + q_pair_lane;
+        const int q_row = q_base_row + q_lane;
+#pragma unroll
+        for (int hh = 0; hh < GGML_CUDA_Q8K_DOT4_KQ_GQA6; ++hh) {
+            if (q_row < nq) {
+                const int hq = hq_base + hh;
+                dst[((size_t(b) * nq + q_row) * (size_t)n_heads_q + hq) * GGML_CUDA_Q8K_DOT4_KQ_D + dim] = out[phase][hh] / denom_shared[q_lane][hh];
+            }
+        }
+    }
+}
+
 static __global__ __launch_bounds__(512, 1) void ggml_cuda_q8k_dot4_grouped_gqa_qtile4_tile8_fattn_q4_0_kernel(
         const int   * __restrict__ q_payload,
         const float * __restrict__ q_scales,
@@ -1888,6 +2359,35 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_blockfa_hybr
     }
 }
 
+static __device__ int ggml_cuda_q8k_dot4_hotcold_live_tail_trace_once = 0;
+
+static __device__ __forceinline__ int ggml_cuda_q8k_dot4_mask_live_k_end(
+        const char * __restrict__ mask,
+        int64_t nb30,
+        int64_t nb31,
+        int64_t nb33,
+        int64_t ne33,
+        int q,
+        int b,
+        int nk) {
+    if (mask == nullptr) {
+        return nk;
+    }
+
+    const int64_t stream = int64_t(b) % (ne33 > 0 ? ne33 : int64_t(1));
+    const char * row = mask + stream * nb33 + int64_t(q) * nb31;
+    for (int k = nk - 1; k >= 0; --k) {
+        const half mh = *(const half *) (row + int64_t(k) * nb30);
+        // The KQ mask is F16 here. Valid causal entries are finite (usually 0),
+        // while padded/empty cells are -inf. Use a finite-half threshold instead
+        // of equality so this also handles alibi-style finite negative values.
+        if (__half2float(mh) > -65504.0f) {
+            return k + 1;
+        }
+    }
+    return 0;
+}
+
 // Recthist-v3 chunked FA: hoist Q once, hoist V tile per k-iteration,
 // then reuse for all BM q-rows.  Same DOT4 QK dot, softmax, and V
 // accumulation as recthist_v2, but eliminates repeated global reads
@@ -1917,7 +2417,15 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_blockfa_rect
         int k_begin_arg,
         int k_end_arg,
         int partial_slots,
-        int partial_slot) {
+        int partial_slot,
+        const char * __restrict__ mask_tail,
+        int64_t nb30,
+        int64_t nb31,
+        int64_t nb33,
+        int64_t ne33,
+        int mask_tail_window,
+        int mask_tail_align,
+        int mask_tail_mode) {
     static constexpr int BM = 8;
     static constexpr int I32_PER_ROW = GGML_CUDA_Q8K_DOT4_KQ_D / 4;   // 64
     static constexpr int N_BLOCKS   = GGML_CUDA_Q8K_DOT4_KQ_BLOCKS;   // 8
@@ -1939,8 +2447,25 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_blockfa_rect
         return;
     }
 
-    const int k_begin = max(0, min(k_begin_arg, nk));
-    const int k_end   = max(k_begin, min(k_end_arg, nk));
+    int k_begin = max(0, min(k_begin_arg, nk));
+    int k_end   = max(k_begin, min(k_end_arg, nk));
+    if (mask_tail_mode != 0 && mask_tail != nullptr && mask_tail_window > 0) {
+        // Hot/cold MTP draft decode has nq == 1, batch == 1. Its graph nk is
+        // padded, so deriving the split from nk makes the exact hot tail mostly
+        // padding. Anchor the split to the last finite mask entry instead.
+        const int live_k_end = ggml_cuda_q8k_dot4_mask_live_k_end(mask_tail, nb30, nb31, nb33, ne33, q0, b, nk);
+        int hot_begin = max(0, live_k_end - mask_tail_window);
+        if (mask_tail_align > 1) {
+            hot_begin = (hot_begin / mask_tail_align) * mask_tail_align;
+        }
+        if (mask_tail_mode == 1) {
+            k_begin = 0;
+            k_end = hot_begin;
+        } else {
+            k_begin = hot_begin;
+            k_end = live_k_end;
+        }
+    }
     const size_t q_head_base = ((size_t(b) * n_heads_q + hq) * size_t(nq));
     const size_t k_head_base = ((size_t(b) * n_heads_k + hk) * size_t(nk));
     const char * v_head = V + int64_t(b) * nb23 + int64_t(hk) * nb22;
@@ -3102,6 +3627,314 @@ static __global__ void ggml_cuda_q8k_dot4_blockfa_reset_partial_kernel(
     partial_l[i] = 0.0f;
 }
 
+static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_f16_hot_tail_q4_0_partial_kernel(
+        const float * __restrict__ Q,
+        const char  * __restrict__ K_shadow,
+        const char  * __restrict__ V,
+        const char  * __restrict__ mask,
+        float       * __restrict__ partial_o,
+        float       * __restrict__ partial_m,
+        float       * __restrict__ partial_l,
+        float scale,
+        int64_t nb00,
+        int64_t nb01,
+        int64_t nb02,
+        int64_t nb03,
+        int64_t nbk0,
+        int64_t nbk1,
+        int64_t nbk2,
+        int64_t nb20,
+        int64_t nb21,
+        int64_t nb22,
+        int64_t nb23,
+        int64_t nb30,
+        int64_t nb31,
+        int64_t nb33,
+        int64_t ne33,
+        int nq,
+        int nk,
+        int n_heads_q,
+        int n_heads_k,
+        int gqa_ratio,
+        int batch,
+        int k_begin,
+        int k_end,
+        int partial_slots,
+        int partial_slot,
+        int mask_tail_window,
+        int mask_tail_mode,
+        int mask_tail_align,
+        int debug_live_tail) {
+    const int q   = int(blockIdx.x);
+    const int hq  = int(blockIdx.y);
+    const int b   = int(blockIdx.z);
+    const int tid = int(threadIdx.x);
+    const int hk  = hq / gqa_ratio;
+
+    if (q >= nq || hq >= n_heads_q || b >= batch || hk >= n_heads_k) {
+        return;
+    }
+
+    __shared__ float reduce[GGML_CUDA_Q8K_DOT4_KQ_D];
+    __shared__ float m_shared;
+    __shared__ float l_shared;
+    __shared__ float p_shared;
+    __shared__ float old_scale_shared;
+
+    const char * q_row = (const char *) Q + int64_t(b) * nb03 + int64_t(hq) * nb02 + int64_t(q) * nb01;
+    const char * k_base = K_shadow + int64_t(b) * nbk2;
+    const char * v_head = V + int64_t(b) * nb23 + int64_t(hk) * nb22;
+
+    float out = 0.0f;
+    if (tid == 0) {
+        m_shared = -FLT_MAX / 2.0f;
+        l_shared = 0.0f;
+        p_shared = 0.0f;
+        old_scale_shared = 0.0f;
+    }
+    __syncthreads();
+
+    k_begin = max(0, min(k_begin, nk));
+    k_end   = max(k_begin, min(k_end, nk));
+    int live_k_end = nk;
+    if (mask_tail_mode != 0 && mask != nullptr && mask_tail_window > 0) {
+        live_k_end = ggml_cuda_q8k_dot4_mask_live_k_end(mask, nb30, nb31, nb33, ne33, q, b, nk);
+        k_begin = max(0, live_k_end - mask_tail_window);
+        if (mask_tail_align > 1) {
+            k_begin = (k_begin / mask_tail_align) * mask_tail_align;
+        }
+        k_end = live_k_end;
+    }
+    if (debug_live_tail && tid == 0 && q == 0 && hq == 0 && b == 0 &&
+            atomicCAS(&ggml_cuda_q8k_dot4_hotcold_live_tail_trace_once, 0, 1) == 0) {
+        printf("MTP_PACKED16_HOTCOLD_K: live_tail window=%d live_k_end=%d hot=[%d,%d) nk=%d\n",
+            mask_tail_window, live_k_end, k_begin, k_end, nk);
+    }
+
+    for (int k = k_begin; k < k_end; ++k) {
+        float prod = 0.0f;
+        if (tid < GGML_CUDA_Q8K_DOT4_KQ_D) {
+            const float qv = *(const float *) (q_row + int64_t(tid) * nb00);
+            const half  kv = *(const half  *) (k_base + int64_t(k) * nbk1 + int64_t(hk * GGML_CUDA_Q8K_DOT4_KQ_D + tid) * nbk0);
+            prod = qv * __half2float(kv);
+        }
+        reduce[tid] = prod;
+        __syncthreads();
+        for (int stride = GGML_CUDA_Q8K_DOT4_KQ_D / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                reduce[tid] += reduce[tid + stride];
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            float score = reduce[0] * scale;
+            if (mask != nullptr) {
+                const half * mh = (const half *) (mask + int64_t(b % max(int64_t(1), ne33)) * nb33 + int64_t(q) * nb31 + int64_t(k) * nb30);
+                score += __half2float(*mh);
+            }
+            const float m_new = fmaxf(m_shared, score);
+            old_scale_shared = expf(m_shared - m_new);
+            p_shared = expf(score - m_new);
+            l_shared = l_shared * old_scale_shared + p_shared;
+            m_shared = m_new;
+        }
+        __syncthreads();
+        if (tid < GGML_CUDA_Q8K_DOT4_KQ_D) {
+            const float vv = ggml_cuda_q8k_dot4_dequant_q4_0(v_head + int64_t(k) * nb21, nb20, tid);
+            out = out * old_scale_shared + p_shared * vv;
+        }
+        __syncthreads();
+    }
+
+    const size_t slot = ((size_t(b) * n_heads_q + hq) * size_t(partial_slots) + size_t(partial_slot)) * size_t(nq) + q;
+    if (tid < GGML_CUDA_Q8K_DOT4_KQ_D) {
+        partial_o[slot * GGML_CUDA_Q8K_DOT4_KQ_D + tid] = out;
+    }
+    if (tid == 0) {
+        partial_m[slot] = m_shared;
+        partial_l[slot] = l_shared;
+    }
+}
+
+template <int BN>
+static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_hotcold_mixed_q4_0_kernel(
+        const float * __restrict__ Q,
+        const int   * __restrict__ q_payload,
+        const float * __restrict__ q_scales,
+        const int   * __restrict__ k_payload,
+        const half  * __restrict__ k_scales,
+        const char  * __restrict__ K_shadow,
+        const char  * __restrict__ V,
+        const char  * __restrict__ mask,
+        float       * __restrict__ dst,
+        float scale,
+        int64_t nb00,
+        int64_t nb01,
+        int64_t nb02,
+        int64_t nb03,
+        int64_t nbk0,
+        int64_t nbk1,
+        int64_t nbk2,
+        int64_t nb20,
+        int64_t nb21,
+        int64_t nb22,
+        int64_t nb23,
+        int64_t nb30,
+        int64_t nb31,
+        int64_t nb33,
+        int64_t ne33,
+        int nq,
+        int nk,
+        int n_heads_q,
+        int n_heads_k,
+        int gqa_ratio,
+        int batch,
+        int hot_window_arg,
+        int hot_align,
+        int debug_live_tail) {
+    const int q   = int(blockIdx.x);
+    const int hq  = int(blockIdx.y);
+    const int b   = int(blockIdx.z);
+    const int tid = int(threadIdx.x);
+    const int hk  = hq / gqa_ratio;
+
+    if (q >= nq || hq >= n_heads_q || b >= batch || hk >= n_heads_k) {
+        return;
+    }
+
+    __shared__ float logits[BN];
+    __shared__ float p_tile[BN];
+    __shared__ float reduce[GGML_CUDA_Q8K_DOT4_KQ_D];
+    __shared__ float m_shared;
+    __shared__ float l_shared;
+    __shared__ float old_scale_shared;
+
+    const char * q_row = (const char *) Q + int64_t(b) * nb03 + int64_t(hq) * nb02 + int64_t(q) * nb01;
+    const size_t q_base = ((size_t(b) * n_heads_q + hq) * size_t(nq)) + size_t(q);
+    const int   * q_row_payload = q_payload + q_base * (GGML_CUDA_Q8K_DOT4_KQ_D / 4);
+    const float * q_row_scales  = q_scales  + q_base * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS;
+    const size_t k_head_base = ((size_t(b) * n_heads_k + hk) * size_t(nk));
+    const char * k_shadow_base = K_shadow + int64_t(b) * nbk2;
+    const char * v_head = V + int64_t(b) * nb23 + int64_t(hk) * nb22;
+
+    int live_k_end = nk;
+    if (mask != nullptr) {
+        live_k_end = ggml_cuda_q8k_dot4_mask_live_k_end(mask, nb30, nb31, nb33, ne33, q, b, nk);
+    }
+    live_k_end = max(0, min(live_k_end, nk));
+    const int hot_window = max(1, min(hot_window_arg, max(1, live_k_end)));
+    int hot_begin = max(0, live_k_end - hot_window);
+    if (hot_align > 1) {
+        hot_begin = (hot_begin / hot_align) * hot_align;
+    }
+
+    if (debug_live_tail && tid == 0 && q == 0 && hq == 0 && b == 0 &&
+            atomicCAS(&ggml_cuda_q8k_dot4_hotcold_live_tail_trace_once, 0, 1) == 0) {
+        printf("MTP_PACKED16_HOTCOLD_K: mixed_live_tail window=%d align=%d live_k_end=%d hot=[%d,%d) nk=%d\n",
+            hot_window, hot_align, live_k_end, hot_begin, live_k_end, nk);
+    }
+
+    float out = 0.0f;
+    if (tid == 0) {
+        m_shared = -FLT_MAX / 2.0f;
+        l_shared = 0.0f;
+        old_scale_shared = 0.0f;
+    }
+    __syncthreads();
+
+    for (int k0 = 0; k0 < hot_begin; k0 += BN) {
+        const int tile_n = min(BN, hot_begin - k0);
+        if (tid < BN) {
+            float s = -FLT_MAX / 2.0f;
+            if (tid < tile_n) {
+                const int k = k0 + tid;
+                const size_t k_base = k_head_base + size_t(k);
+                s = ggml_cuda_q8k_dot4_kq_dot_direct(
+                    q_row_payload,
+                    q_row_scales,
+                    k_payload + k_base * (GGML_CUDA_Q8K_DOT4_KQ_D / 4),
+                    k_scales + k_base * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS) * scale;
+            }
+            logits[tid] = s;
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            float tile_m = -FLT_MAX / 2.0f;
+#pragma unroll
+            for (int kk = 0; kk < BN; ++kk) {
+                tile_m = fmaxf(tile_m, logits[kk]);
+            }
+            const float m_new = fmaxf(m_shared, tile_m);
+            old_scale_shared = expf(m_shared - m_new);
+            float l_new = l_shared * old_scale_shared;
+#pragma unroll
+            for (int kk = 0; kk < BN; ++kk) {
+                const float p = expf(logits[kk] - m_new);
+                p_tile[kk] = p;
+                l_new += p;
+            }
+            m_shared = m_new;
+            l_shared = l_new;
+        }
+        __syncthreads();
+
+        if (tid < GGML_CUDA_Q8K_DOT4_KQ_D) {
+            float acc = out * old_scale_shared;
+#pragma unroll
+            for (int kk = 0; kk < BN; ++kk) {
+                if (kk < tile_n) {
+                    const int k = k0 + kk;
+                    const float vv = ggml_cuda_q8k_dot4_dequant_q4_0(v_head + int64_t(k) * nb21, nb20, tid);
+                    acc += p_tile[kk] * vv;
+                }
+            }
+            out = acc;
+        }
+        __syncthreads();
+    }
+
+    for (int k = hot_begin; k < live_k_end; ++k) {
+        float prod = 0.0f;
+        if (tid < GGML_CUDA_Q8K_DOT4_KQ_D) {
+            const float qv = *(const float *) (q_row + int64_t(tid) * nb00);
+            const half  kv = *(const half  *) (k_shadow_base + int64_t(k) * nbk1 + int64_t(hk * GGML_CUDA_Q8K_DOT4_KQ_D + tid) * nbk0);
+            prod = qv * __half2float(kv);
+        }
+        reduce[tid] = prod;
+        __syncthreads();
+        for (int stride = GGML_CUDA_Q8K_DOT4_KQ_D / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                reduce[tid] += reduce[tid + stride];
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            float score = reduce[0] * scale;
+            if (mask != nullptr) {
+                const half * mh = (const half *) (mask + int64_t(b % max(int64_t(1), ne33)) * nb33 + int64_t(q) * nb31 + int64_t(k) * nb30);
+                score += __half2float(*mh);
+            }
+            const float m_new = fmaxf(m_shared, score);
+            old_scale_shared = expf(m_shared - m_new);
+            p_tile[0] = expf(score - m_new);
+            l_shared = l_shared * old_scale_shared + p_tile[0];
+            m_shared = m_new;
+        }
+        __syncthreads();
+        if (tid < GGML_CUDA_Q8K_DOT4_KQ_D) {
+            const float vv = ggml_cuda_q8k_dot4_dequant_q4_0(v_head + int64_t(k) * nb21, nb20, tid);
+            out = out * old_scale_shared + p_tile[0] * vv;
+        }
+        __syncthreads();
+    }
+
+    if (tid < GGML_CUDA_Q8K_DOT4_KQ_D) {
+        const float denom = fmaxf(l_shared, 1.0e-20f);
+        dst[((size_t(b) * nq + q) * (size_t)n_heads_q + hq) * GGML_CUDA_Q8K_DOT4_KQ_D + tid] = out / denom;
+    }
+}
+
 static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_blockfa_combine_kernel(
         const float * __restrict__ partial_o,
         const float * __restrict__ partial_m,
@@ -3283,6 +4116,18 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
     const char * check_env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_KQ_CHECK");
     const bool check = check_env && atoi(check_env) != 0;
     const char * variant_env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_KQ_VARIANT");
+    const char * required_route_env = getenv("GGML_CUDA_FA_ROUTE_REQUIRE");
+    const bool require_grouped_gqa6_qtile4_kvshared = required_route_env &&
+        (strcmp(required_route_env, "rocm_q8k_dot4_qtile4_gqa6_kvshared") == 0 ||
+         strcmp(required_route_env, "rocm_packed16_qtile4_gqa6_kvshared") == 0 ||
+         strcmp(required_route_env, "qtile4_gqa6_kvshared") == 0);
+    const int auto_grouped_gqa6_qtile4_kvshared_min_nq = max(1,
+        ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_QTILE4_GQA6_KVSHARED_MIN_NQ", 4));
+    const bool auto_grouped_gqa6_qtile4_kvshared =
+        !variant_env &&
+        ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_QTILE4_GQA6_KVSHARED_AUTO") &&
+        K->type == GGML_TYPE_I32 && V->type == GGML_TYPE_Q4_0 &&
+        nq >= auto_grouped_gqa6_qtile4_kvshared_min_nq && gqa_ratio == GGML_CUDA_Q8K_DOT4_KQ_GQA6;
     const bool q8block_variant = variant_env && strcmp(variant_env, "q8block") == 0;
     const bool fused_online = variant_env && strcmp(variant_env, "fused_online") == 0;
     const bool fused_tile8_parallel = variant_env && strcmp(variant_env, "fused_tile8_parallel") == 0;
@@ -3291,6 +4136,9 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
     const bool grouped_gqa_qtile4_tile8 = variant_env && strcmp(variant_env, "grouped_gqa_qtile4_tile8") == 0;
     const bool grouped_gqa6_qtile4_tile8 = variant_env && strcmp(variant_env, "grouped_gqa6_qtile4_tile8") == 0;
     const bool grouped_gqa6_qtile4_vshared = variant_env && strcmp(variant_env, "grouped_gqa6_qtile4_vshared") == 0;
+    const bool grouped_gqa6_qtile4_kvshared =
+        (variant_env && strcmp(variant_env, "grouped_gqa6_qtile4_kvshared") == 0) ||
+        require_grouped_gqa6_qtile4_kvshared || auto_grouped_gqa6_qtile4_kvshared;
     const bool blockfa_hybrid_bm8 = variant_env && strcmp(variant_env, "blockfa_hybrid_bm8") == 0;
     const bool blockfa_hybrid_bm8_packed16_scalar = variant_env && strcmp(variant_env, "blockfa_hybrid_bm8_packed16_scalar") == 0;
     const bool blockfa_hybrid_bm8_vreuse = variant_env && strcmp(variant_env, "blockfa_hybrid_bm8_vreuse") == 0;
@@ -3311,19 +4159,91 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
     const bool blockfa_hybrid_bm8_kreuse = blockfa_hybrid_bm8_hpair_kreuse || blockfa_hybrid_bm8_htriad_kreuse;
     const bool blockfa_hybrid_bm8_any = blockfa_hybrid_bm8 || blockfa_hybrid_bm8_packed16_scalar || blockfa_hybrid_bm8_vreuse || blockfa_hybrid_bm8_hgroup;
     const bool blockfa_runtime_any_explicit = blockfa_hybrid_bm8_any || blockfa_recthist_any_explicit;
-    const bool fused_variant_explicit = fused_online || fused_tile8_parallel || grouped_gqa_online || grouped_gqa_qtile2_tile8 || grouped_gqa_qtile4_tile8 || grouped_gqa6_qtile4_tile8 || grouped_gqa6_qtile4_vshared || blockfa_runtime_any_explicit;
+    const bool fused_variant_explicit = fused_online || fused_tile8_parallel || grouped_gqa_online || grouped_gqa_qtile2_tile8 || grouped_gqa_qtile4_tile8 || grouped_gqa6_qtile4_tile8 || grouped_gqa6_qtile4_vshared || grouped_gqa6_qtile4_kvshared || blockfa_runtime_any_explicit;
     const bool full_fa_env = ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_KQ_FULL_FA");
+    ggml_tensor * registered_payload_tensor = nullptr;
+    ggml_tensor * registered_scales_tensor  = nullptr;
+    if (K && K->data) {
+        llama_kv_cache_get_packed16_tensors(K->data, &registered_payload_tensor, &registered_scales_tensor);
+    }
+    const bool registered_packed16_sidecar = registered_payload_tensor != nullptr && registered_scales_tensor != nullptr;
+
+    ggml_tensor * hotcold_shadow_k = nullptr;
+    const int packed16_hotcold_window = ggml_cuda_q8k_dot4_kq_env_int("LLAMA_MTP_PACKED16_HOTCOLD_K_WINDOW", 256);
+    const int packed16_hotcold_align = max(1, ggml_cuda_q8k_dot4_kq_env_int("LLAMA_MTP_PACKED16_HOTCOLD_K_ALIGN", 1));
+    const bool packed16_hotcold_requested =
+        ggml_cuda_q8k_dot4_kq_env_enabled("LLAMA_MTP_PACKED16_HOTCOLD_K") && packed16_hotcold_window > 0;
+    const bool graph_f16_hotcold_sidecar =
+        packed16_hotcold_requested &&
+        K->type == GGML_TYPE_F16 &&
+        V->type == GGML_TYPE_Q4_0 &&
+        registered_packed16_sidecar;
+    const bool packed16_hotcold_cold_unsafe =
+        ggml_cuda_q8k_dot4_kq_env_enabled("LLAMA_MTP_PACKED16_HOTCOLD_K_COLD_UNSAFE");
+    const bool graph_f16_hotcold_sidecar_allowed =
+        graph_f16_hotcold_sidecar &&
+        (packed16_hotcold_window >= K->ne[1] || packed16_hotcold_cold_unsafe);
+    const bool graph_f16_hotcold_decode_sidecar =
+        graph_f16_hotcold_sidecar &&
+        fa_inst_i32 == GGML_FATTN_INST_MTP_DRAFT_DECODE_QK &&
+        Q->ne[1] == 1;
+    const bool graph_f16_hotcold_decode_or_allowed =
+        graph_f16_hotcold_sidecar_allowed || graph_f16_hotcold_decode_sidecar;
+
     // FA2 packed16 MTP draft-decode is a real attention lane, not the legacy
     // KQ-only probe. When the selector routes persistent packed16/I32 MTP draft
-    // decode through rocm_q8k_dot4_kq, auto-enable FULL_FA so the launcher
-    // executes the native FA output path instead of zero/probe behavior.
-    const bool auto_full_fa_mtp_packed16_draft =
-        !full_fa_env &&
+    // decode, or graph-facing-F16 hot/cold sidecar decode, through
+    // rocm_q8k_dot4_kq, auto-enable FULL_FA so the launcher executes the native
+    // FA output path instead of zero/probe behavior.
+    const int packed16_small_verify_max_nq_for_full_fa = ggml_cuda_q8k_dot4_kq_env_int(
+        "GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ", 4);
+    const bool mtp_packed16_draft_decode =
         fa_inst_i32 == GGML_FATTN_INST_MTP_DRAFT_DECODE_QK &&
         Q->ne[1] == 1 &&
-        K->type == GGML_TYPE_I32 &&
-        V->type == GGML_TYPE_Q4_0;
-    const bool full_fa = full_fa_env || auto_full_fa_mtp_packed16_draft;
+        V->type == GGML_TYPE_Q4_0 &&
+        (K->type == GGML_TYPE_I32 || graph_f16_hotcold_decode_or_allowed);
+    const bool mtp_packed16_small_verify =
+        (fa_inst_i32 == GGML_FATTN_INST_MTP_VERIFY_QK || fa_inst_i32 == GGML_FATTN_INST_NONE) &&
+        Q->ne[1] >= 2 && Q->ne[1] <= packed16_small_verify_max_nq_for_full_fa &&
+        V->type == GGML_TYPE_Q4_0 &&
+        (K->type == GGML_TYPE_I32 || graph_f16_hotcold_sidecar_allowed);
+    const bool auto_full_fa_mtp_packed16_draft = !full_fa_env && mtp_packed16_draft_decode;
+    const bool auto_full_fa_mtp_packed16_small_verify = !full_fa_env && mtp_packed16_small_verify;
+    const bool full_fa = full_fa_env || auto_full_fa_mtp_packed16_draft ||
+        auto_full_fa_mtp_packed16_small_verify || auto_grouped_gqa6_qtile4_kvshared;
+
+    if (packed16_hotcold_requested) {
+        if (graph_f16_hotcold_decode_or_allowed) {
+            hotcold_shadow_k = K;
+        } else {
+            llama_kv_cache_get_packed16_shadow_k(K->data, &hotcold_shadow_k);
+        }
+    }
+    const bool packed16_hotcold_supported =
+        packed16_hotcold_requested &&
+        mtp_packed16_draft_decode &&
+        graph_f16_hotcold_decode_or_allowed &&
+        hotcold_shadow_k && hotcold_shadow_k->type == GGML_TYPE_F16 &&
+        batch == 1;
+    if (packed16_hotcold_requested && !packed16_hotcold_supported &&
+            ggml_cuda_q8k_dot4_kq_env_enabled("LLAMA_MTP_PACKED16_HOTCOLD_K_TRACE")) {
+        static bool hotcold_disabled_printed = false;
+        if (!hotcold_disabled_printed) {
+            hotcold_disabled_printed = true;
+            fprintf(stderr,
+                "MTP_PACKED16_HOTCOLD_K: disabled mtp_packed16_draft=%d f16_sidecar=%d decode_sidecar=%d cold_allowed=%d cold_unsafe=%d shadow=%p shadow_type=%s batch=%d window=%d nk=%d\n",
+                (int) mtp_packed16_draft_decode,
+                (int) graph_f16_hotcold_sidecar,
+                (int) graph_f16_hotcold_decode_sidecar,
+                (int) graph_f16_hotcold_sidecar_allowed,
+                (int) packed16_hotcold_cold_unsafe,
+                hotcold_shadow_k ? (void *) hotcold_shadow_k->data : nullptr,
+                hotcold_shadow_k ? ggml_type_name(hotcold_shadow_k->type) : "none",
+                batch,
+                packed16_hotcold_window,
+                nk);
+        }
+    }
 
     // Auto-select blockfa_recthist_v4_single for f16/q8_0/q4_0 V when FULL_FA=1
     // and no explicit variant is set. The default packed16 path for f16/q8_0 would
@@ -3337,7 +4257,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
     const bool blockfa_recthist_v4_single_effective = blockfa_recthist_v4_single || blockfa_recthist_v4_single_auto;
     const bool blockfa_recthist_any_effective = blockfa_recthist_v2_any || blockfa_recthist_v3_vhoist || blockfa_recthist_v4_single_effective;
     const bool blockfa_runtime_any_effective = blockfa_hybrid_bm8_any || blockfa_recthist_any_effective;
-    const bool fused_variant_effective = fused_online || fused_tile8_parallel || grouped_gqa_online || grouped_gqa_qtile2_tile8 || grouped_gqa_qtile4_tile8 || grouped_gqa6_qtile4_tile8 || grouped_gqa6_qtile4_vshared || blockfa_runtime_any_effective;
+    const bool fused_variant_effective = fused_online || fused_tile8_parallel || grouped_gqa_online || grouped_gqa_qtile2_tile8 || grouped_gqa_qtile4_tile8 || grouped_gqa6_qtile4_tile8 || grouped_gqa6_qtile4_vshared || grouped_gqa6_qtile4_kvshared || blockfa_runtime_any_effective;
 
     const char * variant_name = blockfa_recthist_v4_single_auto && !blockfa_recthist_v4_single ? "blockfa_recthist_v4_single_auto" :
             (blockfa_recthist_v4_single ? "blockfa_recthist_v4_single" :
@@ -3353,6 +4273,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
             (blockfa_hybrid_bm8_vreuse ? "blockfa_hybrid_bm8_vreuse" :
             (blockfa_hybrid_bm8_packed16_scalar ? "blockfa_hybrid_bm8_packed16_scalar" :
             (blockfa_hybrid_bm8 ? "blockfa_hybrid_bm8" :
+            (grouped_gqa6_qtile4_kvshared ? "grouped_gqa6_qtile4_kvshared" :
             (grouped_gqa6_qtile4_vshared ? "grouped_gqa6_qtile4_vshared" :
             (grouped_gqa6_qtile4_tile8 ? "grouped_gqa6_qtile4_tile8" :
             (grouped_gqa_qtile4_tile8 ? "grouped_gqa_qtile4_tile8" :
@@ -3360,7 +4281,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
             (grouped_gqa_online ? "grouped_gqa_online" :
             (fused_tile8_parallel ? "fused_tile8_parallel" :
             (fused_online ? "fused_online" :
-            (q8block_variant ? "q8block" : "packed16")))))))))))))))))))));
+            (q8block_variant ? "q8block" : "packed16"))))))))))))))))))))));
     const char * variant_note = blockfa_recthist_v4_single_effective ? "blockfa_recthist_v4_single_probe" :
             (blockfa_recthist_v2_bn16 ? "blockfa_recthist_v2_bn16_probe" :
             (blockfa_recthist_v2 ? "blockfa_recthist_v2_probe" :
@@ -3374,6 +4295,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
             (blockfa_hybrid_bm8_vreuse ? "blockfa_hybrid_bm8_vreuse_probe" :
             (blockfa_hybrid_bm8_packed16_scalar ? "blockfa_hybrid_bm8_packed16_scalar_probe" :
             (blockfa_hybrid_bm8 ? "blockfa_hybrid_bm8_probe" :
+            (grouped_gqa6_qtile4_kvshared ? "grouped_gqa6_qtile4_kvshared_probe" :
             (grouped_gqa6_qtile4_vshared ? "grouped_gqa6_qtile4_vshared_probe" :
             (grouped_gqa6_qtile4_tile8 ? "grouped_gqa6_qtile4_tile8_probe" :
             (grouped_gqa_qtile4_tile8 ? "grouped_gqa_qtile4_tile8_probe" :
@@ -3381,7 +4303,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
             (grouped_gqa_online ? "grouped_gqa_online_probe" :
             (fused_tile8_parallel ? "fused_tile8_parallel_probe" :
             (fused_online ? "fused_online_probe" :
-            (full_fa ? "full_fa_from_logits_probe" : "kq_only_zero_output"))))))))))))))))))));
+            (full_fa ? "full_fa_from_logits_probe" : "kq_only_zero_output")))))))))))))))))))));
     if (fused_variant_effective && !full_fa) {
         GGML_ABORT("q8k_dot4_kq fused variants require GGML_CUDA_ROCM_Q8K_DOT4_KQ_FULL_FA=1");
     }
@@ -3405,9 +4327,13 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
             GGML_ABORT("q8k_dot4_kq grouped_gqa variants support GQA ratio <= %d, got %d",
                     GGML_CUDA_Q8K_DOT4_KQ_MAX_GQA, gqa_ratio);
         }
-        if ((grouped_gqa6_qtile4_tile8 || grouped_gqa6_qtile4_vshared) && gqa_ratio != GGML_CUDA_Q8K_DOT4_KQ_GQA6) {
+        if ((grouped_gqa6_qtile4_tile8 || grouped_gqa6_qtile4_vshared || grouped_gqa6_qtile4_kvshared) && gqa_ratio != GGML_CUDA_Q8K_DOT4_KQ_GQA6) {
             GGML_ABORT("q8k_dot4_kq grouped_gqa6 qtile4 variants require GQA ratio %d, got %d",
                     GGML_CUDA_Q8K_DOT4_KQ_GQA6, gqa_ratio);
+        }
+        if (grouped_gqa6_qtile4_kvshared && V->type != GGML_TYPE_Q4_0) {
+            GGML_ABORT("q8k_dot4_kq grouped_gqa6_qtile4_kvshared requires V=q4_0, got V=%s",
+                    ggml_type_name(V->type));
         }
         if (blockfa_runtime_any_effective && mask && getenv("GGML_CUDA_ROCM_Q8K_DOT4_BLOCKFA_ASSUME_CAUSAL") == nullptr) {
             // Auto-selected blockfa_recthist_v4_single: assume causal mask is
@@ -3446,6 +4372,8 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
         GGML_ABORT("q8k_dot4_kq packed16-q8 side-channel K requires packed16 K cache sidecars; K=%s physical=%s",
                 ggml_type_name(K->type), ggml_cuda_q8k_dot4_k_physical_name(K));
     }
+    int k_payload_row_stride_i32 = GGML_CUDA_Q8K_DOT4_KQ_D / 4;
+    int k_scales_row_stride_half = GGML_CUDA_Q8K_DOT4_KQ_BLOCKS;
     bool skip_k_repack = false;
     if (use_packed16) {
         // Prefer GGML tensors from registry (allocated by KV cache). Fall back to hipMalloc.
@@ -3462,6 +4390,8 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
             // Use GGML tensors directly — no hipMalloc needed.
             k_payload.ptr = (int *) payload_tensor->data;
             k_scales.ptr  = (half *) scales_tensor->data;
+            k_payload_row_stride_i32 = (int) (payload_tensor->nb[1] / (int64_t) sizeof(int));
+            k_scales_row_stride_half = (int) (scales_tensor->nb[1] / (int64_t) sizeof(half));
             // One-time DOT4 packed16 registry dump
             static bool dot4_registry_printed = false;
             if (!dot4_registry_printed) {
@@ -3469,19 +4399,30 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                 const int64_t head_stride = (payload_tensor->ne[1] > 0 && K->ne[2] > 0) ? payload_tensor->ne[1] / K->ne[2] : 0;
                 fprintf(stderr, "DOT4 packed16 registry: payload=%p scales=%p "
                         "payload_ne=(%lld,%lld,%lld,%lld) scales_ne=(%lld,%lld,%lld,%lld) "
+                        "payload_row_stride_i32=%d scales_row_stride_half=%d "
                         "physical=packed16_q8_sidechannel_i32_f16scales head_stride=%lld row=hk*head_stride+k\n",
                         (void*)payload_tensor->data, (void*)scales_tensor->data,
                         (long long)payload_tensor->ne[0], (long long)payload_tensor->ne[1],
                         (long long)payload_tensor->ne[2], (long long)payload_tensor->ne[3],
                         (long long)scales_tensor->ne[0], (long long)scales_tensor->ne[1],
                         (long long)scales_tensor->ne[2], (long long)scales_tensor->ne[3],
+                        k_payload_row_stride_i32, k_scales_row_stride_half,
                         (long long)head_stride);
             }
-            // Check if cache unchanged since last repack.
-            std::lock_guard<std::mutex> lock(s_cache_mutex);
-            size_t & prev_rows = s_cache_rows[K->data];
-            if (prev_rows >= (size_t)k_rows) {
+            // Registered KV-cache sidecars are maintained by cpy_k/pack_k.  In
+            // graph-facing-F16 hot/cold mode, do not repack the whole K cache
+            // during attention; consume the sidecar as the route-private cold
+            // representation and the F16 K view as the hot/exact tail.
+            const bool registry_prepacked = k_is_i32_packed16 || graph_f16_hotcold_sidecar;
+            if (registry_prepacked) {
                 skip_k_repack = true;
+            } else {
+                // Check if cache unchanged since last repack.
+                std::lock_guard<std::mutex> lock(s_cache_mutex);
+                size_t & prev_rows = s_cache_rows[K->data];
+                if (prev_rows >= (size_t)k_rows) {
+                    skip_k_repack = true;
+                }
             }
         } else {
             // Fallback: hipMalloc persistent buffers.
@@ -3550,8 +4491,8 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
             GGML_ABORT("q8k_dot4_kq blockfa_hybrid_bm8_packed16_scalar excludes V/K reuse variants");
         }
     }
-    if ((blockfa_recthist_any_effective && !blockfa_recthist_v4_single_effective) || (blockfa_hybrid_bm8_any && blockfa_split_k > 1)) {
-        const size_t partial_rows = q_rows * size_t(blockfa_recthist_any_effective ? 2 : blockfa_split_k);
+    if (packed16_hotcold_supported || (blockfa_recthist_any_effective && !blockfa_recthist_v4_single_effective) || (blockfa_hybrid_bm8_any && blockfa_split_k > 1)) {
+        const size_t partial_rows = packed16_hotcold_supported ? q_rows * size_t(2) : q_rows * size_t(blockfa_recthist_any_effective ? 2 : blockfa_split_k);
         blockfa_partial_o.alloc(partial_rows * GGML_CUDA_Q8K_DOT4_KQ_D);
         blockfa_partial_m.alloc(partial_rows);
         blockfa_partial_l.alloc(partial_rows);
@@ -3590,6 +4531,8 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
 
     dim3 q_grid(nq, n_heads_q, batch);
     dim3 block(256);
+    const int k_scale_mode = ggml_cuda_q8k_dot4_packed16_k_scale_mode(0);
+    const float k_scale_mul = ggml_cuda_q8k_dot4_packed16_k_scale_mul();
     ggml_cuda_q8k_dot4_quant_q_packed16_kernel<<<q_grid, block, 0, stream>>>(
         (const float *) Q->data, q_payload.ptr, q_scales.ptr,
         Q->nb[1], Q->nb[2], Q->nb[3], nq, n_heads_q, batch);
@@ -3609,7 +4552,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                 dim3 k_quant_grid(nk, n_heads_k, batch);
                 ggml_cuda_q8k_dot4_quant_k_packed16_kernel<<<k_quant_grid, block, 0, stream>>>(
                     (const half *) K->data, k_payload.ptr, k_scales.ptr,
-                    K->nb[1], K->nb[2], K->nb[3], nk, n_heads_k, batch);
+                    K->nb[1], K->nb[2], K->nb[3], nk, n_heads_k, batch, k_scale_mode, k_scale_mul);
                 CUDA_CHECK(cudaGetLastError());
             } else {
                 // q8_0→packed16 repack (existing path)
@@ -3694,7 +4637,94 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
             if (blockfa_hybrid_bm8_hgroup && (gqa_ratio != 6 || blockfa_bn != 8)) {
                 GGML_ABORT("q8k_dot4_kq blockfa_hybrid_bm8 hgroup variants require GQA ratio 6 and BN8");
             }
-            if (blockfa_recthist_v4_single_effective) {
+            if (packed16_hotcold_supported) {
+                const int hot_window = max(1, min(packed16_hotcold_window, nk));
+                int hot_begin = max(0, nk - hot_window);
+                if (packed16_hotcold_align > 1) {
+                    hot_begin = (hot_begin / packed16_hotcold_align) * packed16_hotcold_align;
+                }
+                const int hot_end = nk;
+                const bool packed16_hotcold_mixed = nq == 1 &&
+                    ggml_cuda_q8k_dot4_kq_env_enabled("LLAMA_MTP_PACKED16_HOTCOLD_K_MIXED");
+                if (packed16_hotcold_mixed) {
+                    ggml_cuda_q8k_dot4_hotcold_mixed_q4_0_kernel<8><<<fa_grid, block, 0, stream>>>(
+                        (const float *) Q->data, q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr,
+                        (const char *) hotcold_shadow_k->data, (const char *) V->data,
+                        mask ? (const char *) mask->data : nullptr,
+                        (float *) dst->data, scale,
+                        Q->nb[0], Q->nb[1], Q->nb[2], Q->nb[3],
+                        hotcold_shadow_k->nb[0], hotcold_shadow_k->nb[1], hotcold_shadow_k->nb[2],
+                        V->nb[0], V->nb[1], V->nb[2], V->nb[3],
+                        mask ? mask->nb[0] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[3] : 0, mask ? mask->ne[3] : 1,
+                        nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch,
+                        hot_window, packed16_hotcold_align,
+                        ggml_cuda_q8k_dot4_kq_env_enabled("LLAMA_MTP_PACKED16_HOTCOLD_K_TRACE_LIVE") ? 1 : 0);
+                    CUDA_CHECK(cudaGetLastError());
+                    if (timing) {
+                        CUDA_CHECK(hipEventRecord(ev_recthist_tail, stream));
+                        CUDA_CHECK(hipEventRecord(ev_blockfa, stream));
+                        CUDA_CHECK(hipEventRecord(ev_recthist_merge, stream));
+                        CUDA_CHECK(hipEventRecord(ev_combine, stream));
+                    }
+                } else {
+                const int hotcold_slots = 2;
+                const size_t partial_rows_local = q_rows * size_t(hotcold_slots);
+                ggml_cuda_q8k_dot4_blockfa_reset_partial_kernel<<<(partial_rows_local + 255) / 256, 256, 0, stream>>>(
+                    blockfa_partial_m.ptr, blockfa_partial_l.ptr, partial_rows_local);
+                CUDA_CHECK(cudaGetLastError());
+                if (timing) {
+                    CUDA_CHECK(hipEventRecord(ev_recthist_ready, stream));
+                }
+
+                const dim3 recthist_grid((nq + 7) / 8, n_heads_q, batch);
+                const size_t smem_bn8_vhoist = (size_t(8 * 8 + 3 * 8 + 8 * GGML_CUDA_Q8K_DOT4_KQ_D) + size_t(8 * (GGML_CUDA_Q8K_DOT4_KQ_D / 4)) + size_t(8 * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS)) * sizeof(float);
+                if (hot_begin > 0) {
+                    ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_vhoist_kernel<8, false><<<recthist_grid, block, smem_bn8_vhoist, stream>>>(
+                        q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
+                        blockfa_partial_o.ptr, blockfa_partial_m.ptr, blockfa_partial_l.ptr, scale,
+                        V->nb[0], V->nb[1], V->nb[2], V->nb[3],
+                        nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, 0, hot_begin, hotcold_slots, 0,
+                        mask ? (const char *) mask->data : nullptr,
+                        mask ? mask->nb[0] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[3] : 0, mask ? mask->ne[3] : 1,
+                        hot_window, packed16_hotcold_align, 1);
+                    CUDA_CHECK(cudaGetLastError());
+                }
+                if (timing) {
+                    CUDA_CHECK(hipEventRecord(ev_recthist_prefix, stream));
+                }
+
+                ggml_cuda_q8k_dot4_f16_hot_tail_q4_0_partial_kernel<<<fa_grid, block, 0, stream>>>(
+                    (const float *) Q->data, (const char *) hotcold_shadow_k->data, (const char *) V->data,
+                    mask ? (const char *) mask->data : nullptr,
+                    blockfa_partial_o.ptr, blockfa_partial_m.ptr, blockfa_partial_l.ptr, scale,
+                    Q->nb[0], Q->nb[1], Q->nb[2], Q->nb[3],
+                    hotcold_shadow_k->nb[0], hotcold_shadow_k->nb[1], hotcold_shadow_k->nb[2],
+                    V->nb[0], V->nb[1], V->nb[2], V->nb[3],
+                    mask ? mask->nb[0] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[3] : 0, mask ? mask->ne[3] : 1,
+                    nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, hot_begin, hot_end, hotcold_slots, 1,
+                    hot_window, 2, packed16_hotcold_align, ggml_cuda_q8k_dot4_kq_env_enabled("LLAMA_MTP_PACKED16_HOTCOLD_K_TRACE_LIVE") ? 1 : 0);
+                CUDA_CHECK(cudaGetLastError());
+                if (timing) {
+                    CUDA_CHECK(hipEventRecord(ev_recthist_tail, stream));
+                    CUDA_CHECK(hipEventRecord(ev_blockfa, stream));
+                }
+
+                ggml_cuda_q8k_dot4_blockfa_combine_kernel<<<fa_grid, block, 0, stream>>>(
+                    blockfa_partial_o.ptr, blockfa_partial_m.ptr, blockfa_partial_l.ptr, (float *) dst->data, nq, n_heads_q, hotcold_slots);
+                CUDA_CHECK(cudaGetLastError());
+                if (timing) {
+                    CUDA_CHECK(hipEventRecord(ev_recthist_merge, stream));
+                    CUDA_CHECK(hipEventRecord(ev_combine, stream));
+                }
+                }
+                static bool hotcold_printed = false;
+                if (!hotcold_printed && ggml_cuda_q8k_dot4_kq_env_enabled("LLAMA_MTP_PACKED16_HOTCOLD_K_TRACE")) {
+                    hotcold_printed = true;
+                    fprintf(stderr,
+                        "MTP_PACKED16_HOTCOLD_K: enabled window=%d align=%d impl=%s padded_hot=[%d,%d) padded_cold=[0,%d) nq=%d nk=%d heads_q=%d heads_k=%d shadow=%p mask_tail=1\n",
+                        hot_window, packed16_hotcold_align, packed16_hotcold_mixed ? "mixed" : "split", hot_begin, hot_end, hot_begin, nq, nk, n_heads_q, n_heads_k, (void *) hotcold_shadow_k->data);
+                }
+            } else if (blockfa_recthist_v4_single_effective) {
                 if (!use_causal) {
                     GGML_ABORT("q8k_dot4_kq blockfa_recthist_v4_single requires causal-tail mask and GGML_CUDA_ROCM_Q8K_DOT4_BLOCKFA_ASSUME_CAUSAL=1");
                 }
@@ -3708,11 +4738,11 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                         "q8k_dot4_i32: K type=%d ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] data=%p\n"
                         "q8k_dot4_i32: V type=%d ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] data=%p\n"
                         "q8k_dot4_i32: payload=%p scales=%p nq=%d nk=%d hq=%d hk=%d batch=%d gqa=%d\n",
-                        Q->type, Q->ne[0], Q->ne[1], Q->ne[2], Q->ne[3],
+                        Q->type, (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3],
                         Q->nb[0], Q->nb[1], Q->nb[2], Q->nb[3], Q->data,
-                        K->type, K->ne[0], K->ne[1], K->ne[2], K->ne[3],
+                        K->type, (long long) K->ne[0], (long long) K->ne[1], (long long) K->ne[2], (long long) K->ne[3],
                         K->nb[0], K->nb[1], K->nb[2], K->nb[3], K->data,
-                        V->type, V->ne[0], V->ne[1], V->ne[2], V->ne[3],
+                        V->type, (long long) V->ne[0], (long long) V->ne[1], (long long) V->ne[2], (long long) V->ne[3],
                         V->nb[0], V->nb[1], V->nb[2], V->nb[3], V->data,
                         k_payload.ptr, k_scales.ptr, nq, nk, n_heads_q, n_heads_k, batch, gqa_ratio);
                 }
@@ -3733,13 +4763,84 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                 const bool is_mtp_draft_decode = (fa_inst == GGML_FATTN_INST_MTP_DRAFT_DECODE_QK);
                 const char * packed16_decode_impl_env = getenv("GGML_CUDA_ROCM_PACKED16_DECODE_IMPL");
                 const char * packed16_decode_route = getenv("GGML_CUDA_FA_ROUTE_REQUIRE");
+                const bool packed16_fa2_enabled = ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_PACKED16_FA2");
+                const bool mtp_verify_smallq_fa2_enabled =
+                    ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_MTP_VERIFY_SMALLQ_FA2");
+                int packed16_lds_a8_max_nq = ggml_cuda_q8k_dot4_kq_env_int(
+                    "GGML_CUDA_ROCM_PACKED16_LDS_A8_MAX_NQ",
+                    ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ", 4));
+                if (packed16_lds_a8_max_nq > 4) packed16_lds_a8_max_nq = 4;
+                const int packed16_lds_a8_min_nk = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_PACKED16_LDS_A8_MIN_NK", 12288);
+                const bool packed16_lds_a8_force = ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_PACKED16_LDS_A8_FORCE");
+                const bool packed16_lds_a8_disabled = ggml_cuda_q8k_dot4_kq_env_disabled("GGML_CUDA_ROCM_PACKED16_LDS_A8");
+                const bool packed16_lds_a8_route_allows_auto =
+                    !packed16_decode_route || !packed16_decode_route[0] ||
+                    strcmp(packed16_decode_route, "rocm_packed16_fa2") == 0 ||
+                    strcmp(packed16_decode_route, "rocm_packed16_small_verify_fa2") == 0 ||
+                    strcmp(packed16_decode_route, "rocm_packed16_small_verify_fa2_pv_dot4_lds_a") == 0;
+                const bool packed16_lds_a8_impl_allows_auto =
+                    !packed16_decode_impl_env || !packed16_decode_impl_env[0] ||
+                    strcmp(packed16_decode_impl_env, "auto") == 0 ||
+                    strcmp(packed16_decode_impl_env, "packed16_fa2") == 0 ||
+                    strcmp(packed16_decode_impl_env, "small_verify_fa2") == 0 ||
+                    strcmp(packed16_decode_impl_env, "small_verify_fa2_tune") == 0 ||
+                    strcmp(packed16_decode_impl_env, "small_verify_fa2_pv_dot4_lds_a_tune") == 0;
+                const bool packed16_lds_a8_mtp_context =
+                    is_mtp_draft_decode ||
+                    ggml_cuda_q8k_dot4_kq_env_enabled("LLAMA_MTP_ENABLE_FA") ||
+                    ggml_cuda_q8k_dot4_kq_env_enabled("LLAMA_MTP_FA_ROUTE");
+                const bool packed16_lds_a8_shape_ok =
+                    packed16_lds_a8_mtp_context && (K->type == GGML_TYPE_I32 || graph_f16_hotcold_sidecar_allowed) &&
+                    V->type == GGML_TYPE_Q4_0 && nq >= 2 && nq <= packed16_lds_a8_max_nq && gqa_ratio <= 8;
+                const bool packed16_lds_a8_auto =
+                    !packed16_lds_a8_disabled && packed16_lds_a8_shape_ok &&
+                    (packed16_lds_a8_force ||
+                     (nk >= packed16_lds_a8_min_nk && packed16_lds_a8_route_allows_auto && packed16_lds_a8_impl_allows_auto));
                 const bool packed16_small_verify_requested =
+                    packed16_lds_a8_auto ||
+                    packed16_fa2_enabled ||
+                    mtp_verify_smallq_fa2_enabled ||
                     (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify") == 0) ||
                     (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify_batched_splitk") == 0) ||
+                    (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "packed16_fa2") == 0) ||
                     (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify_fa2") == 0) ||
+                    (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify_fa2_tune") == 0) ||
+                    (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify_fa2_hybrid_tune") == 0) ||
+                    (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify_fa2_pv_dot4_onthefly_tune") == 0) ||
+                    (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify_fa2_pv_dot4_lds_a_tune") == 0) ||
+                    (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify_fa2_fusedpv_tune") == 0) ||
+                    (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify_fa2_pvwmma_tune") == 0) ||
+                    (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify_fa3_tune") == 0) ||
+                    (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify_fa4") == 0) ||
+                    (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify_fa4_tune") == 0) ||
+                    (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify_fa4_pvwmma") == 0) ||
+                    (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify_fa4_pvwmma_tune") == 0) ||
+                    (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "bm_dot4_pages") == 0) ||
+                    (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "bm_dot4_pages_tune") == 0) ||
+                    (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "bm_dot4_pages_pvwmma") == 0) ||
+                    (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "bm_dot4_pages_pint8pv") == 0) ||
+                    (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "bm_dot4_pages_pint8pv_dot4") == 0) ||
+                    (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "bm_dot4_pages_intflash_vfrag_dot4") == 0) ||
+                    (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "bm_dot4_pages_intflash_vfrag_wmma") == 0) ||
                     (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify") == 0) ||
                     (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_batched_splitk") == 0) ||
-                    (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_fa2") == 0);
+                    (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_fa2") == 0) ||
+                    (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_fa2") == 0) ||
+                    (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_fa2_hybrid") == 0) ||
+                    (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_fa2_sparsev") == 0) ||
+                    (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_fa2_pv_dot4_onthefly") == 0) ||
+                    (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_fa2_pv_dot4_lds_a") == 0) ||
+                    (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_fa2_fusedpv") == 0) ||
+                    (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_fa2_pvwmma") == 0) ||
+                    (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_fa3") == 0) ||
+                    (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_fa4") == 0) ||
+                    (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_fa4_pvwmma") == 0) ||
+                    (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_bm_dot4_pages") == 0) ||
+                    (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_bm_dot4_pages_pvwmma") == 0) ||
+                    (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_bm_dot4_pages_pint8pv") == 0) ||
+                    (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_bm_dot4_pages_pint8pv_dot4") == 0) ||
+                    (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_bm_dot4_pages_intflash_vfrag_dot4") == 0) ||
+                    (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_bm_dot4_pages_intflash_vfrag_wmma") == 0);
                 const bool packed16_small_verify_splitk_requested =
                     (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "small_verify_splitk") == 0) ||
                     (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_splitk") == 0);
@@ -3748,21 +4849,28 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                     (packed16_decode_impl_env && strcmp(packed16_decode_impl_env, "splitk") == 0) ||
                     (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_decode_splitk") == 0);
                 const bool use_default_packed16_mtp_decode =
-                    nq == 1 && K->type == GGML_TYPE_I32 && V->type == GGML_TYPE_Q4_0 && is_mtp_draft_decode;
+                    nq == 1 && V->type == GGML_TYPE_Q4_0 && is_mtp_draft_decode &&
+                    (K->type == GGML_TYPE_I32 || graph_f16_hotcold_sidecar);
                 const int decode_bn = ggml_cuda_q8k_dot4_kq_env_int(
                     "GGML_CUDA_ROCM_Q8K_DOT4_DECODE_BN", (use_default_packed16_mtp_decode || packed16_small_verify_requested || packed16_small_verify_splitk_requested) ? 64 : 0);
                 const int decode_max_nq = (packed16_small_verify_requested || packed16_small_verify_splitk_requested) ?
                     ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ", 4) :
                     (packed16_decode_splitk_requested ? ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_MAX_NQ", 1) : 1);
 
-                if (decode_bn > 0 && nq <= decode_max_nq && (K->type == GGML_TYPE_I32 || is_mtp_draft_decode)) {
+                const bool graph_f16_hotcold_small_verify =
+                    graph_f16_hotcold_sidecar_allowed && packed16_small_verify_requested &&
+                    nq >= 2 && nq <= decode_max_nq && V->type == GGML_TYPE_Q4_0;
+                if (decode_bn > 0 && nq <= decode_max_nq &&
+                        (K->type == GGML_TYPE_I32 || is_mtp_draft_decode || graph_f16_hotcold_small_verify)) {
                     // For f16-source K, packed16 is already materialized in k_payload/k_scales.
                     // Strides are computed from packed16 layout, not from K tensor strides.
                     const int k_head_stride_rows  = nk;
                     const int k_batch_stride_rows = n_heads_k * k_head_stride_rows;
                     const int decode_vsub = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_VSUB", 8);
                     const char * packed16_decode_impl =
+                        packed16_lds_a8_auto ? "small_verify_fa2_pv_dot4_lds_a_tune" :
                         (packed16_decode_impl_env && packed16_decode_impl_env[0]) ? packed16_decode_impl_env :
+                        (packed16_fa2_enabled || mtp_verify_smallq_fa2_enabled) ? "packed16_fa2" :
                         (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_decode_q4pair") == 0) ? "q4pair" :
                         (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_decode_gqa_scalar") == 0) ? "gqa_scalar" :
                         (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_decode_waveqk") == 0) ? "waveqk" :
@@ -3776,7 +4884,23 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                         (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify") == 0) ? (nq == 1 ? "splitk" : "small_verify") :
                         (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_splitk") == 0) ? (nq == 1 ? "splitk" : "small_verify_splitk") :
                         (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_batched_splitk") == 0) ? (nq == 1 ? "splitk" : "small_verify_batched_splitk") :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_fa2") == 0) ? (nq == 1 ? "splitk" : "packed16_fa2") :
                         (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_fa2") == 0) ? (nq == 1 ? "splitk" : "small_verify_fa2") :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_fa2_hybrid") == 0) ? (nq == 1 ? "splitk" : "small_verify_fa2_hybrid_tune") :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_fa2_sparsev") == 0) ? (nq == 1 ? "splitk" : "small_verify_fa2_sparsev_tune") :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_fa2_pv_dot4_onthefly") == 0) ? (nq == 1 ? "splitk" : "small_verify_fa2_pv_dot4_onthefly_tune") :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_fa2_pv_dot4_lds_a") == 0) ? (nq == 1 ? "splitk" : "small_verify_fa2_pv_dot4_lds_a_tune") :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_fa2_fusedpv") == 0) ? (nq == 1 ? "splitk" : "small_verify_fa2_fusedpv_tune") :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_fa2_pvwmma") == 0) ? (nq == 1 ? "splitk" : "small_verify_fa2_pvwmma_tune") :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_fa3") == 0) ? (nq == 1 ? "splitk" : "small_verify_fa3_tune") :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_fa4") == 0) ? (nq == 1 ? "splitk" : "small_verify_fa4") :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_small_verify_fa4_pvwmma") == 0) ? (nq == 1 ? "splitk" : "small_verify_fa4_pvwmma") :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_bm_dot4_pages") == 0) ? (nq == 1 ? "splitk" : "bm_dot4_pages") :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_bm_dot4_pages_pvwmma") == 0) ? (nq == 1 ? "splitk" : "bm_dot4_pages_pvwmma") :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_bm_dot4_pages_pint8pv") == 0) ? (nq == 1 ? "splitk" : "bm_dot4_pages_pint8pv") :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_bm_dot4_pages_pint8pv_dot4") == 0) ? (nq == 1 ? "splitk" : "bm_dot4_pages_pint8pv_dot4") :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_bm_dot4_pages_intflash_vfrag_wmma") == 0) ? (nq == 1 ? "splitk" : "bm_dot4_pages_intflash_vfrag_wmma") :
+                        (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_bm_dot4_pages_intflash_vfrag_dot4") == 0) ? (nq == 1 ? "splitk" : "bm_dot4_pages_intflash_vfrag_dot4") :
                         (packed16_decode_route && strcmp(packed16_decode_route, "rocm_packed16_decode_splitk") == 0) ? "splitk" :
                         "scalar";
                     const bool impl_gqa_scalar = strcmp(packed16_decode_impl, "gqa_scalar") == 0;
@@ -3790,13 +4914,33 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                     const bool impl_dsplit = strcmp(packed16_decode_impl, "dsplit") == 0;
                     const bool impl_logits_debug = strcmp(packed16_decode_impl, "logits_debug") == 0;
                     const bool impl_splitk = strcmp(packed16_decode_impl, "splitk") == 0;
-bool impl_small_verify = strcmp(packed16_decode_impl, "small_verify") == 0;
+                    bool impl_small_verify = strcmp(packed16_decode_impl, "small_verify") == 0;
                     bool impl_small_verify_splitk = strcmp(packed16_decode_impl, "small_verify_splitk") == 0;
                     bool impl_small_verify_batched_splitk = strcmp(packed16_decode_impl, "small_verify_batched_splitk") == 0;
+                    bool impl_packed16_fa2 = strcmp(packed16_decode_impl, "packed16_fa2") == 0;
                     bool impl_small_verify_fa2 = strcmp(packed16_decode_impl, "small_verify_fa2") == 0;
-                    const bool impl_supported = impl_scalar || impl_gqa_scalar || impl_inline_q4 || impl_q4pair || impl_waveqk || impl_waveqk_q4pair || impl_pvwmma || impl_wmma_full || impl_dsplit || impl_logits_debug || impl_splitk || impl_small_verify || impl_small_verify_splitk || impl_small_verify_batched_splitk || impl_small_verify_fa2;
+                    bool impl_small_verify_fa2_tune = strcmp(packed16_decode_impl, "small_verify_fa2_tune") == 0;
+                    bool impl_small_verify_fa2_hybrid_tune = strcmp(packed16_decode_impl, "small_verify_fa2_hybrid_tune") == 0;
+                    bool impl_small_verify_fa2_sparsev_tune = strcmp(packed16_decode_impl, "small_verify_fa2_sparsev_tune") == 0;
+                    bool impl_small_verify_fa2_pv_dot4_onthefly_tune = strcmp(packed16_decode_impl, "small_verify_fa2_pv_dot4_onthefly_tune") == 0;
+                    bool impl_small_verify_fa2_pv_dot4_lds_a_tune = strcmp(packed16_decode_impl, "small_verify_fa2_pv_dot4_lds_a_tune") == 0;
+                    bool impl_small_verify_fa2_fusedpv_tune = strcmp(packed16_decode_impl, "small_verify_fa2_fusedpv_tune") == 0;
+                    bool impl_small_verify_fa2_pvwmma_tune = strcmp(packed16_decode_impl, "small_verify_fa2_pvwmma_tune") == 0;
+                    bool impl_small_verify_fa3_tune = strcmp(packed16_decode_impl, "small_verify_fa3_tune") == 0;
+                    bool impl_small_verify_fa4 = strcmp(packed16_decode_impl, "small_verify_fa4") == 0;
+                    bool impl_small_verify_fa4_tune = strcmp(packed16_decode_impl, "small_verify_fa4_tune") == 0;
+                    bool impl_small_verify_fa4_pvwmma = strcmp(packed16_decode_impl, "small_verify_fa4_pvwmma") == 0;
+                    bool impl_small_verify_fa4_pvwmma_tune = strcmp(packed16_decode_impl, "small_verify_fa4_pvwmma_tune") == 0;
+                    bool impl_bm_dot4_pages = strcmp(packed16_decode_impl, "bm_dot4_pages") == 0;
+                    bool impl_bm_dot4_pages_tune = strcmp(packed16_decode_impl, "bm_dot4_pages_tune") == 0;
+                    bool impl_bm_dot4_pages_pvwmma = strcmp(packed16_decode_impl, "bm_dot4_pages_pvwmma") == 0;
+                    bool impl_bm_dot4_pages_pint8pv = strcmp(packed16_decode_impl, "bm_dot4_pages_pint8pv") == 0;
+                    bool impl_bm_dot4_pages_pint8pv_dot4 = strcmp(packed16_decode_impl, "bm_dot4_pages_pint8pv_dot4") == 0;
+                    bool impl_bm_dot4_pages_intflash_vfrag_dot4 = strcmp(packed16_decode_impl, "bm_dot4_pages_intflash_vfrag_dot4") == 0;
+                    bool impl_bm_dot4_pages_intflash_vfrag_wmma = strcmp(packed16_decode_impl, "bm_dot4_pages_intflash_vfrag_wmma") == 0;
+                    const bool impl_supported = impl_scalar || impl_gqa_scalar || impl_inline_q4 || impl_q4pair || impl_waveqk || impl_waveqk_q4pair || impl_pvwmma || impl_wmma_full || impl_dsplit || impl_logits_debug || impl_splitk || impl_small_verify || impl_small_verify_splitk || impl_small_verify_batched_splitk || impl_packed16_fa2 || impl_small_verify_fa2 || impl_small_verify_fa2_tune || impl_small_verify_fa2_hybrid_tune || impl_small_verify_fa2_sparsev_tune || impl_small_verify_fa2_pv_dot4_onthefly_tune || impl_small_verify_fa2_pv_dot4_lds_a_tune || impl_small_verify_fa2_fusedpv_tune || impl_small_verify_fa2_pvwmma_tune || impl_small_verify_fa3_tune || impl_small_verify_fa4 || impl_small_verify_fa4_tune || impl_small_verify_fa4_pvwmma || impl_small_verify_fa4_pvwmma_tune || impl_bm_dot4_pages || impl_bm_dot4_pages_tune || impl_bm_dot4_pages_pvwmma || impl_bm_dot4_pages_pint8pv || impl_bm_dot4_pages_pint8pv_dot4 || impl_bm_dot4_pages_intflash_vfrag_dot4 || impl_bm_dot4_pages_intflash_vfrag_wmma;
                     if (!impl_supported) {
-                        GGML_ABORT("packed16 decode impl '%s' is not implemented yet; supported in this build: scalar, gqa_scalar, inline_q4, q4pair, waveqk, waveqk_q4pair, splitk, small_verify, small_verify_splitk, small_verify_batched_splitk, small_verify_fa2, dsplit, pvwmma, gqa_pvwmma, wmma_full, gqa_wmma_full, logits_debug", packed16_decode_impl);
+                        GGML_ABORT("packed16 decode impl '%s' is not implemented yet; supported in this build: scalar, gqa_scalar, inline_q4, q4pair, waveqk, waveqk_q4pair, splitk, small_verify, small_verify_splitk, small_verify_batched_splitk, packed16_fa2, small_verify_fa2, small_verify_fa2_tune, small_verify_fa2_hybrid_tune, small_verify_fa2_sparsev_tune, small_verify_fa2_pv_dot4_onthefly_tune, small_verify_fa2_pv_dot4_lds_a_tune, small_verify_fa2_fusedpv_tune, small_verify_fa2_pvwmma_tune, small_verify_fa3_tune, small_verify_fa4, small_verify_fa4_pvwmma, bm_dot4_pages, bm_dot4_pages_pvwmma, bm_dot4_pages_pint8pv, bm_dot4_pages_pint8pv_dot4, bm_dot4_pages_intflash_vfrag_dot4, bm_dot4_pages_intflash_vfrag_wmma, dsplit, pvwmma, gqa_pvwmma, wmma_full, gqa_wmma_full, logits_debug", packed16_decode_impl);
                     }
                     const bool packed16_decode_impl_explicit = packed16_decode_impl_env && packed16_decode_impl_env[0];
                     const bool packed16_decode_log =
@@ -3808,9 +4952,10 @@ bool impl_small_verify = strcmp(packed16_decode_impl, "small_verify") == 0;
                         if (packed16_decode_impl_explicit || packed16_decode_impl_seen.find(shape_key) == packed16_decode_impl_seen.end()) {
                             packed16_decode_impl_seen.insert(shape_key);
                             fprintf(stderr,
-                                "packed16_decode_impl selected=%s route=%s nq=%d nk=%d hq=%d hk=%d batch=%d gqa=%d V=%s\n",
+                                "packed16_decode_impl selected=%s route=%s nq=%d nk=%d hq=%d hk=%d batch=%d gqa=%d K=%s V=%s f16_sidecar=%d lds_a8_auto=%d min_nk=%d\n",
                                 packed16_decode_impl, packed16_decode_route ? packed16_decode_route : "",
-                                nq, nk, n_heads_q, n_heads_k, batch, gqa_ratio, ggml_type_name(V->type));
+                                nq, nk, n_heads_q, n_heads_k, batch, gqa_ratio, ggml_type_name(K->type), ggml_type_name(V->type),
+                                graph_f16_hotcold_sidecar_allowed ? 1 : 0, packed16_lds_a8_auto ? 1 : 0, packed16_lds_a8_min_nk);
                         }
                     }
                     const bool inline_q4 = ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_INLINE_Q4") || impl_inline_q4;
@@ -3824,10 +4969,32 @@ bool impl_small_verify = strcmp(packed16_decode_impl, "small_verify") == 0;
                     if (impl_small_verify && nq < 2) impl_small_verify = false;
                     if (impl_small_verify_splitk && nq < 2) impl_small_verify_splitk = false;
                     if (impl_small_verify_batched_splitk && nq < 2) impl_small_verify_batched_splitk = false;
+                    if (impl_packed16_fa2 && nq < 2) impl_packed16_fa2 = false;
                     if (impl_small_verify_fa2 && nq < 2) impl_small_verify_fa2 = false;
-                    if ((impl_small_verify || impl_small_verify_splitk || impl_small_verify_batched_splitk || impl_small_verify_fa2) && !(nq >= 2 && nq <= decode_max_nq && K->type == GGML_TYPE_I32 && V->type == GGML_TYPE_Q4_0)) {
-                        GGML_ABORT("packed16 %s requires I32 K, q4_0 V, and 2 <= nq <= %d; got nq=%d K=%s V=%s",
-                            packed16_decode_impl, decode_max_nq, nq, ggml_type_name(K->type), ggml_type_name(V->type));
+                    if (impl_small_verify_fa2_tune && nq < 2) impl_small_verify_fa2_tune = false;
+                    if (impl_small_verify_fa2_hybrid_tune && nq < 2) impl_small_verify_fa2_hybrid_tune = false;
+                    if (impl_small_verify_fa2_sparsev_tune && nq < 2) impl_small_verify_fa2_sparsev_tune = false;
+                    if (impl_small_verify_fa2_pv_dot4_onthefly_tune && nq < 2) impl_small_verify_fa2_pv_dot4_onthefly_tune = false;
+                    if (impl_small_verify_fa2_pv_dot4_lds_a_tune && nq < 2) impl_small_verify_fa2_pv_dot4_lds_a_tune = false;
+                    if (impl_small_verify_fa2_fusedpv_tune && nq < 2) impl_small_verify_fa2_fusedpv_tune = false;
+                    if (impl_small_verify_fa2_pvwmma_tune && nq < 2) impl_small_verify_fa2_pvwmma_tune = false;
+                    if (impl_small_verify_fa3_tune && nq < 2) impl_small_verify_fa3_tune = false;
+                    if (impl_small_verify_fa4 && nq < 2) impl_small_verify_fa4 = false;
+                    if (impl_small_verify_fa4_tune && nq < 2) impl_small_verify_fa4_tune = false;
+                    if (impl_small_verify_fa4_pvwmma && nq < 2) impl_small_verify_fa4_pvwmma = false;
+                    if (impl_small_verify_fa4_pvwmma_tune && nq < 2) impl_small_verify_fa4_pvwmma_tune = false;
+                    if (impl_bm_dot4_pages && nq < 2) impl_bm_dot4_pages = false;
+                    if (impl_bm_dot4_pages_tune && nq < 2) impl_bm_dot4_pages_tune = false;
+                    if (impl_bm_dot4_pages_pvwmma && nq < 2) impl_bm_dot4_pages_pvwmma = false;
+                    if (impl_bm_dot4_pages_pint8pv && nq < 2) impl_bm_dot4_pages_pint8pv = false;
+                    if (impl_bm_dot4_pages_pint8pv_dot4 && nq < 2) impl_bm_dot4_pages_pint8pv_dot4 = false;
+                    if (impl_bm_dot4_pages_intflash_vfrag_dot4 && nq < 2) impl_bm_dot4_pages_intflash_vfrag_dot4 = false;
+                    if (impl_bm_dot4_pages_intflash_vfrag_wmma && nq < 2) impl_bm_dot4_pages_intflash_vfrag_wmma = false;
+                    const bool packed16_small_verify_k_ok =
+                        K->type == GGML_TYPE_I32 || graph_f16_hotcold_sidecar_allowed;
+                    if ((impl_small_verify || impl_small_verify_splitk || impl_small_verify_batched_splitk || impl_packed16_fa2 || impl_small_verify_fa2 || impl_small_verify_fa2_tune || impl_small_verify_fa2_hybrid_tune || impl_small_verify_fa2_sparsev_tune || impl_small_verify_fa2_pv_dot4_onthefly_tune || impl_small_verify_fa2_pv_dot4_lds_a_tune || impl_small_verify_fa2_fusedpv_tune || impl_small_verify_fa2_pvwmma_tune || impl_small_verify_fa3_tune || impl_small_verify_fa4 || impl_small_verify_fa4_tune || impl_small_verify_fa4_pvwmma || impl_small_verify_fa4_pvwmma_tune || impl_bm_dot4_pages || impl_bm_dot4_pages_tune || impl_bm_dot4_pages_pvwmma || impl_bm_dot4_pages_pint8pv || impl_bm_dot4_pages_pint8pv_dot4 || impl_bm_dot4_pages_intflash_vfrag_dot4 || impl_bm_dot4_pages_intflash_vfrag_wmma) && !(nq >= 2 && nq <= decode_max_nq && packed16_small_verify_k_ok && V->type == GGML_TYPE_Q4_0)) {
+                        GGML_ABORT("packed16 %s requires packed16 I32 K or F16 hot/cold sidecar, q4_0 V, and 2 <= nq <= %d; got nq=%d K=%s V=%s sidecar=%d",
+                            packed16_decode_impl, decode_max_nq, nq, ggml_type_name(K->type), ggml_type_name(V->type), graph_f16_hotcold_sidecar_allowed ? 1 : 0);
                     }
                     if (impl_small_verify) {
                         if (gqa_ratio > 8) GGML_ABORT("packed16 small_verify supports gqa_ratio <= 8, got %d", gqa_ratio);
@@ -3851,12 +5018,309 @@ bool impl_small_verify = strcmp(packed16_decode_impl, "small_verify") == 0;
                         else { GGML_ABORT("packed16 %s: expected BN=64 VSUB=8, got BN=%d VSUB=%d", packed16_decode_impl, decode_bn, decode_vsub); }
                         return;
                     }
+                    if (impl_packed16_fa2) {
+                        if (gqa_ratio > 8) GGML_ABORT("packed16 %s supports gqa_ratio <= 8, got %d", packed16_decode_impl, gqa_ratio);
+                        if (decode_vsub != 8) GGML_ABORT("packed16 %s: expected VSUB=8, got VSUB=%d", packed16_decode_impl, decode_vsub);
+                        const int tune_bn = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_PACKED16_FA2_BN", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_FUSEDPV_TUNE_BN", 64));
+                        const int tune_gh = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_PACKED16_FA2_GH", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_FUSEDPV_TUNE_GH", gqa_ratio == 6 ? 6 : 8));
+                        const int split_default = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_PACKED16_FA2_SPLIT_SIZE", 160);
+#define LAUNCH_DECODE_PACKED16_FA2_CASE(BNVAL, GHVAL) do { \
+                            if (nq <= 2) { LAUNCH_DECODE_SMALL_VERIFY_FA2_FUSEDPV_BATCHED_SPLITK(BNVAL, 8, GHVAL, 2, split_default) } \
+                            else if (nq <= 3) { LAUNCH_DECODE_SMALL_VERIFY_FA2_FUSEDPV_BATCHED_SPLITK(BNVAL, 8, GHVAL, 3, split_default) } \
+                            else { LAUNCH_DECODE_SMALL_VERIFY_FA2_FUSEDPV_BATCHED_SPLITK(BNVAL, 8, GHVAL, 4, split_default) } \
+                        } while (0)
+                        if (tune_bn == 32 && tune_gh == 6) { LAUNCH_DECODE_PACKED16_FA2_CASE(32, 6); }
+                        else if (tune_bn == 64 && tune_gh == 6) { LAUNCH_DECODE_PACKED16_FA2_CASE(64, 6); }
+                        else if (tune_bn == 128 && tune_gh == 6) { LAUNCH_DECODE_PACKED16_FA2_CASE(128, 6); }
+                        else if (tune_bn == 32 && tune_gh == 8) { LAUNCH_DECODE_PACKED16_FA2_CASE(32, 8); }
+                        else if (tune_bn == 64 && tune_gh == 8) { LAUNCH_DECODE_PACKED16_FA2_CASE(64, 8); }
+                        else if (tune_bn == 128 && tune_gh == 8) { LAUNCH_DECODE_PACKED16_FA2_CASE(128, 8); }
+                        else { GGML_ABORT("packed16 %s unsupported BN/GH: BN=%d GH=%d", packed16_decode_impl, tune_bn, tune_gh); }
+#undef LAUNCH_DECODE_PACKED16_FA2_CASE
+                        return;
+                    }
                     if (impl_small_verify_fa2) {
                         if (gqa_ratio > 8) GGML_ABORT("packed16 %s supports gqa_ratio <= 8, got %d", packed16_decode_impl, gqa_ratio);
                         if (decode_bn == 64 && decode_vsub == 8) {
-                            if (nq <= 2) { LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(64, 8, 8, 2, 112) }
-                            else if (nq <= 3) { LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(64, 8, 8, 3, 112) }
-                            else { LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(64, 8, 8, 4, 112) }
+                            // Qwen 27B MTP verify is GQA6.  Specialize the qtile state to
+                            // GH_MAX=6 instead of the generic GH_MAX=8 path: less LDS,
+                            // fewer unrolled PV/softmax lanes, and lower register pressure
+                            // without changing route semantics or adding another PV variant.
+                            if (gqa_ratio == 6) {
+                                if (nq <= 2) { LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(64, 8, 6, 2, 224) }
+                                else if (nq <= 3) { LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(64, 8, 6, 3, 224) }
+                                else { LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(64, 8, 6, 4, 224) }
+                            } else {
+                                if (nq <= 2) { LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(64, 8, 8, 2, 112) }
+                                else if (nq <= 3) { LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(64, 8, 8, 3, 112) }
+                                else { LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(64, 8, 8, 4, 112) }
+                            }
+                        }
+                        else { GGML_ABORT("packed16 %s: expected BN=64 VSUB=8, got BN=%d VSUB=%d", packed16_decode_impl, decode_bn, decode_vsub); }
+                        return;
+                    }
+                    if (impl_small_verify_fa2_tune) {
+                        if (gqa_ratio > 8) GGML_ABORT("packed16 %s supports gqa_ratio <= 8, got %d", packed16_decode_impl, gqa_ratio);
+                        if (decode_vsub != 8) GGML_ABORT("packed16 %s tune: expected VSUB=8, got VSUB=%d", packed16_decode_impl, decode_vsub);
+                        const int tune_bn = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_TUNE_BN", 64);
+                        const int tune_gh = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_TUNE_GH", gqa_ratio == 6 ? 6 : 8);
+#define LAUNCH_DECODE_SMALL_VERIFY_FA2_TUNE_CASE(BNVAL, GHVAL, SPLIT_DEFAULT) do { \
+                            if (nq <= 2) { LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(BNVAL, 8, GHVAL, 2, SPLIT_DEFAULT) } \
+                            else if (nq <= 3) { LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(BNVAL, 8, GHVAL, 3, SPLIT_DEFAULT) } \
+                            else { LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(BNVAL, 8, GHVAL, 4, SPLIT_DEFAULT) } \
+                        } while (0)
+                        if (tune_bn == 32 && tune_gh == 6) { LAUNCH_DECODE_SMALL_VERIFY_FA2_TUNE_CASE(32, 6, 160); }
+                        else if (tune_bn == 64 && tune_gh == 6) { LAUNCH_DECODE_SMALL_VERIFY_FA2_TUNE_CASE(64, 6, 160); }
+                        else if (tune_bn == 128 && tune_gh == 6) { LAUNCH_DECODE_SMALL_VERIFY_FA2_TUNE_CASE(128, 6, 160); }
+                        else if (tune_bn == 32 && tune_gh == 8) { LAUNCH_DECODE_SMALL_VERIFY_FA2_TUNE_CASE(32, 8, 160); }
+                        else if (tune_bn == 64 && tune_gh == 8) { LAUNCH_DECODE_SMALL_VERIFY_FA2_TUNE_CASE(64, 8, 160); }
+                        else if (tune_bn == 128 && tune_gh == 8) { LAUNCH_DECODE_SMALL_VERIFY_FA2_TUNE_CASE(128, 8, 160); }
+                        else { GGML_ABORT("packed16 %s tune unsupported BN/GH: BN=%d GH=%d", packed16_decode_impl, tune_bn, tune_gh); }
+#undef LAUNCH_DECODE_SMALL_VERIFY_FA2_TUNE_CASE
+                        return;
+                    }
+                    if (impl_small_verify_fa2_hybrid_tune) {
+                        if (gqa_ratio > 8) GGML_ABORT("packed16 %s supports gqa_ratio <= 8, got %d", packed16_decode_impl, gqa_ratio);
+                        if (decode_vsub != 8) GGML_ABORT("packed16 %s tune: expected VSUB=8, got VSUB=%d", packed16_decode_impl, decode_vsub);
+                        const int tune_bn = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_HYBRID_TUNE_BN", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_TUNE_BN", 32));
+                        const int tune_gh = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_HYBRID_TUNE_GH", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_TUNE_GH", gqa_ratio == 6 ? 6 : 8));
+                        const int split_nq2 = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_HYBRID_SPLIT_SIZE_NQ2", 160);
+                        const int split_nq3 = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_HYBRID_SPLIT_SIZE_NQ3", 224);
+                        // Isolated nq=4 favored 320 by noise-level margin, but full-server
+                        // decode prefers the lower-latency 224 grouping.
+                        const int split_nq4 = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_HYBRID_SPLIT_SIZE_NQ4", 224);
+#define LAUNCH_DECODE_SMALL_VERIFY_FA2_HYBRID_TUNE_CASE(BNVAL, GHVAL) do { \
+                            if (nq <= 2) { LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(BNVAL, 8, GHVAL, 2, split_nq2) } \
+                            else if (nq <= 3) { LAUNCH_DECODE_SMALL_VERIFY_FA2_FUSEDPV_BATCHED_SPLITK(BNVAL, 8, GHVAL, 3, split_nq3) } \
+                            else { LAUNCH_DECODE_SMALL_VERIFY_FA2_FUSEDPV_BATCHED_SPLITK(BNVAL, 8, GHVAL, 4, split_nq4) } \
+                        } while (0)
+                        if (tune_bn == 32 && tune_gh == 6) { LAUNCH_DECODE_SMALL_VERIFY_FA2_HYBRID_TUNE_CASE(32, 6); }
+                        else if (tune_bn == 64 && tune_gh == 6) { LAUNCH_DECODE_SMALL_VERIFY_FA2_HYBRID_TUNE_CASE(64, 6); }
+                        else if (tune_bn == 128 && tune_gh == 6) { LAUNCH_DECODE_SMALL_VERIFY_FA2_HYBRID_TUNE_CASE(128, 6); }
+                        else if (tune_bn == 32 && tune_gh == 8) { LAUNCH_DECODE_SMALL_VERIFY_FA2_HYBRID_TUNE_CASE(32, 8); }
+                        else if (tune_bn == 64 && tune_gh == 8) { LAUNCH_DECODE_SMALL_VERIFY_FA2_HYBRID_TUNE_CASE(64, 8); }
+                        else if (tune_bn == 128 && tune_gh == 8) { LAUNCH_DECODE_SMALL_VERIFY_FA2_HYBRID_TUNE_CASE(128, 8); }
+                        else { GGML_ABORT("packed16 %s tune unsupported BN/GH: BN=%d GH=%d", packed16_decode_impl, tune_bn, tune_gh); }
+#undef LAUNCH_DECODE_SMALL_VERIFY_FA2_HYBRID_TUNE_CASE
+                        return;
+                    }
+                    if (impl_small_verify_fa2_sparsev_tune) {
+                        if (gqa_ratio > 8) GGML_ABORT("packed16 %s supports gqa_ratio <= 8, got %d", packed16_decode_impl, gqa_ratio);
+                        if (decode_vsub != 8) GGML_ABORT("packed16 %s tune: expected VSUB=8, got VSUB=%d", packed16_decode_impl, decode_vsub);
+                        const int tune_bn = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_SPARSEV_TUNE_BN", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_TUNE_BN", 32));
+                        const int tune_gh = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_SPARSEV_TUNE_GH", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_TUNE_GH", gqa_ratio == 6 ? 6 : 8));
+#define LAUNCH_DECODE_SMALL_VERIFY_FA2_SPARSEV_TUNE_CASE(BNVAL, GHVAL, SPLIT_DEFAULT) do { \
+                            if (nq <= 2) { LAUNCH_DECODE_SMALL_VERIFY_FA2_SPARSEV_BATCHED_SPLITK(BNVAL, 8, GHVAL, 2, SPLIT_DEFAULT) } \
+                            else if (nq <= 3) { LAUNCH_DECODE_SMALL_VERIFY_FA2_SPARSEV_BATCHED_SPLITK(BNVAL, 8, GHVAL, 3, SPLIT_DEFAULT) } \
+                            else { LAUNCH_DECODE_SMALL_VERIFY_FA2_SPARSEV_BATCHED_SPLITK(BNVAL, 8, GHVAL, 4, SPLIT_DEFAULT) } \
+                        } while (0)
+                        if (tune_bn == 32 && tune_gh == 6) { LAUNCH_DECODE_SMALL_VERIFY_FA2_SPARSEV_TUNE_CASE(32, 6, 224); }
+                        else if (tune_bn == 64 && tune_gh == 6) { LAUNCH_DECODE_SMALL_VERIFY_FA2_SPARSEV_TUNE_CASE(64, 6, 224); }
+                        else if (tune_bn == 128 && tune_gh == 6) { LAUNCH_DECODE_SMALL_VERIFY_FA2_SPARSEV_TUNE_CASE(128, 6, 224); }
+                        else if (tune_bn == 32 && tune_gh == 8) { LAUNCH_DECODE_SMALL_VERIFY_FA2_SPARSEV_TUNE_CASE(32, 8, 224); }
+                        else if (tune_bn == 64 && tune_gh == 8) { LAUNCH_DECODE_SMALL_VERIFY_FA2_SPARSEV_TUNE_CASE(64, 8, 224); }
+                        else if (tune_bn == 128 && tune_gh == 8) { LAUNCH_DECODE_SMALL_VERIFY_FA2_SPARSEV_TUNE_CASE(128, 8, 224); }
+                        else { GGML_ABORT("packed16 %s tune unsupported BN/GH: BN=%d GH=%d", packed16_decode_impl, tune_bn, tune_gh); }
+#undef LAUNCH_DECODE_SMALL_VERIFY_FA2_SPARSEV_TUNE_CASE
+                        return;
+                    }
+                    if (impl_small_verify_fa2_pv_dot4_onthefly_tune) {
+                        if (gqa_ratio > 8) GGML_ABORT("packed16 %s supports gqa_ratio <= 8, got %d", packed16_decode_impl, gqa_ratio);
+                        if (decode_vsub != 8) GGML_ABORT("packed16 %s tune: expected VSUB=8, got VSUB=%d", packed16_decode_impl, decode_vsub);
+                        const int tune_bn = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_PV_DOT4_TUNE_BN", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_TUNE_BN", 32));
+                        const int tune_gh = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_PV_DOT4_TUNE_GH", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_TUNE_GH", gqa_ratio == 6 ? 6 : 8));
+#define LAUNCH_DECODE_SMALL_VERIFY_FA2_PV_DOT4_ONFLY_TUNE_CASE(BNVAL, GHVAL, SPLIT_DEFAULT) do { \
+                            if (nq <= 2) { LAUNCH_DECODE_SMALL_VERIFY_FA2_PV_DOT4_ONFLY_BATCHED_SPLITK(BNVAL, 8, GHVAL, 2, SPLIT_DEFAULT) } \
+                            else if (nq <= 3) { LAUNCH_DECODE_SMALL_VERIFY_FA2_PV_DOT4_ONFLY_BATCHED_SPLITK(BNVAL, 8, GHVAL, 3, SPLIT_DEFAULT) } \
+                            else { LAUNCH_DECODE_SMALL_VERIFY_FA2_PV_DOT4_ONFLY_BATCHED_SPLITK(BNVAL, 8, GHVAL, 4, SPLIT_DEFAULT) } \
+                        } while (0)
+                        if (tune_bn == 32 && tune_gh == 6) { LAUNCH_DECODE_SMALL_VERIFY_FA2_PV_DOT4_ONFLY_TUNE_CASE(32, 6, 224); }
+                        else if (tune_bn == 64 && tune_gh == 6) { LAUNCH_DECODE_SMALL_VERIFY_FA2_PV_DOT4_ONFLY_TUNE_CASE(64, 6, 224); }
+                        else if (tune_bn == 128 && tune_gh == 6) { LAUNCH_DECODE_SMALL_VERIFY_FA2_PV_DOT4_ONFLY_TUNE_CASE(128, 6, 224); }
+                        else if (tune_bn == 32 && tune_gh == 8) { LAUNCH_DECODE_SMALL_VERIFY_FA2_PV_DOT4_ONFLY_TUNE_CASE(32, 8, 224); }
+                        else if (tune_bn == 64 && tune_gh == 8) { LAUNCH_DECODE_SMALL_VERIFY_FA2_PV_DOT4_ONFLY_TUNE_CASE(64, 8, 224); }
+                        else if (tune_bn == 128 && tune_gh == 8) { LAUNCH_DECODE_SMALL_VERIFY_FA2_PV_DOT4_ONFLY_TUNE_CASE(128, 8, 224); }
+                        else { GGML_ABORT("packed16 %s tune unsupported BN/GH: BN=%d GH=%d", packed16_decode_impl, tune_bn, tune_gh); }
+#undef LAUNCH_DECODE_SMALL_VERIFY_FA2_PV_DOT4_ONFLY_TUNE_CASE
+                        return;
+                    }
+                    if (impl_small_verify_fa2_pv_dot4_lds_a_tune) {
+                        if (gqa_ratio > 8) GGML_ABORT("packed16 %s supports gqa_ratio <= 8, got %d", packed16_decode_impl, gqa_ratio);
+                        if (decode_vsub != 8) GGML_ABORT("packed16 %s tune: expected VSUB=8, got VSUB=%d", packed16_decode_impl, decode_vsub);
+                        const int tune_bn = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_PV_DOT4_LDS_A_TUNE_BN", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_PV_DOT4_TUNE_BN", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_TUNE_BN", 32)));
+                        const int tune_gh = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_PV_DOT4_LDS_A_TUNE_GH", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_PV_DOT4_TUNE_GH", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_TUNE_GH", gqa_ratio == 6 ? 6 : 8)));
+#define LAUNCH_DECODE_SMALL_VERIFY_FA2_PV_DOT4_LDS_A_TUNE_CASE(BNVAL, GHVAL, SPLIT_DEFAULT) do { \
+                            if (nq <= 2) { LAUNCH_DECODE_SMALL_VERIFY_FA2_PV_DOT4_LDS_A_BATCHED_SPLITK(BNVAL, 8, GHVAL, 2, SPLIT_DEFAULT) } \
+                            else if (nq <= 3) { LAUNCH_DECODE_SMALL_VERIFY_FA2_PV_DOT4_LDS_A_BATCHED_SPLITK(BNVAL, 8, GHVAL, 3, SPLIT_DEFAULT) } \
+                            else { LAUNCH_DECODE_SMALL_VERIFY_FA2_PV_DOT4_LDS_A_BATCHED_SPLITK(BNVAL, 8, GHVAL, 4, SPLIT_DEFAULT) } \
+                        } while (0)
+                        if (tune_bn == 32 && tune_gh == 6) { LAUNCH_DECODE_SMALL_VERIFY_FA2_PV_DOT4_LDS_A_TUNE_CASE(32, 6, 224); }
+                        else if (tune_bn == 64 && tune_gh == 6) { LAUNCH_DECODE_SMALL_VERIFY_FA2_PV_DOT4_LDS_A_TUNE_CASE(64, 6, 224); }
+                        else if (tune_bn == 128 && tune_gh == 6) { LAUNCH_DECODE_SMALL_VERIFY_FA2_PV_DOT4_LDS_A_TUNE_CASE(128, 6, 224); }
+                        else if (tune_bn == 32 && tune_gh == 8) { LAUNCH_DECODE_SMALL_VERIFY_FA2_PV_DOT4_LDS_A_TUNE_CASE(32, 8, 224); }
+                        else if (tune_bn == 64 && tune_gh == 8) { LAUNCH_DECODE_SMALL_VERIFY_FA2_PV_DOT4_LDS_A_TUNE_CASE(64, 8, 224); }
+                        else if (tune_bn == 128 && tune_gh == 8) { LAUNCH_DECODE_SMALL_VERIFY_FA2_PV_DOT4_LDS_A_TUNE_CASE(128, 8, 224); }
+                        else { GGML_ABORT("packed16 %s tune unsupported BN/GH: BN=%d GH=%d", packed16_decode_impl, tune_bn, tune_gh); }
+#undef LAUNCH_DECODE_SMALL_VERIFY_FA2_PV_DOT4_LDS_A_TUNE_CASE
+                        return;
+                    }
+                    if (impl_small_verify_fa2_fusedpv_tune) {
+                        if (gqa_ratio > 8) GGML_ABORT("packed16 %s supports gqa_ratio <= 8, got %d", packed16_decode_impl, gqa_ratio);
+                        if (decode_vsub != 8) GGML_ABORT("packed16 %s tune: expected VSUB=8, got VSUB=%d", packed16_decode_impl, decode_vsub);
+                        const int tune_bn = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_FUSEDPV_TUNE_BN", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_TUNE_BN", 64));
+                        const int tune_gh = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_FUSEDPV_TUNE_GH", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_TUNE_GH", gqa_ratio == 6 ? 6 : 8));
+#define LAUNCH_DECODE_SMALL_VERIFY_FA2_FUSEDPV_TUNE_CASE(BNVAL, GHVAL, SPLIT_DEFAULT) do { \
+                            if (nq <= 2) { LAUNCH_DECODE_SMALL_VERIFY_FA2_FUSEDPV_BATCHED_SPLITK(BNVAL, 8, GHVAL, 2, SPLIT_DEFAULT) } \
+                            else if (nq <= 3) { LAUNCH_DECODE_SMALL_VERIFY_FA2_FUSEDPV_BATCHED_SPLITK(BNVAL, 8, GHVAL, 3, SPLIT_DEFAULT) } \
+                            else { LAUNCH_DECODE_SMALL_VERIFY_FA2_FUSEDPV_BATCHED_SPLITK(BNVAL, 8, GHVAL, 4, SPLIT_DEFAULT) } \
+                        } while (0)
+                        if (tune_bn == 32 && tune_gh == 6) { LAUNCH_DECODE_SMALL_VERIFY_FA2_FUSEDPV_TUNE_CASE(32, 6, 160); }
+                        else if (tune_bn == 64 && tune_gh == 6) { LAUNCH_DECODE_SMALL_VERIFY_FA2_FUSEDPV_TUNE_CASE(64, 6, 160); }
+                        else if (tune_bn == 128 && tune_gh == 6) { LAUNCH_DECODE_SMALL_VERIFY_FA2_FUSEDPV_TUNE_CASE(128, 6, 160); }
+                        else if (tune_bn == 32 && tune_gh == 8) { LAUNCH_DECODE_SMALL_VERIFY_FA2_FUSEDPV_TUNE_CASE(32, 8, 160); }
+                        else if (tune_bn == 64 && tune_gh == 8) { LAUNCH_DECODE_SMALL_VERIFY_FA2_FUSEDPV_TUNE_CASE(64, 8, 160); }
+                        else if (tune_bn == 128 && tune_gh == 8) { LAUNCH_DECODE_SMALL_VERIFY_FA2_FUSEDPV_TUNE_CASE(128, 8, 160); }
+                        else { GGML_ABORT("packed16 %s tune unsupported BN/GH: BN=%d GH=%d", packed16_decode_impl, tune_bn, tune_gh); }
+#undef LAUNCH_DECODE_SMALL_VERIFY_FA2_FUSEDPV_TUNE_CASE
+                        return;
+                    }
+                    if (impl_small_verify_fa2_pvwmma_tune) {
+                        if (gqa_ratio > 8) GGML_ABORT("packed16 %s supports gqa_ratio <= 8, got %d", packed16_decode_impl, gqa_ratio);
+                        if (decode_vsub != 8) GGML_ABORT("packed16 %s tune: expected VSUB=8, got VSUB=%d", packed16_decode_impl, decode_vsub);
+                        const int tune_bn = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_PVWMMA_TUNE_BN", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_TUNE_BN", 64));
+                        const int tune_gh = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_PVWMMA_TUNE_GH", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_TUNE_GH", gqa_ratio == 6 ? 6 : 8));
+#define LAUNCH_DECODE_SMALL_VERIFY_FA2_PVWMMA_TUNE_CASE(BNVAL, GHVAL, SPLIT_DEFAULT) do { \
+                            if (nq <= 2) { LAUNCH_DECODE_SMALL_VERIFY_FA2_PVWMMA_BATCHED_SPLITK(BNVAL, 8, GHVAL, 2, SPLIT_DEFAULT) } \
+                            else if (nq <= 3) { LAUNCH_DECODE_SMALL_VERIFY_FA2_PVWMMA_BATCHED_SPLITK(BNVAL, 8, GHVAL, 3, SPLIT_DEFAULT) } \
+                            else { LAUNCH_DECODE_SMALL_VERIFY_FA2_PVWMMA_BATCHED_SPLITK(BNVAL, 8, GHVAL, 4, SPLIT_DEFAULT) } \
+                        } while (0)
+                        if (tune_bn == 32 && tune_gh == 6) { LAUNCH_DECODE_SMALL_VERIFY_FA2_PVWMMA_TUNE_CASE(32, 6, 160); }
+                        else if (tune_bn == 64 && tune_gh == 6) { LAUNCH_DECODE_SMALL_VERIFY_FA2_PVWMMA_TUNE_CASE(64, 6, 160); }
+                        else if (tune_bn == 128 && tune_gh == 6) { LAUNCH_DECODE_SMALL_VERIFY_FA2_PVWMMA_TUNE_CASE(128, 6, 160); }
+                        else if (tune_bn == 32 && tune_gh == 8) { LAUNCH_DECODE_SMALL_VERIFY_FA2_PVWMMA_TUNE_CASE(32, 8, 160); }
+                        else if (tune_bn == 64 && tune_gh == 8) { LAUNCH_DECODE_SMALL_VERIFY_FA2_PVWMMA_TUNE_CASE(64, 8, 160); }
+                        else if (tune_bn == 128 && tune_gh == 8) { LAUNCH_DECODE_SMALL_VERIFY_FA2_PVWMMA_TUNE_CASE(128, 8, 160); }
+                        else { GGML_ABORT("packed16 %s tune unsupported BN/GH: BN=%d GH=%d", packed16_decode_impl, tune_bn, tune_gh); }
+#undef LAUNCH_DECODE_SMALL_VERIFY_FA2_PVWMMA_TUNE_CASE
+                        return;
+                    }
+                    if (impl_small_verify_fa3_tune) {
+                        if (gqa_ratio > 8) GGML_ABORT("packed16 %s supports gqa_ratio <= 8, got %d", packed16_decode_impl, gqa_ratio);
+                        if (decode_vsub != 8) GGML_ABORT("packed16 %s tune: expected VSUB=8, got VSUB=%d", packed16_decode_impl, decode_vsub);
+                        const int tune_bn = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA3_TUNE_BN", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_TUNE_BN", 64));
+                        const int tune_gh = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA3_TUNE_GH", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_TUNE_GH", gqa_ratio == 6 ? 6 : 8));
+#define LAUNCH_DECODE_SMALL_VERIFY_FA3_TUNE_CASE(BNVAL, GHVAL, SPLIT_DEFAULT) do { \
+                            if (nq <= 2) { LAUNCH_DECODE_SMALL_VERIFY_FA3_BATCHED_SPLITK(BNVAL, 8, GHVAL, 2, SPLIT_DEFAULT) } \
+                            else if (nq <= 3) { LAUNCH_DECODE_SMALL_VERIFY_FA3_BATCHED_SPLITK(BNVAL, 8, GHVAL, 3, SPLIT_DEFAULT) } \
+                            else { LAUNCH_DECODE_SMALL_VERIFY_FA3_BATCHED_SPLITK(BNVAL, 8, GHVAL, 4, SPLIT_DEFAULT) } \
+                        } while (0)
+                        if (tune_bn == 32 && tune_gh == 6) { LAUNCH_DECODE_SMALL_VERIFY_FA3_TUNE_CASE(32, 6, 160); }
+                        else if (tune_bn == 64 && tune_gh == 6) { LAUNCH_DECODE_SMALL_VERIFY_FA3_TUNE_CASE(64, 6, 160); }
+                        else if (tune_bn == 128 && tune_gh == 6) { LAUNCH_DECODE_SMALL_VERIFY_FA3_TUNE_CASE(128, 6, 160); }
+                        else if (tune_bn == 32 && tune_gh == 8) { LAUNCH_DECODE_SMALL_VERIFY_FA3_TUNE_CASE(32, 8, 160); }
+                        else if (tune_bn == 64 && tune_gh == 8) { LAUNCH_DECODE_SMALL_VERIFY_FA3_TUNE_CASE(64, 8, 160); }
+                        else if (tune_bn == 128 && tune_gh == 8) { LAUNCH_DECODE_SMALL_VERIFY_FA3_TUNE_CASE(128, 8, 160); }
+                        else { GGML_ABORT("packed16 %s tune unsupported BN/GH: BN=%d GH=%d", packed16_decode_impl, tune_bn, tune_gh); }
+#undef LAUNCH_DECODE_SMALL_VERIFY_FA3_TUNE_CASE
+                        return;
+                    }
+                    if (impl_bm_dot4_pages_tune) {
+                        if (gqa_ratio > 8) GGML_ABORT("packed16 %s supports gqa_ratio <= 8, got %d", packed16_decode_impl, gqa_ratio);
+                        if (decode_vsub != 8) GGML_ABORT("packed16 %s tune: expected VSUB=8, got VSUB=%d", packed16_decode_impl, decode_vsub);
+                        const int tune_bn = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_BM_DOT4_PAGES_TUNE_BN", 128);
+                        const int tune_gh = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_BM_DOT4_PAGES_TUNE_GH", gqa_ratio == 6 ? 6 : 8);
+                        const int tune_row = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_BM_DOT4_PAGES_TUNE_ROW_BLOCK", 16);
+                        const int tune_pv = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_BM_DOT4_PAGES_TUNE_PV_IMPL", 0);
+#define LAUNCH_DECODE_BM_DOT4_PAGES_TUNE_CASE(BNVAL, GHVAL, ROWVAL, PVVAL) do { \
+                            if (nq <= 2) { LAUNCH_DECODE_BM_DOT4_PAGES(BNVAL, 8, GHVAL, ROWVAL, 2, PVVAL) } \
+                            else if (nq <= 3) { LAUNCH_DECODE_BM_DOT4_PAGES(BNVAL, 8, GHVAL, ROWVAL, 3, PVVAL) } \
+                            else { LAUNCH_DECODE_BM_DOT4_PAGES(BNVAL, 8, GHVAL, ROWVAL, 4, PVVAL) } \
+                        } while (0)
+#define DISPATCH_DECODE_BM_DOT4_PAGES_TUNE_CASE(BNVAL, GHVAL, ROWVAL) do { \
+                            if (tune_pv == 0) { LAUNCH_DECODE_BM_DOT4_PAGES_TUNE_CASE(BNVAL, GHVAL, ROWVAL, BM_DOT4_PAGES_PV_IMPL_SCALAR); } \
+                            else if (tune_pv == 1) { LAUNCH_DECODE_BM_DOT4_PAGES_TUNE_CASE(BNVAL, GHVAL, ROWVAL, BM_DOT4_PAGES_PV_IMPL_PVWMMA); } \
+                            else if (tune_pv == 5) { LAUNCH_DECODE_BM_DOT4_PAGES_TUNE_CASE(BNVAL, GHVAL, ROWVAL, BM_DOT4_PAGES_PV_IMPL_INTFLASH_VFRAG_WMMA); } \
+                            else { GGML_ABORT("packed16 %s tune unsupported PV_IMPL=%d; use 0=scalar, 1=pvwmma, 5=intflash_vfrag_wmma", packed16_decode_impl, tune_pv); } \
+                        } while (0)
+                        if (tune_bn == 64 && tune_gh == 6 && tune_row == 16) { DISPATCH_DECODE_BM_DOT4_PAGES_TUNE_CASE(64, 6, 16); }
+                        else if (tune_bn == 128 && tune_gh == 6 && tune_row == 16) { DISPATCH_DECODE_BM_DOT4_PAGES_TUNE_CASE(128, 6, 16); }
+                        else if (tune_bn == 64 && tune_gh == 8 && tune_row == 16) { DISPATCH_DECODE_BM_DOT4_PAGES_TUNE_CASE(64, 8, 16); }
+                        else if (tune_bn == 128 && tune_gh == 8 && tune_row == 16) { DISPATCH_DECODE_BM_DOT4_PAGES_TUNE_CASE(128, 8, 16); }
+                        else { GGML_ABORT("packed16 %s tune unsupported BN/GH/ROW_BLOCK: BN=%d GH=%d ROW_BLOCK=%d; BM/page kernel currently requires ROW_BLOCK=16", packed16_decode_impl, tune_bn, tune_gh, tune_row); }
+#undef DISPATCH_DECODE_BM_DOT4_PAGES_TUNE_CASE
+#undef LAUNCH_DECODE_BM_DOT4_PAGES_TUNE_CASE
+                        return;
+                    }
+                    if (impl_bm_dot4_pages || impl_bm_dot4_pages_pvwmma || impl_bm_dot4_pages_pint8pv || impl_bm_dot4_pages_pint8pv_dot4 || impl_bm_dot4_pages_intflash_vfrag_dot4 || impl_bm_dot4_pages_intflash_vfrag_wmma) {
+                        if (gqa_ratio > 8) GGML_ABORT("packed16 %s supports gqa_ratio <= 8, got %d", packed16_decode_impl, gqa_ratio);
+                        if (decode_vsub == 8) {
+                            if (impl_bm_dot4_pages_pvwmma) {
+                                if (nq <= 2) { LAUNCH_DECODE_BM_DOT4_PAGES(128, 8, 8, 16, 2, BM_DOT4_PAGES_PV_IMPL_PVWMMA) }
+                                else if (nq <= 3) { LAUNCH_DECODE_BM_DOT4_PAGES(128, 8, 8, 16, 3, BM_DOT4_PAGES_PV_IMPL_PVWMMA) }
+                                else { LAUNCH_DECODE_BM_DOT4_PAGES(128, 8, 8, 16, 4, BM_DOT4_PAGES_PV_IMPL_PVWMMA) }
+                            } else if (impl_bm_dot4_pages_pint8pv) {
+                                if (nq <= 2) { LAUNCH_DECODE_BM_DOT4_PAGES(128, 8, 8, 16, 2, BM_DOT4_PAGES_PV_IMPL_PINT8PV) }
+                                else if (nq <= 3) { LAUNCH_DECODE_BM_DOT4_PAGES(128, 8, 8, 16, 3, BM_DOT4_PAGES_PV_IMPL_PINT8PV) }
+                                else { LAUNCH_DECODE_BM_DOT4_PAGES(128, 8, 8, 16, 4, BM_DOT4_PAGES_PV_IMPL_PINT8PV) }
+                            } else if (impl_bm_dot4_pages_pint8pv_dot4) {
+                                if (nq <= 2) { LAUNCH_DECODE_BM_DOT4_PAGES(128, 8, 8, 16, 2, BM_DOT4_PAGES_PV_IMPL_PINT8PV_DOT4) }
+                                else if (nq <= 3) { LAUNCH_DECODE_BM_DOT4_PAGES(128, 8, 8, 16, 3, BM_DOT4_PAGES_PV_IMPL_PINT8PV_DOT4) }
+                                else { LAUNCH_DECODE_BM_DOT4_PAGES(128, 8, 8, 16, 4, BM_DOT4_PAGES_PV_IMPL_PINT8PV_DOT4) }
+                            } else if (impl_bm_dot4_pages_intflash_vfrag_dot4) {
+                                if (nq <= 2) { LAUNCH_DECODE_BM_DOT4_PAGES(128, 8, 8, 16, 2, BM_DOT4_PAGES_PV_IMPL_INTFLASH_VFRAG_DOT4) }
+                                else if (nq <= 3) { LAUNCH_DECODE_BM_DOT4_PAGES(128, 8, 8, 16, 3, BM_DOT4_PAGES_PV_IMPL_INTFLASH_VFRAG_DOT4) }
+                                else { LAUNCH_DECODE_BM_DOT4_PAGES(128, 8, 8, 16, 4, BM_DOT4_PAGES_PV_IMPL_INTFLASH_VFRAG_DOT4) }
+                            } else if (impl_bm_dot4_pages_intflash_vfrag_wmma) {
+                                if (nq <= 2) { LAUNCH_DECODE_BM_DOT4_PAGES(128, 8, 8, 16, 2, BM_DOT4_PAGES_PV_IMPL_INTFLASH_VFRAG_WMMA) }
+                                else if (nq <= 3) { LAUNCH_DECODE_BM_DOT4_PAGES(128, 8, 8, 16, 3, BM_DOT4_PAGES_PV_IMPL_INTFLASH_VFRAG_WMMA) }
+                                else { LAUNCH_DECODE_BM_DOT4_PAGES(128, 8, 8, 16, 4, BM_DOT4_PAGES_PV_IMPL_INTFLASH_VFRAG_WMMA) }
+                            } else {
+                                if (nq <= 2) { LAUNCH_DECODE_BM_DOT4_PAGES(128, 8, 8, 16, 2, BM_DOT4_PAGES_PV_IMPL_SCALAR) }
+                                else if (nq <= 3) { LAUNCH_DECODE_BM_DOT4_PAGES(128, 8, 8, 16, 3, BM_DOT4_PAGES_PV_IMPL_SCALAR) }
+                                else { LAUNCH_DECODE_BM_DOT4_PAGES(128, 8, 8, 16, 4, BM_DOT4_PAGES_PV_IMPL_SCALAR) }
+                            }
+                        }
+                        else { GGML_ABORT("packed16 %s: expected VSUB=8, got VSUB=%d", packed16_decode_impl, decode_vsub); }
+                        return;
+                    }
+                    if (impl_small_verify_fa4_tune || impl_small_verify_fa4_pvwmma_tune) {
+                        if (gqa_ratio > 8) GGML_ABORT("packed16 %s supports gqa_ratio <= 8, got %d", packed16_decode_impl, gqa_ratio);
+                        if (decode_vsub != 8) GGML_ABORT("packed16 %s tune: expected VSUB=8, got VSUB=%d", packed16_decode_impl, decode_vsub);
+                        const int tune_bn = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA4_TUNE_BN", 64);
+                        const int tune_gh = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA4_TUNE_GH", gqa_ratio == 6 ? 6 : 8);
+#define LAUNCH_DECODE_SMALL_VERIFY_FA4_TUNE_CASE(BNVAL, GHVAL, SPLIT_DEFAULT, PVWMMA_VAL) do { \
+                            if (nq <= 2) { LAUNCH_DECODE_SMALL_VERIFY_FA4_BATCHED_SPLITK(BNVAL, 8, GHVAL, 2, SPLIT_DEFAULT, PVWMMA_VAL) } \
+                            else if (nq <= 3) { LAUNCH_DECODE_SMALL_VERIFY_FA4_BATCHED_SPLITK(BNVAL, 8, GHVAL, 3, SPLIT_DEFAULT, PVWMMA_VAL) } \
+                            else { LAUNCH_DECODE_SMALL_VERIFY_FA4_BATCHED_SPLITK(BNVAL, 8, GHVAL, 4, SPLIT_DEFAULT, PVWMMA_VAL) } \
+                        } while (0)
+                        if (impl_small_verify_fa4_pvwmma_tune) {
+                            if (tune_bn == 32 && tune_gh == 6) { LAUNCH_DECODE_SMALL_VERIFY_FA4_TUNE_CASE(32, 6, 128, true); }
+                            else if (tune_bn == 64 && tune_gh == 6) { LAUNCH_DECODE_SMALL_VERIFY_FA4_TUNE_CASE(64, 6, 128, true); }
+                            else if (tune_bn == 32 && tune_gh == 8) { LAUNCH_DECODE_SMALL_VERIFY_FA4_TUNE_CASE(32, 8, 128, true); }
+                            else if (tune_bn == 64 && tune_gh == 8) { LAUNCH_DECODE_SMALL_VERIFY_FA4_TUNE_CASE(64, 8, 128, true); }
+                            else { GGML_ABORT("packed16 %s tune unsupported BN/GH: BN=%d GH=%d", packed16_decode_impl, tune_bn, tune_gh); }
+                        } else {
+                            if (tune_bn == 32 && tune_gh == 6) { LAUNCH_DECODE_SMALL_VERIFY_FA4_TUNE_CASE(32, 6, 128, false); }
+                            else if (tune_bn == 64 && tune_gh == 6) { LAUNCH_DECODE_SMALL_VERIFY_FA4_TUNE_CASE(64, 6, 128, false); }
+                            else if (tune_bn == 32 && tune_gh == 8) { LAUNCH_DECODE_SMALL_VERIFY_FA4_TUNE_CASE(32, 8, 128, false); }
+                            else if (tune_bn == 64 && tune_gh == 8) { LAUNCH_DECODE_SMALL_VERIFY_FA4_TUNE_CASE(64, 8, 128, false); }
+                            else { GGML_ABORT("packed16 %s tune unsupported BN/GH: BN=%d GH=%d", packed16_decode_impl, tune_bn, tune_gh); }
+                        }
+#undef LAUNCH_DECODE_SMALL_VERIFY_FA4_TUNE_CASE
+                        return;
+                    }
+                    if (impl_small_verify_fa4 || impl_small_verify_fa4_pvwmma) {
+                        if (gqa_ratio > 8) GGML_ABORT("packed16 %s supports gqa_ratio <= 8, got %d", packed16_decode_impl, gqa_ratio);
+                        if (decode_bn == 64 && decode_vsub == 8) {
+                            if (impl_small_verify_fa4_pvwmma) {
+                                if (nq <= 2) { LAUNCH_DECODE_SMALL_VERIFY_FA4_BATCHED_SPLITK(64, 8, 8, 2, 128, true) }
+                                else if (nq <= 3) { LAUNCH_DECODE_SMALL_VERIFY_FA4_BATCHED_SPLITK(64, 8, 8, 3, 128, true) }
+                                else { LAUNCH_DECODE_SMALL_VERIFY_FA4_BATCHED_SPLITK(64, 8, 8, 4, 128, true) }
+                            } else {
+                                if (nq <= 2) { LAUNCH_DECODE_SMALL_VERIFY_FA4_BATCHED_SPLITK(64, 8, 8, 2, 128, false) }
+                                else if (nq <= 3) { LAUNCH_DECODE_SMALL_VERIFY_FA4_BATCHED_SPLITK(64, 8, 8, 3, 128, false) }
+                                else { LAUNCH_DECODE_SMALL_VERIFY_FA4_BATCHED_SPLITK(64, 8, 8, 4, 128, false) }
+                            }
                         }
                         else { GGML_ABORT("packed16 %s: expected BN=64 VSUB=8, got BN=%d VSUB=%d", packed16_decode_impl, decode_bn, decode_vsub); }
                         return;
@@ -4010,7 +5474,8 @@ bool impl_small_verify = strcmp(packed16_decode_impl, "small_verify") == 0;
                             q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
                             blockfa_partial_o.ptr, blockfa_partial_m.ptr, blockfa_partial_l.ptr, scale,
                             V->nb[0], V->nb[1], V->nb[2], V->nb[3],
-                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, 0, prefix_k, recthist_slots, 0);
+                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, 0, prefix_k, recthist_slots, 0,
+                            nullptr, 0, 0, 0, 1, 0, 1, 0);
                     } else if (blockfa_bn == 16) {
                         ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_kernel<16, false><<<recthist_grid, block, smem_bn16, stream>>>(
                             q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
@@ -4034,7 +5499,8 @@ bool impl_small_verify = strcmp(packed16_decode_impl, "small_verify") == 0;
                             q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
                             blockfa_partial_o.ptr, blockfa_partial_m.ptr, blockfa_partial_l.ptr, scale,
                             V->nb[0], V->nb[1], V->nb[2], V->nb[3],
-                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, prefix_k, nk, recthist_slots, 1);
+                            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, prefix_k, nk, recthist_slots, 1,
+                            nullptr, 0, 0, 0, 1, 0, 1, 0);
                     } else if (blockfa_bn == 16) {
                         ggml_cuda_q8k_dot4_blockfa_recthist_bm8_q4_0_kernel<16, true><<<recthist_grid, block, smem_bn16, stream>>>(
                             q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data,
@@ -4191,6 +5657,15 @@ bool impl_small_verify = strcmp(packed16_decode_impl, "small_verify") == 0;
                     CUDA_CHECK(hipEventRecord(ev_combine, stream));
                 }
             }
+        } else if (grouped_gqa6_qtile4_kvshared) {
+            dim3 grouped_grid((nq + 3) / 4, n_heads_k, batch);
+            dim3 qtile_block(512);
+            ggml_cuda_q8k_dot4_grouped_gqa6_qtile4_kvshared_fattn_q4_0_kernel<<<grouped_grid, qtile_block, 0, stream>>>(
+                q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr,
+                (const char *) V->data, mask ? (const char *) mask->data : nullptr, (float *) dst->data, scale,
+                V->nb[0], V->nb[1], V->nb[2], V->nb[3],
+                mask ? mask->nb[0] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[3] : 0, mask ? mask->ne[3] : 1,
+                nq, nk, n_heads_q, n_heads_k, batch);
         } else if (grouped_gqa6_qtile4_vshared) {
             dim3 grouped_grid((nq + 3) / 4, n_heads_k, batch);
             dim3 qtile_block(512);
@@ -4373,18 +5848,21 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
         ? k_cur->nb[2]   // nb[2] advances across tokens in [D, nh, nk, B]
         : k_cur->nb[1];  // nb[1] advances across tokens in [D*nh, nk, 1, B]
 
+    const int k_scale_mode = ggml_cuda_q8k_dot4_packed16_k_scale_mode(1);
+    const float k_scale_mul = ggml_cuda_q8k_dot4_packed16_k_scale_mul();
+
     static bool pack_debug_printed = false;
     if (!pack_debug_printed && ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_KQ_DEBUG_I32")) {
         pack_debug_printed = true;
         fprintf(stderr,
             "pack_k_i32: k_cur type=%d ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] "
             "payload ne=[%lld,%lld,%lld,%lld] scales ne=[%lld,%lld,%lld,%lld] "
-            "n_heads=%d nk_cur=%d kv_size=%d src_head_stride=%lld\n",
-            k_cur->type, k_cur->ne[0], k_cur->ne[1], k_cur->ne[2], k_cur->ne[3],
+            "n_heads=%d nk_cur=%d kv_size=%d src_head_stride=%lld scale_mode=%d scale_mul=%g\n",
+            k_cur->type, (long long) k_cur->ne[0], (long long) k_cur->ne[1], (long long) k_cur->ne[2], (long long) k_cur->ne[3],
             k_cur->nb[0], k_cur->nb[1], k_cur->nb[2], k_cur->nb[3],
-            payload->ne[0], payload->ne[1], payload->ne[2], payload->ne[3],
-            scales->ne[0], scales->ne[1], scales->ne[2], scales->ne[3],
-            n_heads, nk_cur, kv_size, (long long) src_head_stride_bytes);
+            (long long) payload->ne[0], (long long) payload->ne[1], (long long) payload->ne[2], (long long) payload->ne[3],
+            (long long) scales->ne[0], (long long) scales->ne[1], (long long) scales->ne[2], (long long) scales->ne[3],
+            n_heads, nk_cur, kv_size, (long long) src_head_stride_bytes, k_scale_mode, (double) k_scale_mul);
     }
 
     dim3 grid(nk_cur, n_heads, batch);
@@ -4405,7 +5883,7 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
             (const int64_t *) k_idxs->data,
             src_token_stride_bytes, k_cur->nb[2], k_cur->nb[3],
             src_head_stride_bytes,
-            nk_cur, n_heads, batch, kv_size);
+            nk_cur, n_heads, batch, kv_size, k_scale_mode, k_scale_mul);
     } else {
         GGML_ASSERT(k_idxs->type == GGML_TYPE_I32);
         ggml_cuda_q8k_dot4_quant_k_packed16_indexed_kernel<int32_t><<<grid, block, 0, stream>>>(
@@ -4415,7 +5893,7 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
             (const int32_t *) k_idxs->data,
             src_token_stride_bytes, k_cur->nb[2], k_cur->nb[3],
             src_head_stride_bytes,
-            nk_cur, n_heads, batch, kv_size);
+            nk_cur, n_heads, batch, kv_size, k_scale_mode, k_scale_mul);
     }
     CUDA_CHECK(cudaGetLastError());
 }

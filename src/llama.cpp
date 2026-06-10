@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
@@ -107,8 +108,24 @@ void llama_numa_init(enum ggml_numa_strategy numa) {
     }
 }
 
+static bool llama_env_flag_enabled(const char * name) {
+    const char * env = std::getenv(name);
+    return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0 && std::strcmp(env, "off") != 0 && std::strcmp(env, "false") != 0;
+}
+
 void llama_backend_free(void) {
     ggml_quantize_free();
+
+    if (llama_env_flag_enabled("GGML_CUDA_RESET_ON_EXIT") || llama_env_flag_enabled("LLAMA_ROCM_RESET_ON_EXIT")) {
+        using ggml_backend_cuda_reset_devices_fn = void (*)();
+        for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+            ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+            auto * reset_devices = (ggml_backend_cuda_reset_devices_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_reset_devices");
+            if (reset_devices != nullptr) {
+                reset_devices();
+            }
+        }
+    }
 }
 
 int64_t llama_time_us(void) {

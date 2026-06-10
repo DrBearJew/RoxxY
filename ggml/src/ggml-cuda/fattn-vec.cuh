@@ -4,6 +4,10 @@
 #include <mutex>
 #include <vector>
 
+extern "C" {
+void llama_kv_cache_get_packed16_tensors(const void * k_view_data, struct ggml_tensor ** payload, struct ggml_tensor ** scales);
+}
+
 static int ggml_cuda_fattn_vec_get_nthreads_host(const int cc) {
     return 128;
     GGML_UNUSED(cc);
@@ -112,12 +116,7 @@ static __global__ void flash_attn_ext_vec(
     constexpr int V_rows_per_thread = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 2*cpy_ne : 4;
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
 
-    vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ, tbq4_vec_norm_hoist>();
-    if constexpr (type_K == GGML_TYPE_Q8_0 && D == 256) {
-        if (q8k_dot4_packed16_vec) {
-            vec_dot_KQ = vec_dot_fattn_vec_KQ_q8_0_packed16<D, nthreads_KQ>;
-        }
-    }
+    constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ_selected<type_K, D, nthreads_KQ, tbq4_vec_norm_hoist, q8k_dot4_packed16_vec>();
     constexpr bool Q_q8_1 = !KQ_uses_Q_reg;
 #ifdef V_DOT2_F32_F16_AVAILABLE
     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread>();
@@ -276,12 +275,21 @@ static __global__ void flash_attn_ext_vec(
     }
 
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
+    const char * K_aux = sinks;
+    if constexpr (q8k_dot4_packed16_vec) {
+        if (K_aux != nullptr) {
+            constexpr int K_aux_row_bytes = (D / QK8_0) * int(sizeof(half));
+            K_aux += (int64_t(sequence) * ne12 + head / gqa_ratio) * ne11 * K_aux_row_bytes;
+            K_aux += int64_t(blockIdx.y) * k_tile_rows * K_aux_row_bytes;
+        }
+    }
     K     += blockIdx.y*k_tile_rows * nb11;
     V     += blockIdx.y*k_tile_rows * nb21;
     maskh += blockIdx.y*k_tile_rows;
     for (int k_VKQ_0 = blockIdx.y*k_tile_rows; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*k_tile_rows,
              // Increment pointers after each loop:
-             K += gridDim.y*k_tile_rows*nb11, V += gridDim.y*k_tile_rows*nb21, maskh += gridDim.y*k_tile_rows) {
+             K += gridDim.y*k_tile_rows*nb11, V += gridDim.y*k_tile_rows*nb21, maskh += gridDim.y*k_tile_rows,
+             K_aux += (q8k_dot4_packed16_vec && K_aux != nullptr) ? int64_t(gridDim.y)*k_tile_rows*(D / QK8_0)*int(sizeof(half)) : 0) {
 
         const int rows_this_tile = k_VKQ_max - k_VKQ_0 < k_tile_rows ? k_VKQ_max - k_VKQ_0 : k_tile_rows;
         if constexpr (tbq4_lds_d_k) {
@@ -301,16 +309,24 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
         for (int i_KQ_0 = 0; i_KQ_0 < nthreads_KQ; ++i_KQ_0) {
             const int i_KQ = threadIdx.y*WARP_SIZE + (nthreads_KQ == WARP_SIZE ? 0 : (threadIdx.x & ~(nthreads_KQ-1))) + i_KQ_0;
+            const bool active_k = i_KQ < rows_this_tile;
+            const char * K_aux_row = nullptr;
+            if constexpr (q8k_dot4_packed16_vec) {
+                constexpr int K_aux_row_bytes = (D / QK8_0) * int(sizeof(half));
+                K_aux_row = (K_aux != nullptr && active_k) ? K_aux + int64_t(i_KQ) * K_aux_row_bytes : nullptr;
+            }
 
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
-                const bool active_k = !tbq4_lds_d_k || i_KQ < rows_this_tile;
                 float sum;
                 if constexpr (tbq4_lds_d_k) {
                     sum = active_k ? vec_dot_fattn_vec_KQ_tbq4_0_lds_f16<D, nthreads_KQ>(
                         tbq4_lds_f16_smem + i_KQ*ggml_cuda_tbq4_lds_d_k_f16_stride_half2<D>(), Q_reg[j]) : 0.0f;
+                } else if constexpr (q8k_dot4_packed16_vec) {
+                    sum = active_k ? vec_dot_fattn_vec_KQ_q8_0_packed16<D, nthreads_KQ>(
+                        K + i_KQ*nb11, K_aux_row, Q_reg[j], Q_i32[j], Q_ds[j]) : 0.0f;
                 } else {
-                    sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                    sum = active_k ? vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]) : 0.0f;
                 }
                 sum = warp_reduce_sum<nthreads_KQ>(sum);
 
@@ -397,10 +413,8 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
         for (int k0 = 0; k0 < WARP_SIZE; k0 += V_cols_per_iter) {
             const int k = threadIdx.y*WARP_SIZE + k0 + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V);
-            if constexpr (tbq4_lds_d_k) {
-                if (k >= rows_this_tile) {
-                    continue;
-                }
+            if (k >= rows_this_tile) {
+                continue;
             }
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
@@ -476,7 +490,7 @@ static __global__ void flash_attn_ext_vec(
         }
     }
 
-    if (sinks && blockIdx.y == 0) {
+    if (sinks && !q8k_dot4_packed16_vec && blockIdx.y == 0) {
         const float sink = ((const float *) sinks)[head];
 
 #pragma unroll
@@ -794,13 +808,21 @@ static const char * ggml_cuda_q8k_packed16_vec_cache_get(
 template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool tbq4_vec_norm_hoist = false, bool sparse_v_dequant = false, int sparse_v_tau_level = 0, bool tbq4_lds_d_k = false>
 void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
 
     const int nthreads = ggml_cuda_fattn_vec_get_nthreads_host(cc);
     const int nwarps   = nthreads / WARP_SIZE;
-    const bool q8k_dot4_packed16_vec = type_K == GGML_TYPE_Q8_0 && D == 256 && ggml_cuda_q8k_dot4_packed16_vec_enabled();
+    const bool q8k_dot4_packed16_vec =
+        (type_K == GGML_TYPE_Q8_0 && D == 256 && ggml_cuda_q8k_dot4_packed16_vec_enabled()) ||
+        (type_K == GGML_TYPE_I32  && D == 256 && ggml_cuda_packed16_fa2_vec_enabled());
     fattn_kernel_t fattn_kernel = nullptr;
-    if constexpr (type_K == GGML_TYPE_Q8_0 && D == 256) {
+    if constexpr (type_K == GGML_TYPE_I32 && D == 256) {
+        if (!q8k_dot4_packed16_vec) {
+            GGML_ABORT("packed16 I32 VEC route requires GGML_CUDA_ROCM_PACKED16_FA2_VEC=1 or GGML_CUDA_FA_ROUTE_REQUIRE=rocm_packed16_fa2_vec");
+        }
+        fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, tbq4_vec_norm_hoist, sparse_v_dequant, sparse_v_tau_level, tbq4_lds_d_k, true>;
+    } else if constexpr (type_K == GGML_TYPE_Q8_0 && D == 256) {
         fattn_kernel = q8k_dot4_packed16_vec ?
             flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, tbq4_vec_norm_hoist, sparse_v_dequant, sparse_v_tau_level, tbq4_lds_d_k, true> :
             flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, tbq4_vec_norm_hoist, sparse_v_dequant, sparse_v_tau_level, tbq4_lds_d_k, false>;
@@ -814,9 +836,41 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
 
     ggml_cuda_pool_alloc<char> K_packed(ctx.pool());
     const char * K_data_override = nullptr;
+    const char * K_sinks_override = nullptr;
     size_t nb11_override = 0;
     size_t nb12_override = 0;
     size_t nb13_override = 0;
+    if constexpr (type_K == GGML_TYPE_I32 && D == 256) {
+        if (q8k_dot4_packed16_vec) {
+#ifdef GGML_USE_HIP
+            ggml_tensor * payload_tensor = nullptr;
+            ggml_tensor * scales_tensor = nullptr;
+            const void * lookup = (K->view_src != nullptr) ? K->view_src->data : K->data;
+            llama_kv_cache_get_packed16_tensors(lookup, &payload_tensor, &scales_tensor);
+            if (!payload_tensor || !scales_tensor) {
+                GGML_ABORT("packed16 FA2/VEC sidecar route requires registered K payload/scales tensors");
+            }
+            const ptrdiff_t payload_offset = (const char *) K->data - (const char *) payload_tensor->data;
+            const ptrdiff_t payload_row_bytes = (ptrdiff_t) payload_tensor->nb[1];
+            const ptrdiff_t scales_row_bytes  = (ptrdiff_t) scales_tensor->nb[1];
+            ptrdiff_t row_offset = 0;
+            if (payload_offset >= 0 && payload_offset % payload_row_bytes == 0) {
+                row_offset = payload_offset / payload_row_bytes;
+            }
+            // Always feed the VEC kernel from the registered packed16 payload. In
+            // live KV this is usually identical to K->data (a payload view), but
+            // tests and some graph views register a separate I32 tensor that only
+            // describes the packed16 K shape. The sidecar registry is authoritative.
+            K_data_override = (const char *) payload_tensor->data + row_offset * payload_row_bytes;
+            nb11_override = (size_t) payload_row_bytes;
+            nb12_override = (size_t) K->ne[1] * nb11_override;
+            nb13_override = (size_t) K->ne[2] * nb12_override;
+            K_sinks_override = (const char *) scales_tensor->data + row_offset * scales_row_bytes;
+#else
+            GGML_ABORT("packed16 FA2/VEC sidecar route is HIP-only");
+#endif
+        }
+    }
     if constexpr (type_K == GGML_TYPE_Q8_0 && D == 256) {
         if (q8k_dot4_packed16_vec) {
 #ifdef GGML_USE_HIP
@@ -843,7 +897,7 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     }
 
     launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, need_f16_K, need_f16_V, false,
-        WARP_SIZE, K_data_override, nb11_override, nb12_override, nb13_override);
+        WARP_SIZE, K_data_override, nb11_override, nb12_override, nb13_override, K_sinks_override);
 }
 
 template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool tbq4_vec_norm_hoist, bool tbq4_lds_d_k = false>
@@ -934,16 +988,21 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     }
 
 #ifdef GGML_USE_HIP
-    // Unsafe A/B probe for q8_0-K/q4_0-V prefill that keeps the stable VEC
-    // launch_fattn/parallel-block/combine path but groups four Q columns per
-    // block. This is intentionally opt-in so default quantized-KV behavior and
-    // long-context serving stay on the validated cols=2 VEC route.
-    if constexpr (D == 256 && type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q4_0) {
+    // Unsafe A/B probe for D256 q8_0/packed16-K + q4_0-V VEC that keeps the
+    // stable launch_fattn/parallel-block/combine path but groups more Q columns
+    // per block. This is intentionally opt-in so default quantized-KV behavior
+    // and long-context serving stay on the validated cols=2 VEC route.
+    if constexpr (D == 256 && (type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_I32) && type_V == GGML_TYPE_Q4_0) {
         const char * unsafe = getenv("GGML_CUDA_ROCM_EXPERIMENTAL_UNSAFE");
         if (!unsafe) {
             unsafe = getenv("GGML_CUDA_ROCM_UNSAFE_EXPERIMENTS");
         }
-        const char * cols_env = getenv("GGML_CUDA_ROCM_Q8K_Q4V_VEC_COLS");
+        const char * cols_env = nullptr;
+        if constexpr (type_K == GGML_TYPE_I32) {
+            cols_env = getenv("GGML_CUDA_ROCM_PACKED16_FA2_VEC_COLS");
+        } else {
+            cols_env = getenv("GGML_CUDA_ROCM_Q8K_Q4V_VEC_COLS");
+        }
         const int cols_override = (unsafe && atoi(unsafe) != 0 && cols_env) ? atoi(cols_env) : 0;
         if (cols_override == 16) {
             constexpr int cols_per_block = 16;

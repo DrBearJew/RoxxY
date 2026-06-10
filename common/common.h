@@ -311,7 +311,7 @@ struct common_params_speculative_draft {
     int32_t n_min = 0;  // minimum number of draft tokens to use for speculative decoding
 
     float p_split = 0.1f;  // speculative decoding split probability
-    float p_min   = 0.75f; // minimum speculative decoding probability (greedy) // TODO: change default to 0.0f
+    float p_min   = 0.0f;  // minimum speculative decoding probability (greedy)
 
     common_params_model mparams;
 

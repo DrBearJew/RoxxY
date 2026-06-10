@@ -1711,6 +1711,355 @@ static void ggml_compute_forward_mul_mat_id(
     }
 }
 
+static void ggml_compute_forward_moe_routed_lanes(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const struct ggml_tensor * selected = dst->src[0];
+    const int n_expert = ggml_get_op_params_i32(dst, 0);
+    const int64_t n_slots = selected->ne[0];
+    const int64_t n_rows  = selected->ne[1];
+    const int64_t n_lanes = n_slots * n_rows;
+
+    int32_t * out = (int32_t *) dst->data;
+    for (int64_t i = 0; i < ggml_nelements(dst); ++i) {
+        out[i] = -1;
+    }
+
+    int64_t lane = 0;
+    for (int expert = 0; expert < n_expert; ++expert) {
+        const int64_t expert_row = n_lanes + expert;
+        const int64_t start = lane;
+        for (int64_t row = 0; row < n_rows; ++row) {
+            for (int64_t slot = 0; slot < n_slots; ++slot) {
+                const int32_t id = *(const int32_t *) ((const char *) selected->data + slot*selected->nb[0] + row*selected->nb[1]);
+                if (id != expert) {
+                    continue;
+                }
+                *(int32_t *) ((char *) dst->data + 0*dst->nb[0] + lane*dst->nb[1]) = id;
+                *(int32_t *) ((char *) dst->data + 1*dst->nb[0] + lane*dst->nb[1]) = (int32_t) row;
+                *(int32_t *) ((char *) dst->data + 2*dst->nb[0] + lane*dst->nb[1]) = (int32_t) slot;
+                *(int32_t *) ((char *) dst->data + 3*dst->nb[0] + lane*dst->nb[1]) = (int32_t) (row*n_slots + slot);
+                ++lane;
+            }
+        }
+        *(int32_t *) ((char *) dst->data + 0*dst->nb[0] + expert_row*dst->nb[1]) = (int32_t) start;
+        *(int32_t *) ((char *) dst->data + 1*dst->nb[0] + expert_row*dst->nb[1]) = (int32_t) (lane - start);
+        *(int32_t *) ((char *) dst->data + 2*dst->nb[0] + expert_row*dst->nb[1]) = expert;
+        *(int32_t *) ((char *) dst->data + 3*dst->nb[0] + expert_row*dst->nb[1]) = 0;
+    }
+
+    GGML_ASSERT(lane == n_lanes);
+    GGML_UNUSED(dst->src[1]);
+}
+
+static void ggml_compute_forward_moe_routed_lanes_row_slot_map(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const struct ggml_tensor * weights = dst->src[0];
+    const struct ggml_tensor * lanes   = dst->src[1];
+
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(lanes->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+
+    const int64_t n_slots = weights->ne[1];
+    const int64_t n_rows  = weights->ne[2];
+    const int64_t n_lanes = n_slots * n_rows;
+
+    int32_t * out = (int32_t *) dst->data;
+    for (int64_t i = 0; i < ggml_nelements(dst); ++i) {
+        out[i] = -1;
+    }
+
+    for (int64_t lane = 0; lane < n_lanes; ++lane) {
+        const int32_t row  = *(const int32_t *) ((const char *) lanes->data + 1*lanes->nb[0] + lane*lanes->nb[1]);
+        const int32_t slot = *(const int32_t *) ((const char *) lanes->data + 2*lanes->nb[0] + lane*lanes->nb[1]);
+        const int32_t key  = *(const int32_t *) ((const char *) lanes->data + 3*lanes->nb[0] + lane*lanes->nb[1]);
+        GGML_ASSERT(row >= 0 && row < n_rows);
+        GGML_ASSERT(slot >= 0 && slot < n_slots);
+        GGML_ASSERT(key == row*n_slots + slot);
+        *(int32_t *) ((char *) dst->data + slot*dst->nb[0] + row*dst->nb[1]) = (int32_t) lane;
+    }
+
+    for (int64_t row = 0; row < n_rows; ++row) {
+        for (int64_t slot = 0; slot < n_slots; ++slot) {
+            const int32_t lane = *(const int32_t *) ((const char *) dst->data + slot*dst->nb[0] + row*dst->nb[1]);
+            GGML_ASSERT(lane >= 0 && lane < n_lanes);
+        }
+    }
+}
+
+static void ggml_compute_forward_moe_routed_lanes_expert_bounds(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const struct ggml_tensor * lanes = dst->src[0];
+
+    GGML_ASSERT(lanes->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(lanes->ne[0] == 4);
+
+    const int n_expert = ggml_get_op_params_i32(lanes, 0);
+    GGML_ASSERT(n_expert > 0 && dst->ne[0] == 2 && dst->ne[1] == n_expert);
+    GGML_ASSERT(lanes->ne[1] > n_expert);
+    const int64_t n_lanes = lanes->ne[1] - n_expert;
+
+    for (int expert = 0; expert < n_expert; ++expert) {
+        const int64_t expert_row = n_lanes + expert;
+        const int32_t start = *(const int32_t *) ((const char *) lanes->data + 0*lanes->nb[0] + expert_row*lanes->nb[1]);
+        const int32_t count = *(const int32_t *) ((const char *) lanes->data + 1*lanes->nb[0] + expert_row*lanes->nb[1]);
+        const int32_t id    = *(const int32_t *) ((const char *) lanes->data + 2*lanes->nb[0] + expert_row*lanes->nb[1]);
+        GGML_ASSERT(id == expert);
+        GGML_ASSERT(start >= 0 && start <= n_lanes);
+        GGML_ASSERT(count >= 0 && start + count <= n_lanes);
+        *(int32_t *) ((char *) dst->data + 0*dst->nb[0] + expert*dst->nb[1]) = start;
+        *(int32_t *) ((char *) dst->data + 1*dst->nb[0] + expert*dst->nb[1]) = count;
+    }
+}
+
+static void ggml_compute_forward_moe_routed_lanes_projection(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const struct ggml_tensor * weights = dst->src[0];
+    const struct ggml_tensor * compact = dst->src[1];
+    const struct ggml_tensor * lanes   = dst->src[2];
+    const struct ggml_tensor * bounds  = dst->src[3];
+
+    GGML_ASSERT(weights->type == GGML_TYPE_F32 || weights->type == GGML_TYPE_Q8_0 || weights->type == GGML_TYPE_IQ4_XS || weights->type == GGML_TYPE_IQ3_S);
+    GGML_ASSERT(compact->type == GGML_TYPE_F32);
+    GGML_ASSERT(lanes->type == GGML_TYPE_I32);
+    GGML_ASSERT(bounds->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int64_t n_in     = compact->ne[0];
+    const int64_t n_lanes  = compact->ne[1];
+    const int64_t n_out    = weights->ne[1];
+    const int64_t n_expert = weights->ne[2];
+
+    GGML_ASSERT(weights->ne[0] == n_in);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32 || n_in % ggml_blck_size(weights->type) == 0);
+    GGML_ASSERT(dst->ne[0] == n_out && dst->ne[1] == n_lanes);
+    GGML_ASSERT(bounds->ne[0] == 2 && bounds->ne[1] == n_expert);
+    GGML_ASSERT(lanes->ne[1] == n_lanes + n_expert);
+
+    for (int64_t i = 0; i < ggml_nelements(dst); ++i) {
+        ((float *) dst->data)[i] = 0.0f;
+    }
+
+    void * compact_q8_0 = NULL;
+    void * compact_q8_K = NULL;
+    if (weights->type == GGML_TYPE_Q8_0 || weights->type == GGML_TYPE_IQ4_XS || weights->type == GGML_TYPE_IQ3_S) {
+        GGML_ASSERT(n_in <= INT_MAX);
+        GGML_ASSERT(compact->nb[0] == (int64_t) sizeof(float));
+        if (weights->type == GGML_TYPE_Q8_0) {
+            compact_q8_0 = malloc(ggml_row_size(GGML_TYPE_Q8_0, n_in));
+            GGML_ASSERT(compact_q8_0 != NULL);
+        } else {
+            GGML_ASSERT(weights->type == GGML_TYPE_IQ4_XS || weights->type == GGML_TYPE_IQ3_S);
+            compact_q8_K = malloc(ggml_row_size(GGML_TYPE_Q8_K, n_in));
+            GGML_ASSERT(compact_q8_K != NULL);
+        }
+    }
+
+    for (int64_t expert = 0; expert < n_expert; ++expert) {
+        const int32_t start = *(const int32_t *) ((const char *) bounds->data + 0*bounds->nb[0] + expert*bounds->nb[1]);
+        const int32_t count = *(const int32_t *) ((const char *) bounds->data + 1*bounds->nb[0] + expert*bounds->nb[1]);
+        GGML_ASSERT(start >= 0 && count >= 0 && (int64_t) start + count <= n_lanes);
+
+        for (int64_t l = 0; l < count; ++l) {
+            const int64_t lane = (int64_t) start + l;
+            const int32_t lane_expert = *(const int32_t *) ((const char *) lanes->data + 0*lanes->nb[0] + lane*lanes->nb[1]);
+            GGML_ASSERT(lane_expert == expert);
+            if (weights->type == GGML_TYPE_Q8_0) {
+                quantize_row_q8_0((const float *) ((const char *) compact->data + lane*compact->nb[1]), compact_q8_0, n_in);
+            } else if (weights->type == GGML_TYPE_IQ4_XS || weights->type == GGML_TYPE_IQ3_S) {
+                quantize_row_q8_K((const float *) ((const char *) compact->data + lane*compact->nb[1]), compact_q8_K, n_in);
+            }
+            for (int64_t o = 0; o < n_out; ++o) {
+                float acc = 0.0f;
+                if (weights->type == GGML_TYPE_F32) {
+                    for (int64_t k = 0; k < n_in; ++k) {
+                        const float w = *(const float *) ((const char *) weights->data + k*weights->nb[0] + o*weights->nb[1] + expert*weights->nb[2]);
+                        const float x = *(const float *) ((const char *) compact->data + k*compact->nb[0] + lane*compact->nb[1]);
+                        acc += w*x;
+                    }
+                } else if (weights->type == GGML_TYPE_Q8_0) {
+                    GGML_ASSERT(weights->nb[1] % ggml_type_size(weights->type) == 0);
+                    GGML_ASSERT(weights->nb[2] % ggml_type_size(weights->type) == 0);
+                    GGML_ASSERT(n_in % QK8_0 == 0);
+                    const block_q8_0 * w_blocks = (const block_q8_0 *) ((const char *) weights->data + o*weights->nb[1] + expert*weights->nb[2]);
+                    ggml_vec_dot_q8_0_q8_0((int) n_in, &acc, 0, w_blocks, 0, compact_q8_0, 0, 1);
+                } else if (weights->type == GGML_TYPE_IQ4_XS) {
+                    GGML_ASSERT(weights->nb[1] % ggml_type_size(weights->type) == 0);
+                    GGML_ASSERT(weights->nb[2] % ggml_type_size(weights->type) == 0);
+                    GGML_ASSERT(n_in % QK_K == 0);
+                    const block_iq4_xs * w_blocks = (const block_iq4_xs *) ((const char *) weights->data + o*weights->nb[1] + expert*weights->nb[2]);
+                    ggml_vec_dot_iq4_xs_q8_K((int) n_in, &acc, 0, w_blocks, 0, compact_q8_K, 0, 1);
+                } else {
+                    GGML_ASSERT(weights->type == GGML_TYPE_IQ3_S);
+                    GGML_ASSERT(weights->nb[1] % ggml_type_size(weights->type) == 0);
+                    GGML_ASSERT(weights->nb[2] % ggml_type_size(weights->type) == 0);
+                    GGML_ASSERT(n_in % QK_K == 0);
+                    const block_iq3_s * w_blocks = (const block_iq3_s *) ((const char *) weights->data + o*weights->nb[1] + expert*weights->nb[2]);
+                    ggml_vec_dot_iq3_s_q8_K((int) n_in, &acc, 0, w_blocks, 0, compact_q8_K, 0, 1);
+                }
+                *(float *) ((char *) dst->data + o*dst->nb[0] + lane*dst->nb[1]) = acc;
+            }
+        }
+    }
+
+    free(compact_q8_0);
+    free(compact_q8_K);
+}
+
+static void ggml_compute_forward_moe_routed_lanes_pack_slots(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const struct ggml_tensor * slot_x = dst->src[0];
+    const struct ggml_tensor * row_slot_to_lane = dst->src[1];
+
+    GGML_ASSERT(slot_x->type == GGML_TYPE_F32);
+    GGML_ASSERT(row_slot_to_lane->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int64_t n_in    = slot_x->ne[0];
+    const int64_t n_slots = row_slot_to_lane->ne[0];
+    const int64_t n_rows  = row_slot_to_lane->ne[1];
+    const int64_t n_lanes = dst->ne[1];
+
+    for (int64_t row = 0; row < n_rows; ++row) {
+        for (int64_t slot = 0; slot < n_slots; ++slot) {
+            const int32_t lane = *(const int32_t *) ((const char *) row_slot_to_lane->data + slot*row_slot_to_lane->nb[0] + row*row_slot_to_lane->nb[1]);
+            GGML_ASSERT(lane >= 0 && lane < n_lanes);
+            for (int64_t i = 0; i < n_in; ++i) {
+                const float v = *(const float *) ((const char *) slot_x->data + i*slot_x->nb[0] + slot*slot_x->nb[1] + row*slot_x->nb[2]);
+                *(float *) ((char *) dst->data + i*dst->nb[0] + (int64_t) lane*dst->nb[1]) = v;
+            }
+        }
+    }
+}
+
+static void ggml_compute_forward_moe_routed_lanes_unpack_slots(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const struct ggml_tensor * compact = dst->src[0];
+    const struct ggml_tensor * row_slot_to_lane = dst->src[1];
+
+    GGML_ASSERT(compact->type == GGML_TYPE_F32);
+    GGML_ASSERT(row_slot_to_lane->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int64_t n_out   = compact->ne[0];
+    const int64_t n_slots = row_slot_to_lane->ne[0];
+    const int64_t n_rows  = row_slot_to_lane->ne[1];
+    const int64_t n_lanes = compact->ne[1];
+
+    for (int64_t row = 0; row < n_rows; ++row) {
+        for (int64_t slot = 0; slot < n_slots; ++slot) {
+            const int32_t lane = *(const int32_t *) ((const char *) row_slot_to_lane->data + slot*row_slot_to_lane->nb[0] + row*row_slot_to_lane->nb[1]);
+            GGML_ASSERT(lane >= 0 && lane < n_lanes);
+            for (int64_t i = 0; i < n_out; ++i) {
+                const float v = *(const float *) ((const char *) compact->data + i*compact->nb[0] + (int64_t) lane*compact->nb[1]);
+                *(float *) ((char *) dst->data + i*dst->nb[0] + slot*dst->nb[1] + row*dst->nb[2]) = v;
+            }
+        }
+    }
+}
+
+static void ggml_compute_forward_moe_routed_lanes_gather(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const struct ggml_tensor * x     = dst->src[0];
+    const struct ggml_tensor * lanes = dst->src[1];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(lanes->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int64_t n_embd  = x->ne[0];
+    const int64_t n_lanes = dst->ne[1];
+
+    for (int64_t lane = 0; lane < n_lanes; ++lane) {
+        const int32_t row = *(const int32_t *) ((const char *) lanes->data + 1*lanes->nb[0] + lane*lanes->nb[1]);
+        GGML_ASSERT(row >= 0 && row < x->ne[1]);
+        for (int64_t i = 0; i < n_embd; ++i) {
+            const float v = *(const float *) ((const char *) x->data + i*x->nb[0] + row*x->nb[1]);
+            *(float *) ((char *) dst->data + i*dst->nb[0] + lane*dst->nb[1]) = v;
+        }
+    }
+}
+
+static void ggml_compute_forward_moe_routed_lanes_scatter_reduce(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const struct ggml_tensor * compact = dst->src[0];
+    const struct ggml_tensor * weights = dst->src[1];
+    const struct ggml_tensor * lanes   = dst->src[2];
+
+    GGML_ASSERT(compact->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(lanes->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int64_t n_embd  = compact->ne[0];
+    const int64_t n_lanes = compact->ne[1];
+    const int64_t n_slots = weights->ne[1];
+    const int64_t n_rows  = weights->ne[2];
+
+    for (int64_t row = 0; row < n_rows; ++row) {
+        for (int64_t i = 0; i < n_embd; ++i) {
+            float acc = 0.0f;
+            for (int64_t slot = 0; slot < n_slots; ++slot) {
+                const int32_t key = (int32_t) (row*n_slots + slot);
+                int64_t lane_found = -1;
+                for (int64_t lane = 0; lane < n_lanes; ++lane) {
+                    const int32_t lane_key = *(const int32_t *) ((const char *) lanes->data + 3*lanes->nb[0] + lane*lanes->nb[1]);
+                    if (lane_key == key) {
+                        lane_found = lane;
+                        break;
+                    }
+                }
+                GGML_ASSERT(lane_found >= 0);
+                const float v = *(const float *) ((const char *) compact->data + i*compact->nb[0] + lane_found*compact->nb[1]);
+                const float w = *(const float *) ((const char *) weights->data + 0*weights->nb[0] + slot*weights->nb[1] + row*weights->nb[2]);
+                acc += v*w;
+            }
+            *(float *) ((char *) dst->data + i*dst->nb[0] + row*dst->nb[1]) = acc;
+        }
+    }
+}
+
 /////////////////////////////////
 
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
@@ -1986,6 +2335,38 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_top_k(params, tensor);
             } break;
+        case GGML_OP_MOE_ROUTED_LANES:
+            {
+                ggml_compute_forward_moe_routed_lanes(params, tensor);
+            } break;
+        case GGML_OP_MOE_ROUTED_LANES_ROW_SLOT_MAP:
+            {
+                ggml_compute_forward_moe_routed_lanes_row_slot_map(params, tensor);
+            } break;
+        case GGML_OP_MOE_ROUTED_LANES_EXPERT_BOUNDS:
+            {
+                ggml_compute_forward_moe_routed_lanes_expert_bounds(params, tensor);
+            } break;
+        case GGML_OP_MOE_ROUTED_LANES_PROJECTION:
+            {
+                ggml_compute_forward_moe_routed_lanes_projection(params, tensor);
+            } break;
+        case GGML_OP_MOE_ROUTED_LANES_PACK_SLOTS:
+            {
+                ggml_compute_forward_moe_routed_lanes_pack_slots(params, tensor);
+            } break;
+        case GGML_OP_MOE_ROUTED_LANES_UNPACK_SLOTS:
+            {
+                ggml_compute_forward_moe_routed_lanes_unpack_slots(params, tensor);
+            } break;
+        case GGML_OP_MOE_ROUTED_LANES_GATHER:
+            {
+                ggml_compute_forward_moe_routed_lanes_gather(params, tensor);
+            } break;
+        case GGML_OP_MOE_ROUTED_LANES_SCATTER_REDUCE:
+            {
+                ggml_compute_forward_moe_routed_lanes_scatter_reduce(params, tensor);
+            } break;
         case GGML_OP_LEAKY_RELU:
             {
                 ggml_compute_forward_leaky_relu(params, tensor);
@@ -2235,6 +2616,14 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SUM_ROWS:
         case GGML_OP_MEAN:
         case GGML_OP_ARGMAX:
+        case GGML_OP_MOE_ROUTED_LANES:
+        case GGML_OP_MOE_ROUTED_LANES_ROW_SLOT_MAP:
+        case GGML_OP_MOE_ROUTED_LANES_EXPERT_BOUNDS:
+        case GGML_OP_MOE_ROUTED_LANES_PROJECTION:
+        case GGML_OP_MOE_ROUTED_LANES_PACK_SLOTS:
+        case GGML_OP_MOE_ROUTED_LANES_UNPACK_SLOTS:
+        case GGML_OP_MOE_ROUTED_LANES_GATHER:
+        case GGML_OP_MOE_ROUTED_LANES_SCATTER_REDUCE:
             {
                 n_tasks = 1;
             } break;

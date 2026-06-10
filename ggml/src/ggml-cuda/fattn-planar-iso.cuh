@@ -9,7 +9,8 @@
 // ── Planar3 KQ dot product: Givens inverse rotation + centroid lookup ──
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_planar3_0(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const char * __restrict__ K_c,
+    const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
 
     const block_planar3_0 * K = (const block_planar3_0 *) K_c;
     GGML_UNUSED(Q_q8); GGML_UNUSED(Q_ds_v);
@@ -60,7 +61,8 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_planar3_0(
 // ── Iso3 KQ dot product: quaternion inverse rotation ──
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_iso3_0(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const char * __restrict__ K_c,
+    const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
 
     const block_iso3_0 * K = (const block_iso3_0 *) K_c;
     GGML_UNUSED(Q_q8); GGML_UNUSED(Q_ds_v);
@@ -120,7 +122,8 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_iso3_0(
 // ── Planar4 KQ dot product: Givens inverse + 4-bit centroids ──
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_planar4_0(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const char * __restrict__ K_c,
+    const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
 
     const block_planar4_0 * K = (const block_planar4_0 *) K_c;
     GGML_UNUSED(Q_q8); GGML_UNUSED(Q_ds_v);
@@ -168,7 +171,8 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_planar4_0(
 // ── Iso4 KQ dot product: quaternion inverse + 4-bit ──
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_iso4_0(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const char * __restrict__ K_c,
+    const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
 
     const block_iso4_0 * K = (const block_iso4_0 *) K_c;
     GGML_UNUSED(Q_q8); GGML_UNUSED(Q_ds_v);

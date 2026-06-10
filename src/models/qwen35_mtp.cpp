@@ -191,6 +191,12 @@ llama_model_qwen35_mtp::graph::graph(const llama_model & model, const llm_graph_
     // snapshot the MTP block's post-FFN hidden for AR loop for when MTP tokens > 1
     res->t_mtp_out = cur;
 
+    const char * mtp_block_only = getenv("LLAMA_MTP_BLOCK_ONLY");
+    if (mtp_block_only && atoi(mtp_block_only) == 1) {
+        ggml_build_forward_expand(gf, res->t_mtp_out);
+        return;
+    }
+
     ggml_tensor * head_norm_w = layer.nextn.shared_head_norm
             ? layer.nextn.shared_head_norm
             : model.output_norm;
@@ -200,6 +206,30 @@ llama_model_qwen35_mtp::graph::graph(const llama_model & model, const llm_graph_
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     GGML_ASSERT(head_w && "QWEN35_MTP: missing LM head (nextn.shared_head_head or model.output)");
+
+    const char * fused_lm_head_topk = getenv("LLAMA_MTP_FUSED_LM_HEAD_TOPK");
+    if (fused_lm_head_topk && atoi(fused_lm_head_topk) != 0 && head_w->type == GGML_TYPE_Q6_K) {
+        ggml_tensor * sampled = ggml_lm_head_top_k(ctx0, head_w, cur, 1);
+        cb(sampled, "mtp_lm_head_top1", -1);
+
+        int32_t out_idx = 0;
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            if (!ubatch.output[i]) {
+                continue;
+            }
+            llama_seq_id seq_id = ubatch.seq_id[i][0];
+            ggml_tensor * sampled_seq = ggml_view_1d(ctx0, sampled, 1, out_idx * sampled->nb[1]);
+            sampled_seq = ggml_cont(ctx0, sampled_seq);
+            ggml_format_name(sampled_seq, "mtp_lm_head_top1_seq_%d", seq_id);
+            res->t_sampled[seq_id] = sampled_seq;
+            ggml_build_forward_expand(gf, sampled_seq);
+            ++out_idx;
+        }
+
+        ggml_build_forward_expand(gf, sampled);
+        return;
+    }
+
     cur = build_lora_mm(head_w, cur);
     cb(cur, "result_output", -1);
 

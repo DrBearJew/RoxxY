@@ -145,6 +145,7 @@ struct llama_context {
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
+    int decode(const llama_batch & batch_inp, llm_graph_type gtype);
 
     //
     // state save/load

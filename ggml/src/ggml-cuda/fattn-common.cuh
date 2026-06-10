@@ -4,9 +4,7 @@
 #include "convert.cuh"
 #include "vecdotq.cuh"
 #include "fattn-mma-tbq4.cuh"
-
-// Forward declaration from fattn-dot4-q8k-kq.cuh
-static inline bool ggml_cuda_q8k_dot4_packed16_k_cache_enabled();
+#include "fattn-packed16-common.cuh"
 
 // AMD_BFE: recognized by ROCm LLVM codegen as v_bfe_u32
 #ifndef AMD_BFE
@@ -103,6 +101,31 @@ static inline bool ggml_cuda_q8k_dot4_packed16_vec_enabled() {
         if (v && atoi(v) == 0) return false;
     }
     return ggml_cuda_q8k_dot4_packed16_vec_route_required();
+#else
+    return false;
+#endif
+}
+
+static inline bool ggml_cuda_packed16_fa2_vec_route_required() {
+#ifdef GGML_USE_HIP
+    const char * required = getenv("GGML_CUDA_FA_ROUTE_REQUIRE");
+    if (required && strcmp(required, "rocm_packed16_fa2_vec") == 0) {
+        return true;
+    }
+    const char * env = getenv("GGML_CUDA_ROCM_PACKED16_FA2_VEC");
+    return env && atoi(env) != 0;
+#else
+    return false;
+#endif
+}
+
+static inline bool ggml_cuda_packed16_fa2_vec_enabled() {
+#ifdef GGML_USE_HIP
+    {
+        const char * v = getenv("GGML_CUDA_ROCM_PACKED16_FA2_VEC");
+        if (v && atoi(v) == 0) return false;
+    }
+    return ggml_cuda_packed16_fa2_vec_route_required();
 #else
     return false;
 #endif
@@ -442,30 +465,53 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
 // while replacing ggml's 34B q8_0 block reads with contiguous payload + scales.
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0_packed16(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const char * __restrict__ K_c, const char * __restrict__ K_aux, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
 
     static_assert(D == 256, "q8_0 packed16 K shadow is currently D256-only");
     static_assert(D % QK8_0 == 0, "bad q8_0 packed16 D");
     GGML_UNUSED(Q_v);
 
     const int  * K_qs = (const int  *) K_c;
-    const half * K_ds = (const half *) (K_c + D);
+    const half * K_ds = nullptr;
+    if (K_aux != nullptr) {
+        K_ds = (const half *) K_aux;
+    } else {
+        K_ds = (const half *) (K_c + D);
+    }
     const float2 * Q_ds = (const float2 *) Q_ds_v;
 
     float sum = 0.0f;
 
+    if constexpr (nthreads <= QI8_0) {
+        static_assert(QI8_0 % nthreads == 0, "packed16 VEC scale-hoist assumes nthreads divides QI8_0");
+        const int lane = nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads;
 #pragma unroll
-    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
-        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        for (int ib = 0; ib < D / QK8_0; ++ib) {
+            const float K_d = __half2float(K_ds[ib]);
+#pragma unroll
+            for (int iqs0 = 0; iqs0 < QI8_0; iqs0 += nthreads) {
+                const int iqs = iqs0 + lane;
+                const int k_KQ_0 = ib*QI8_0 + iqs0;
+                const int v = K_qs[ib*QI8_0 + iqs];
+                const float Q_d = Q_ds[k_KQ_0/nthreads].x;
 
-        const int ib  = k_KQ / QI8_0;
-        const int iqs = k_KQ % QI8_0;
+                sum += vec_dot_q8_0_q8_1_impl<float, 1>(&v, &Q_q8[k_KQ_0/nthreads], K_d, Q_d);
+            }
+        }
+    } else {
+#pragma unroll
+        for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+            const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
 
-        const int v = K_qs[ib*QI8_0 + iqs];
-        const float Q_d = Q_ds[k_KQ_0/nthreads].x;
-        const float K_d = __half2float(K_ds[ib]);
+            const int ib  = k_KQ / QI8_0;
+            const int iqs = k_KQ % QI8_0;
 
-        sum += vec_dot_q8_0_q8_1_impl<float, 1>(&v, &Q_q8[k_KQ_0/nthreads], K_d, Q_d);
+            const int v = K_qs[ib*QI8_0 + iqs];
+            const float Q_d = Q_ds[k_KQ_0/nthreads].x;
+            const float K_d = __half2float(K_ds[ib]);
+
+            sum += vec_dot_q8_0_q8_1_impl<float, 1>(&v, &Q_q8[k_KQ_0/nthreads], K_d, Q_d);
+        }
     }
 
     return sum;
@@ -989,6 +1035,17 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
+    }
+}
+
+template <ggml_type type_K, int D, int nthreads, bool tbq4_vec_norm_hoist = false, bool q8k_dot4_packed16_vec = false>
+constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ_selected() {
+    if constexpr (q8k_dot4_packed16_vec) {
+        static_assert(type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_I32, "packed16 VEC KQ is only valid for q8_0 K or packed16 I32 sidecar K");
+        static_assert(D == 256, "packed16 VEC KQ is currently D256-only");
+        return nullptr;
+    } else {
+        return get_vec_dot_KQ<type_K, D, nthreads, tbq4_vec_norm_hoist>();
     }
 }
 
@@ -1542,7 +1599,8 @@ template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE,
-    const char * K_data_override = nullptr, const size_t nb11_override = 0, const size_t nb12_override = 0, const size_t nb13_override = 0
+    const char * K_data_override = nullptr, const size_t nb11_override = 0, const size_t nb12_override = 0, const size_t nb13_override = 0,
+    const char * sinks_data_override = nullptr
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1792,7 +1850,7 @@ void launch_fattn(
         K_data,
         V_data,
         mask ? ((const char *) mask->data) : nullptr,
-        sinks ? ((const char *) sinks->data) : nullptr,
+        sinks_data_override ? sinks_data_override : (sinks ? ((const char *) sinks->data) : nullptr),
         KV_max.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,

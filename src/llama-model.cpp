@@ -2108,6 +2108,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 }
 
 ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
+    if ((params.gtype == LLM_GRAPH_TYPE_DECODER_PREFIX_VERIFY ||
+         params.gtype == LLM_GRAPH_TYPE_DECODER_PREFIX_COMMIT) &&
+            arch != LLM_ARCH_QWEN35MOE && arch != LLM_ARCH_QWEN35) {
+        LLAMA_LOG_ERROR(
+                "%s: prefix MTP verifier/commit graph type %d is reserved for qwen35/qwen35moe and is not implemented for arch %s\n",
+                __func__, (int) params.gtype, llm_arch_name(arch));
+        return nullptr;
+    }
+
     std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
 
     // add on pooling layer

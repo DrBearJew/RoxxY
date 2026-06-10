@@ -53,6 +53,10 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 
+// process the batch using externally captured target pre-norm embedding rows.
+// h_pre_norm must contain batch.n_tokens contiguous rows of llama_model_n_embd(ctx_tgt) floats.
+bool common_speculative_process_with_pre_norm(common_speculative * spec, const llama_batch & batch, const float * h_pre_norm);
+
 // true if any implementation requires target post-norm embeddings to be extracted
 bool common_speculative_need_embd(common_speculative * spec);
 

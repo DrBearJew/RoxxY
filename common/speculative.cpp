@@ -17,6 +17,7 @@
 #include <map>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
@@ -173,6 +174,11 @@ struct common_speculative_impl {
     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
 
     virtual bool process(const llama_batch & batch) = 0;
+
+    virtual bool process_with_pre_norm(const llama_batch & batch, const float * h_pre_norm) {
+        (void) h_pre_norm;
+        return process(batch);
+    }
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
@@ -419,6 +425,44 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     std::vector<common_sampler_ptr> smpls;
 
+    std::vector<llama_sampler *> backend_topk_smpls;
+    std::vector<bool> backend_topk_attached;
+
+    bool backend_topk_enabled = false;
+    bool backend_topk_require = false;
+    bool backend_topk_verify = false;
+    int32_t backend_topk_k = 16;
+
+    bool sidecar_enabled = false;
+    bool sidecar_require = false;
+    int32_t sidecar_k = 256;
+
+    bool quality_trace_enabled = false;
+    bool teacher_probe_enabled = false;
+
+    // Default-off position-fragility gate for noisy MTP draft paths (for example packed16 K).
+    // It stops drafting before low-margin later positions instead of forcing a fixed max depth.
+    bool margin_gate_enabled = false;
+    float margin_gate_min = 0.0f;
+    int32_t margin_gate_depth_min = 1;
+
+    struct backend_topk_entry {
+        llama_token id = LLAMA_TOKEN_NULL;
+        float logit = -INFINITY;
+    };
+
+    struct quality_trace_entry {
+        bool valid = false;
+        int depth = 0;
+        llama_token draft_top1 = LLAMA_TOKEN_NULL;
+        llama_token target_top1 = LLAMA_TOKEN_NULL;
+        float draft_p_top1 = 0.0f;
+        float draft_margin = 0.0f;
+        float target_margin = 0.0f;
+        bool top1_match = false;
+        const char * source = "unknown";
+    };
+
     int32_t n_embd = 0;
 
     bool kv_shared_with_target = false;
@@ -434,7 +478,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // Hidden rows from the most recent target verification batch, grouped by seq.
     // Row 0 corresponds to the sampled token, row N to the Nth accepted draft token.
     std::vector<std::vector<float>> verify_h;
+    std::vector<std::vector<backend_topk_entry>> target_sidecar;
     std::vector<int32_t> verify_h_rows;
+    std::vector<std::vector<quality_trace_entry>> last_quality_trace;
 
     // Per-seq draft length from the last draft() call, used in accept() to
     // roll back ctx_dft's recurrent state past the AR draft's redundant
@@ -468,6 +514,118 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
 
+        backend_topk_enabled = []() {
+            const char * env = getenv("LLAMA_MTP_BACKEND_TOPK");
+            return env && atoi(env) != 0;
+        }();
+        backend_topk_require = []() {
+            const char * env = getenv("LLAMA_MTP_BACKEND_TOPK_REQUIRE");
+            return env && atoi(env) != 0;
+        }();
+        backend_topk_verify = []() {
+            const char * env = getenv("LLAMA_MTP_TOPK_VERIFY");
+            return env && atoi(env) != 0;
+        }();
+        quality_trace_enabled = []() {
+            const char * env = getenv("LLAMA_MTP_PACKED16_QUALITY_TRACE");
+            if (env && atoi(env) != 0) {
+                return true;
+            }
+            env = getenv("LLAMA_MTP_QUALITY_TRACE");
+            return env && atoi(env) != 0;
+        }();
+        teacher_probe_enabled = []() {
+            const char * env = getenv("LLAMA_MTP_TEACHER_PROBE");
+            return env && atoi(env) != 0;
+        }();
+        if (teacher_probe_enabled && backend_topk_enabled) {
+            LOG_WRN("%s: disabling MTP backend top-k while LLAMA_MTP_TEACHER_PROBE=1 because probe catch-up emits multiple logits rows per sequence\n", __func__);
+            backend_topk_enabled = false;
+            backend_topk_require = false;
+        }
+        if (const char * env = getenv("LLAMA_MTP_DRAFT_MARGIN_MIN")) {
+            char * end = nullptr;
+            const float v = std::strtof(env, &end);
+            if (end != env && std::isfinite(v) && v > 0.0f) {
+                margin_gate_enabled = true;
+                margin_gate_min = v;
+            }
+        }
+        if (const char * env = getenv("LLAMA_MTP_DRAFT_MARGIN_DEPTH_MIN")) {
+            margin_gate_depth_min = std::max(1, atoi(env));
+        }
+        bool backend_topk_k_user = false;
+        if (const char * env = getenv("LLAMA_MTP_BACKEND_TOPK_K")) {
+            backend_topk_k = std::max(1, std::min(16, atoi(env)));
+            backend_topk_k_user = true;
+        }
+        if (!backend_topk_k_user && quality_trace_enabled) {
+            backend_topk_k = 16;
+        } else if (!backend_topk_k_user && this->params.p_min <= 0.0f) {
+            backend_topk_k = 1;
+        }
+        if (this->params.p_min > 0.0f && backend_topk_k < 16) {
+            LOG_WRN("%s: MTP backend top-k k=%d is insufficient for p_min confidence gate; using k=16\n",
+                    __func__, backend_topk_k);
+            backend_topk_k = 16;
+        }
+        if (margin_gate_enabled && backend_topk_k < 2) {
+            backend_topk_k = 2;
+        }
+
+        sidecar_enabled = []() {
+            const char * env = getenv("LLAMA_MTP_SIDECAR_CANDIDATES");
+            return env && atoi(env) != 0;
+        }();
+        sidecar_require = []() {
+            const char * env = getenv("LLAMA_MTP_SIDECAR_REQUIRE");
+            return env && atoi(env) != 0;
+        }();
+        if (const char * env = getenv("LLAMA_MTP_SIDECAR_K")) {
+            sidecar_k = std::max(1, std::min(1024, atoi(env)));
+        }
+        if (quality_trace_enabled && sidecar_k < 2) {
+            sidecar_k = 2;
+        }
+        if (quality_trace_enabled) {
+            LOG_INF("%s: MTP packed16 quality trace enabled sidecar_k=%d backend_topk_k=%d direct_sidecar=%d\n",
+                    __func__, sidecar_k, backend_topk_k, sidecar_enabled ? 1 : 0);
+        }
+        if (margin_gate_enabled) {
+            LOG_INF("%s: MTP draft margin gate enabled min=%.6g depth_min=%d backend_topk_k=%d\n",
+                    __func__, (double) margin_gate_min, margin_gate_depth_min, backend_topk_k);
+        }
+        if (sidecar_enabled) {
+            LOG_INF("%s: MTP target-topK sidecar enabled k=%d require=%d source=target_topk direct_top1=1\n",
+                    __func__, sidecar_k, sidecar_require ? 1 : 0);
+        }
+
+        backend_topk_smpls.assign(n_seq, nullptr);
+        backend_topk_attached.assign(n_seq, false);
+        if (backend_topk_enabled) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                llama_sampler_chain_params cparams = llama_sampler_chain_default_params();
+                llama_sampler * chain = llama_sampler_chain_init(cparams);
+                llama_sampler_chain_add(chain, llama_sampler_init_top_k(backend_topk_k));
+
+                if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
+                    LOG_WRN("%s: failed to attach backend top-k sampler for seq_id=%d; falling back to CPU sampler path\n",
+                            __func__, (int) seq_id);
+                    llama_sampler_free(chain);
+                    if (backend_topk_require) {
+                        throw std::runtime_error("LLAMA_MTP_BACKEND_TOPK_REQUIRE=1 but backend top-k sampler attachment failed");
+                    }
+                    continue;
+                }
+
+                backend_topk_smpls[seq_id] = chain;
+                backend_topk_attached[seq_id] = true;
+            }
+
+            LOG_INF("%s: MTP backend top-k consumer enabled k=%d require=%d verify=%d\n",
+                    __func__, backend_topk_k, backend_topk_require ? 1 : 0, backend_topk_verify ? 1 : 0);
+        }
+
         llama_set_embeddings_pre_norm(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_pre_norm(ctx_dft, true, /*masked*/ true);
         llama_set_mtp_source(ctx_dft, ctx_tgt);
@@ -480,12 +638,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         i_batch_end.assign(n_seq, -1);
 
         verify_h.assign(n_seq, {});
+        target_sidecar.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+        last_quality_trace.assign(n_seq, {});
 
         last_n_drafted.assign(n_seq, 0);
     }
 
     ~common_speculative_impl_draft_mtp() override {
+        auto * ctx_dft = this->params.ctx_dft;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_topk_smpls.size(); ++seq_id) {
+            if (backend_topk_smpls[seq_id] != nullptr) {
+                llama_set_sampler(ctx_dft, seq_id, nullptr);
+                llama_sampler_free(backend_topk_smpls[seq_id]);
+                backend_topk_smpls[seq_id] = nullptr;
+            }
+        }
+
         if (batch.token != nullptr) {
             free(batch.token);
             batch.token = nullptr;
@@ -493,10 +662,297 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_batch_free(batch);
     }
 
-    float draft_confidence_topk(struct llama_context * ctx, int idx, llama_token id) const {
+    bool draft_backend_topk(struct llama_context * ctx, int idx, llama_seq_id seq_id, llama_token & id, float & p_top1,
+            std::vector<backend_topk_entry> & top, std::string & reason) const {
+        top.clear();
+
+        if (!backend_topk_enabled) {
+            reason = "disabled";
+            return false;
+        }
+        if (seq_id < 0 || seq_id >= (llama_seq_id) backend_topk_attached.size() || !backend_topk_attached[seq_id]) {
+            reason = "not_attached";
+            return false;
+        }
+
+        const int nv = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+        if (backend_topk_k == 1 && params.p_min <= 0.0f && !backend_topk_verify) {
+            const llama_token sampled = llama_get_sampled_token_ith(ctx, idx);
+            if (sampled != LLAMA_TOKEN_NULL) {
+                if (sampled < 0 || sampled >= nv) {
+                    reason = "sampled_id";
+                    return false;
+                }
+                id = sampled;
+                p_top1 = 1.0f;
+                top.push_back({ sampled, 0.0f });
+                if (getenv("LLAMA_MTP_TOPK_TRACE")) {
+                    fprintf(stderr, "MTP_TOPK_TRACE: idx=%d sampled=%d source=fused_lm_head_top1\n", idx, (int) id);
+                }
+                reason.clear();
+                return true;
+            }
+        }
+
+        const uint32_t n_logits = llama_get_sampled_logits_count_ith(ctx, idx);
+        const uint32_t n_ids    = llama_get_sampled_candidates_count_ith(ctx, idx);
+        float * logits = llama_get_sampled_logits_ith(ctx, idx);
+        llama_token * ids = llama_get_sampled_candidates_ith(ctx, idx);
+
+        if (logits == nullptr) {
+            reason = "logits_null";
+            return false;
+        }
+        if (ids == nullptr) {
+            reason = "candidates_null";
+            return false;
+        }
+        if (n_logits == 0 || n_logits > (uint32_t) backend_topk_k) {
+            reason = "logits_count";
+            return false;
+        }
+        if (n_ids != n_logits) {
+            reason = "count_mismatch";
+            return false;
+        }
+
+        top.reserve(n_logits);
+        for (uint32_t k = 0; k < n_logits; ++k) {
+            if (ids[k] < 0 || ids[k] >= nv) {
+                reason = "candidate_id";
+                return false;
+            }
+            if (!std::isfinite(logits[k])) {
+                reason = "candidate_logit";
+                return false;
+            }
+            top.push_back({ ids[k], logits[k] });
+        }
+
+        std::sort(top.begin(), top.end(), [](const backend_topk_entry & a, const backend_topk_entry & b) {
+            if (a.logit == b.logit) {
+                return a.id < b.id;
+            }
+            return a.logit > b.logit;
+        });
+
+        if (top.empty()) {
+            reason = "empty";
+            return false;
+        }
+
+        float denom = 0.0f;
+        for (const auto & e : top) {
+            denom += std::exp(e.logit - top[0].logit);
+        }
+
+        id = top[0].id;
+        p_top1 = denom > 0.0f ? 1.0f / denom : 0.0f;
+
+        if (getenv("LLAMA_MTP_CONF_TRACE")) {
+            const float margin = top.size() > 1 ? top[0].logit - top[1].logit : INFINITY;
+            const llama_token top2_id = top.size() > 1 ? top[1].id : LLAMA_TOKEN_NULL;
+            const float top2_logit = top.size() > 1 ? top[1].logit : -INFINITY;
+            fprintf(stderr, "MTP_CONF_TRACE: idx=%d sampled=%d top1=%d p_top16=%.6g margin=%.6g top1_logit=%.6g top2=%d top2_logit=%.6g source=backend count=%zu\n",
+                    idx, (int) id, (int) top[0].id, p_top1, margin, top[0].logit, (int) top2_id, top2_logit, top.size());
+        }
+
+        if (getenv("LLAMA_MTP_TOPK_TRACE")) {
+            fprintf(stderr, "MTP_TOPK_TRACE: idx=%d sampled=%d source=backend", idx, (int) id);
+            for (const auto & e : top) {
+                fprintf(stderr, " %d:%.8g", (int) e.id, e.logit);
+            }
+            fprintf(stderr, "\n");
+        }
+
+        reason.clear();
+        return true;
+    }
+
+    bool verify_backend_topk(struct llama_context * ctx, int idx, llama_seq_id seq_id,
+            const std::vector<backend_topk_entry> & top, float p_top1) const {
+        if (!backend_topk_verify) {
+            return true;
+        }
+
+        const float * logits = llama_get_logits_raw_ith(ctx, idx);
+        const int nv = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+
+        std::string mismatch;
+        auto add_mismatch = [&mismatch](const char * what) {
+            if (!mismatch.empty()) {
+                mismatch += ",";
+            }
+            mismatch += what;
+        };
+
+        if (logits == nullptr) {
+            fprintf(stderr, "MTP_TOPK_VERIFY: idx=%d seq_id=%d ok=0 mismatch=raw_logits_null\n", idx, (int) seq_id);
+            return false;
+        }
+        if (top.empty()) {
+            fprintf(stderr, "MTP_TOPK_VERIFY: idx=%d seq_id=%d ok=0 mismatch=backend_empty\n", idx, (int) seq_id);
+            return false;
+        }
+
+        const int k_conf = std::max(1, std::min(16, backend_topk_k));
+        std::vector<backend_topk_entry> cpu_top;
+        cpu_top.reserve(k_conf);
+
+        for (int j = 0; j < nv; ++j) {
+            const float v = logits[j];
+            if (!std::isfinite(v)) {
+                continue;
+            }
+
+            backend_topk_entry cand { j, v };
+            auto better = [](const backend_topk_entry & a, const backend_topk_entry & b) {
+                if (a.logit == b.logit) {
+                    return a.id < b.id;
+                }
+                return a.logit > b.logit;
+            };
+
+            auto it = cpu_top.begin();
+            for (; it != cpu_top.end(); ++it) {
+                if (better(cand, *it)) {
+                    break;
+                }
+            }
+            if (it != cpu_top.end() || (int) cpu_top.size() < k_conf) {
+                cpu_top.insert(it, cand);
+                if ((int) cpu_top.size() > k_conf) {
+                    cpu_top.pop_back();
+                }
+            }
+        }
+
+        if (cpu_top.empty()) {
+            fprintf(stderr, "MTP_TOPK_VERIFY: idx=%d seq_id=%d ok=0 mismatch=cpu_empty\n", idx, (int) seq_id);
+            return false;
+        }
+
+        const auto contains_id = [](const std::vector<backend_topk_entry> & entries, llama_token id) {
+            for (const auto & e : entries) {
+                if (e.id == id) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        const float logit_tol = 1.0e-4f;
+        const float tie_tol   = 1.0e-6f;
+        const float p_tol     = 5.0e-4f;
+
+        bool logits_match = true;
+        for (const auto & e : top) {
+            if (e.id < 0 || e.id >= nv) {
+                logits_match = false;
+                continue;
+            }
+            const float raw = logits[e.id];
+            const float tol = logit_tol * std::max(1.0f, std::max(std::fabs(raw), std::fabs(e.logit)));
+            if (!std::isfinite(raw) || std::fabs(raw - e.logit) > tol) {
+                logits_match = false;
+            }
+        }
+        if (!logits_match) {
+            add_mismatch("logits");
+        }
+
+        const bool top1_match = top[0].id == cpu_top[0].id;
+        if (!top1_match) {
+            add_mismatch("top1");
+        }
+
+        const size_t k_cmp = std::min(top.size(), cpu_top.size());
+        bool set_exact = top.size() == k_cmp;
+        for (size_t k = 0; k < k_cmp && set_exact; ++k) {
+            if (!contains_id(top, cpu_top[k].id)) {
+                set_exact = false;
+            }
+        }
+
+        bool set_tie_permitted = true;
+        if (k_cmp == 0 || top.size() > cpu_top.size()) {
+            set_tie_permitted = false;
+        } else {
+            const float boundary = cpu_top[k_cmp - 1].logit;
+            for (const auto & e : top) {
+                if (e.id < 0 || e.id >= nv || logits[e.id] + tie_tol < boundary) {
+                    set_tie_permitted = false;
+                    break;
+                }
+            }
+            for (size_t k = 0; k < k_cmp; ++k) {
+                if (cpu_top[k].logit > boundary + tie_tol && !contains_id(top, cpu_top[k].id)) {
+                    set_tie_permitted = false;
+                    break;
+                }
+            }
+        }
+
+        const bool candidates_match = set_exact || set_tie_permitted;
+        if (!candidates_match) {
+            add_mismatch("candidates");
+        }
+
+        float p_cpu = 0.0f;
+        {
+            float denom = 0.0f;
+            for (int k = 0; k < k_conf && k < (int) cpu_top.size(); ++k) {
+                denom += std::exp(cpu_top[k].logit - cpu_top[0].logit);
+            }
+            p_cpu = denom > 0.0f ? 1.0f / denom : 0.0f;
+        }
+
+        bool p_close = top.size() >= (size_t) k_conf;
+        if (p_close) {
+            const float tol = p_tol * std::max(1.0f, std::max(std::fabs(p_top1), std::fabs(p_cpu)));
+            p_close = std::fabs(p_top1 - p_cpu) <= tol;
+        }
+        if (!p_close) {
+            add_mismatch("p_top16");
+        }
+
+        const bool ok = top1_match && candidates_match && logits_match && p_close;
+        fprintf(stderr,
+                "MTP_TOPK_VERIFY: idx=%d seq_id=%d ok=%d mismatch=%s top1_backend=%d top1_cpu=%d count_backend=%zu count_cpu=%zu p_top16_backend=%.9g p_top16_cpu=%.9g candidates=%d logits=%d p_close=%d\n",
+                idx, (int) seq_id, ok ? 1 : 0, ok ? "none" : mismatch.c_str(),
+                (int) top[0].id, (int) cpu_top[0].id, top.size(), cpu_top.size(),
+                p_top1, p_cpu, candidates_match ? 1 : 0, logits_match ? 1 : 0, p_close ? 1 : 0);
+
+        return ok;
+    }
+
+    static float draft_margin_from_top(const std::vector<backend_topk_entry> & top) {
+        return top.size() > 1 ? top[0].logit - top[1].logit : INFINITY;
+    }
+
+    bool draft_margin_gate_reject(int depth, const std::vector<backend_topk_entry> & top, float & margin, const char *& reason) const {
+        margin = draft_margin_from_top(top);
+        reason = "disabled";
+        if (!margin_gate_enabled || depth < margin_gate_depth_min) {
+            return false;
+        }
+        if (top.size() < 2 || !std::isfinite(margin)) {
+            reason = "missing_top2";
+            return true;
+        }
+        if (margin < margin_gate_min) {
+            reason = "low_margin";
+            return true;
+        }
+        reason = "ok";
+        return false;
+    }
+
+    float draft_confidence_topk(struct llama_context * ctx, int idx, llama_token id,
+            std::vector<backend_topk_entry> * top_out = nullptr) const {
         constexpr int k_conf = 16;
 
-        const float * logits = llama_get_logits_ith(ctx, idx);
+        const float * logits = llama_get_logits_raw_ith(ctx, idx);
         if (logits == nullptr) {
             return 0.0f;
         }
@@ -524,6 +980,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     top_id[k]  = j;
                     break;
                 }
+            }
+        }
+
+        if (top_out != nullptr) {
+            top_out->clear();
+            for (int k = 0; k < k_conf && top_id[k] != LLAMA_TOKEN_NULL; ++k) {
+                top_out->push_back({ top_id[k], top_val[k] });
             }
         }
 
@@ -590,6 +1053,162 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
+    void capture_target_sidecar(struct llama_context * ctx, int idx, llama_seq_id seq_id) {
+        if ((!sidecar_enabled && !quality_trace_enabled) || seq_id < 0 || seq_id >= (llama_seq_id) target_sidecar.size()) {
+            return;
+        }
+
+        auto & out = target_sidecar[seq_id];
+        out.clear();
+
+        const float * logits = llama_get_logits_raw_ith(ctx, idx);
+        if (logits == nullptr) {
+            logits = llama_get_logits_ith(ctx, idx);
+        }
+        if (logits == nullptr) {
+            if (getenv("LLAMA_MTP_SIDECAR_TRACE") || quality_trace_enabled) {
+                fprintf(stderr, "MTP_SIDECAR_TRACE: phase=capture idx=%d seq_id=%d status=missing_logits quality=%d\n", idx, (int) seq_id, quality_trace_enabled ? 1 : 0);
+            }
+            return;
+        }
+
+        const int nv = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+        const int k = std::max(1, std::min(sidecar_k, nv));
+        out.reserve(k);
+
+        auto better = [](const backend_topk_entry & a, const backend_topk_entry & b) {
+            if (a.logit == b.logit) {
+                return a.id < b.id;
+            }
+            return a.logit > b.logit;
+        };
+        auto heap_cmp = [&](const backend_topk_entry & a, const backend_topk_entry & b) {
+            return better(b, a);
+        };
+
+        for (int j = 0; j < nv; ++j) {
+            const float v = logits[j];
+            if (!std::isfinite(v)) {
+                continue;
+            }
+            backend_topk_entry cand { j, v };
+            if ((int) out.size() < k) {
+                out.push_back(cand);
+                std::push_heap(out.begin(), out.end(), heap_cmp);
+            } else if (better(cand, out.front())) {
+                std::pop_heap(out.begin(), out.end(), heap_cmp);
+                out.back() = cand;
+                std::push_heap(out.begin(), out.end(), heap_cmp);
+            }
+        }
+
+        std::sort(out.begin(), out.end(), better);
+
+        if (getenv("LLAMA_MTP_SIDECAR_TRACE")) {
+            fprintf(stderr, "MTP_SIDECAR_TRACE: phase=capture idx=%d seq_id=%d count=%zu", idx, (int) seq_id, out.size());
+            for (int i = 0; i < std::min<int>(5, out.size()); ++i) {
+                fprintf(stderr, " %d:%.8g", (int) out[i].id, out[i].logit);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+
+    bool draft_sidecar_direct(llama_seq_id seq_id, llama_token & id, float & p_top1) const {
+        if (!sidecar_enabled || seq_id < 0 || seq_id >= (llama_seq_id) target_sidecar.size()) {
+            return false;
+        }
+        const auto & top = target_sidecar[seq_id];
+        if (top.empty()) {
+            return false;
+        }
+        id = top[0].id;
+        if (top.size() == 1) {
+            p_top1 = 1.0f;
+        } else {
+            float denom = 0.0f;
+            for (const auto & e : top) {
+                denom += std::exp(e.logit - top[0].logit);
+            }
+            p_top1 = denom > 0.0f ? 1.0f / denom : 0.0f;
+        }
+        return id != LLAMA_TOKEN_NULL;
+    }
+
+    const char * quality_lane_name() const {
+        const char * disable_p16 = getenv("LLAMA_MTP_DISABLE_PACKED16_FA");
+        if (disable_p16 && atoi(disable_p16) == 0) {
+            return "packed16_dot4_optin";
+        }
+        return "f16_exact_control";
+    }
+
+    static const char * quality_env_value(const char * primary, const char * alias, const char * fallback) {
+        const char * v = getenv(primary);
+        if (!v || v[0] == '\0') {
+            v = alias ? getenv(alias) : nullptr;
+        }
+        return (v && v[0] != '\0') ? v : fallback;
+    }
+
+    void record_quality_trace(
+            llama_seq_id seq_id,
+            int depth,
+            llama_token draft_id,
+            float p_draft,
+            const std::vector<backend_topk_entry> & draft_top,
+            const char * source) {
+        if (!quality_trace_enabled || seq_id < 0 || seq_id >= (llama_seq_id) target_sidecar.size()) {
+            return;
+        }
+
+        quality_trace_entry stored = {};
+        stored.depth = depth;
+        stored.draft_top1 = draft_top.empty() ? draft_id : draft_top[0].id;
+        stored.draft_p_top1 = p_draft;
+        stored.source = source ? source : "unknown";
+        stored.draft_margin = draft_top.size() > 1 ? draft_top[0].logit - draft_top[1].logit : 0.0f;
+
+        const auto & target_top = target_sidecar[seq_id];
+        const llama_token draft_top2 = draft_top.size() > 1 ? draft_top[1].id : LLAMA_TOKEN_NULL;
+
+        if (depth != 1) {
+            last_quality_trace[seq_id].push_back(stored);
+            fprintf(stderr,
+                    "MTP_PACKED16_QUALITY: phase=draft lane=%s seq_id=%d depth=%d status=target_sidecar_depth1_only "
+                    "draft_top1=%d draft_top2=%d draft_p_top1=%.8g draft_margin=%.8g draft_source=%s k_scale_mode=%s k_scale_mul=%s\n",
+                    quality_lane_name(), (int) seq_id, depth, (int) stored.draft_top1, (int) draft_top2,
+                    stored.draft_p_top1, stored.draft_margin, stored.source,
+                    quality_env_value("GGML_CUDA_ROCM_PACKED16_K_SCALE_MODE", "LLAMA_MTP_PACKED16_K_SCALE_MODE", "default"),
+                    quality_env_value("GGML_CUDA_ROCM_PACKED16_K_SCALE_MUL", "LLAMA_MTP_PACKED16_K_SCALE_MUL", "1"));
+            return;
+        }
+
+        if (target_top.empty()) {
+            last_quality_trace[seq_id].push_back(stored);
+            fprintf(stderr,
+                    "MTP_PACKED16_QUALITY: phase=draft lane=%s seq_id=%d depth=%d status=missing_target_sidecar draft_top1=%d draft_source=%s\n",
+                    quality_lane_name(), (int) seq_id, depth, (int) stored.draft_top1, stored.source);
+            return;
+        }
+
+        stored.valid = true;
+        stored.target_top1 = target_top[0].id;
+        stored.target_margin = target_top.size() > 1 ? target_top[0].logit - target_top[1].logit : 0.0f;
+        stored.top1_match = stored.draft_top1 == stored.target_top1;
+        last_quality_trace[seq_id].push_back(stored);
+
+        const llama_token target_top2 = target_top.size() > 1 ? target_top[1].id : LLAMA_TOKEN_NULL;
+        fprintf(stderr,
+                "MTP_PACKED16_QUALITY: phase=draft lane=%s seq_id=%d depth=%d draft_top1=%d target_raw_top1=%d raw_top1_match=%d "
+                "draft_top2=%d target_raw_top2=%d draft_p_top1=%.8g draft_margin=%.8g target_raw_margin=%.8g "
+                "draft_source=%s k_scale_mode=%s k_scale_mul=%s\n",
+                quality_lane_name(), (int) seq_id, depth, (int) stored.draft_top1, (int) stored.target_top1,
+                stored.top1_match ? 1 : 0, (int) draft_top2, (int) target_top2,
+                stored.draft_p_top1, stored.draft_margin, stored.target_margin, stored.source,
+                quality_env_value("GGML_CUDA_ROCM_PACKED16_K_SCALE_MODE", "LLAMA_MTP_PACKED16_K_SCALE_MODE", "default"),
+                quality_env_value("GGML_CUDA_ROCM_PACKED16_K_SCALE_MUL", "LLAMA_MTP_PACKED16_K_SCALE_MUL", "1"));
+    }
+
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -608,6 +1227,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     bool process(const llama_batch & batch_in) override {
+        return process_impl(batch_in, nullptr);
+    }
+
+    bool process_with_pre_norm(const llama_batch & batch_in, const float * h_pre_norm) override {
+        if (h_pre_norm == nullptr || sidecar_enabled || quality_trace_enabled || teacher_probe_enabled) {
+            return process(batch_in);
+        }
+        return process_impl(batch_in, h_pre_norm);
+    }
+
+    bool process_impl(const llama_batch & batch_in, const float * h_pre_norm) {
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -653,7 +1283,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             common_batch_clear(batch);
 
             std::vector<llama_token> teacher_expected;
-            const bool teacher_probe = getenv("LLAMA_MTP_TEACHER_PROBE") != nullptr;
+            const bool teacher_probe = teacher_probe_enabled;
             for (int k = 0; k < n_tokens; ++k) {
                 const bool want_logits = teacher_probe && k + 1 < n_tokens;
                 common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, want_logits);
@@ -668,7 +1298,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
             {
-                const float * h_tgt = llama_get_embeddings_pre_norm(ctx_tgt);
+                const float * h_tgt = h_pre_norm ? h_pre_norm : llama_get_embeddings_pre_norm(ctx_tgt);
+                GGML_ASSERT(h_tgt != nullptr);
                 std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
             }
 
@@ -738,12 +1369,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_pre_norm_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                const float * h = h_pre_norm ? h_pre_norm + (size_t) (i_batch_beg[seq_id] + i) * n_embd :
+                    llama_get_embeddings_pre_norm_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                GGML_ASSERT(h != nullptr);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+
+            if (h_pre_norm == nullptr) {
+                capture_target_sidecar(ctx_tgt, i_batch_end[seq_id], seq_id);
+            }
         }
 
         return true;
@@ -763,6 +1400,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
+            if (seq_id >= 0 && seq_id < (llama_seq_id) last_quality_trace.size()) {
+                last_quality_trace[seq_id].clear();
+            }
 
             if (!dp.drafting) {
                 continue;
@@ -776,6 +1416,45 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             h_row = pending_h[seq_id].data();
             std::memcpy(batch.embd + n_embd*(batch.n_tokens - 1), h_row, row_bytes);
+        }
+
+        if (sidecar_enabled) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                auto & dp = dparams[seq_id];
+                if (!dp.drafting) {
+                    last_n_drafted[seq_id] = 0;
+                    continue;
+                }
+
+                llama_token id = LLAMA_TOKEN_NULL;
+                float p_draft = 0.0f;
+                if (!draft_sidecar_direct(seq_id, id, p_draft)) {
+                    if (sidecar_require) {
+                        GGML_ABORT("LLAMA_MTP_SIDECAR_REQUIRE=1 but target-topK sidecar is unavailable/invalid");
+                    }
+                    if (getenv("LLAMA_MTP_SIDECAR_TRACE")) {
+                        fprintf(stderr, "MTP_SIDECAR_TRACE: phase=draft seq_id=%d status=missing no_draft=1\n", (int) seq_id);
+                    }
+                    last_n_drafted[seq_id] = 0;
+                    continue;
+                }
+
+                if (getenv("LLAMA_MTP_SIDECAR_TRACE")) {
+                    fprintf(stderr, "MTP_SIDECAR_TRACE: phase=draft seq_id=%d sampled=%d p=%.8g source=target_topk_direct\n",
+                            (int) seq_id, (int) id, p_draft);
+                }
+
+                if (p_draft < params.p_min) {
+                    last_n_drafted[seq_id] = 0;
+                    continue;
+                }
+
+                common_sampler_accept(smpls[seq_id].get(), id, true);
+                dp.result->push_back(id);
+                last_n_drafted[seq_id] = 1;
+            }
+
+            return;
         }
 
         validate_real_mtp_batch("draft_initial", batch);
@@ -823,25 +1502,82 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto * smpl = smpls[seq_id].get();
 
                 const int sample_idx = i_batch;
-                common_sampler_sample(smpl, ctx_dft, sample_idx, true);
+                llama_token id = LLAMA_TOKEN_NULL;
+                float p_draft = 0.0f;
+                bool used_backend_topk = false;
+                std::vector<backend_topk_entry> top_backend;
+                std::vector<backend_topk_entry> top_cpu;
+
+                if (backend_topk_enabled) {
+                    std::string reason;
+                    used_backend_topk = draft_backend_topk(ctx_dft, sample_idx, seq_id, id, p_draft, top_backend, reason);
+                    if (!used_backend_topk) {
+                        if (backend_topk_require) {
+                            GGML_ABORT("LLAMA_MTP_BACKEND_TOPK_REQUIRE=1 but backend top-k output is unavailable/invalid");
+                        }
+                        if (getenv("LLAMA_MTP_TOPK_TRACE")) {
+                            fprintf(stderr, "MTP_TOPK_TRACE: idx=%d seq_id=%d source=backend invalid=%s fallback=cpu\n",
+                                    sample_idx, (int) seq_id, reason.c_str());
+                        }
+                    }
+                }
+
+                if (used_backend_topk && backend_topk_verify) {
+                    const bool verify_ok = verify_backend_topk(ctx_dft, sample_idx, seq_id, top_backend, p_draft);
+                    if (!verify_ok && backend_topk_require) {
+                        GGML_ABORT("LLAMA_MTP_BACKEND_TOPK_REQUIRE=1 but backend top-k verification failed");
+                    }
+                }
+
+                if (!used_backend_topk) {
+                    common_sampler_sample(smpl, ctx_dft, sample_idx, true);
+                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
+
+                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                        LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                                seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                    }
+
+                    // Add drafted token for each sequence if the MTP head is confident enough.
+                    // The sampler itself remains greedy (top_k=1); p_min is gated by a
+                    // separate top-k logit confidence so it is not permanently 1.0.
+                    id = cur_p->data[0].id;
+                    const bool need_confidence = params.p_min > 0.0f || quality_trace_enabled || margin_gate_enabled || getenv("LLAMA_MTP_CONF_TRACE") || getenv("LLAMA_MTP_TOPK_TRACE");
+                    p_draft = need_confidence ? draft_confidence_topk(ctx_dft, sample_idx, id, &top_cpu) : 1.0f;
+                } else {
+                    for (int k = 0; k < std::min(3, (int) top_backend.size()); ++k) {
+                        LOG_DBG(" - seq_id %d, draft backend candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                                seq_id, k, i, top_backend[k].id, top_backend[k].logit,
+                                common_token_to_piece(ctx_dft, top_backend[k].id).c_str());
+                    }
+                }
+
+                const auto & top_for_gate = used_backend_topk ? top_backend : top_cpu;
+
+                if (quality_trace_enabled) {
+                    record_quality_trace(seq_id, i + 1, id, p_draft, top_for_gate,
+                            used_backend_topk ? "backend_topk" : "cpu_sampler");
+                }
+
                 h_row = llama_get_embeddings_pre_norm_ith(ctx_dft, sample_idx);
                 ++i_batch;
 
-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
-
-                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                    LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                            seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
-                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                if (p_draft < params.p_min) {
+                    drafting[seq_id] = false;
+                    n_drafting--;
+                    continue;
                 }
 
-                // Add drafted token for each sequence if the MTP head is confident enough.
-                // The sampler itself remains greedy (top_k=1); p_min is gated by a
-                // separate top-k logit confidence so it is not permanently 1.0.
-                const llama_token id = cur_p->data[0].id;
-                const float p_draft = draft_confidence_topk(ctx_dft, sample_idx, id);
-
-                if (p_draft < params.p_min) {
+                float draft_margin = 0.0f;
+                const char * margin_reason = nullptr;
+                if (draft_margin_gate_reject(i + 1, top_for_gate, draft_margin, margin_reason)) {
+                    if (getenv("LLAMA_MTP_DRAFT_MARGIN_TRACE") || getenv("LLAMA_MTP_CONF_TRACE")) {
+                        fprintf(stderr,
+                                "MTP_DRAFT_MARGIN_GATE: seq_id=%d depth=%d stop=1 reason=%s margin=%.8g min=%.8g p_top1=%.8g topk=%zu token=%d\n",
+                                (int) seq_id, i + 1, margin_reason ? margin_reason : "unknown", draft_margin,
+                                (double) margin_gate_min, p_draft, top_for_gate.size(), (int) id);
+                    }
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -897,6 +1633,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void accept(llama_seq_id seq_id, uint16_t n_accepted) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
+        }
+
+        if (getenv("LLAMA_MTP_PROFILE")) {
+            const uint16_t n_drafted = seq_id < (llama_seq_id) last_n_drafted.size() ? last_n_drafted[seq_id] : 0;
+            const uint16_t n_rejected = n_drafted > n_accepted ? (uint16_t) (n_drafted - n_accepted) : 0;
+            fprintf(stderr,
+                    "MTP_PROFILE_ACCEPT seq_id=%d drafted=%u accepted=%u rejected=%u "
+                    "total_generated=%zu total_accepted=%zu calls_accept=%zu p_min=%.6g n_max=%d backend_topk=%d sidecar=%d\n",
+                    (int) seq_id, (unsigned) n_drafted, (unsigned) n_accepted, (unsigned) n_rejected,
+                    n_gen_tokens, n_acc_tokens, n_call_accept,
+                    (double) params.p_min, params.n_max, backend_topk_enabled ? 1 : 0, sidecar_enabled ? 1 : 0);
+        }
+
+        if (quality_trace_enabled && seq_id >= 0 && seq_id < (llama_seq_id) last_quality_trace.size()) {
+            for (const auto & q : last_quality_trace[seq_id]) {
+                const bool accepted = q.depth > 0 && q.depth <= (int) n_accepted;
+                fprintf(stderr,
+                        "MTP_PACKED16_QUALITY: phase=accept lane=%s seq_id=%d depth=%d accepted=%d draft_top1=%d target_raw_top1=%d raw_top1_match=%d "
+                        "draft_p_top1=%.8g draft_margin=%.8g target_raw_margin=%.8g draft_source=%s\n",
+                        quality_lane_name(), (int) seq_id, q.depth, accepted ? 1 : 0,
+                        (int) q.draft_top1, (int) q.target_top1, q.top1_match ? 1 : 0,
+                        q.draft_p_top1, q.draft_margin, q.target_margin, q.source);
+            }
         }
 
         const int32_t n_rows = verify_h_rows[seq_id];
@@ -1612,6 +2371,20 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
 
     for (auto & impl : spec->impls) {
         result = result && impl->process(batch);
+    }
+
+    return result;
+}
+
+bool common_speculative_process_with_pre_norm(common_speculative * spec, const llama_batch & batch, const float * h_pre_norm) {
+    bool result = true;
+
+    if (spec == nullptr) {
+        return result;
+    }
+
+    for (auto & impl : spec->impls) {
+        result = result && impl->process_with_pre_norm(batch, h_pre_norm);
     }
 
     return result;

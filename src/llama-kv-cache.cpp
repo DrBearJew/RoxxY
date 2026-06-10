@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <sstream>
 #include <stdexcept>
 
 static bool ggml_is_power_of_2(int n) {
@@ -258,18 +259,52 @@ llama_kv_cache::llama_kv_cache(
             }
         }
 
-        // MTP draft contexts keep source-F16 K by default. For persistent
-        // packed16/MMQ experiments, reuse the existing opt-out debug knob:
-        // LLAMA_MTP_ENABLE_FA=1 LLAMA_MTP_DISABLE_PACKED16_FA=0.
+        // Keep graph-facing K in the requested cache type by default. The
+        // reference/daily build does not silently replace target K with the
+        // experimental packed16/I32 sidecar cache; doing so changes greedy
+        // target decode output and makes no-spec/spec equivalence meaningless.
+        //
+        // Persistent packed16 K remains explicit opt-in for non-MTP/target
+        // probes.  For MTP draft contexts the I32+scale sidecar is demoted
+        // behind an unsafe force flag: dense qwen35 rank probes showed that
+        // enabling it via LLAMA_MTP_DISABLE_PACKED16_FA=0 changes draft logits
+        // and collapses acceptance while the f16K/q4V route preserves the exact
+        // target trajectory.  Keep the experimental sidecar reachable, but do
+        // not let the legacy double-negative opt-in silently poison draft
+        // quality.
+        //   - MTP draft hot/cold sidecar experiment: LLAMA_MTP_ENABLE_FA=1
+        //       LLAMA_MTP_PACKED16_HOTCOLD_K=1 (FP16 graph-facing K + route-private sidecar)
+        //   - old packed16 graph-facing unsafe experiment: LLAMA_MTP_ENABLE_FA=1
+        //       LLAMA_MTP_DISABLE_PACKED16_FA=0 LLAMA_MTP_PACKED16_DRAFT_K_UNSAFE=1
+        //   - non-MTP/target probe: GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE=1
         const char * mtp_disable_p16_env = getenv("LLAMA_MTP_DISABLE_PACKED16_FA");
-        const bool mtp_packed16_experiment = is_mtp_draft &&
+        const bool mtp_packed16_requested = is_mtp_draft &&
             getenv("LLAMA_MTP_ENABLE_FA") && atoi(getenv("LLAMA_MTP_ENABLE_FA")) != 0 &&
             mtp_disable_p16_env && atoi(mtp_disable_p16_env) == 0;
-        const bool packed16_active = has_k && (!is_mtp_draft || mtp_packed16_experiment)
-            && !(getenv("GGML_CUDA_ROCM_PACKED16_DISABLE") && atoi(getenv("GGML_CUDA_ROCM_PACKED16_DISABLE")) != 0)
-            && !(getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE") && atoi(getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE")) == 0);
+        const char * mtp_packed16_unsafe_env = getenv("LLAMA_MTP_PACKED16_DRAFT_K_UNSAFE");
+        const bool mtp_packed16_unsafe = mtp_packed16_unsafe_env && atoi(mtp_packed16_unsafe_env) != 0;
+        const bool mtp_packed16_experiment = mtp_packed16_requested && mtp_packed16_unsafe;
+        const bool mtp_packed16_hotcold_k = is_mtp_draft &&
+            getenv("LLAMA_MTP_ENABLE_FA") && atoi(getenv("LLAMA_MTP_ENABLE_FA")) != 0 &&
+            getenv("LLAMA_MTP_PACKED16_HOTCOLD_K") && atoi(getenv("LLAMA_MTP_PACKED16_HOTCOLD_K")) != 0;
+        if (mtp_packed16_requested && !mtp_packed16_unsafe && !mtp_packed16_hotcold_k) {
+            static bool warned = false;
+            if (!warned) {
+                LLAMA_LOG_WARN("%s: ignoring LLAMA_MTP_DISABLE_PACKED16_FA=0 for MTP draft K; "
+                        "packed16 draft K is demoted after acceptance/rank regression. "
+                        "Set LLAMA_MTP_PACKED16_DRAFT_K_UNSAFE=1 for the old experimental sidecar.\n", __func__);
+                warned = true;
+            }
+        }
+        const char * packed16_k_cache_env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE");
+        const bool packed16_k_cache_opt_in = packed16_k_cache_env && atoi(packed16_k_cache_env) != 0;
+        const bool packed16_disabled = getenv("GGML_CUDA_ROCM_PACKED16_DISABLE") &&
+            atoi(getenv("GGML_CUDA_ROCM_PACKED16_DISABLE")) != 0;
+        const bool packed16_active = has_k && !packed16_disabled &&
+            (mtp_packed16_experiment || mtp_packed16_hotcold_k || (!is_mtp_draft && packed16_k_cache_opt_in));
 
-        ggml_tensor * k = (has_k && !packed16_active) ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+        ggml_tensor * k = (has_k && (!packed16_active || mtp_packed16_hotcold_k)) ?
+            ggml_new_tensor_3d(ctx, mtp_packed16_hotcold_k ? GGML_TYPE_F16 : type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v_layer, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
         ggml_tensor * k_payload = nullptr;
@@ -357,10 +392,18 @@ llama_kv_cache::llama_kv_cache(
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
-    // Register packed16 K tensors for DOT4 FA dispatch lookup.
+    // Register packed16 K tensors for DOT4 FA dispatch lookup. Opt-in MTP
+    // hot/cold mode keeps exact FP16 K as the graph-facing cache while a
+    // packed16/I32 sidecar is available only to DOT4-aware decode routes.
+    const bool register_mtp_hotcold_shadow = getenv("LLAMA_MTP_PACKED16_HOTCOLD_K") &&
+        atoi(getenv("LLAMA_MTP_PACKED16_HOTCOLD_K")) != 0;
     for (auto & layer : layers) {
         if (layer.k_payload && layer.k_scales) {
-            llama_kv_cache_register_packed16(layer.k_payload->data, layer.k_payload, layer.k_scales);
+            if (register_mtp_hotcold_shadow && layer.k && layer.k->type == GGML_TYPE_F16) {
+                llama_kv_cache_register_packed16_shadow(layer.k_payload->data, layer.k_payload, layer.k_scales, layer.k);
+            } else {
+                llama_kv_cache_register_packed16(layer.k_payload->data, layer.k_payload, layer.k_scales);
+            }
             if (layer.k) {
                 llama_kv_cache_register_packed16(layer.k->data, layer.k_payload, layer.k_scales);
             }
@@ -1243,7 +1286,9 @@ bool llama_kv_cache::get_has_shift() const {
 }
 
 ggml_type llama_kv_cache::type_k() const {
-    if (!layers[0].k && layers[0].k_payload) return layers[0].k_payload->type; // I32
+    if (layers[0].k_payload && !layers[0].k) {
+        return layers[0].k_payload->type; // I32 packed16-only mode
+    }
     return layers[0].k->type;
 }
 
@@ -1273,7 +1318,9 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     auto * k = layers[ikv].k;
     auto * kp = layers[ikv].k_payload;
 
-    // Packed16-only mode: return I32 payload as 4D view.
+    // Packed16-only mode: return I32 payload as a 4D view. MTP hot/cold mode
+    // intentionally keeps FP16 K graph-facing and exposes the packed16 sidecar
+    // only through the DOT4 registry.
     if (!k && kp) {
         const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
         const int64_t n_head_kv = hparams.n_head_kv(il);
@@ -1412,9 +1459,11 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
             const int64_t n_head      = k_cur->ne[1];
             const int64_t n_embd_gqa  = n_embd_head * n_head;
             ggml_tensor * k_cur_2d = ggml_view_2d(ctx, k_cur, n_embd_gqa, k_cur->ne[2], k_cur->nb[2], 0);
-            ggml_set_rows(ctx, k, k_cur_2d, k_idxs);
-            // Pack from q8_0 shadow K — uses calibrated q8_0 block quantizer.
-            ggml_tensor * pack = ggml_pack_k_packed16(ctx, k, k_payload, k_scales, k_idxs);
+            ggml_tensor * k_shadow_write = ggml_set_rows(ctx, k, k_cur_2d, k_idxs);
+            // Pack from the just-written FP16 shadow K.  Using the set_rows result
+            // as the pack source keeps the exact-K shadow write in the graph;
+            // otherwise the optimizer may only schedule the packed sidecar write.
+            ggml_tensor * pack = ggml_pack_k_packed16(ctx, k_shadow_write, k_payload, k_scales, k_idxs);
             return pack;
         }
         // Packed16-only mode (no shadow K): indexed pack is the primary K write.
@@ -1861,6 +1910,76 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         set_input_kq_mask_impl<true> (args, data);
     } else {
         set_input_kq_mask_impl<false>(args, data);
+    }
+
+    if (const char * env = getenv("LLAMA_MTP_KQ_MASK_TRACE"); env && atoi(env) != 0) {
+        static int trace_count = 0;
+        const char * limit_env = getenv("LLAMA_MTP_KQ_MASK_TRACE_LIMIT");
+        const int trace_limit = limit_env ? std::max(0, atoi(limit_env)) : 16;
+        if (trace_count < trace_limit && n_tokens <= 16) {
+            trace_count++;
+
+            int future_leaks = 0;
+            int past_or_self_blocks = 0;
+            int missing_cells = 0;
+            int checked = 0;
+            std::ostringstream ss;
+            ss << "MTP_KQ_MASK_TRACE: count=" << trace_count
+               << " causal=" << (causal_attn ? 1 : 0)
+               << " n_tokens=" << n_tokens
+               << " n_kv=" << n_kv
+               << " n_stream=" << n_stream
+               << " rows=[";
+
+            for (uint32_t i = 0; i < n_tokens; ++i) {
+                if (ubatch->n_seq_id[i] != 1) {
+                    continue;
+                }
+                const llama_seq_id seq_i = ubatch->seq_id[i][0];
+                const llama_pos pos_i = ubatch->pos[i];
+                if (seq_i < 0 || (size_t) seq_i >= seq_to_stream.size()) {
+                    continue;
+                }
+                const auto & cells_i = v_cells.at(seq_to_stream[seq_i]);
+                if (i != 0) {
+                    ss << ";";
+                }
+                ss << "i" << i << ":p" << pos_i << "=";
+                for (uint32_t j = 0; j < n_tokens; ++j) {
+                    if (ubatch->n_seq_id[j] != 1 || ubatch->seq_id[j][0] != seq_i) {
+                        continue;
+                    }
+                    const llama_pos pos_j = ubatch->pos[j];
+                    int64_t cell_j = -1;
+                    for (uint32_t c = 0; c < cells_i.size(); ++c) {
+                        if (!cells_i.is_empty(c) && cells_i.seq_has(c, seq_i) && cells_i.pos_get(c) == pos_j) {
+                            cell_j = (int64_t) c;
+                            break;
+                        }
+                    }
+                    if (cell_j < 0 || cell_j >= n_kv) {
+                        missing_cells++;
+                        ss << (j == 0 ? "" : ",") << "j" << j << ":missing";
+                        continue;
+                    }
+                    const float v = data[(uint64_t) n_kv * i + (uint64_t) cell_j];
+                    const bool masked = std::isinf(v) && v < 0.0f;
+                    if (causal_attn && pos_j > pos_i && !masked) {
+                        future_leaks++;
+                    }
+                    if (causal_attn && pos_j <= pos_i && masked) {
+                        past_or_self_blocks++;
+                    }
+                    checked++;
+                    ss << (j == 0 ? "" : ",") << "j" << j << ":c" << cell_j << ":" << (masked ? "-inf" : "0");
+                }
+            }
+            ss << "] checked=" << checked
+               << " future_leaks=" << future_leaks
+               << " past_or_self_blocks=" << past_or_self_blocks
+               << " missing_cells=" << missing_cells;
+            fprintf(stderr, "%s\n", ss.str().c_str());
+        }
     }
 
     //const int64_t t_end = ggml_time_us();

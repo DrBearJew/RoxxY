@@ -1,5 +1,115 @@
 #include "models.h"
+#include "llama-kv-cache.h"
 #include "llama-memory-recurrent.h"
+
+#include <cstdlib>
+
+namespace {
+
+bool qwen35_env_enabled(const char * name) {
+    const char * env = getenv(name);
+    return env != nullptr && env[0] != '\0' && atoi(env) != 0;
+}
+
+int qwen35_env_i32(const char * name, int def) {
+    const char * env = getenv(name);
+    if (env == nullptr || env[0] == '\0') {
+        return def;
+    }
+    char * end = nullptr;
+    const long v = strtol(env, &end, 10);
+    return end != env ? (int) v : def;
+}
+
+bool qwen35_prefix_state_candidate_trace_enabled(int il) {
+    if (!qwen35_env_enabled("LLAMA_MTP_PREFIX_STATE_CANDIDATE_TRACE")) {
+        return false;
+    }
+    const int layer_filter = qwen35_env_i32("LLAMA_MTP_PREFIX_STATE_CANDIDATE_TRACE_LAYER", 0);
+    return layer_filter < 0 || layer_filter == il;
+}
+
+bool qwen35_prefix_state_reconstruct_copy_enabled(int il) {
+    if (!qwen35_env_enabled("LLAMA_MTP_PREFIX_STATE_RECONSTRUCT_COPY")) {
+        return false;
+    }
+    const int layer_filter = qwen35_env_i32("LLAMA_MTP_PREFIX_STATE_RECONSTRUCT_COPY_LAYER", 0);
+    return layer_filter < 0 || layer_filter == il;
+}
+
+bool qwen35_prefix_state_source_trace_enabled(int il) {
+    if (!qwen35_env_enabled("LLAMA_MTP_PREFIX_STATE_SOURCE_TRACE")) {
+        return false;
+    }
+    const int layer_filter = qwen35_env_i32("LLAMA_MTP_PREFIX_STATE_SOURCE_TRACE_LAYER", 0);
+    return layer_filter < 0 || layer_filter == il;
+}
+
+bool qwen35_prefix_r_direct_reconstruct_copy_enabled(int il) {
+    if (!qwen35_env_enabled("LLAMA_MTP_PREFIX_R_DIRECT_RECONSTRUCT_COPY")) {
+        return false;
+    }
+    const int layer_filter = qwen35_env_i32("LLAMA_MTP_PREFIX_R_DIRECT_RECONSTRUCT_COPY_LAYER", 0);
+    return layer_filter < 0 || layer_filter == il;
+}
+
+bool qwen35_prefix_s_state_only_reconstruct_copy_enabled(int il) {
+    if (!qwen35_env_enabled("LLAMA_MTP_PREFIX_S_STATE_ONLY_RECONSTRUCT_COPY")) {
+        return false;
+    }
+    const int layer_filter = qwen35_env_i32("LLAMA_MTP_PREFIX_S_STATE_ONLY_RECONSTRUCT_COPY_LAYER", 0);
+    return layer_filter < 0 || layer_filter == il;
+}
+
+bool qwen35_prefix_accepted_row_only_commit_enabled() {
+    return qwen35_env_enabled("LLAMA_MTP_PREFIX_ACCEPTED_ROW_ONLY_COMMIT");
+}
+
+void qwen35_lm_head_top1_apply_eog_mask(const llama_model & model, ggml_tensor * top1) {
+    top1->op_params[0] = 0;
+    if (!qwen35_env_enabled("LLAMA_MTP_TARGET_LM_HEAD_TOPK_EOG_MASK")) {
+        return;
+    }
+
+    int32_t n_ban = 0;
+    const int32_t n_vocab = model.vocab.n_tokens();
+    for (llama_token tok = 0; tok < n_vocab && n_ban < 8; ++tok) {
+        if (model.vocab.is_eog(tok)) {
+            top1->op_params[1 + n_ban] = tok;
+            ++n_ban;
+        }
+    }
+    top1->op_params[0] = n_ban;
+
+    if (qwen35_env_enabled("LLAMA_MTP_FUSED_LM_HEAD_TOPK_LOG")) {
+        fprintf(stderr, "MTP_TARGET_TOP1_EOG_MASK: tensor=%s n_ban=%d", top1->name, (int) n_ban);
+        for (int32_t i = 0; i < n_ban; ++i) {
+            fprintf(stderr, " %d", top1->op_params[1 + i]);
+        }
+        fprintf(stderr, "\n");
+    }
+}
+
+ggml_tensor * qwen35_mul_mat_aux(
+        ggml_context * ctx,
+        ggml_tensor * cur,
+        ggml_tensor * rot) {
+    const auto n = rot->ne[0];
+
+    ggml_tensor * res;
+    if (!ggml_is_contiguous(cur)) {
+        res = ggml_cont_2d(ctx, cur, n, ggml_nelements(cur) / n);
+    } else {
+        res = ggml_reshape_2d(ctx, cur, n, ggml_nelements(cur) / n);
+    }
+    res = ggml_mul_mat(ctx, rot, res);
+    ggml_mul_mat_set_hint(res, GGML_HINT_SRC0_IS_HADAMARD);
+    res = ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
+
+    return res;
+}
+
+}
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -134,6 +244,10 @@ std::unique_ptr<llm_graph_context> llama_model_qwen35::build_arch_graph(const ll
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
         return std::make_unique<graph_mtp>(*this, params);
     }
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_PREFIX_VERIFY ||
+        params.gtype == LLM_GRAPH_TYPE_DECODER_PREFIX_COMMIT) {
+        return std::make_unique<graph_prefix_verify>(*this, params);
+    }
     return std::make_unique<graph>(*this, params);
 }
 
@@ -229,11 +343,56 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
+    ggml_tensor * lm_head_input = cur;
+
+    const char * target_top1_active = getenv("LLAMA_MTP_TARGET_LM_HEAD_TOPK_ACTIVE");
+    const char * target_top1_active_raw = getenv("LLAMA_MTP_TARGET_LM_HEAD_TOPK_ACTIVE_RAW_UNSAFE");
+    const char * target_top1_active_logits = getenv("LLAMA_MTP_TARGET_LM_HEAD_TOPK_ACTIVE_LOGITS");
+    const bool lm_head_top1_direct_supported =
+            (model.output->type == GGML_TYPE_Q6_K || model.output->type == GGML_TYPE_Q8_0) &&
+            (loras == nullptr || loras->empty());
+    const bool target_top1_active_enabled = target_top1_active && atoi(target_top1_active) != 0 &&
+            target_top1_active_raw && atoi(target_top1_active_raw) != 0 &&
+            lm_head_top1_direct_supported;
+    const bool target_top1_active_from_logits = target_top1_active_enabled &&
+            target_top1_active_logits && atoi(target_top1_active_logits) != 0;
+    if (target_top1_active_enabled && !target_top1_active_from_logits) {
+        ggml_tensor * sampled = ggml_lm_head_top_k(ctx0, model.output, lm_head_input, 1);
+        cb(sampled, "target_lm_head_top1_active", -1);
+        qwen35_lm_head_top1_apply_eog_mask(model, sampled);
+        res->t_mtp_target_top1_fused_all = sampled;
+        ggml_build_forward_expand(gf, sampled);
+        return;
+    }
+
     // LM head
     cur = build_lora_mm(model.output, cur);
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
+
+    if (target_top1_active_from_logits) {
+        ggml_tensor * sampled = ggml_top_k(ctx0, cur, 1);
+        cb(sampled, "target_logits_top1_active", -1);
+        qwen35_lm_head_top1_apply_eog_mask(model, sampled);
+        res->t_mtp_target_top1_fused_all = sampled;
+        ggml_build_forward_expand(gf, sampled);
+    }
+
+    const char * target_top1_shadow = getenv("LLAMA_MTP_TARGET_LM_HEAD_TOPK_SHADOW");
+    if (target_top1_shadow && atoi(target_top1_shadow) != 0 &&
+            lm_head_top1_direct_supported) {
+        const char * target_top1_shadow_no_cont = getenv("LLAMA_MTP_TARGET_LM_HEAD_TOPK_SHADOW_NO_CONT");
+        ggml_tensor * lm_head_input_for_top1 = lm_head_input;
+        if (!(target_top1_shadow_no_cont && atoi(target_top1_shadow_no_cont) != 0)) {
+            lm_head_input_for_top1 = ggml_cont(ctx0, lm_head_input);
+            cb(lm_head_input_for_top1, "target_lm_head_input_cont_shadow", -1);
+        }
+        ggml_tensor * fused_top1 = ggml_lm_head_top_k(ctx0, model.output, lm_head_input_for_top1, 1);
+        cb(fused_top1, "target_lm_head_top1_fused", -1);
+        res->t_mtp_target_top1_fused_all = fused_top1;
+        ggml_build_forward_expand(gf, fused_top1);
+    }
 
     ggml_build_forward_expand(gf, cur);
 }
@@ -500,6 +659,603 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, cons
     return cur;
 }
 
+llama_model_qwen35::graph_prefix_verify::graph_prefix_verify(const llama_model & model, const llm_graph_params & params) :
+    llm_build_delta_net_base(params), model(model) {
+    const bool commit_only = params.gtype == LLM_GRAPH_TYPE_DECODER_PREFIX_COMMIT;
+    GGML_ASSERT(params.gtype == LLM_GRAPH_TYPE_DECODER_PREFIX_VERIFY || commit_only);
+    GGML_ASSERT(!commit_only || params.mtp_prefix_commit_slot >= 0);
+    GGML_ASSERT(ubatch.equal_seqs());
+    GGML_ASSERT(ubatch.n_seqs == 1);
+    GGML_ASSERT(ubatch.n_seq_tokens == ubatch.n_tokens);
+    GGML_ASSERT(cparams.n_rs_seq > 0);
+    GGML_ASSERT(ubatch.n_tokens <= 1 + cparams.n_rs_seq);
+
+    const int64_t n_embd_head = hparams.n_embd_head_v();
+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+
+    int sections[4];
+    std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
+
+    ggml_tensor * inpL = build_inp_embd(model.tok_embd);
+    cb(inpL, "prefix_model.input_embed", -1);
+
+    auto * inp = build_inp_mem_hybrid();
+
+    ggml_tensor * inp_pos = build_inp_pos();
+
+    const int n_transformer_layers = n_layer - (int) hparams.nextn_predict_layers;
+    std::vector<ggml_tensor *> conv_state(n_transformer_layers, nullptr);
+    std::vector<ggml_tensor *> ssm_state (n_transformer_layers, nullptr);
+
+    std::vector<ggml_tensor *> inp_pos_rows((size_t) ubatch.n_tokens, nullptr);
+    for (int64_t row = 0; row < (int64_t) ubatch.n_tokens; ++row) {
+        ggml_tensor * inp_pos_row = nullptr;
+        for (uint32_t p = 0; p < ubatch.n_pos; ++p) {
+            ggml_tensor * pos_comp = ggml_view_1d(ctx0, inp_pos, 1, (p * (int64_t) ubatch.n_tokens + row) * inp_pos->nb[0]);
+            inp_pos_row = inp_pos_row ? ggml_concat(ctx0, inp_pos_row, pos_comp, 0) : pos_comp;
+        }
+        cb(inp_pos_row, "prefix_pos_row", -1);
+        inp_pos_rows[(size_t) row] = inp_pos_row;
+    }
+
+    const bool skip_verify_snapshots = !commit_only && qwen35_prefix_accepted_row_only_commit_enabled();
+    const bool batch_output_head = !commit_only && params.mtp_prefix_batch_output_head;
+    const char * target_top1_active_env = getenv("LLAMA_MTP_TARGET_LM_HEAD_TOPK_ACTIVE");
+    const char * target_top1_active_raw_env = getenv("LLAMA_MTP_TARGET_LM_HEAD_TOPK_ACTIVE_RAW_UNSAFE");
+    const char * target_top1_active_logits_env = getenv("LLAMA_MTP_TARGET_LM_HEAD_TOPK_ACTIVE_LOGITS");
+    const bool lm_head_top1_direct_supported =
+            (model.output->type == GGML_TYPE_Q6_K || model.output->type == GGML_TYPE_Q8_0) &&
+            (loras == nullptr || loras->empty());
+    const bool target_top1_active = !commit_only &&
+            target_top1_active_env && atoi(target_top1_active_env) != 0 &&
+            target_top1_active_raw_env && atoi(target_top1_active_raw_env) != 0 &&
+            lm_head_top1_direct_supported;
+    const bool target_top1_active_from_logits = target_top1_active &&
+            target_top1_active_logits_env && atoi(target_top1_active_logits_env) != 0;
+    // Accepted-row-only mode cannot know the accepted length until after
+    // sampling.  Materialize a small suffix of verifier rows into rollback
+    // slots during verifier decode; covered rollback values can commit without
+    // a checkpoint restore or second prefix pass, and uncovered partial accepts
+    // fall back to the commit graph.
+    const int64_t snapshot_slot_limit    = skip_verify_snapshots ? params.mtp_prefix_accepted_commit_verify_slots : 0;
+    const int64_t snapshot_slot_override = commit_only ? params.mtp_prefix_commit_slot : -1;
+
+    ggml_tensor * h_pre_norm_all = nullptr;
+    ggml_tensor * embd_all       = nullptr;
+    ggml_tensor * logits_all     = nullptr;
+    for (int64_t row = 0; row < (int64_t) ubatch.n_tokens; ++row) {
+        ggml_tensor * cur = ggml_view_2d(ctx0, inpL, n_embd, 1, inpL->nb[1], row * inpL->nb[1]);
+        cb(cur, "prefix_input_row", -1);
+
+        for (int il = 0; il < n_transformer_layers; ++il) {
+            ggml_tensor * inpSA = cur;
+
+            cur = build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+            cb(cur, "prefix_attn_norm", il);
+
+            ggml_build_forward_expand(gf, cur);
+
+            if (hparams.is_recurrent(il)) {
+                cur = build_layer_attn_linear_prefix_row(inp->get_recr(), cur, conv_state[il], ssm_state[il], il, row, ubatch.n_tokens,
+                        commit_only || skip_verify_snapshots, snapshot_slot_limit, snapshot_slot_override);
+            } else {
+                cur = build_layer_attn_prefix_row(inp->get_attn(), cur, inp_pos_rows[(size_t) row], sections, il, row);
+            }
+
+            cur = ggml_add(ctx0, cur, inpSA);
+            cb(cur, "prefix_attn_residual", il);
+
+            ggml_tensor * ffn_residual = cur;
+
+            ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
+            cb(attn_post_norm, "prefix_attn_post_norm", il);
+
+            cur = build_layer_ffn(attn_post_norm, il);
+            cb(cur, "prefix_ffn_out", il);
+
+            cur = ggml_add(ctx0, cur, ffn_residual);
+            cb(cur, "prefix_post_ffn", il);
+
+            cur = build_cvec(cur, il);
+            cb(cur, "prefix_l_out", il);
+        }
+
+        cb(cur, "prefix_h_pre_norm_row", -1);
+        h_pre_norm_all = h_pre_norm_all ? ggml_concat(ctx0, h_pre_norm_all, cur, 1) : cur;
+
+        if (!commit_only && !batch_output_head) {
+            ggml_tensor * embd_row = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+            cb(embd_row, "prefix_result_norm_row", -1);
+            embd_all = embd_all ? ggml_concat(ctx0, embd_all, embd_row, 1) : embd_row;
+
+            if (!target_top1_active || target_top1_active_from_logits) {
+                ggml_tensor * logits_row = build_lora_mm(model.output, embd_row);
+                cb(logits_row, "prefix_result_output_row", -1);
+                logits_all = logits_all ? ggml_concat(ctx0, logits_all, logits_row, 1) : logits_row;
+            }
+        }
+    }
+
+    if (batch_output_head) {
+        embd_all = build_norm(h_pre_norm_all, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+        cb(embd_all, "prefix_result_norm_batched", -1);
+
+        if (!target_top1_active || target_top1_active_from_logits) {
+            logits_all = build_lora_mm(model.output, embd_all);
+            cb(logits_all, "prefix_result_output_batched", -1);
+        }
+    }
+
+    if (target_top1_active) {
+        ggml_tensor * sampled = nullptr;
+        if (target_top1_active_from_logits) {
+            sampled = ggml_top_k(ctx0, logits_all, 1);
+            cb(sampled, "prefix_target_logits_top1_active", -1);
+        } else {
+            sampled = ggml_lm_head_top_k(ctx0, model.output, embd_all, 1);
+            cb(sampled, "prefix_target_lm_head_top1_active", -1);
+        }
+        qwen35_lm_head_top1_apply_eog_mask(model, sampled);
+        res->t_mtp_target_top1_fused_all = sampled;
+    } else if (!commit_only) {
+        const char * target_top1_shadow = getenv("LLAMA_MTP_TARGET_LM_HEAD_TOPK_SHADOW");
+        if (target_top1_shadow && atoi(target_top1_shadow) != 0 &&
+                lm_head_top1_direct_supported) {
+            ggml_tensor * fused_top1 = ggml_lm_head_top_k(ctx0, model.output, embd_all, 1);
+            cb(fused_top1, "prefix_target_lm_head_top1_fused", -1);
+            res->t_mtp_target_top1_fused_all = fused_top1;
+        }
+    }
+
+    res->t_h_pre_norm = h_pre_norm_all;
+    res->t_embd       = embd_all;
+    res->t_logits     = logits_all;
+
+    ggml_build_forward_expand(gf, h_pre_norm_all);
+    if (!commit_only) {
+        ggml_build_forward_expand(gf, embd_all);
+        if (res->t_mtp_target_top1_fused_all != nullptr) {
+            ggml_build_forward_expand(gf, res->t_mtp_target_top1_fused_all);
+        }
+        if (!target_top1_active || target_top1_active_from_logits) {
+            ggml_build_forward_expand(gf, logits_all);
+        }
+    }
+}
+
+ggml_tensor * llama_model_qwen35::graph_prefix_verify::build_attn_prefix_row(
+        llm_graph_input_attn_kv * inp_attn,
+        ggml_tensor *             q_cur,
+        ggml_tensor *             k_cur,
+        ggml_tensor *             v_cur,
+        float                     kq_scale,
+        int                       il,
+        int64_t                   row) {
+    if (inp_attn->self_k_rot) {
+        q_cur = qwen35_mul_mat_aux(ctx0, q_cur, inp_attn->self_k_rot);
+        k_cur = qwen35_mul_mat_aux(ctx0, k_cur, inp_attn->self_k_rot);
+    }
+
+    if (inp_attn->self_v_rot) {
+        v_cur = qwen35_mul_mat_aux(ctx0, v_cur, inp_attn->self_v_rot);
+    }
+
+    ggml_build_forward_expand(gf, q_cur);
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_cur);
+
+    const auto * mctx_cur = inp_attn->mctx;
+
+    ggml_tensor * k_idxs = ggml_view_1d(ctx0, inp_attn->get_k_idxs(), 1, row * inp_attn->get_k_idxs()->nb[0]);
+
+    const int64_t v_idx_span = inp_attn->get_v_idxs()->ne[0] / n_tokens;
+    GGML_ASSERT(v_idx_span * n_tokens == inp_attn->get_v_idxs()->ne[0]);
+    ggml_tensor * v_idxs = ggml_view_1d(ctx0, inp_attn->get_v_idxs(), v_idx_span, row * v_idx_span * inp_attn->get_v_idxs()->nb[0]);
+
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+    ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+
+    ggml_tensor * kq_mask = inp_attn->get_kq_mask();
+    kq_mask = ggml_view_4d(ctx0, kq_mask,
+            kq_mask->ne[0], 1, kq_mask->ne[2], kq_mask->ne[3],
+            kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], row * kq_mask->nb[1]);
+
+    ggml_tensor * q = q_cur;
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+
+    const bool use_fa = (cparams.flash_attn || k->type == GGML_TYPE_I32);
+    ggml_tensor * v = mctx_cur->get_v(
+            ctx0,
+            il,
+            use_fa ? LLAMA_KV_V_LAYOUT_FOR_FA
+                   : LLAMA_KV_V_LAYOUT_FOR_NON_FA);
+
+    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask, nullptr, nullptr, kq_scale, il);
+    cb(cur, "prefix_kqv_out", il);
+
+    if (inp_attn->self_v_rot) {
+        cur = qwen35_mul_mat_aux(ctx0, cur, inp_attn->self_v_rot);
+    }
+
+    return cur;
+}
+
+ggml_tensor * llama_model_qwen35::graph_prefix_verify::build_layer_attn_prefix_row(
+        llm_graph_input_attn_kv * inp_attn,
+        ggml_tensor *             cur,
+        ggml_tensor *             inp_pos_row,
+        int *                     sections,
+        int                       il,
+        int64_t                   row) {
+    const int64_t n_embd_head = hparams.n_embd_head_v();
+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+
+    ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s);
+    cb(Qcur_full, "prefix_Qcur_full", il);
+
+    ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, 1,
+        ggml_element_size(Qcur_full) * n_embd_head * 2,
+        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
+    cb(Qcur, "prefix_Qcur_reshaped", il);
+
+    Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
+    cb(Qcur, "prefix_Qcur_normed", il);
+
+    ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+    cb(Kcur, "prefix_Kcur", il);
+
+    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+    cb(Vcur, "prefix_Vcur", il);
+
+    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, 1);
+    Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+    cb(Kcur, "prefix_Kcur_normed", il);
+
+    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, 1,
+        ggml_element_size(Qcur_full) * n_embd_head * 2,
+        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
+        ggml_element_size(Qcur_full) * n_embd_head);
+    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, 1);
+    cb(gate, "prefix_gate_reshaped", il);
+
+    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, 1);
+
+    Qcur = ggml_rope_multi(
+            ctx0, Qcur, inp_pos_row, nullptr,
+            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+
+    Kcur = ggml_rope_multi(
+            ctx0, Kcur, inp_pos_row, nullptr,
+            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+
+    cb(Qcur, "prefix_Qcur", il);
+    cb(Kcur, "prefix_Kcur", il);
+    cb(Vcur, "prefix_Vcur", il);
+
+    const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+
+    cur = build_attn_prefix_row(inp_attn, Qcur, Kcur, Vcur, kq_scale, il, row);
+    cb(cur, "prefix_attn_pregate", il);
+
+    ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
+    cb(gate_sigmoid, "prefix_gate_sigmoid", il);
+
+    cur = ggml_mul(ctx0, cur, gate_sigmoid);
+    cb(cur, "prefix_attn_gated", il);
+
+    cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
+    cb(cur, "prefix_attn_output", il);
+
+    return cur;
+}
+
+void llama_model_qwen35::graph_prefix_verify::copy_prefix_snapshot(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        snapshot,
+        ggml_tensor *        states_all,
+        int64_t              state_size,
+        int                  il,
+        int64_t              row,
+        int64_t              n_prefix,
+        const char *         name,
+        int64_t              slot_override) {
+    const auto * mctx_cur   = inp->mctx;
+    const auto   kv_head    = mctx_cur->get_head();
+    const uint32_t mem_size = mctx_cur->get_size();
+    const uint32_t slot     = (uint32_t) (slot_override >= 0 ? slot_override : (n_prefix - 1 - row));
+
+    const size_t row_size = state_size * ggml_element_size(states_all);
+    ggml_tensor * dst = ggml_view_2d(ctx0, states_all, state_size, 1, states_all->nb[1], ((size_t) slot * mem_size + kv_head) * row_size);
+    ggml_tensor * cpy = ggml_cpy(ctx0, snapshot, dst);
+    const std::string copy_name = std::string("prefix_") + name + "_row" + std::to_string(row) + "_slot" + std::to_string(slot);
+    cb(cpy, copy_name.c_str(), il);
+    ggml_build_forward_expand(gf, cpy);
+}
+
+void llama_model_qwen35::graph_prefix_verify::copy_prefix_conv_reconstruct_snapshot_direct(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        conv_state,
+        ggml_tensor *        qkv_mixed,
+        ggml_tensor *        conv_states_all,
+        int64_t              conv_kernel_size,
+        int64_t              conv_channels,
+        int                  il,
+        int64_t              row,
+        int64_t              n_prefix,
+        int64_t              slot_override) {
+    GGML_ASSERT(conv_kernel_size > 1);
+
+    const auto * mctx_cur   = inp->mctx;
+    const auto   kv_head    = mctx_cur->get_head();
+    const uint32_t mem_size = mctx_cur->get_size();
+    const uint32_t slot     = (uint32_t) (slot_override >= 0 ? slot_override : (n_prefix - 1 - row));
+
+    const size_t elem_size = ggml_element_size(conv_states_all);
+    const int64_t state_size = (conv_kernel_size - 1) * conv_channels;
+    const size_t row_size = state_size * elem_size;
+    const size_t base_off = ((size_t) slot * mem_size + kv_head) * row_size;
+    const size_t dst_channel_stride = (size_t) (conv_kernel_size - 1) * elem_size;
+
+    ggml_tensor * src_tail = ggml_view_3d(ctx0, conv_state, conv_kernel_size - 2, conv_channels, 1,
+            conv_state->nb[1], conv_state->nb[2], ggml_element_size(conv_state));
+    ggml_tensor * dst_tail = ggml_view_2d(ctx0, conv_states_all, conv_kernel_size - 2, conv_channels,
+            dst_channel_stride, base_off);
+    ggml_tensor * tail_cpy = ggml_cpy(ctx0, src_tail, dst_tail);
+    const std::string tail_name = "prefix_conv_state_direct_tail_row" + std::to_string(row) + "_slot" + std::to_string(slot);
+    cb(tail_cpy, tail_name.c_str(), il);
+    ggml_build_forward_expand(gf, tail_cpy);
+
+    ggml_tensor * dst_qkv = ggml_view_2d(ctx0, conv_states_all, 1, conv_channels,
+            dst_channel_stride, base_off + (size_t) (conv_kernel_size - 2) * elem_size);
+    // Use the pre-transpose [channel, 1] qkv tensor here.  Copying from the
+    // [1, channel] transpose into a strided destination can hit CUDA's
+    // transpose-specialized CPY path, which assumes a contiguous destination and
+    // corrupts the channel-strided conv-state layout.
+    ggml_tensor * qkv_cpy = ggml_cpy(ctx0, qkv_mixed, dst_qkv);
+    const std::string qkv_name = "prefix_conv_state_direct_qkv_row" + std::to_string(row) + "_slot" + std::to_string(slot);
+    cb(qkv_cpy, qkv_name.c_str(), il);
+    ggml_build_forward_expand(gf, qkv_cpy);
+}
+
+ggml_tensor * llama_model_qwen35::graph_prefix_verify::build_layer_attn_linear_prefix_row(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        cur,
+        ggml_tensor *&       conv_state,
+        ggml_tensor *&       ssm_state,
+        int                  il,
+        int64_t              row,
+        int64_t              n_prefix,
+        bool                 snapshot_selected_only,
+        int64_t              snapshot_slot_limit,
+        int64_t              snapshot_slot_override) {
+    const int64_t d_inner      = hparams.ssm_d_inner;
+    const int64_t head_k_dim   = hparams.ssm_d_state;
+    const int64_t num_k_heads  = hparams.ssm_n_group;
+    const int64_t num_v_heads  = hparams.ssm_dt_rank;
+    const int64_t head_v_dim   = d_inner / num_v_heads;
+
+    ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, cur, model.layers[il].wqkv_s);
+    qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], 1, 1);
+    cb(qkv_mixed, "prefix_linear_attn_qkv_mixed", il);
+
+    ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, cur, model.layers[il].wqkv_gate_s);
+    cb(z, "prefix_z", il);
+
+    ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+    beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, 1, 1);
+    cb(beta, "prefix_beta", il);
+
+    beta = ggml_sigmoid(ctx0, beta);
+    cb(beta, "prefix_beta_sigmoid", il);
+
+    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+    alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, 1, 1);
+    cb(alpha, "prefix_alpha", il);
+
+    ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
+    ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
+    cb(alpha_softplus, "prefix_a_softplus", il);
+
+    ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);
+    cb(gate, "prefix_gate", il);
+
+    gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, 1, 1);
+
+    ggml_tensor * conv_states_all = inp->mctx->get_r_l(il);
+    ggml_tensor * ssm_states_all  = inp->mctx->get_s_l(il);
+
+    ggml_tensor * conv_kernel      = model.layers[il].ssm_conv1d;
+    const int64_t conv_kernel_size = conv_kernel->ne[0];
+    const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
+
+    if (conv_state == nullptr) {
+        conv_state = build_rs(inp, conv_states_all, hparams.n_embd_r(), 1);
+        cb(conv_state, "prefix_conv_states", il);
+        conv_state = ggml_reshape_3d(ctx0, conv_state, conv_kernel_size - 1, conv_channels, 1);
+        cb(conv_state, "prefix_conv_states_reshaped", il);
+    }
+
+    ggml_tensor * qkv_mixed_t = ggml_transpose(ctx0, qkv_mixed);
+    cb(qkv_mixed_t, "prefix_qkv_mixed_transposed", il);
+
+    ggml_tensor * conv_input = ggml_concat(ctx0, conv_state, qkv_mixed_t, 0);
+    cb(conv_input, "prefix_conv_input", il);
+
+    ggml_tensor * new_conv_state = ggml_view_3d(ctx0, conv_input, conv_kernel_size - 1, conv_channels, 1,
+            conv_input->nb[1], conv_input->nb[2], ggml_element_size(conv_input));
+    cb(new_conv_state, "prefix_last_conv_states", il);
+    const bool prefix_state_candidate_trace    = qwen35_prefix_state_candidate_trace_enabled(il);
+    const bool prefix_state_reconstruct_copy   = qwen35_prefix_state_reconstruct_copy_enabled(il);
+    const bool prefix_state_source_trace       = qwen35_prefix_state_source_trace_enabled(il);
+    const bool prefix_r_direct_reconstruct_copy =
+        prefix_state_reconstruct_copy &&
+        qwen35_prefix_r_direct_reconstruct_copy_enabled(il) &&
+        !qwen35_env_enabled("LLAMA_MTP_PREFIX_SNAPSHOT_TRACE");
+    const int64_t natural_snapshot_slot = n_prefix - 1 - row;
+    const bool copy_snapshot_this_row = !snapshot_selected_only ||
+        (snapshot_slot_override >= 0 ? row == n_prefix - 1 : natural_snapshot_slot < snapshot_slot_limit);
+    const bool reconstruct_snapshot_this_row = prefix_state_reconstruct_copy && copy_snapshot_this_row;
+    const uint32_t prefix_state_candidate_slot = (uint32_t) (snapshot_slot_override >= 0 ? snapshot_slot_override : natural_snapshot_slot);
+    if (prefix_state_source_trace && reconstruct_snapshot_this_row) {
+        ggml_build_forward_expand(gf, new_conv_state);
+    }
+
+    ggml_tensor * r_snapshot = new_conv_state;
+    if (prefix_state_candidate_trace || reconstruct_snapshot_this_row) {
+        ggml_tensor * r_candidate_prev_tail = ggml_view_3d(ctx0, conv_state, conv_kernel_size - 2, conv_channels, 1,
+                conv_state->nb[1], conv_state->nb[2], ggml_element_size(conv_state));
+        if (prefix_state_candidate_trace) {
+            cb(r_candidate_prev_tail, "prefix_state_candidate_r_prev_tail", il);
+        }
+        ggml_tensor * r_candidate_reconstructed = ggml_concat(ctx0, r_candidate_prev_tail, qkv_mixed_t, 0);
+        if (prefix_state_candidate_trace) {
+            cb(r_candidate_reconstructed, "prefix_state_candidate_r_reconstructed", il);
+            ggml_tensor * r_candidate = ggml_cont_2d(ctx0, r_candidate_reconstructed, (conv_kernel_size - 1) * conv_channels, 1);
+            const std::string r_candidate_name = "prefix_state_candidate_r_row" + std::to_string(row) + "_slot" + std::to_string(prefix_state_candidate_slot);
+            cb(r_candidate, r_candidate_name.c_str(), il);
+            ggml_build_forward_expand(gf, r_candidate);
+        }
+        if (reconstruct_snapshot_this_row) {
+            r_snapshot = r_candidate_reconstructed;
+        }
+    }
+    if (copy_snapshot_this_row) {
+        if (prefix_r_direct_reconstruct_copy) {
+            copy_prefix_conv_reconstruct_snapshot_direct(inp, conv_state, qkv_mixed, conv_states_all, conv_kernel_size, conv_channels, il, row, n_prefix, snapshot_slot_override);
+        } else {
+            copy_prefix_snapshot(inp, r_snapshot, conv_states_all, (conv_kernel_size - 1) * conv_channels, il, row, n_prefix, "conv_state_copy", snapshot_slot_override);
+        }
+    }
+
+    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+    cb(conv_output_proper, "prefix_conv_output_raw", il);
+
+    ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+    cb(conv_output_silu, "prefix_conv_output_silu", il);
+
+    ggml_tensor * conv_qkv_mix = conv_output_silu;
+
+    const int64_t qkv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
+    const int64_t nb1_qkv = ggml_row_size(conv_qkv_mix->type, qkv_dim);
+
+    ggml_tensor * q_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, 1, 1,
+            ggml_row_size(conv_qkv_mix->type, head_k_dim), nb1_qkv, nb1_qkv, 0);
+
+    ggml_tensor * k_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, 1, 1,
+            ggml_row_size(conv_qkv_mix->type, head_k_dim), nb1_qkv, nb1_qkv,
+            head_k_dim * num_k_heads * ggml_element_size(conv_qkv_mix));
+
+    ggml_tensor * v_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_v_dim, num_v_heads, 1, 1,
+            ggml_row_size(conv_qkv_mix->type, head_v_dim), nb1_qkv, nb1_qkv,
+            ggml_row_size(conv_qkv_mix->type, 2 * head_k_dim * num_k_heads));
+
+    cb(q_conv, "prefix_q_conv", il);
+    cb(k_conv, "prefix_k_conv", il);
+    cb(v_conv, "prefix_v_conv", il);
+
+    const float eps_norm = hparams.f_norm_rms_eps;
+
+    q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
+    k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+
+    if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
+        GGML_ASSERT(num_v_heads % num_k_heads == 0);
+        q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_v_heads, 1, 1);
+        k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, 1, 1);
+    }
+
+    cb(q_conv, "prefix_q_conv_predelta", il);
+    cb(k_conv, "prefix_k_conv_predelta", il);
+    cb(v_conv, "prefix_v_conv_predelta", il);
+
+    if (ssm_state == nullptr) {
+        ssm_state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), 1);
+        ssm_state = ggml_reshape_4d(ctx0, ssm_state, head_v_dim, head_v_dim, num_v_heads, 1);
+        cb(ssm_state, "prefix_state_predelta", il);
+    }
+
+    auto attn_out = build_delta_net(q_conv, k_conv, v_conv, gate, beta, ssm_state, il);
+    ggml_tensor * output    = attn_out.first;
+    ggml_tensor * new_state = attn_out.second;
+    cb(output, "prefix_attn_output", il);
+    cb(new_state, "prefix_new_state", il);
+    if (prefix_state_source_trace && reconstruct_snapshot_this_row) {
+        ggml_build_forward_expand(gf, new_state);
+    }
+
+    ggml_tensor * s_snapshot = new_state;
+    if (prefix_state_candidate_trace || reconstruct_snapshot_this_row) {
+        ggml_tensor * s_candidate_state = nullptr;
+        const bool s_state_only_reconstruct_copy =
+            reconstruct_snapshot_this_row &&
+            qwen35_prefix_s_state_only_reconstruct_copy_enabled(il) &&
+            cparams.fused_gdn_ar;
+        if (s_state_only_reconstruct_copy) {
+            s_candidate_state = build_delta_net_fused_state_only(q_conv, k_conv, v_conv, gate, beta, ssm_state, il);
+        } else {
+            auto s_candidate_attn_out = build_delta_net(q_conv, k_conv, v_conv, gate, beta, ssm_state, il);
+            s_candidate_state = s_candidate_attn_out.second;
+        }
+        if (prefix_state_candidate_trace) {
+            cb(s_candidate_state, "prefix_state_candidate_s_reconstructed", il);
+            ggml_tensor * s_candidate = ggml_cont_2d(ctx0, s_candidate_state, hparams.n_embd_s(), 1);
+            const std::string s_candidate_name = "prefix_state_candidate_s_row" + std::to_string(row) + "_slot" + std::to_string(prefix_state_candidate_slot);
+            cb(s_candidate, s_candidate_name.c_str(), il);
+            ggml_build_forward_expand(gf, s_candidate);
+        }
+        if (reconstruct_snapshot_this_row) {
+            s_snapshot = s_candidate_state;
+        }
+    }
+    if (copy_snapshot_this_row) {
+        copy_prefix_snapshot(inp, s_snapshot, ssm_states_all, hparams.n_embd_s(), il, row, n_prefix, "ssm_state_copy", snapshot_slot_override);
+    }
+
+    ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, 1, 1);
+
+    ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
+
+    ggml_tensor * final_output = ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, 1, 1);
+    cb(final_output, "prefix_final_output", il);
+
+    cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
+    cb(cur, "prefix_linear_attn_out", il);
+
+    cur = ggml_reshape_2d(ctx0, cur, n_embd, 1);
+
+    conv_state = new_conv_state;
+    ssm_state  = new_state;
+
+    return cur;
+}
+
+ggml_tensor * llama_model_qwen35::graph_prefix_verify::build_norm_gated(
+        ggml_tensor * input,
+        ggml_tensor * weights,
+        ggml_tensor * gate,
+        int           layer) {
+    ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
+    ggml_tensor * gated_silu = ggml_silu(ctx0, gate);
+
+    return ggml_mul(ctx0, normalized, gated_silu);
+}
+
+ggml_tensor * llama_model_qwen35::graph_prefix_verify::build_layer_ffn(ggml_tensor * cur, const int il) {
+    GGML_ASSERT(model.layers[il].ffn_gate_inp == nullptr);
+
+    cur = build_ffn(cur,
+        model.layers[il].ffn_up, NULL, model.layers[il].ffn_up_s,
+        model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
+        model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
+        NULL,
+        LLM_FFN_SILU, LLM_FFN_PAR, il);
+    cb(cur, "prefix_ffn_dense_out", il);
+
+    return cur;
+}
+
 // LLM_GRAPH_TYPE_DECODER_MTP draft head for Qwen3.5/3.6 dense series
 llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
     : llm_graph_context(params) {
@@ -663,6 +1419,13 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     // (In the trunk graph this is `t_h_pre_norm`; the MTP head reuses the same slot.)
     cb(cur, "h_pre_norm", -1);
     res->t_h_pre_norm = cur;
+    res->t_mtp_out    = cur;
+
+    const char * mtp_block_only = getenv("LLAMA_MTP_BLOCK_ONLY");
+    if (mtp_block_only && atoi(mtp_block_only) != 0) {
+        ggml_build_forward_expand(gf, res->t_mtp_out);
+        return;
+    }
 
     ggml_tensor * head_norm_w = layer.nextn.shared_head_norm
             ? layer.nextn.shared_head_norm
@@ -681,6 +1444,30 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
             (long long)cur->ne[0], (long long)cur->ne[1],
             llama_vocab_n_tokens(llama_model_get_vocab(&model)));
     }
+
+    const char * fused_lm_head_topk = getenv("LLAMA_MTP_FUSED_LM_HEAD_TOPK");
+    if (fused_lm_head_topk && atoi(fused_lm_head_topk) != 0 && head_w->type == GGML_TYPE_Q6_K && head_s == nullptr) {
+        ggml_tensor * sampled = ggml_lm_head_top_k(ctx0, head_w, cur, 1);
+        cb(sampled, "mtp_lm_head_top1", -1);
+
+        int32_t out_idx = 0;
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            if (!ubatch.output[i]) {
+                continue;
+            }
+            llama_seq_id seq_id = ubatch.seq_id[i][0];
+            ggml_tensor * sampled_seq = ggml_view_1d(ctx0, sampled, 1, out_idx * sampled->nb[1]);
+            sampled_seq = ggml_cont(ctx0, sampled_seq);
+            ggml_format_name(sampled_seq, "mtp_lm_head_top1_seq_%d", seq_id);
+            res->t_sampled[seq_id] = sampled_seq;
+            ggml_build_forward_expand(gf, sampled_seq);
+            ++out_idx;
+        }
+
+        ggml_build_forward_expand(gf, sampled);
+        return;
+    }
+
     cur = build_lora_mm(head_w, cur, head_s);
     cb(cur, "result_output", -1);
 

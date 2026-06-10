@@ -74,6 +74,35 @@ constexpr int DECODE_D = 256;
 constexpr int DECODE_I32_PER_ROW = 64;
 constexpr int DECODE_N_BLOCKS = 8;
 
+struct small_verify_fa4_profile {
+    unsigned long long qk_cycles;
+    unsigned long long softmax_cycles;
+    unsigned long long pv_cycles;
+    unsigned long long write_cycles;
+    unsigned long long reduce_cycles;
+    unsigned long long sparse_v_kept;
+    unsigned long long sparse_v_skipped;
+};
+
+#define SMALL_VERIFY_PROFILE_PHASE_BEGIN() do { \
+    if (profile) { \
+        __syncthreads(); \
+        if (tid == 0) { profile_t0 = clock64(); } \
+        __syncthreads(); \
+    } \
+} while (0)
+
+#define SMALL_VERIFY_PROFILE_PHASE_END(FIELD) do { \
+    if (profile) { \
+        __syncthreads(); \
+        if (tid == 0) { \
+            const unsigned long long profile_t1 = clock64(); \
+            atomicAdd(&profile->FIELD, profile_t1 >= profile_t0 ? profile_t1 - profile_t0 : 0ull); \
+        } \
+        __syncthreads(); \
+    } \
+} while (0)
+
 template <int BN, int BN_VSUB, bool INLINE_Q4, bool Q4PAIR>
 static __global__ __launch_bounds__(256, 1)
 void ggml_cuda_q8k_dot4_decode_p16_kernel(
@@ -1210,6 +1239,26 @@ void ggml_cuda_q8k_dot4_small_verify_gqa_splitk_stage1_kernel(
     }
 }
 
+static __device__ __forceinline__ int ggml_cuda_q8k_dot4_sv_quantize_i8_symmetric(
+        float x,
+        float inv_scale) {
+    int qi = inv_scale > 0.0f ? __float2int_rn(x * inv_scale) : 0;
+    qi = qi < -127 ? -127 : qi;
+    qi = qi > 127 ? 127 : qi;
+    return qi;
+}
+
+static __device__ __forceinline__ int ggml_cuda_q8k_dot4_sv_pack_i8x4(
+        const int x0,
+        const int x1,
+        const int x2,
+        const int x3) {
+    return int(uint32_t(uint8_t(int8_t(x0))) |
+               (uint32_t(uint8_t(int8_t(x1))) << 8) |
+               (uint32_t(uint8_t(int8_t(x2))) << 16) |
+               (uint32_t(uint8_t(int8_t(x3))) << 24));
+}
+
 // ── Grouped-GQA Batched-Q split-K Stage 1: K/V shared across all nq queries ──
 //
 // Grid: (n_splits, n_heads_k, batch) — one CTA per (split, kv_head, batch).
@@ -1225,13 +1274,15 @@ void ggml_cuda_q8k_dot4_small_verify_gqa_splitk_stage1_kernel(
 //                          partial_l[batch][nq][n_heads_k][n_splits][GH_MAX]
 // Same layout as the per-query stage1 for compatibility with the existing reduce kernel.
 //
-template <int BN, int BN_VSUB, int GH_MAX, int NQ_MAX>
+template <int BN, int BN_VSUB, int GH_MAX, int NQ_MAX, bool FA4_QKPV = false, bool FA4_PVWMMA = false, bool REVERSE_KV = false, bool FUSED_SCALAR_PV = FA4_QKPV, bool SPARSE_V = false, bool PV_DOT4_ONFLY = false, bool PV_DOT4_LDS_A = false>
 static __global__ __launch_bounds__(256, 1)
 void ggml_cuda_q8k_dot4_small_verify_batched_gqa_splitk_stage1_kernel(
         const int   * __restrict__ q_payload,
         const float * __restrict__ q_scales,
         const int   * __restrict__ k_payload,
         const half  * __restrict__ k_scales,
+        int k_payload_row_stride_i32,
+        int k_scales_row_stride_half,
         const char  * __restrict__ V,
         const char  * __restrict__ mask,
         float       * __restrict__ partial_o,   // [batch, nq, n_heads_k, n_splits, GH_MAX, D]
@@ -1243,12 +1294,15 @@ void ggml_cuda_q8k_dot4_small_verify_batched_gqa_splitk_stage1_kernel(
         int nq, int nk, int n_heads_q, int n_heads_k,
         int gqa_ratio, int batch, int q_offset,
         int k_head_stride_rows, int k_batch_stride_rows,
-        int split_size, int n_splits) {
+        int split_size, int n_splits,
+        float sparse_v_tau,
+        small_verify_fa4_profile * __restrict__ profile) {
 
     if (nq < 2 || nq > NQ_MAX || gqa_ratio <= 0 || gqa_ratio > GH_MAX) return;
     static_assert(BN % BN_VSUB == 0, "BN must be multiple of BN_VSUB");
 
-    const int split = blockIdx.x;
+    const int split_linear = blockIdx.x;
+    const int split = REVERSE_KV ? (n_splits - 1 - split_linear) : split_linear;
     const int hk   = blockIdx.y;
     const int b    = blockIdx.z;
     if (b >= batch || hk >= n_heads_k || split >= n_splits) return;
@@ -1265,17 +1319,28 @@ void ggml_cuda_q8k_dot4_small_verify_batched_gqa_splitk_stage1_kernel(
     //   q_i32[NQ_MAX * GH_MAX * DECODE_I32_PER_ROW]  — all Q payloads
     //   q_scl[NQ_MAX * GH_MAX * DECODE_N_BLOCKS]     — all Q scales
     //   k_i32[BN * DECODE_I32_PER_ROW]                — K tile payload, loaded once from global
-    //   k_scl[BN]                                     — K tile scale, loaded once from global
+    //   k_scl[BN * DECODE_N_BLOCKS]                   — K tile scales for all 8 D blocks
     //   logits[NQ_MAX * GH_MAX * BN]                  — ALL Q×K scores for this K tile
     //   probs[NQ_MAX * GH_MAX * BN]                   — post-softmax probs
     //   sm[NQ_MAX * GH_MAX * 4]                        — softmax running state per (q,g)
+    //   keep_v[BN]                                     — sparse-V keep flags when SPARSE_V
+    //   pv_dot4_pmax[NQ_MAX * GH_MAX]                  — optional factorized P max for PV_DOT4_LDS_A
+    //   pv_dot4_dmax[8]                                — optional factorized V-scale max for PV_DOT4_LDS_A
+    //   pv_dot4_steps[NQ_MAX * GH_MAX * 8]             — transient P*q4_0.scale int8 scales
+    //   pv_dot4_a_pack[NQ_MAX * GH_MAX * 8 * (BN/4)]   — LDS prepacked transient A8 for PV_DOT4_LDS_A
+    constexpr int K_SCALE_SMEM = BN * DECODE_N_BLOCKS;
     int   * q_i32  = reinterpret_cast<int   *>(smem);
     float * q_scl  = reinterpret_cast<float *>(q_i32 + NQ_MAX * GH_MAX * DECODE_I32_PER_ROW);
     int   * k_i32  = reinterpret_cast<int   *>(q_scl + NQ_MAX * GH_MAX * DECODE_N_BLOCKS);
     float * k_scl  = reinterpret_cast<float *>(k_i32 + BN * DECODE_I32_PER_ROW);
-    float * logits  = k_scl + BN;
+    float * logits  = k_scl + K_SCALE_SMEM;
     float * probs   = logits + NQ_MAX * GH_MAX * BN;
     float * sm      = probs  + NQ_MAX * GH_MAX * BN;
+    int   * keep_v  = reinterpret_cast<int *>(sm + NQ_MAX * GH_MAX * 4);
+    float * pv_dot4_pmax  = reinterpret_cast<float *>(keep_v + (SPARSE_V ? BN : 0));
+    float * pv_dot4_dmax  = pv_dot4_pmax + (PV_DOT4_LDS_A ? (NQ_MAX * GH_MAX) : 0);
+    float * pv_dot4_steps = pv_dot4_dmax + (PV_DOT4_LDS_A ? DECODE_N_BLOCKS : 0);
+    int   * pv_dot4_a_pack = reinterpret_cast<int *>(pv_dot4_steps + ((PV_DOT4_ONFLY || PV_DOT4_LDS_A) ? (NQ_MAX * GH_MAX * DECODE_N_BLOCKS) : 0));
 
     // Load all Q payloads and scales for all nq queries across gh heads
     for (int i = tid; i < NQ_MAX * GH_MAX * DECODE_I32_PER_ROW; i += blockDim.x) {
@@ -1313,23 +1378,44 @@ void ggml_cuda_q8k_dot4_small_verify_batched_gqa_splitk_stage1_kernel(
     }
     __syncthreads();
 
-    // Per-thread output accumulator: out[q_idx][g]
+    // Per-thread scalar output accumulator: out[q_idx][g]
     float out[NQ_MAX][GH_MAX];
+    if constexpr (!FA4_PVWMMA) {
 #pragma unroll
-    for (int q_idx = 0; q_idx < NQ_MAX; ++q_idx)
+        for (int q_idx = 0; q_idx < NQ_MAX; ++q_idx)
 #pragma unroll
-        for (int g = 0; g < GH_MAX; ++g)
-            out[q_idx][g] = 0.0f;
+            for (int g = 0; g < GH_MAX; ++g)
+                out[q_idx][g] = 0.0f;
+    }
+
+    // PV-WMMA output accumulator. Two row blocks cover up to NQ_MAX*GH_MAX=32 logical rows;
+    // each pass/wave covers one 16-column D tile, matching the decode PV-WMMA layout.
+    constexpr int FA4_PV_ROW_BLOCKS = (NQ_MAX * GH_MAX + 15) / 16;
+    float out_pv[FA4_PV_ROW_BLOCKS][2][8];
+    if constexpr (FA4_PVWMMA) {
+#pragma unroll
+        for (int rb = 0; rb < FA4_PV_ROW_BLOCKS; ++rb)
+#pragma unroll
+            for (int pass = 0; pass < 2; ++pass)
+#pragma unroll
+                for (int i = 0; i < 8; ++i)
+                    out_pv[rb][pass][i] = 0.0f;
+    }
 
     const size_t k_head_base = size_t(b)  * size_t(k_batch_stride_rows)
                              + size_t(hk) * size_t(k_head_stride_rows);
     const char * v_head = V + int64_t(b) * nb23 + int64_t(hk) * nb22;
+    unsigned long long profile_t0 = 0;
 
     // ── Main K/V tile loop: K/V read ONCE per tile, Q×K computed for ALL nq in one sweep ──
-    for (int k0 = k_begin; k0 < k_end; k0 += BN) {
-        const int tile_n = (k0 + BN <= k_end) ? BN : (k_end - k0);
+    const int n_tiles = (k_end > k_begin) ? ((k_end - k_begin + BN - 1) / BN) : 0;
+    for (int tile_it = 0; tile_it < n_tiles; ++tile_it) {
+        const int tile_linear = REVERSE_KV ? (n_tiles - 1 - tile_it) : tile_it;
+        const int k0 = k_begin + tile_linear * BN;
+        const int tile_n = min(BN, k_end - k0);
 
         // ── Phase 1: ALL Q×K scores in one parallel sweep using DOT4 batched across 4 queries ──
+        SMALL_VERIFY_PROFILE_PHASE_BEGIN();
         // Each thread processes up to 4 consecutive logits positions (q_idx, g, kk) where
         // (g, kk) are shared and K is loaded ONCE for all 4 queries. DOT4 computes 4 I8
         // element-products per instruction; with 4 query chains interleaved, K elements are
@@ -1344,53 +1430,127 @@ void ggml_cuda_q8k_dot4_small_verify_batched_gqa_splitk_stage1_kernel(
             int val = 0;
             if (kk < tile_n && k < nk) {
                 const size_t kb = k_head_base + k;
-                val = k_payload[kb * DECODE_I32_PER_ROW + pos];
+                val = k_payload[kb * k_payload_row_stride_i32 + pos];
             }
             k_i32[i] = val;
         }
-        for (int kk = tid; kk < BN; kk += blockDim.x) {
-            const int k = k0 + kk;
+        for (int i = tid; i < BN * DECODE_N_BLOCKS; i += blockDim.x) {
+            const int kk = i / DECODE_N_BLOCKS;
+            const int qb = i - kk * DECODE_N_BLOCKS;
+            const int k  = k0 + kk;
             float val = 0.0f;
             if (kk < tile_n && k < nk) {
                 const size_t kb = k_head_base + k;
-                val = __half2float(k_scales[kb * DECODE_N_BLOCKS]);
+                val = __half2float(k_scales[kb * k_scales_row_stride_half + qb]);
             }
-            k_scl[kk] = val;
+            k_scl[i] = val;
         }
         __syncthreads();
 
-        const int NQK_STRIDE = NQ_MAX * GH_MAX * BN;
-        for (int idx = tid; idx < NQK_STRIDE; idx += blockDim.x) {
-            const int q_idx = idx / (GH_MAX * BN);
-            const int guard = idx - q_idx * (GH_MAX * BN);
-            const int g     = guard / BN;
-            const int kk    = guard - g * BN;
-            const int k     = k0 + kk;
-
-            int acc = 0;
-            const bool have = q_idx < nq && g < gh && kk < tile_n && k < nk;
-            const int * qp = q_i32 + (q_idx * GH_MAX + g) * DECODE_I32_PER_ROW;
+        if constexpr (FA4_QKPV) {
+            // FA4 lane model: one thread owns (g, kk), loads K words once,
+            // and computes up to four q lanes as independent accumulator chains.
+            // This makes q0/q1/q2/q3 structural lanes instead of separate logits work-items.
+            // Qwen3.6 27B uses gqa=6 while GH_MAX=8. Keep constant-stride indexing
+            // but skip inactive GQA lanes before the DOT4 loops.
+            for (int idx = tid; idx < GH_MAX * BN; idx += blockDim.x) {
+                const int g  = idx / BN;
+                if (g >= gh) continue;
+                const int kk = idx - g * BN;
+                const int k  = k0 + kk;
+                float sums[NQ_MAX];
 #pragma unroll
-            for (int pos = 0; pos < DECODE_I32_PER_ROW; ++pos) {
-                const int k_val = k_i32[kk * DECODE_I32_PER_ROW + pos];
-                acc = have ? ggml_cuda_q8k_dot4_i8_i8(qp[pos], k_val, acc) : acc;
-            }
+                for (int q_idx = 0; q_idx < NQ_MAX; ++q_idx) sums[q_idx] = 0.0f;
 
-            float s = -1e38f;
-            if (have) {
-                const int q_pos = q_offset + q_idx;
-                bool valid = mask ? true : (k <= q_pos);
-                if (valid) {
-                    const float * qs = q_scl + (q_idx * GH_MAX + g) * DECODE_N_BLOCKS;
-                    const float raw = float(acc) * qs[0] * k_scl[kk] * scale;
-                    s = mask ? raw + ggml_cuda_q8k_dot4_mask_value(mask, nb30, nb31, nb33, ne33, q_idx, k, b) : raw;
+                const bool have_base = g < gh && kk < tile_n && k < nk;
+#pragma unroll
+                for (int qb = 0; qb < DECODE_N_BLOCKS; ++qb) {
+                    int acc[NQ_MAX];
+#pragma unroll
+                    for (int q_idx = 0; q_idx < NQ_MAX; ++q_idx) acc[q_idx] = 0;
+#pragma unroll
+                    for (int word = 0; word < QK8_0 / 4; ++word) {
+                        const int pos = qb * (QK8_0 / 4) + word;
+                        const int k_val = k_i32[kk * DECODE_I32_PER_ROW + pos];
+#pragma unroll
+                        for (int q_idx = 0; q_idx < NQ_MAX; ++q_idx) {
+                            if (q_idx < nq && have_base) {
+                                const int * qp = q_i32 + (q_idx * GH_MAX + g) * DECODE_I32_PER_ROW;
+                                acc[q_idx] = ggml_cuda_q8k_dot4_i8_i8(qp[pos], k_val, acc[q_idx]);
+                            }
+                        }
+                    }
+#pragma unroll
+                    for (int q_idx = 0; q_idx < NQ_MAX; ++q_idx) {
+                        if (q_idx < nq && have_base) {
+                            const float * qs = q_scl + (q_idx * GH_MAX + g) * DECODE_N_BLOCKS;
+                            sums[q_idx] += float(acc[q_idx]) * qs[qb] * k_scl[kk * DECODE_N_BLOCKS + qb];
+                        }
+                    }
+                }
+#pragma unroll
+                for (int q_idx = 0; q_idx < NQ_MAX; ++q_idx) {
+                    float s = -1e38f;
+                    if (q_idx < nq && have_base) {
+                        const int q_pos = q_offset + q_idx;
+                        const bool valid = mask ? true : (k <= q_pos);
+                        if (valid) {
+                            const float raw = sums[q_idx] * scale;
+                            s = mask ? raw + ggml_cuda_q8k_dot4_mask_value(mask, nb30, nb31, nb33, ne33, q_idx, k, b) : raw;
+                        }
+                    }
+                    logits[q_idx * GH_MAX * BN + g * BN + kk] = s;
                 }
             }
-            logits[idx] = s;
+        } else {
+            // Keep constant-stride indexing for cheap address arithmetic, but skip
+            // inactive q/g rows before entering the DOT4 loops. This avoids wasting
+            // scalar QK work on GH_MAX padding lanes (target gqa=6 vs GH_MAX=8)
+            // and on unused NQ_MAX rows while preserving the GH_MAX logits layout.
+            const int NQK_STRIDE = NQ_MAX * GH_MAX * BN;
+            for (int idx = tid; idx < NQK_STRIDE; idx += blockDim.x) {
+                const int q_idx = idx / (GH_MAX * BN);
+                const int guard = idx - q_idx * (GH_MAX * BN);
+                const int g     = guard / BN;
+                if (q_idx >= nq || g >= gh) continue;
+                const int kk    = guard - g * BN;
+                const int k     = k0 + kk;
+
+                float sum = 0.0f;
+                const bool have = kk < tile_n && k < nk;
+                const int * qp = q_i32 + (q_idx * GH_MAX + g) * DECODE_I32_PER_ROW;
+                const float * qs = q_scl + (q_idx * GH_MAX + g) * DECODE_N_BLOCKS;
+#pragma unroll
+                for (int qb = 0; qb < DECODE_N_BLOCKS; ++qb) {
+                    int acc = 0;
+#pragma unroll
+                    for (int word = 0; word < QK8_0 / 4; ++word) {
+                        const int pos = qb * (QK8_0 / 4) + word;
+                        const int k_val = k_i32[kk * DECODE_I32_PER_ROW + pos];
+                        acc = have ? ggml_cuda_q8k_dot4_i8_i8(qp[pos], k_val, acc) : acc;
+                    }
+                    if (have) {
+                        sum += float(acc) * qs[qb] * k_scl[kk * DECODE_N_BLOCKS + qb];
+                    }
+                }
+
+                float s = -1e38f;
+                if (have) {
+                    const int q_pos = q_offset + q_idx;
+                    bool valid = mask ? true : (k <= q_pos);
+                    if (valid) {
+                        const float raw = sum * scale;
+                        s = mask ? raw + ggml_cuda_q8k_dot4_mask_value(mask, nb30, nb31, nb33, ne33, q_idx, k, b) : raw;
+                    }
+                }
+                logits[q_idx * GH_MAX * BN + g * BN + kk] = s;
+            }
         }
         __syncthreads();
+        SMALL_VERIFY_PROFILE_PHASE_END(qk_cycles);
 
         // ── Phase 2: All-query softmax in one phase ──
+        SMALL_VERIFY_PROFILE_PHASE_BEGIN();
         // Each thread handles one (q_idx, g) pair.
         if (tid < NQ_MAX * GH_MAX) {
             const int q_idx = tid / GH_MAX;
@@ -1399,52 +1559,457 @@ void ggml_cuda_q8k_dot4_small_verify_batched_gqa_splitk_stage1_kernel(
                 float tile_m = -1e38f;
                 const int logit_base = q_idx * GH_MAX * BN + g * BN;
                 for (int kk = 0; kk < tile_n; ++kk) tile_m = fmaxf(tile_m, logits[logit_base + kk]);
-                float m_prev = sm[(q_idx * GH_MAX + g) * 4 + 0];
-                float l_prev = sm[(q_idx * GH_MAX + g) * 4 + 1];
-                float m_new  = fmaxf(m_prev, tile_m);
-                float old_scale = (l_prev > 0.0f) ? expf(m_prev - m_new) : 0.0f;
-                float tile_l = 0.0f;
-                for (int kk = 0; kk < tile_n; ++kk) {
-                    float p = expf(logits[logit_base + kk] - m_new);
-                    probs[logit_base + kk] = p;
-                    tile_l += p;
+                const int sm_base = (q_idx * GH_MAX + g) * 4;
+                if (tile_m <= -0.5e38f) {
+                    for (int kk = 0; kk < tile_n; ++kk) {
+                        probs[logit_base + kk] = 0.0f;
+                    }
+                    sm[sm_base + 2] = 1.0f;
+                } else {
+                    float m_prev = sm[sm_base + 0];
+                    float l_prev = sm[sm_base + 1];
+                    float m_new  = fmaxf(m_prev, tile_m);
+                    float old_scale = (l_prev > 0.0f) ? expf(m_prev - m_new) : 0.0f;
+                    float tile_l = 0.0f;
+                    for (int kk = 0; kk < tile_n; ++kk) {
+                        float p = expf(logits[logit_base + kk] - m_new);
+                        probs[logit_base + kk] = p;
+                        tile_l += p;
+                    }
+                    sm[sm_base + 0] = m_new;
+                    sm[sm_base + 1] = l_prev * old_scale + tile_l;
+                    sm[sm_base + 2] = old_scale;
                 }
-                sm[(q_idx * GH_MAX + g) * 4 + 0] = m_new;
-                sm[(q_idx * GH_MAX + g) * 4 + 1] = l_prev * old_scale + tile_l;
-                sm[(q_idx * GH_MAX + g) * 4 + 2] = old_scale;
             }
         }
         __syncthreads();
+        SMALL_VERIFY_PROFILE_PHASE_END(softmax_cycles);
 
         // ── Phase 3: All-query P×V accumulation in one phase ──
-        // Each of D=256 threads iterates across all nq queries for its dimension.
-        if (tid < DECODE_D) {
+        SMALL_VERIFY_PROFILE_PHASE_BEGIN();
+        if constexpr (SPARSE_V) {
+            // CTA-wide probability gate: skip q4_0 V dequant for K rows whose
+            // current unnormalised softmax contribution is tiny for every
+            // active (q,g) row.  This is intentionally a diagnostic math mode:
+            // partial_l still includes the full probability mass, while PV omits
+            // rows below tau * row_l.
+            for (int kk = tid; kk < BN; kk += blockDim.x) {
+                int keep = 0;
+                if (kk < tile_n && k0 + kk < nk) {
+                    if (sparse_v_tau <= 0.0f) {
+                        keep = 1;
+                    } else {
 #pragma unroll
-            for (int q_idx = 0; q_idx < NQ_MAX; ++q_idx) {
-                if (q_idx >= nq) break;
-                const int logit_base = q_idx * GH_MAX * BN;
+                        for (int q_idx = 0; q_idx < NQ_MAX; ++q_idx) {
+                            if (q_idx < nq) {
 #pragma unroll
-                for (int g = 0; g < GH_MAX; ++g) {
-                    if (g < gh) out[q_idx][g] *= sm[(q_idx * GH_MAX + g) * 4 + 2];
+                                for (int g = 0; g < GH_MAX; ++g) {
+                                    if (g < gh) {
+                                        const int row = q_idx * GH_MAX + g;
+                                        const float row_l = sm[row * 4 + 1];
+                                        const float p = probs[row * BN + kk];
+                                        if (row_l > 0.0f && p >= sparse_v_tau * row_l) keep = 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                keep_v[kk] = keep;
+            }
+            __syncthreads();
+            if (profile && tid == 0) {
+                unsigned long long kept = 0;
+                unsigned long long skipped = 0;
+                for (int kk = 0; kk < tile_n; ++kk) {
+                    if (keep_v[kk]) ++kept;
+                    else ++skipped;
+                }
+                atomicAdd(&profile->sparse_v_kept, kept);
+                atomicAdd(&profile->sparse_v_skipped, skipped);
+            }
+            __syncthreads();
+        }
+        if constexpr (FA4_PVWMMA) {
+            // FA4 PV-WMMA row layout is packed by active GH:
+            //   row = q_idx * gh + g
+            // Two 16-row WMMA blocks cover nq<=4, gh<=8. B/V fragments are shared
+            // across both row blocks for each D tile, so V traffic is not multiplied
+            // by query lane count as in per-query decode-style PV.
+            const int wave    = tid >> 5;
+            const int lane    = tid & 31;
+            const int lane_lo = lane & 15;
+            const int lane_hi = lane >> 4;
+#pragma unroll
+            for (int rb = 0; rb < FA4_PV_ROW_BLOCKS; ++rb) {
+#pragma unroll
+                for (int pass = 0; pass < 2; ++pass) {
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const int row = rb * 16 + pbwmma_f16_d_row_from_acc(i, lane_hi);
+                        const int q_idx = row / gh;
+                        const int g = row - q_idx * gh;
+                        if (q_idx < nq && g < gh) {
+                            out_pv[rb][pass][i] *= sm[(q_idx * GH_MAX + g) * 4 + 2];
+                        }
+                    }
+                }
+            }
+            for (int sub = 0; sub < BN; sub += 16) {
+#pragma unroll
+                for (int pass = 0; pass < 2; ++pass) {
+                    const int d_tile = (pass * 8 + wave) * 16;
+                    const int b_col = pbwmma_f16_b_col_from_lane_lo(lane_lo);
+                    pbwmma_v16fp16 b_frag;
+#pragma unroll
+                    for (int i = 0; i < 16; ++i) {
+                        const int kk = sub + i;
+                        const int k  = k0 + kk;
+                        b_frag[i] = (_Float16)((kk < tile_n && k < nk && d_tile + b_col < DECODE_D) ?
+                            ggml_cuda_q8k_dot4_dequant_q4_0(v_head + int64_t(k) * nb21, nb20, d_tile + b_col) : 0.0f);
+                    }
+#pragma unroll
+                    for (int rb = 0; rb < FA4_PV_ROW_BLOCKS; ++rb) {
+                        pbwmma_v16fp16 a_frag;
+                        const int a_row = pbwmma_f16_a_row_from_lane_lo(lane_lo);
+                        const int row = rb * 16 + a_row;
+                        const int q_idx = row / gh;
+                        const int g = row - q_idx * gh;
+                        const bool valid_row = q_idx < nq && g < gh;
+#pragma unroll
+                        for (int i = 0; i < 16; ++i) {
+                            const int kk = sub + i;
+                            a_frag[i] = (_Float16)((valid_row && kk < tile_n) ? probs[(q_idx * GH_MAX + g) * BN + kk] : 0.0f);
+                        }
+                        pbwmma_v8fp32 acc = {0,0,0,0,0,0,0,0};
+                        acc = pbwmma_mma(a_frag, b_frag, acc);
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            const int out_row = rb * 16 + pbwmma_f16_d_row_from_acc(i, lane_hi);
+                            const int out_q = out_row / gh;
+                            const int out_g = out_row - out_q * gh;
+                            if (out_q < nq && out_g < gh) out_pv[rb][pass][i] += acc[i];
+                        }
+                    }
+                }
+            }
+        } else if constexpr (PV_DOT4_LDS_A) {
+            // LDS-prepacked on-the-fly DOT4 PV.  Build transient A8=P*q4_0.delta
+            // packs once per CTA tile and reuse them across the 32 D lanes in each
+            // q4_0 block.  This preserves q4_0 V globally while avoiding the
+            // per-output-lane P*d requantization of the simpler onfly probe.
+            constexpr int K4_PACKS = BN / 4;
+            if (sparse_v_tau <= 0.0f) {
+                for (int row = tid; row < NQ_MAX * GH_MAX; row += blockDim.x) {
+                    const int q_idx = row / GH_MAX;
+                    const int g     = row - q_idx * GH_MAX;
+                    float pmax = 0.0f;
+                    if (q_idx < nq && g < gh) {
+                        const int row_base = q_idx * GH_MAX * BN + g * BN;
+                        for (int kk = 0; kk < tile_n; ++kk) {
+                            if constexpr (SPARSE_V) { if (!keep_v[kk]) continue; }
+                            pmax = fmaxf(pmax, fabsf(probs[row_base + kk]));
+                        }
+                    }
+                    pv_dot4_pmax[row] = pmax;
+                }
+                for (int dblk = tid; dblk < DECODE_N_BLOCKS; dblk += blockDim.x) {
+                    float dmax = 0.0f;
+                    for (int kk = 0; kk < tile_n; ++kk) {
+                        if constexpr (SPARSE_V) { if (!keep_v[kk]) continue; }
+                        const int k = k0 + kk;
+                        const char * v_row = v_head + int64_t(k) * nb21;
+                        const block_q4_0 * v_blk = (const block_q4_0 *) (v_row + int64_t(dblk) * nb20);
+                        dmax = fmaxf(dmax, fabsf(__half2float(v_blk->d)));
+                    }
+                    pv_dot4_dmax[dblk] = dmax;
+                }
+                __syncthreads();
+            }
+            for (int i = tid; i < NQ_MAX * GH_MAX * DECODE_N_BLOCKS; i += blockDim.x) {
+                const int row  = i / DECODE_N_BLOCKS;
+                const int dblk = i - row * DECODE_N_BLOCKS;
+                const float step = sparse_v_tau > 0.0f ? sparse_v_tau : ((pv_dot4_pmax[row] * pv_dot4_dmax[dblk]) / 127.0f);
+                pv_dot4_steps[i] = step;
+            }
+            __syncthreads();
+
+            for (int idx = tid; idx < NQ_MAX * GH_MAX * DECODE_N_BLOCKS * K4_PACKS; idx += blockDim.x) {
+                const int k4 = idx % K4_PACKS;
+                const int tmp = idx / K4_PACKS;
+                const int dblk = tmp % DECODE_N_BLOCKS;
+                const int row = tmp / DECODE_N_BLOCKS;
+                const int q_idx = row / GH_MAX;
+                const int g = row - q_idx * GH_MAX;
+                int p_i8_0 = 0, p_i8_1 = 0, p_i8_2 = 0, p_i8_3 = 0;
+                if (q_idx < nq && g < gh) {
+                    const int row_base = q_idx * GH_MAX * BN + g * BN;
+                    const float step = pv_dot4_steps[row * DECODE_N_BLOCKS + dblk];
+                    const float inv_step = step > 0.0f ? (1.0f / step) : 0.0f;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const int kk = k4 * 4 + i;
+                        if (kk >= tile_n) continue;
+                        if constexpr (SPARSE_V) { if (!keep_v[kk]) continue; }
+                        const int k = k0 + kk;
+                        const char * v_row = v_head + int64_t(k) * nb21;
+                        const block_q4_0 * v_blk = (const block_q4_0 *) (v_row + int64_t(dblk) * nb20);
+                        const int p_i8 = ggml_cuda_q8k_dot4_sv_quantize_i8_symmetric(probs[row_base + kk] * __half2float(v_blk->d), inv_step);
+                        if (i == 0) p_i8_0 = p_i8;
+                        else if (i == 1) p_i8_1 = p_i8;
+                        else if (i == 2) p_i8_2 = p_i8;
+                        else p_i8_3 = p_i8;
+                    }
+                }
+                pv_dot4_a_pack[idx] = ggml_cuda_q8k_dot4_sv_pack_i8x4(p_i8_0, p_i8_1, p_i8_2, p_i8_3);
+            }
+            __syncthreads();
+
+            if (tid < DECODE_D) {
+                const int q4_blk   = tid / QK4_0;
+                const int q4_iq    = tid & 15;
+                const int q4_shift = (tid & 31) >= 16 ? 4 : 0;
+                int acc[NQ_MAX][GH_MAX];
+#pragma unroll
+                for (int q_idx = 0; q_idx < NQ_MAX; ++q_idx) {
+#pragma unroll
+                    for (int g = 0; g < GH_MAX; ++g) {
+                        acc[q_idx][g] = 0;
+                        if (q_idx < nq && g < gh) out[q_idx][g] *= sm[(q_idx * GH_MAX + g) * 4 + 2];
+                    }
+                }
+                for (int k4 = 0; k4 < K4_PACKS; ++k4) {
+                    int v_i8_0 = 0, v_i8_1 = 0, v_i8_2 = 0, v_i8_3 = 0;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const int kk = k4 * 4 + i;
+                        if (kk >= tile_n) continue;
+                        if constexpr (SPARSE_V) { if (!keep_v[kk]) continue; }
+                        const int k = k0 + kk;
+                        const char * v_row = v_head + int64_t(k) * nb21;
+                        const block_q4_0 * v_blk = (const block_q4_0 *) (v_row + int64_t(q4_blk) * nb20);
+                        const int v_i8 = int((v_blk->qs[q4_iq] >> q4_shift) & 0x0f) - 8;
+                        if (i == 0) v_i8_0 = v_i8;
+                        else if (i == 1) v_i8_1 = v_i8;
+                        else if (i == 2) v_i8_2 = v_i8;
+                        else v_i8_3 = v_i8;
+                    }
+                    const int v_pack = ggml_cuda_q8k_dot4_sv_pack_i8x4(v_i8_0, v_i8_1, v_i8_2, v_i8_3);
+#pragma unroll
+                    for (int q_idx = 0; q_idx < NQ_MAX; ++q_idx) {
+                        if (q_idx < nq) {
+#pragma unroll
+                            for (int g = 0; g < GH_MAX; ++g) {
+                                if (g < gh) {
+                                    const int row = q_idx * GH_MAX + g;
+                                    const int a_idx = (row * DECODE_N_BLOCKS + q4_blk) * K4_PACKS + k4;
+                                    acc[q_idx][g] = ggml_cuda_q8k_dot4_i8_i8(pv_dot4_a_pack[a_idx], v_pack, acc[q_idx][g]);
+                                }
+                            }
+                        }
+                    }
+                }
+#pragma unroll
+                for (int q_idx = 0; q_idx < NQ_MAX; ++q_idx) {
+                    if (q_idx < nq) {
+#pragma unroll
+                        for (int g = 0; g < GH_MAX; ++g) {
+                            if (g < gh) {
+                                const int row = q_idx * GH_MAX + g;
+                                const float step = pv_dot4_steps[row * DECODE_N_BLOCKS + q4_blk];
+                                out[q_idx][g] += step * float(acc[q_idx][g]);
+                            }
+                        }
+                    }
+                }
+            }
+        } else if constexpr (PV_DOT4_ONFLY) {
+            // On-the-fly DOT4 PV over the K axis from the existing q4_0 V cache.
+            // Global V stays q4_0; for this CTA/tile we fold each q4_0 block scale
+            // into P, quantize P*d to int8 per active row×dblk, and DOT4 it against
+            // centered q4 values packed from four K rows.  This is a diagnostic
+            // approximate PV math mode; no persistent execution-format V is stored.
+            if (sparse_v_tau <= 0.0f) {
+                for (int i = tid; i < NQ_MAX * GH_MAX * DECODE_N_BLOCKS; i += blockDim.x) {
+                    const int row   = i / DECODE_N_BLOCKS;
+                    const int dblk  = i - row * DECODE_N_BLOCKS;
+                    const int q_idx = row / GH_MAX;
+                    const int g     = row - q_idx * GH_MAX;
+                    float max_abs = 0.0f;
+                    if (q_idx < nq && g < gh) {
+                        const int row_base = q_idx * GH_MAX * BN + g * BN;
+                        for (int kk = 0; kk < tile_n; ++kk) {
+                            if constexpr (SPARSE_V) { if (!keep_v[kk]) continue; }
+                            const int k = k0 + kk;
+                            const char * v_row = v_head + int64_t(k) * nb21;
+                            const block_q4_0 * v_blk = (const block_q4_0 *) (v_row + int64_t(dblk) * nb20);
+                            max_abs = fmaxf(max_abs, fabsf(probs[row_base + kk] * __half2float(v_blk->d)));
+                        }
+                    }
+                    pv_dot4_steps[i] = max_abs > 0.0f ? (max_abs / 127.0f) : 0.0f;
+                }
+                __syncthreads();
+            }
+
+            if (tid < DECODE_D) {
+                const int q4_blk   = tid / QK4_0;
+                const int q4_iq    = tid & 15;
+                const int q4_shift = (tid & 31) >= 16 ? 4 : 0;
+                int acc[NQ_MAX][GH_MAX];
+#pragma unroll
+                for (int q_idx = 0; q_idx < NQ_MAX; ++q_idx) {
+#pragma unroll
+                    for (int g = 0; g < GH_MAX; ++g) {
+                        acc[q_idx][g] = 0;
+                        if (q_idx < nq && g < gh) out[q_idx][g] *= sm[(q_idx * GH_MAX + g) * 4 + 2];
+                    }
+                }
+
+                for (int kk = 0; kk < tile_n; kk += 4) {
+                    int v_i8_0 = 0, v_i8_1 = 0, v_i8_2 = 0, v_i8_3 = 0;
+                    float vd_0 = 0.0f, vd_1 = 0.0f, vd_2 = 0.0f, vd_3 = 0.0f;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const int kk_i = kk + i;
+                        if (kk_i >= tile_n) continue;
+                        if constexpr (SPARSE_V) { if (!keep_v[kk_i]) continue; }
+                        const int k = k0 + kk_i;
+                        const char * v_row = v_head + int64_t(k) * nb21;
+                        const block_q4_0 * v_blk = (const block_q4_0 *) (v_row + int64_t(q4_blk) * nb20);
+                        const int v_i8 = int((v_blk->qs[q4_iq] >> q4_shift) & 0x0f) - 8;
+                        const float vd = __half2float(v_blk->d);
+                        if (i == 0) {
+                            v_i8_0 = v_i8; vd_0 = vd;
+                        } else if (i == 1) {
+                            v_i8_1 = v_i8; vd_1 = vd;
+                        } else if (i == 2) {
+                            v_i8_2 = v_i8; vd_2 = vd;
+                        } else {
+                            v_i8_3 = v_i8; vd_3 = vd;
+                        }
+                    }
+                    const int v_pack = ggml_cuda_q8k_dot4_sv_pack_i8x4(v_i8_0, v_i8_1, v_i8_2, v_i8_3);
+#pragma unroll
+                    for (int q_idx = 0; q_idx < NQ_MAX; ++q_idx) {
+                        if (q_idx < nq) {
+                            const int logit_base = q_idx * GH_MAX * BN;
+#pragma unroll
+                            for (int g = 0; g < GH_MAX; ++g) {
+                                if (g < gh) {
+                                    const int row = q_idx * GH_MAX + g;
+                                    const float step = sparse_v_tau > 0.0f ? sparse_v_tau : pv_dot4_steps[row * DECODE_N_BLOCKS + q4_blk];
+                                    const float inv_step = step > 0.0f ? (1.0f / step) : 0.0f;
+                                    const int p_i8_0 = (kk + 0 < tile_n) ? ggml_cuda_q8k_dot4_sv_quantize_i8_symmetric(probs[logit_base + g * BN + kk + 0] * vd_0, inv_step) : 0;
+                                    const int p_i8_1 = (kk + 1 < tile_n) ? ggml_cuda_q8k_dot4_sv_quantize_i8_symmetric(probs[logit_base + g * BN + kk + 1] * vd_1, inv_step) : 0;
+                                    const int p_i8_2 = (kk + 2 < tile_n) ? ggml_cuda_q8k_dot4_sv_quantize_i8_symmetric(probs[logit_base + g * BN + kk + 2] * vd_2, inv_step) : 0;
+                                    const int p_i8_3 = (kk + 3 < tile_n) ? ggml_cuda_q8k_dot4_sv_quantize_i8_symmetric(probs[logit_base + g * BN + kk + 3] * vd_3, inv_step) : 0;
+                                    const int p_pack = ggml_cuda_q8k_dot4_sv_pack_i8x4(p_i8_0, p_i8_1, p_i8_2, p_i8_3);
+                                    acc[q_idx][g] = ggml_cuda_q8k_dot4_i8_i8(p_pack, v_pack, acc[q_idx][g]);
+                                }
+                            }
+                        }
+                    }
+                }
+#pragma unroll
+                for (int q_idx = 0; q_idx < NQ_MAX; ++q_idx) {
+                    if (q_idx < nq) {
+#pragma unroll
+                        for (int g = 0; g < GH_MAX; ++g) {
+                            if (g < gh) {
+                                const int row = q_idx * GH_MAX + g;
+                                const float step = sparse_v_tau > 0.0f ? sparse_v_tau : pv_dot4_steps[row * DECODE_N_BLOCKS + q4_blk];
+                                out[q_idx][g] += step * float(acc[q_idx][g]);
+                            }
+                        }
+                    }
+                }
+            }
+        } else if (tid < DECODE_D) {
+            // Each of D=256 threads iterates across all nq queries for its dimension.
+            if constexpr (FA4_QKPV || FUSED_SCALAR_PV) {
+                // Fused scalar PV: load/dequant V once for this K row and feed
+                // all q/g lanes. Originally coupled to the exact FA4 QK path;
+                // FUSED_SCALAR_PV lets approximate-QK routes reuse the same V path.
+#pragma unroll
+                for (int q_idx = 0; q_idx < NQ_MAX; ++q_idx) {
+                    if (q_idx < nq) {
+#pragma unroll
+                        for (int g = 0; g < GH_MAX; ++g) {
+                            if (g < gh) out[q_idx][g] *= sm[(q_idx * GH_MAX + g) * 4 + 2];
+                        }
+                    }
                 }
                 for (int sub = 0; sub < tile_n; sub += BN_VSUB) {
                     int end = (sub + BN_VSUB < tile_n) ? sub + BN_VSUB : tile_n;
                     for (int kk = sub; kk < end; ++kk) {
+                        if constexpr (SPARSE_V) { if (!keep_v[kk]) continue; }
                         const int k = k0 + kk;
                         const float v = ggml_cuda_q8k_dot4_dequant_q4_0(v_head + int64_t(k) * nb21, nb20, tid);
 #pragma unroll
-                        for (int g = 0; g < GH_MAX; ++g) {
-                            if (g < gh) out[q_idx][g] += probs[logit_base + g * BN + kk] * v;
+                        for (int q_idx = 0; q_idx < NQ_MAX; ++q_idx) {
+                            if (q_idx < nq) {
+                                const int logit_base = q_idx * GH_MAX * BN;
+#pragma unroll
+                                for (int g = 0; g < GH_MAX; ++g) {
+                                    if (g < gh) out[q_idx][g] += probs[logit_base + g * BN + kk] * v;
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int q_idx = 0; q_idx < NQ_MAX; ++q_idx) {
+                    if (q_idx >= nq) break;
+                    const int logit_base = q_idx * GH_MAX * BN;
+#pragma unroll
+                    for (int g = 0; g < GH_MAX; ++g) {
+                        if (g < gh) out[q_idx][g] *= sm[(q_idx * GH_MAX + g) * 4 + 2];
+                    }
+                    for (int sub = 0; sub < tile_n; sub += BN_VSUB) {
+                        int end = (sub + BN_VSUB < tile_n) ? sub + BN_VSUB : tile_n;
+                        for (int kk = sub; kk < end; ++kk) {
+                            if constexpr (SPARSE_V) { if (!keep_v[kk]) continue; }
+                            const int k = k0 + kk;
+                            const float v = ggml_cuda_q8k_dot4_dequant_q4_0(v_head + int64_t(k) * nb21, nb20, tid);
+#pragma unroll
+                            for (int g = 0; g < GH_MAX; ++g) {
+                                if (g < gh) out[q_idx][g] += probs[logit_base + g * BN + kk] * v;
+                            }
                         }
                     }
                 }
             }
         }
         __syncthreads();
+        SMALL_VERIFY_PROFILE_PHASE_END(pv_cycles);
     }
 
+    SMALL_VERIFY_PROFILE_PHASE_BEGIN();
     // Write unnormalised partials per (q, g)
-    if (tid < DECODE_D) {
+    if constexpr (FA4_PVWMMA) {
+        const int wave    = tid >> 5;
+        const int lane    = tid & 31;
+        const int lane_lo = lane & 15;
+        (void) wave;
+#pragma unroll
+        for (int rb = 0; rb < FA4_PV_ROW_BLOCKS; ++rb) {
+#pragma unroll
+            for (int pass = 0; pass < 2; ++pass) {
+                const int d_col = (pass * 8 + wave) * 16 + lane_lo;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int row = rb * 16 + pbwmma_f16_d_row_from_acc(i, (lane >> 4));
+                    const int q_idx = row / gh;
+                    const int g = row - q_idx * gh;
+                    if (q_idx < nq && g < gh && d_col < DECODE_D) {
+                        const size_t partial_base = ((size_t(b) * size_t(nq) + size_t(q_idx)) * size_t(n_heads_k) + size_t(hk)) * size_t(n_splits) + size_t(split);
+                        partial_o[(partial_base * GH_MAX + g) * DECODE_D + d_col] = out_pv[rb][pass][i];
+                    }
+                }
+            }
+        }
+    } else if (tid < DECODE_D) {
 #pragma unroll
         for (int q_idx = 0; q_idx < NQ_MAX; ++q_idx) {
             if (q_idx < nq) {
@@ -1467,6 +2032,768 @@ void ggml_cuda_q8k_dot4_small_verify_batched_gqa_splitk_stage1_kernel(
             partial_l[partial_base * GH_MAX + g] = sm[(q_idx * GH_MAX + g) * 4 + 1];
         }
     }
+    SMALL_VERIFY_PROFILE_PHASE_END(write_cycles);
+}
+
+static constexpr int BM_DOT4_PAGES_PV_IMPL_SCALAR               = 0;
+static constexpr int BM_DOT4_PAGES_PV_IMPL_PVWMMA               = 1;
+static constexpr int BM_DOT4_PAGES_PV_IMPL_PINT8PV              = 2;
+static constexpr int BM_DOT4_PAGES_PV_IMPL_PINT8PV_DOT4         = 3;
+static constexpr int BM_DOT4_PAGES_PV_IMPL_INTFLASH_VFRAG_DOT4  = 4;
+static constexpr int BM_DOT4_PAGES_PV_IMPL_INTFLASH_VFRAG_WMMA  = 5;
+
+static __device__ __forceinline__ int ggml_cuda_q8k_dot4_quantize_i8_symmetric(
+        float x,
+        float inv_scale) {
+    int qi = inv_scale > 0.0f ? __float2int_rn(x * inv_scale) : 0;
+    qi = qi < -127 ? -127 : qi;
+    qi = qi > 127 ? 127 : qi;
+    return qi;
+}
+
+// Positive signed-int8 DOT4 lane: clamp to [0, 127] so the packed bytes stay
+// valid for the existing signed int8 DOT4 helper while encoding E ~= exp(logit-m).
+static __device__ __forceinline__ int ggml_cuda_q8k_dot4_quantize_i8_positive_unit(
+        float x) {
+    int qi = __float2int_rn(x * 127.0f);
+    qi = qi < 0 ? 0 : qi;
+    qi = qi > 127 ? 127 : qi;
+    return qi;
+}
+
+static __device__ __forceinline__ int ggml_cuda_q8k_dot4_pack_i8x4(
+        const int x0,
+        const int x1,
+        const int x2,
+        const int x3) {
+    return int(uint32_t(uint8_t(int8_t(x0))) |
+               (uint32_t(uint8_t(int8_t(x1))) << 8) |
+               (uint32_t(uint8_t(int8_t(x2))) << 16) |
+               (uint32_t(uint8_t(int8_t(x3))) << 24));
+}
+
+// ── BM/page DOT4 Stage 1: one CTA per (KV page, KV-head row-block, batch) ─
+//
+// This is the first vLLM-style scheduler scaffold for packed16 MTP verify.
+// Unlike the FA4 scaffold above, grid.y contains 16-row blocks inside each KV
+// head, so nq*GQA rows are distributed across many CTAs instead of being fused
+// into one fat CTA per KV head.  The microkernel keeps scalar DOT4 QK, then
+// optionally swaps the PV core between scalar q4_0, f16 PVWMMA, the existing
+// signed-int8 weighted-P routes, and experimental INT-FlashAttention-style
+// transient-V-fragment DOT4/WMMA routes.  Its row/page organization matches the
+// calculator-backed 16x16 WMMA layout in
+// scripts/hip/rdna3-wmma-bm-pages-calculator.py.
+template <int BN, int BN_VSUB, int GH_MAX, int ROW_BLOCK, int NQ_MAX, int PV_IMPL = BM_DOT4_PAGES_PV_IMPL_SCALAR>
+static __global__ __launch_bounds__(128, 1)
+void ggml_cuda_q8k_dot4_bm_dot4_pages_stage1_kernel(
+        const int   * __restrict__ q_payload,
+        const float * __restrict__ q_scales,
+        const int   * __restrict__ k_payload,
+        const half  * __restrict__ k_scales,
+        int k_payload_row_stride_i32,
+        int k_scales_row_stride_half,
+        const char  * __restrict__ V,
+        const char  * __restrict__ mask,
+        float       * __restrict__ partial_o,   // [batch, nq, n_heads_k, n_pages, GH_MAX, D]
+        float       * __restrict__ partial_m,   // [batch, nq, n_heads_k, n_pages, GH_MAX]
+        float       * __restrict__ partial_l,   // [batch, nq, n_heads_k, n_pages, GH_MAX]
+        float scale,
+        int64_t nb20, int64_t nb21, int64_t nb22, int64_t nb23,
+        int64_t nb30, int64_t nb31, int64_t nb33, int64_t ne33,
+        int nq, int nk, int n_heads_q, int n_heads_k,
+        int gqa_ratio, int batch, int q_offset,
+        int k_head_stride_rows, int k_batch_stride_rows,
+        int n_pages,
+        small_verify_fa4_profile * __restrict__ profile) {
+
+    static_assert(BN % 16 == 0, "BM/page BN must be a multiple of the WMMA key tile");
+    static_assert(ROW_BLOCK == 16, "BM/page ROW_BLOCK must be 16");
+    static_assert(BN % BN_VSUB == 0, "BN must be multiple of BN_VSUB");
+    static_assert(PV_IMPL == BM_DOT4_PAGES_PV_IMPL_SCALAR ||
+            PV_IMPL == BM_DOT4_PAGES_PV_IMPL_PVWMMA ||
+            PV_IMPL == BM_DOT4_PAGES_PV_IMPL_PINT8PV ||
+            PV_IMPL == BM_DOT4_PAGES_PV_IMPL_PINT8PV_DOT4 ||
+            PV_IMPL == BM_DOT4_PAGES_PV_IMPL_INTFLASH_VFRAG_DOT4 ||
+            PV_IMPL == BM_DOT4_PAGES_PV_IMPL_INTFLASH_VFRAG_WMMA,
+            "unsupported BM/page PV implementation");
+
+    constexpr bool PVWMMA = PV_IMPL == BM_DOT4_PAGES_PV_IMPL_PVWMMA;
+    constexpr bool PINT8PV = PV_IMPL == BM_DOT4_PAGES_PV_IMPL_PINT8PV;
+    constexpr bool PINT8PV_DOT4 = PV_IMPL == BM_DOT4_PAGES_PV_IMPL_PINT8PV_DOT4;
+    constexpr bool INTFLASH_VFRAG_DOT4 = PV_IMPL == BM_DOT4_PAGES_PV_IMPL_INTFLASH_VFRAG_DOT4;
+    constexpr bool INTFLASH_VFRAG_WMMA = PV_IMPL == BM_DOT4_PAGES_PV_IMPL_INTFLASH_VFRAG_WMMA;
+    constexpr bool INTFLASH_VFRAG = INTFLASH_VFRAG_DOT4 || INTFLASH_VFRAG_WMMA;
+    constexpr bool WMMA_PV = PVWMMA || INTFLASH_VFRAG_WMMA;
+
+    if (nq < 2 || nq > NQ_MAX || gqa_ratio <= 0 || gqa_ratio > GH_MAX) return;
+
+    const int page = blockIdx.x;
+    const int y    = blockIdx.y;
+    const int b    = blockIdx.z;
+    const int row_blocks_per_hk = (nq * gqa_ratio + ROW_BLOCK - 1) / ROW_BLOCK;
+    if (row_blocks_per_hk <= 0) return;
+    const int hk = y / row_blocks_per_hk;
+    const int row_block_id = y - hk * row_blocks_per_hk;
+    if (b >= batch || hk >= n_heads_k || page >= n_pages || row_block_id >= row_blocks_per_hk) return;
+
+    const int tid = threadIdx.x;
+    const int hq0 = hk * gqa_ratio;
+    const int gh  = min(gqa_ratio, n_heads_q - hq0);
+    if (gh <= 0) return;
+
+    const int k0 = page * BN;
+    const int tile_n = min(BN, nk - k0);
+    if (tile_n <= 0) return;
+
+    extern __shared__ __align__(16) unsigned char smem[];
+    int   * q_i32  = reinterpret_cast<int   *>(smem);
+    float * q_scl  = reinterpret_cast<float *>(q_i32 + ROW_BLOCK * DECODE_I32_PER_ROW);
+    int   * k_i32  = reinterpret_cast<int   *>(q_scl + ROW_BLOCK * DECODE_N_BLOCKS);
+    float * k_scl  = reinterpret_cast<float *>(k_i32 + BN * DECODE_I32_PER_ROW);
+    float * logits = k_scl + BN * DECODE_N_BLOCKS;
+    float * probs  = logits + ROW_BLOCK * BN;
+    float * sm     = probs  + ROW_BLOCK * BN;
+
+    // Load the row block of Q payload/scales.  Rows outside nq*gh are padded
+    // with zeros and never written.
+    for (int i = tid; i < ROW_BLOCK * DECODE_I32_PER_ROW; i += blockDim.x) {
+        const int row = i / DECODE_I32_PER_ROW;
+        const int pos = i - row * DECODE_I32_PER_ROW;
+        const int logical_row = row_block_id * ROW_BLOCK + row;
+        const int q_idx = logical_row / gh;
+        const int g     = logical_row - q_idx * gh;
+        int val = 0;
+        if (q_idx < nq && g < gh) {
+            const int hq = hq0 + g;
+            const size_t q_base = ((size_t(b) * size_t(n_heads_q) + size_t(hq)) * size_t(nq) + size_t(q_idx));
+            val = q_payload[q_base * DECODE_I32_PER_ROW + pos];
+        }
+        q_i32[i] = val;
+    }
+    for (int i = tid; i < ROW_BLOCK * DECODE_N_BLOCKS; i += blockDim.x) {
+        const int row = i / DECODE_N_BLOCKS;
+        const int qb  = i - row * DECODE_N_BLOCKS;
+        const int logical_row = row_block_id * ROW_BLOCK + row;
+        const int q_idx = logical_row / gh;
+        const int g     = logical_row - q_idx * gh;
+        float val = 0.0f;
+        if (q_idx < nq && g < gh) {
+            const int hq = hq0 + g;
+            const size_t q_base = ((size_t(b) * size_t(n_heads_q) + size_t(hq)) * size_t(nq) + size_t(q_idx));
+            val = q_scales[q_base * DECODE_N_BLOCKS + qb];
+        }
+        q_scl[i] = val;
+    }
+
+    for (int i = tid; i < ROW_BLOCK * 4; i += blockDim.x) {
+        const int off = i & 3;
+        sm[i] = (off == 0) ? -1e38f : 0.0f;
+    }
+    __syncthreads();
+
+    float out[ROW_BLOCK][2];
+    if constexpr (!WMMA_PV) {
+#pragma unroll
+        for (int row = 0; row < ROW_BLOCK; ++row) {
+            out[row][0] = 0.0f;
+            out[row][1] = 0.0f;
+        }
+    }
+
+    float out_pv[4][8];
+    if constexpr (WMMA_PV) {
+#pragma unroll
+        for (int pass = 0; pass < 4; ++pass)
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+                out_pv[pass][i] = 0.0f;
+    }
+
+    const size_t k_head_base = size_t(b)  * size_t(k_batch_stride_rows)
+                             + size_t(hk) * size_t(k_head_stride_rows);
+    const char * v_head = V + int64_t(b) * nb23 + int64_t(hk) * nb22;
+    unsigned long long profile_t0 = 0;
+
+    // QK: one 16-row block by one BM-wide KV page.
+    SMALL_VERIFY_PROFILE_PHASE_BEGIN();
+    for (int i = tid; i < BN * DECODE_I32_PER_ROW; i += blockDim.x) {
+        const int kk  = i / DECODE_I32_PER_ROW;
+        const int pos = i - kk * DECODE_I32_PER_ROW;
+        const int k   = k0 + kk;
+        int val = 0;
+        if (kk < tile_n && k < nk) {
+            const size_t kb = k_head_base + k;
+            val = k_payload[kb * k_payload_row_stride_i32 + pos];
+        }
+        k_i32[i] = val;
+    }
+    for (int i = tid; i < BN * DECODE_N_BLOCKS; i += blockDim.x) {
+        const int kk = i / DECODE_N_BLOCKS;
+        const int qb = i - kk * DECODE_N_BLOCKS;
+        const int k  = k0 + kk;
+        float val = 0.0f;
+        if (kk < tile_n && k < nk) {
+            const size_t kb = k_head_base + k;
+            val = __half2float(k_scales[kb * k_scales_row_stride_half + qb]);
+        }
+        k_scl[i] = val;
+    }
+    __syncthreads();
+
+    for (int idx = tid; idx < ROW_BLOCK * BN; idx += blockDim.x) {
+        const int row = idx / BN;
+        const int kk  = idx - row * BN;
+        const int k   = k0 + kk;
+        const int logical_row = row_block_id * ROW_BLOCK + row;
+        const int q_idx = logical_row / gh;
+        const int g     = logical_row - q_idx * gh;
+        const bool have = q_idx < nq && g < gh && kk < tile_n && k < nk;
+
+        float sum = 0.0f;
+        if (have) {
+            const int * qp = q_i32 + row * DECODE_I32_PER_ROW;
+            const float * qs = q_scl + row * DECODE_N_BLOCKS;
+#pragma unroll
+            for (int qb = 0; qb < DECODE_N_BLOCKS; ++qb) {
+                int acc = 0;
+#pragma unroll
+                for (int word = 0; word < QK8_0 / 4; ++word) {
+                    const int pos = qb * (QK8_0 / 4) + word;
+                    acc = ggml_cuda_q8k_dot4_i8_i8(qp[pos], k_i32[kk * DECODE_I32_PER_ROW + pos], acc);
+                }
+                sum += float(acc) * qs[qb] * k_scl[kk * DECODE_N_BLOCKS + qb];
+            }
+        }
+
+        float s = -1e38f;
+        if (have) {
+            const int q_pos = q_offset + q_idx;
+            const bool valid = mask ? true : (k <= q_pos);
+            if (valid) {
+                const float raw = sum * scale;
+                s = mask ? raw + ggml_cuda_q8k_dot4_mask_value(mask, nb30, nb31, nb33, ne33, q_idx, k, b) : raw;
+            }
+        }
+        logits[row * BN + kk] = s;
+    }
+    __syncthreads();
+    SMALL_VERIFY_PROFILE_PHASE_END(qk_cycles);
+
+    // Page-local online softmax state.  This stores unnormalised probabilities
+    // so the existing max/sum-exp reducer can merge pages exactly like split-K.
+    SMALL_VERIFY_PROFILE_PHASE_BEGIN();
+    if (tid < ROW_BLOCK) {
+        const int row = tid;
+        const int logical_row = row_block_id * ROW_BLOCK + row;
+        const int q_idx = logical_row / gh;
+        const int g     = logical_row - q_idx * gh;
+        if (q_idx < nq && g < gh) {
+            float tile_m = -1e38f;
+            const int base = row * BN;
+            for (int kk = 0; kk < tile_n; ++kk) tile_m = fmaxf(tile_m, logits[base + kk]);
+
+            const float m_prev = sm[row * 4 + 0];
+            const float l_prev = sm[row * 4 + 1];
+            const float m_new = fmaxf(m_prev, tile_m);
+            const float old_scale = (l_prev > 0.0f && m_new > -1e30f) ? expf(m_prev - m_new) : 0.0f;
+            constexpr float INTFLASH_SOFTMAX_INV_E_SCALE = 1.0f / 127.0f;
+            float tile_l = 0.0f;
+            for (int kk = 0; kk < tile_n; ++kk) {
+                const float logit = logits[base + kk];
+                const float p = (m_new > -1e30f && logit > -1e30f) ? expf(logit - m_new) : 0.0f;
+                if constexpr (INTFLASH_VFRAG) {
+                    const int e_i8 = ggml_cuda_q8k_dot4_quantize_i8_positive_unit(p);
+                    const float e_q = float(e_i8) * INTFLASH_SOFTMAX_INV_E_SCALE;
+                    probs[base + kk] = e_q;
+                    tile_l += e_q;
+                } else {
+                    probs[base + kk] = p;
+                    tile_l += p;
+                }
+            }
+            sm[row * 4 + 0] = m_new;
+            sm[row * 4 + 1] = l_prev * old_scale + tile_l;
+            sm[row * 4 + 2] = old_scale;
+        }
+    }
+    __syncthreads();
+    SMALL_VERIFY_PROFILE_PHASE_END(softmax_cycles);
+
+    // PV phase.  The default path is the scalar q4_0 correctness baseline.
+    // The PVWMMA path keeps the same 16-row row-block contract and uses four
+    // wave32 waves to cover D=256 as 4 passes × 4 waves × 16 columns.
+    // The explicit pint8pv routes quantize signed weighted-P = P * q4_0.delta
+    // per (row, 16-key tile, q4 block) to int8. The scalar variant keeps a
+    // per-element integer MAC baseline; the dot4 variant packs four weighted-P
+    // and four centered q4_0 values into int8x4 words and uses the ROCm DOT4
+    // helper for the PV core before one float rescale at tile exit.
+    // The intflash_vfrag_dot4 route instead quantizes the unnormalised
+    // exponent tile E directly to positive int8 and forms a transient per-
+    // subtile, per-output-column int8 V fragment before DOT4, rescaling once
+    // by v_step / 127 without folding V scale into E.
+    SMALL_VERIFY_PROFILE_PHASE_BEGIN();
+    if constexpr (PVWMMA) {
+        const int wave    = tid >> 5;
+        const int lane    = tid & 31;
+        const int lane_lo = lane & 15;
+        const int lane_hi = lane >> 4;
+#pragma unroll
+        for (int pass = 0; pass < 4; ++pass) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int row = pbwmma_f16_d_row_from_acc(i, lane_hi);
+                const int logical_row = row_block_id * ROW_BLOCK + row;
+                const int q_idx = logical_row / gh;
+                const int g     = logical_row - q_idx * gh;
+                if (q_idx < nq && g < gh) out_pv[pass][i] *= sm[row * 4 + 2];
+            }
+        }
+        for (int sub = 0; sub < BN; sub += 16) {
+#pragma unroll
+            for (int pass = 0; pass < 4; ++pass) {
+                const int d_tile = (pass * 4 + wave) * 16;
+                const int b_col = pbwmma_f16_b_col_from_lane_lo(lane_lo);
+                pbwmma_v16fp16 b_frag;
+#pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    const int kk = sub + i;
+                    const int k  = k0 + kk;
+                    b_frag[i] = (_Float16)((kk < tile_n && k < nk && d_tile + b_col < DECODE_D) ?
+                        ggml_cuda_q8k_dot4_dequant_q4_0(v_head + int64_t(k) * nb21, nb20, d_tile + b_col) : 0.0f);
+                }
+
+                pbwmma_v16fp16 a_frag;
+                const int a_row = pbwmma_f16_a_row_from_lane_lo(lane_lo);
+                const int a_logical_row = row_block_id * ROW_BLOCK + a_row;
+                const int a_q_idx = a_logical_row / gh;
+                const int a_g     = a_logical_row - a_q_idx * gh;
+                const bool a_valid = a_q_idx < nq && a_g < gh;
+#pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    const int kk = sub + i;
+                    a_frag[i] = (_Float16)((a_valid && kk < tile_n) ? probs[a_row * BN + kk] : 0.0f);
+                }
+                pbwmma_v8fp32 acc = {0,0,0,0,0,0,0,0};
+                acc = pbwmma_mma(a_frag, b_frag, acc);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int row = pbwmma_f16_d_row_from_acc(i, lane_hi);
+                    const int logical_row = row_block_id * ROW_BLOCK + row;
+                    const int q_idx = logical_row / gh;
+                    const int g     = logical_row - q_idx * gh;
+                    if (q_idx < nq && g < gh) out_pv[pass][i] += acc[i];
+                }
+            }
+        }
+    } else if constexpr (INTFLASH_VFRAG_WMMA) {
+        const int wave    = tid >> 5;
+        const int lane    = tid & 31;
+        const int lane_lo = lane & 15;
+        const int lane_hi = lane >> 4;
+        constexpr float INTFLASH_INV_E_SCALE = 1.0f / 127.0f;
+#pragma unroll
+        for (int pass = 0; pass < 4; ++pass) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int row = pbwmma_i8_d_row_from_acc(i, lane_hi);
+                const int logical_row = row_block_id * ROW_BLOCK + row;
+                const int q_idx = logical_row / gh;
+                const int g     = logical_row - q_idx * gh;
+                if (q_idx < nq && g < gh) out_pv[pass][i] *= sm[row * 4 + 2];
+            }
+        }
+        for (int sub = 0; sub < BN; sub += 16) {
+#pragma unroll
+            for (int pass = 0; pass < 4; ++pass) {
+                const int d_tile = (pass * 4 + wave) * 16;
+                const int b_col = pbwmma_i8_b_col_from_lane_lo(lane_lo);
+                const int d_col = d_tile + b_col;
+
+                float max_abs = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    const int kk = sub + i;
+                    const int k  = k0 + kk;
+                    if (kk < tile_n && k < nk && d_col < DECODE_D) {
+                        const float v = ggml_cuda_q8k_dot4_dequant_q4_0(v_head + int64_t(k) * nb21, nb20, d_col);
+                        max_abs = fmaxf(max_abs, fabsf(v));
+                    }
+                }
+                const float v_step  = max_abs > 0.0f ? (max_abs / 127.0f) : 0.0f;
+                const float inv_v   = max_abs > 0.0f ? (127.0f / max_abs) : 0.0f;
+                const float pv_scale = v_step * INTFLASH_INV_E_SCALE;
+
+                pbwmma_v4i32 a_frag;
+                pbwmma_v4i32 b_frag;
+                const int a_row = pbwmma_i8_a_row_from_lane_lo(lane_lo);
+                const int a_logical_row = row_block_id * ROW_BLOCK + a_row;
+                const int a_q_idx = a_logical_row / gh;
+                const int a_g     = a_logical_row - a_q_idx * gh;
+                const bool a_valid = a_q_idx < nq && a_g < gh;
+#pragma unroll
+                for (int wi = 0; wi < 4; ++wi) {
+                    uint32_t aw = 0;
+                    uint32_t bw = 0;
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const int kk = sub + wi * 4 + j;
+                        const int k  = k0 + kk;
+                        int e_i8 = 0;
+                        int v_i8 = 0;
+                        if (a_valid && kk < tile_n) {
+                            e_i8 = ggml_cuda_q8k_dot4_quantize_i8_positive_unit(probs[a_row * BN + kk]);
+                        }
+                        if (kk < tile_n && k < nk && d_col < DECODE_D) {
+                            const float v = ggml_cuda_q8k_dot4_dequant_q4_0(v_head + int64_t(k) * nb21, nb20, d_col);
+                            v_i8 = ggml_cuda_q8k_dot4_quantize_i8_symmetric(v, inv_v);
+                        }
+                        aw |= uint32_t(uint8_t(int8_t(e_i8))) << (8 * j);
+                        bw |= uint32_t(uint8_t(int8_t(v_i8))) << (8 * j);
+                    }
+                    a_frag[wi] = int(aw);
+                    b_frag[wi] = int(bw);
+                }
+                pbwmma_v8i32 acc = {0,0,0,0,0,0,0,0};
+                acc = pbwmma_mma_i8(a_frag, b_frag, acc);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int row = pbwmma_i8_d_row_from_acc(i, lane_hi);
+                    const int logical_row = row_block_id * ROW_BLOCK + row;
+                    const int q_idx = logical_row / gh;
+                    const int g     = logical_row - q_idx * gh;
+                    if (q_idx < nq && g < gh) out_pv[pass][i] += pv_scale * float(acc[i]);
+                }
+            }
+        }
+    } else if constexpr (PINT8PV) {
+        if (tid < 128) {
+            const int q4_iq = tid & 15;
+            const int q4_shift = (tid & 31) >= 16 ? 4 : 0;
+            const int q4_blk0 = tid / QK4_0;
+            const int q4_blk1 = (tid + 128) / QK4_0;
+#pragma unroll
+            for (int row = 0; row < ROW_BLOCK; ++row) {
+                const int logical_row = row_block_id * ROW_BLOCK + row;
+                const int q_idx = logical_row / gh;
+                const int g     = logical_row - q_idx * gh;
+                if (q_idx < nq && g < gh) {
+                    out[row][0] *= sm[row * 4 + 2];
+                    out[row][1] *= sm[row * 4 + 2];
+                }
+            }
+#pragma unroll
+            for (int row = 0; row < ROW_BLOCK; ++row) {
+                const int logical_row = row_block_id * ROW_BLOCK + row;
+                const int q_idx = logical_row / gh;
+                const int g     = logical_row - q_idx * gh;
+                if (!(q_idx < nq && g < gh)) continue;
+                const int row_base = row * BN;
+                for (int sub = 0; sub < tile_n; sub += 16) {
+                    const int end = (sub + 16 < tile_n) ? sub + 16 : tile_n;
+                    float max_abs0 = 0.0f;
+                    float max_abs1 = 0.0f;
+                    for (int kk = sub; kk < end; ++kk) {
+                        const int k = k0 + kk;
+                        const char * v_row = v_head + int64_t(k) * nb21;
+                        const block_q4_0 * v_blk0 = (const block_q4_0 *) (v_row + int64_t(q4_blk0) * nb20);
+                        const block_q4_0 * v_blk1 = (const block_q4_0 *) (v_row + int64_t(q4_blk1) * nb20);
+                        const float p = probs[row_base + kk];
+                        max_abs0 = fmaxf(max_abs0, fabsf(p * __half2float(v_blk0->d)));
+                        max_abs1 = fmaxf(max_abs1, fabsf(p * __half2float(v_blk1->d)));
+                    }
+                    const float step0 = max_abs0 > 0.0f ? (max_abs0 / 127.0f) : 0.0f;
+                    const float step1 = max_abs1 > 0.0f ? (max_abs1 / 127.0f) : 0.0f;
+                    const float inv_step0 = max_abs0 > 0.0f ? (127.0f / max_abs0) : 0.0f;
+                    const float inv_step1 = max_abs1 > 0.0f ? (127.0f / max_abs1) : 0.0f;
+                    int acc0 = 0;
+                    int acc1 = 0;
+                    for (int kk = sub; kk < end; ++kk) {
+                        const int k = k0 + kk;
+                        const char * v_row = v_head + int64_t(k) * nb21;
+                        const block_q4_0 * v_blk0 = (const block_q4_0 *) (v_row + int64_t(q4_blk0) * nb20);
+                        const block_q4_0 * v_blk1 = (const block_q4_0 *) (v_row + int64_t(q4_blk1) * nb20);
+                        const float p = probs[row_base + kk];
+                        const int p_i8_0 = ggml_cuda_q8k_dot4_quantize_i8_symmetric(p * __half2float(v_blk0->d), inv_step0);
+                        const int p_i8_1 = ggml_cuda_q8k_dot4_quantize_i8_symmetric(p * __half2float(v_blk1->d), inv_step1);
+                        const int v_i4_0 = int((v_blk0->qs[q4_iq] >> q4_shift) & 0x0f) - 8;
+                        const int v_i4_1 = int((v_blk1->qs[q4_iq] >> q4_shift) & 0x0f) - 8;
+                        acc0 += p_i8_0 * v_i4_0;
+                        acc1 += p_i8_1 * v_i4_1;
+                    }
+                    out[row][0] += step0 * float(acc0);
+                    out[row][1] += step1 * float(acc1);
+                }
+            }
+        }
+    } else if constexpr (PINT8PV_DOT4) {
+        if (tid < 128) {
+            const int q4_iq = tid & 15;
+            const int q4_shift = (tid & 31) >= 16 ? 4 : 0;
+            const int q4_blk0 = tid / QK4_0;
+            const int q4_blk1 = (tid + 128) / QK4_0;
+#pragma unroll
+            for (int row = 0; row < ROW_BLOCK; ++row) {
+                const int logical_row = row_block_id * ROW_BLOCK + row;
+                const int q_idx = logical_row / gh;
+                const int g     = logical_row - q_idx * gh;
+                if (q_idx < nq && g < gh) {
+                    out[row][0] *= sm[row * 4 + 2];
+                    out[row][1] *= sm[row * 4 + 2];
+                }
+            }
+#pragma unroll
+            for (int row = 0; row < ROW_BLOCK; ++row) {
+                const int logical_row = row_block_id * ROW_BLOCK + row;
+                const int q_idx = logical_row / gh;
+                const int g     = logical_row - q_idx * gh;
+                if (!(q_idx < nq && g < gh)) continue;
+                const int row_base = row * BN;
+                for (int sub = 0; sub < tile_n; sub += 16) {
+                    const int end = (sub + 16 < tile_n) ? sub + 16 : tile_n;
+                    float max_abs0 = 0.0f;
+                    float max_abs1 = 0.0f;
+                    for (int kk = sub; kk < end; ++kk) {
+                        const int k = k0 + kk;
+                        const char * v_row = v_head + int64_t(k) * nb21;
+                        const block_q4_0 * v_blk0 = (const block_q4_0 *) (v_row + int64_t(q4_blk0) * nb20);
+                        const block_q4_0 * v_blk1 = (const block_q4_0 *) (v_row + int64_t(q4_blk1) * nb20);
+                        const float p = probs[row_base + kk];
+                        max_abs0 = fmaxf(max_abs0, fabsf(p * __half2float(v_blk0->d)));
+                        max_abs1 = fmaxf(max_abs1, fabsf(p * __half2float(v_blk1->d)));
+                    }
+                    const float step0 = max_abs0 > 0.0f ? (max_abs0 / 127.0f) : 0.0f;
+                    const float step1 = max_abs1 > 0.0f ? (max_abs1 / 127.0f) : 0.0f;
+                    const float inv_step0 = max_abs0 > 0.0f ? (127.0f / max_abs0) : 0.0f;
+                    const float inv_step1 = max_abs1 > 0.0f ? (127.0f / max_abs1) : 0.0f;
+                    int acc0 = 0;
+                    int acc1 = 0;
+                    for (int kk = sub; kk < end; kk += 4) {
+                        int p_i8_00 = 0, p_i8_01 = 0, p_i8_02 = 0, p_i8_03 = 0;
+                        int p_i8_10 = 0, p_i8_11 = 0, p_i8_12 = 0, p_i8_13 = 0;
+                        int v_i8_00 = 0, v_i8_01 = 0, v_i8_02 = 0, v_i8_03 = 0;
+                        int v_i8_10 = 0, v_i8_11 = 0, v_i8_12 = 0, v_i8_13 = 0;
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            const int kk_i = kk + i;
+                            if (kk_i >= end) {
+                                continue;
+                            }
+                            const int k = k0 + kk_i;
+                            const char * v_row = v_head + int64_t(k) * nb21;
+                            const block_q4_0 * v_blk0 = (const block_q4_0 *) (v_row + int64_t(q4_blk0) * nb20);
+                            const block_q4_0 * v_blk1 = (const block_q4_0 *) (v_row + int64_t(q4_blk1) * nb20);
+                            const float p = probs[row_base + kk_i];
+                            const int p_i8_0 = ggml_cuda_q8k_dot4_quantize_i8_symmetric(p * __half2float(v_blk0->d), inv_step0);
+                            const int p_i8_1 = ggml_cuda_q8k_dot4_quantize_i8_symmetric(p * __half2float(v_blk1->d), inv_step1);
+                            const int v_i8_0 = int((v_blk0->qs[q4_iq] >> q4_shift) & 0x0f) - 8;
+                            const int v_i8_1 = int((v_blk1->qs[q4_iq] >> q4_shift) & 0x0f) - 8;
+                            if (i == 0) {
+                                p_i8_00 = p_i8_0; p_i8_10 = p_i8_1;
+                                v_i8_00 = v_i8_0; v_i8_10 = v_i8_1;
+                            } else if (i == 1) {
+                                p_i8_01 = p_i8_0; p_i8_11 = p_i8_1;
+                                v_i8_01 = v_i8_0; v_i8_11 = v_i8_1;
+                            } else if (i == 2) {
+                                p_i8_02 = p_i8_0; p_i8_12 = p_i8_1;
+                                v_i8_02 = v_i8_0; v_i8_12 = v_i8_1;
+                            } else {
+                                p_i8_03 = p_i8_0; p_i8_13 = p_i8_1;
+                                v_i8_03 = v_i8_0; v_i8_13 = v_i8_1;
+                            }
+                        }
+                        const int p_pack0 = ggml_cuda_q8k_dot4_pack_i8x4(p_i8_00, p_i8_01, p_i8_02, p_i8_03);
+                        const int p_pack1 = ggml_cuda_q8k_dot4_pack_i8x4(p_i8_10, p_i8_11, p_i8_12, p_i8_13);
+                        const int v_pack0 = ggml_cuda_q8k_dot4_pack_i8x4(v_i8_00, v_i8_01, v_i8_02, v_i8_03);
+                        const int v_pack1 = ggml_cuda_q8k_dot4_pack_i8x4(v_i8_10, v_i8_11, v_i8_12, v_i8_13);
+                        acc0 = ggml_cuda_q8k_dot4_i8_i8(p_pack0, v_pack0, acc0);
+                        acc1 = ggml_cuda_q8k_dot4_i8_i8(p_pack1, v_pack1, acc1);
+                    }
+                    out[row][0] += step0 * float(acc0);
+                    out[row][1] += step1 * float(acc1);
+                }
+            }
+        }
+    } else if constexpr (INTFLASH_VFRAG_DOT4) {
+        if (tid < 128) {
+            const int d0 = tid;
+            const int d1 = tid + 128;
+            constexpr float INTFLASH_INV_E_SCALE = 1.0f / 127.0f;
+#pragma unroll
+            for (int row = 0; row < ROW_BLOCK; ++row) {
+                const int logical_row = row_block_id * ROW_BLOCK + row;
+                const int q_idx = logical_row / gh;
+                const int g     = logical_row - q_idx * gh;
+                if (q_idx < nq && g < gh) {
+                    out[row][0] *= sm[row * 4 + 2];
+                    out[row][1] *= sm[row * 4 + 2];
+                }
+            }
+#pragma unroll
+            for (int row = 0; row < ROW_BLOCK; ++row) {
+                const int logical_row = row_block_id * ROW_BLOCK + row;
+                const int q_idx = logical_row / gh;
+                const int g     = logical_row - q_idx * gh;
+                if (!(q_idx < nq && g < gh)) continue;
+                const int row_base = row * BN;
+                for (int sub = 0; sub < tile_n; sub += 16) {
+                    const int end = (sub + 16 < tile_n) ? sub + 16 : tile_n;
+                    int e_packs[4] = {0, 0, 0, 0};
+                    for (int kk = sub; kk < end; kk += 4) {
+                        int e_i8_0 = 0, e_i8_1 = 0, e_i8_2 = 0, e_i8_3 = 0;
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            const int kk_i = kk + i;
+                            if (kk_i >= end) {
+                                continue;
+                            }
+                            const int e_i8 = ggml_cuda_q8k_dot4_quantize_i8_positive_unit(probs[row_base + kk_i]);
+                            if (i == 0) {
+                                e_i8_0 = e_i8;
+                            } else if (i == 1) {
+                                e_i8_1 = e_i8;
+                            } else if (i == 2) {
+                                e_i8_2 = e_i8;
+                            } else {
+                                e_i8_3 = e_i8;
+                            }
+                        }
+                        e_packs[(kk - sub) >> 2] = ggml_cuda_q8k_dot4_pack_i8x4(e_i8_0, e_i8_1, e_i8_2, e_i8_3);
+                    }
+
+                    float max_abs0 = 0.0f;
+                    float max_abs1 = 0.0f;
+                    for (int kk = sub; kk < end; ++kk) {
+                        const int k = k0 + kk;
+                        const char * v_row = v_head + int64_t(k) * nb21;
+                        const float v0 = ggml_cuda_q8k_dot4_dequant_q4_0(v_row, nb20, d0);
+                        const float v1 = ggml_cuda_q8k_dot4_dequant_q4_0(v_row, nb20, d1);
+                        max_abs0 = fmaxf(max_abs0, fabsf(v0));
+                        max_abs1 = fmaxf(max_abs1, fabsf(v1));
+                    }
+                    const float v_step0 = max_abs0 > 0.0f ? (max_abs0 * INTFLASH_INV_E_SCALE) : 0.0f;
+                    const float v_step1 = max_abs1 > 0.0f ? (max_abs1 * INTFLASH_INV_E_SCALE) : 0.0f;
+                    const float pv_scale0 = v_step0 * INTFLASH_INV_E_SCALE;
+                    const float pv_scale1 = v_step1 * INTFLASH_INV_E_SCALE;
+                    const float inv_step0 = max_abs0 > 0.0f ? (127.0f / max_abs0) : 0.0f;
+                    const float inv_step1 = max_abs1 > 0.0f ? (127.0f / max_abs1) : 0.0f;
+                    int acc0 = 0;
+                    int acc1 = 0;
+                    for (int kk = sub; kk < end; kk += 4) {
+                        int v_i8_00 = 0, v_i8_01 = 0, v_i8_02 = 0, v_i8_03 = 0;
+                        int v_i8_10 = 0, v_i8_11 = 0, v_i8_12 = 0, v_i8_13 = 0;
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            const int kk_i = kk + i;
+                            if (kk_i >= end) {
+                                continue;
+                            }
+                            const int k = k0 + kk_i;
+                            const char * v_row = v_head + int64_t(k) * nb21;
+                            const float v0 = ggml_cuda_q8k_dot4_dequant_q4_0(v_row, nb20, d0);
+                            const float v1 = ggml_cuda_q8k_dot4_dequant_q4_0(v_row, nb20, d1);
+                            const int v_i8_0 = ggml_cuda_q8k_dot4_quantize_i8_symmetric(v0, inv_step0);
+                            const int v_i8_1 = ggml_cuda_q8k_dot4_quantize_i8_symmetric(v1, inv_step1);
+                            if (i == 0) {
+                                v_i8_00 = v_i8_0; v_i8_10 = v_i8_1;
+                            } else if (i == 1) {
+                                v_i8_01 = v_i8_0; v_i8_11 = v_i8_1;
+                            } else if (i == 2) {
+                                v_i8_02 = v_i8_0; v_i8_12 = v_i8_1;
+                            } else {
+                                v_i8_03 = v_i8_0; v_i8_13 = v_i8_1;
+                            }
+                        }
+                        const int e_pack = e_packs[(kk - sub) >> 2];
+                        const int v_pack0 = ggml_cuda_q8k_dot4_pack_i8x4(v_i8_00, v_i8_01, v_i8_02, v_i8_03);
+                        const int v_pack1 = ggml_cuda_q8k_dot4_pack_i8x4(v_i8_10, v_i8_11, v_i8_12, v_i8_13);
+                        acc0 = ggml_cuda_q8k_dot4_i8_i8(e_pack, v_pack0, acc0);
+                        acc1 = ggml_cuda_q8k_dot4_i8_i8(e_pack, v_pack1, acc1);
+                    }
+                    out[row][0] += pv_scale0 * float(acc0);
+                    out[row][1] += pv_scale1 * float(acc1);
+                }
+            }
+        }
+    } else if (tid < 128) {
+#pragma unroll
+        for (int row = 0; row < ROW_BLOCK; ++row) {
+            const int logical_row = row_block_id * ROW_BLOCK + row;
+            const int q_idx = logical_row / gh;
+            const int g     = logical_row - q_idx * gh;
+            if (q_idx < nq && g < gh) {
+                out[row][0] *= sm[row * 4 + 2];
+                out[row][1] *= sm[row * 4 + 2];
+            }
+        }
+        for (int sub = 0; sub < tile_n; sub += BN_VSUB) {
+            const int end = (sub + BN_VSUB < tile_n) ? sub + BN_VSUB : tile_n;
+            for (int kk = sub; kk < end; ++kk) {
+                const int k = k0 + kk;
+                const float v0 = ggml_cuda_q8k_dot4_dequant_q4_0(v_head + int64_t(k) * nb21, nb20, tid);
+                const float v1 = ggml_cuda_q8k_dot4_dequant_q4_0(v_head + int64_t(k) * nb21, nb20, tid + 128);
+#pragma unroll
+                for (int row = 0; row < ROW_BLOCK; ++row) {
+                    const int logical_row = row_block_id * ROW_BLOCK + row;
+                    const int q_idx = logical_row / gh;
+                    const int g     = logical_row - q_idx * gh;
+                    if (q_idx < nq && g < gh) {
+                        const float p = probs[row * BN + kk];
+                        out[row][0] += p * v0;
+                        out[row][1] += p * v1;
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();
+    SMALL_VERIFY_PROFILE_PHASE_END(pv_cycles);
+
+    SMALL_VERIFY_PROFILE_PHASE_BEGIN();
+    if constexpr (WMMA_PV) {
+        const int wave    = tid >> 5;
+        const int lane    = tid & 31;
+        const int lane_lo = lane & 15;
+        const int lane_hi = lane >> 4;
+#pragma unroll
+        for (int pass = 0; pass < 4; ++pass) {
+            const int d_col = (pass * 4 + wave) * 16 + lane_lo;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int row = pbwmma_f16_d_row_from_acc(i, lane_hi);
+                const int logical_row = row_block_id * ROW_BLOCK + row;
+                const int q_idx = logical_row / gh;
+                const int g     = logical_row - q_idx * gh;
+                if (q_idx < nq && g < gh && d_col < DECODE_D) {
+                    const size_t partial_base = ((size_t(b) * size_t(nq) + size_t(q_idx)) * size_t(n_heads_k) + size_t(hk)) * size_t(n_pages) + size_t(page);
+                    partial_o[(partial_base * GH_MAX + g) * DECODE_D + d_col] = out_pv[pass][i];
+                }
+            }
+        }
+    } else if (tid < 128) {
+#pragma unroll
+        for (int row = 0; row < ROW_BLOCK; ++row) {
+            const int logical_row = row_block_id * ROW_BLOCK + row;
+            const int q_idx = logical_row / gh;
+            const int g     = logical_row - q_idx * gh;
+            if (q_idx < nq && g < gh) {
+                const size_t partial_base = ((size_t(b) * size_t(nq) + size_t(q_idx)) * size_t(n_heads_k) + size_t(hk)) * size_t(n_pages) + size_t(page);
+                partial_o[(partial_base * GH_MAX + g) * DECODE_D + tid]       = out[row][0];
+                partial_o[(partial_base * GH_MAX + g) * DECODE_D + tid + 128] = out[row][1];
+            }
+        }
+    }
+    if (tid < ROW_BLOCK) {
+        const int row = tid;
+        const int logical_row = row_block_id * ROW_BLOCK + row;
+        const int q_idx = logical_row / gh;
+        const int g     = logical_row - q_idx * gh;
+        if (q_idx < nq && g < gh) {
+            const size_t partial_base = ((size_t(b) * size_t(nq) + size_t(q_idx)) * size_t(n_heads_k) + size_t(hk)) * size_t(n_pages) + size_t(page);
+            partial_m[partial_base * GH_MAX + g] = sm[row * 4 + 0];
+            partial_l[partial_base * GH_MAX + g] = sm[row * 4 + 1];
+        }
+    }
+    SMALL_VERIFY_PROFILE_PHASE_END(write_cycles);
 }
 
 // ── Grouped-GQA Small-verify split-K Stage 2: reduce partials per (q, hq, hk) ─
@@ -1480,7 +2807,8 @@ void ggml_cuda_q8k_dot4_small_verify_gqa_splitk_reduce_kernel(
         const float * __restrict__ partial_l,
         float       * __restrict__ dst,
         int n_splits, int nq, int n_heads_q, int n_heads_k,
-        int gqa_ratio, int batch) {
+        int gqa_ratio, int batch,
+        small_verify_fa4_profile * __restrict__ profile) {
 
     const int qh = blockIdx.x;
     const int b  = blockIdx.y;
@@ -1494,7 +2822,9 @@ void ggml_cuda_q8k_dot4_small_verify_gqa_splitk_reduce_kernel(
     float m = -1e38f;
     float l = 0.0f;
     float o = 0.0f;
+    unsigned long long profile_t0 = 0;
 
+    SMALL_VERIFY_PROFILE_PHASE_BEGIN();
     for (int s = 0; s < n_splits; ++s) {
         const size_t partial_base = ((size_t(b) * size_t(nq) + size_t(q)) * size_t(n_heads_k) + size_t(hk)) * size_t(n_splits) + size_t(s);
         const float mi = partial_m[partial_base * GH_MAX + g];
@@ -1516,6 +2846,7 @@ void ggml_cuda_q8k_dot4_small_verify_gqa_splitk_reduce_kernel(
         const size_t dst_base = ((size_t(b) * size_t(nq) + size_t(q)) * size_t(n_heads_q) + size_t(hq)) * DECODE_D;
         dst[dst_base + tid] = l > 0.0f ? o / l : 0.0f;
     }
+    SMALL_VERIFY_PROFILE_PHASE_END(reduce_cycles);
 }
 
 // ── Split-K Stage 1: one CTA per K split, writes partial o/m/l ───────────
@@ -1724,6 +3055,12 @@ void ggml_cuda_q8k_dot4_decode_splitk_reduce_kernel(
     int sm = (GH_MAX * BN * 2 + GH_MAX * 4 + GH_MAX * DECODE_I32_PER_ROW + GH_MAX * DECODE_N_BLOCKS) * (int)sizeof(float); \
     int split_size = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_SPLIT_SIZE", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_SPLITK_SIZE", 512)); \
     int n_splits = (nk + split_size - 1) / split_size; \
+    hipEvent_t p16_profile_start = nullptr; \
+    hipEvent_t p16_profile_after_stage1 = nullptr; \
+    hipEvent_t p16_profile_after_reduce = nullptr; \
+    unsigned long long p16_profile_call = 0; \
+    const bool p16_profile = ggml_cuda_q8k_dot4_packed16_attn_profile_begin(stream, &p16_profile_call, &p16_profile_start, &p16_profile_after_stage1, &p16_profile_after_reduce); \
+    if (!p16_profile && p16_profile_call != 0) { ggml_cuda_q8k_dot4_packed16_attn_profile_skip(packed16_decode_impl, nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, split_size, n_splits, BN, GH_MAX, 1, sm, p16_profile_call); } \
     dim3 g1(n_splits, n_heads_k, nq * batch); \
     blockfa_partial_o.alloc((size_t) batch * nq * n_heads_k * n_splits * GH_MAX * 256); \
     blockfa_partial_m.alloc((size_t) batch * nq * n_heads_k * n_splits * GH_MAX); \
@@ -1737,40 +3074,460 @@ void ggml_cuda_q8k_dot4_decode_splitk_reduce_kernel(
         nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, \
         k_head_stride_rows, k_batch_stride_rows, split_size, n_splits); \
     CUDA_CHECK(cudaGetLastError()); \
+    if (p16_profile) { CUDA_CHECK(hipEventRecord(p16_profile_after_stage1, stream)); } \
     dim3 g2(nq * n_heads_q, batch); \
     ggml_cuda_q8k_dot4_small_verify_gqa_splitk_reduce_kernel<GH_MAX><<<g2, 256, 0, stream>>>( \
         blockfa_partial_o.ptr, blockfa_partial_m.ptr, blockfa_partial_l.ptr, (float *) dst->data, \
-        n_splits, nq, n_heads_q, n_heads_k, gqa_ratio, batch); \
+        n_splits, nq, n_heads_q, n_heads_k, gqa_ratio, batch, nullptr); \
     CUDA_CHECK(cudaGetLastError()); \
+    if (p16_profile) { CUDA_CHECK(hipEventRecord(p16_profile_after_reduce, stream)); ggml_cuda_q8k_dot4_packed16_attn_profile_finish(packed16_decode_impl, nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, split_size, n_splits, BN, GH_MAX, 1, sm, p16_profile_call, p16_profile_start, p16_profile_after_stage1, p16_profile_after_reduce); } \
 }
 
 #define LAUNCH_DECODE_SMALL_VERIFY_BATCHED_SPLITK(BN, BN_VSUB, GH_MAX, NQ_MAX, SPLIT_DEFAULT) { \
     int sm = (NQ_MAX * GH_MAX * DECODE_I32_PER_ROW) * (int)sizeof(int) \
            + (NQ_MAX * GH_MAX * DECODE_N_BLOCKS) * (int)sizeof(float) \
            + (BN * DECODE_I32_PER_ROW) * (int)sizeof(int) \
-           + BN * (int)sizeof(float) \
+           + (BN * DECODE_N_BLOCKS) * (int)sizeof(float) \
            + (NQ_MAX * GH_MAX * BN * 2) * (int)sizeof(float) \
            + (NQ_MAX * GH_MAX * 4) * (int)sizeof(float); \
-    int split_size = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_SPLIT_SIZE", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_SPLITK_SIZE", SPLIT_DEFAULT)); \
+    /* Batched small-verify has different occupancy/partial-reduce tradeoffs than nq=1 draft decode. */ \
+    /* Do not let the generic DECODE_SPLITK_SIZE knob silently override this route's tuned default. */ \
+    int split_size = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_SPLIT_SIZE", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_SPLIT_SIZE", SPLIT_DEFAULT)); \
     int n_splits = (nk + split_size - 1) / split_size; \
+    hipEvent_t p16_profile_start = nullptr; \
+    hipEvent_t p16_profile_after_stage1 = nullptr; \
+    hipEvent_t p16_profile_after_reduce = nullptr; \
+    unsigned long long p16_profile_call = 0; \
+    const bool p16_profile = ggml_cuda_q8k_dot4_packed16_attn_profile_begin(stream, &p16_profile_call, &p16_profile_start, &p16_profile_after_stage1, &p16_profile_after_reduce); \
+    if (!p16_profile && p16_profile_call != 0) { ggml_cuda_q8k_dot4_packed16_attn_profile_skip(packed16_decode_impl, nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, split_size, n_splits, BN, GH_MAX, NQ_MAX, sm, p16_profile_call); } \
     dim3 g1(n_splits, n_heads_k, batch); \
     blockfa_partial_o.alloc((size_t) batch * nq * n_heads_k * n_splits * GH_MAX * 256); \
     blockfa_partial_m.alloc((size_t) batch * nq * n_heads_k * n_splits * GH_MAX); \
     blockfa_partial_l.alloc((size_t) batch * nq * n_heads_k * n_splits * GH_MAX); \
     ggml_cuda_q8k_dot4_small_verify_batched_gqa_splitk_stage1_kernel<BN, BN_VSUB, GH_MAX, NQ_MAX><<<g1, 256, sm, stream>>>( \
-        q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, (const char *) V->data, \
+        q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, k_payload_row_stride_i32, k_scales_row_stride_half, (const char *) V->data, \
         mask ? (const char *) mask->data : nullptr, \
         blockfa_partial_o.ptr, blockfa_partial_m.ptr, blockfa_partial_l.ptr, scale, \
         V->nb[0], V->nb[1], V->nb[2], V->nb[3], \
         mask ? mask->nb[0] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[3] : 0, mask ? mask->ne[3] : 1, \
         nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, \
-        k_head_stride_rows, k_batch_stride_rows, split_size, n_splits); \
+        k_head_stride_rows, k_batch_stride_rows, split_size, n_splits, 0.0f, nullptr); \
+    CUDA_CHECK(cudaGetLastError()); \
+    if (p16_profile) { CUDA_CHECK(hipEventRecord(p16_profile_after_stage1, stream)); } \
+    dim3 g2(nq * n_heads_q, batch); \
+    ggml_cuda_q8k_dot4_small_verify_gqa_splitk_reduce_kernel<GH_MAX><<<g2, 256, 0, stream>>>( \
+        blockfa_partial_o.ptr, blockfa_partial_m.ptr, blockfa_partial_l.ptr, (float *) dst->data, \
+        n_splits, nq, n_heads_q, n_heads_k, gqa_ratio, batch, nullptr); \
+    CUDA_CHECK(cudaGetLastError()); \
+    if (p16_profile) { CUDA_CHECK(hipEventRecord(p16_profile_after_reduce, stream)); ggml_cuda_q8k_dot4_packed16_attn_profile_finish(packed16_decode_impl, nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, split_size, n_splits, BN, GH_MAX, NQ_MAX, sm, p16_profile_call, p16_profile_start, p16_profile_after_stage1, p16_profile_after_reduce); } \
+}
+
+#define LAUNCH_DECODE_SMALL_VERIFY_FA2_FUSEDPV_BATCHED_SPLITK(BN, BN_VSUB, GH_MAX, NQ_MAX, SPLIT_DEFAULT) { \
+    int sm = (NQ_MAX * GH_MAX * DECODE_I32_PER_ROW) * (int)sizeof(int) \
+           + (NQ_MAX * GH_MAX * DECODE_N_BLOCKS) * (int)sizeof(float) \
+           + (BN * DECODE_I32_PER_ROW) * (int)sizeof(int) \
+           + (BN * DECODE_N_BLOCKS) * (int)sizeof(float) \
+           + (NQ_MAX * GH_MAX * BN * 2) * (int)sizeof(float) \
+           + (NQ_MAX * GH_MAX * 4) * (int)sizeof(float); \
+    int split_size = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_FUSEDPV_SPLIT_SIZE", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_SPLIT_SIZE", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_SPLIT_SIZE", SPLIT_DEFAULT))); \
+    int n_splits = (nk + split_size - 1) / split_size; \
+    hipEvent_t p16_profile_start = nullptr; \
+    hipEvent_t p16_profile_after_stage1 = nullptr; \
+    hipEvent_t p16_profile_after_reduce = nullptr; \
+    unsigned long long p16_profile_call = 0; \
+    const bool p16_profile = ggml_cuda_q8k_dot4_packed16_attn_profile_begin(stream, &p16_profile_call, &p16_profile_start, &p16_profile_after_stage1, &p16_profile_after_reduce); \
+    if (!p16_profile && p16_profile_call != 0) { ggml_cuda_q8k_dot4_packed16_attn_profile_skip(packed16_decode_impl, nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, split_size, n_splits, BN, GH_MAX, NQ_MAX, sm, p16_profile_call); } \
+    dim3 g1(n_splits, n_heads_k, batch); \
+    blockfa_partial_o.alloc((size_t) batch * nq * n_heads_k * n_splits * GH_MAX * 256); \
+    blockfa_partial_m.alloc((size_t) batch * nq * n_heads_k * n_splits * GH_MAX); \
+    blockfa_partial_l.alloc((size_t) batch * nq * n_heads_k * n_splits * GH_MAX); \
+    ggml_cuda_q8k_dot4_small_verify_batched_gqa_splitk_stage1_kernel<BN, BN_VSUB, GH_MAX, NQ_MAX, false, false, false, true><<<g1, 256, sm, stream>>>( \
+        q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, k_payload_row_stride_i32, k_scales_row_stride_half, (const char *) V->data, \
+        mask ? (const char *) mask->data : nullptr, \
+        blockfa_partial_o.ptr, blockfa_partial_m.ptr, blockfa_partial_l.ptr, scale, \
+        V->nb[0], V->nb[1], V->nb[2], V->nb[3], \
+        mask ? mask->nb[0] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[3] : 0, mask ? mask->ne[3] : 1, \
+        nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, \
+        k_head_stride_rows, k_batch_stride_rows, split_size, n_splits, 0.0f, nullptr); \
+    CUDA_CHECK(cudaGetLastError()); \
+    if (p16_profile) { CUDA_CHECK(hipEventRecord(p16_profile_after_stage1, stream)); } \
+    dim3 g2(nq * n_heads_q, batch); \
+    ggml_cuda_q8k_dot4_small_verify_gqa_splitk_reduce_kernel<GH_MAX><<<g2, 256, 0, stream>>>( \
+        blockfa_partial_o.ptr, blockfa_partial_m.ptr, blockfa_partial_l.ptr, (float *) dst->data, \
+        n_splits, nq, n_heads_q, n_heads_k, gqa_ratio, batch, nullptr); \
+    CUDA_CHECK(cudaGetLastError()); \
+    if (p16_profile) { CUDA_CHECK(hipEventRecord(p16_profile_after_reduce, stream)); ggml_cuda_q8k_dot4_packed16_attn_profile_finish(packed16_decode_impl, nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, split_size, n_splits, BN, GH_MAX, NQ_MAX, sm, p16_profile_call, p16_profile_start, p16_profile_after_stage1, p16_profile_after_reduce); } \
+}
+
+#define LAUNCH_DECODE_SMALL_VERIFY_FA2_PV_DOT4_ONFLY_BATCHED_SPLITK(BN, BN_VSUB, GH_MAX, NQ_MAX, SPLIT_DEFAULT) { \
+    int sm = (NQ_MAX * GH_MAX * DECODE_I32_PER_ROW) * (int)sizeof(int) \
+           + (NQ_MAX * GH_MAX * DECODE_N_BLOCKS) * (int)sizeof(float) \
+           + (BN * DECODE_I32_PER_ROW) * (int)sizeof(int) \
+           + (BN * DECODE_N_BLOCKS) * (int)sizeof(float) \
+           + (NQ_MAX * GH_MAX * BN * 2) * (int)sizeof(float) \
+           + (NQ_MAX * GH_MAX * 4) * (int)sizeof(float) \
+           + (NQ_MAX * GH_MAX * DECODE_N_BLOCKS) * (int)sizeof(float); \
+    int split_size = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_PV_DOT4_SPLIT_SIZE", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_SPLIT_SIZE", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_SPLIT_SIZE", SPLIT_DEFAULT))); \
+    int n_splits = (nk + split_size - 1) / split_size; \
+    float pv_dot4_fixed_step = ggml_cuda_q8k_dot4_kq_env_float("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_PV_DOT4_FIXED_STEP", 0.0f); \
+    if (pv_dot4_fixed_step < 0.0f) pv_dot4_fixed_step = 0.0f; \
+    hipEvent_t p16_profile_start = nullptr; \
+    hipEvent_t p16_profile_after_stage1 = nullptr; \
+    hipEvent_t p16_profile_after_reduce = nullptr; \
+    unsigned long long p16_profile_call = 0; \
+    const bool p16_profile = ggml_cuda_q8k_dot4_packed16_attn_profile_begin(stream, &p16_profile_call, &p16_profile_start, &p16_profile_after_stage1, &p16_profile_after_reduce); \
+    if (!p16_profile && p16_profile_call != 0) { ggml_cuda_q8k_dot4_packed16_attn_profile_skip(packed16_decode_impl, nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, split_size, n_splits, BN, GH_MAX, NQ_MAX, sm, p16_profile_call); } \
+    dim3 g1(n_splits, n_heads_k, batch); \
+    blockfa_partial_o.alloc((size_t) batch * nq * n_heads_k * n_splits * GH_MAX * 256); \
+    blockfa_partial_m.alloc((size_t) batch * nq * n_heads_k * n_splits * GH_MAX); \
+    blockfa_partial_l.alloc((size_t) batch * nq * n_heads_k * n_splits * GH_MAX); \
+    ggml_cuda_q8k_dot4_small_verify_batched_gqa_splitk_stage1_kernel<BN, BN_VSUB, GH_MAX, NQ_MAX, false, false, false, true, false, true><<<g1, 256, sm, stream>>>( \
+        q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, k_payload_row_stride_i32, k_scales_row_stride_half, (const char *) V->data, \
+        mask ? (const char *) mask->data : nullptr, \
+        blockfa_partial_o.ptr, blockfa_partial_m.ptr, blockfa_partial_l.ptr, scale, \
+        V->nb[0], V->nb[1], V->nb[2], V->nb[3], \
+        mask ? mask->nb[0] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[3] : 0, mask ? mask->ne[3] : 1, \
+        nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, \
+        k_head_stride_rows, k_batch_stride_rows, split_size, n_splits, pv_dot4_fixed_step, nullptr); \
+    CUDA_CHECK(cudaGetLastError()); \
+    if (p16_profile) { CUDA_CHECK(hipEventRecord(p16_profile_after_stage1, stream)); } \
+    dim3 g2(nq * n_heads_q, batch); \
+    ggml_cuda_q8k_dot4_small_verify_gqa_splitk_reduce_kernel<GH_MAX><<<g2, 256, 0, stream>>>( \
+        blockfa_partial_o.ptr, blockfa_partial_m.ptr, blockfa_partial_l.ptr, (float *) dst->data, \
+        n_splits, nq, n_heads_q, n_heads_k, gqa_ratio, batch, nullptr); \
+    CUDA_CHECK(cudaGetLastError()); \
+    if (p16_profile) { CUDA_CHECK(hipEventRecord(p16_profile_after_reduce, stream)); ggml_cuda_q8k_dot4_packed16_attn_profile_finish(packed16_decode_impl, nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, split_size, n_splits, BN, GH_MAX, NQ_MAX, sm, p16_profile_call, p16_profile_start, p16_profile_after_stage1, p16_profile_after_reduce); } \
+}
+
+#define LAUNCH_DECODE_SMALL_VERIFY_FA2_PV_DOT4_LDS_A_BATCHED_SPLITK(BN, BN_VSUB, GH_MAX, NQ_MAX, SPLIT_DEFAULT) { \
+    int sm = (NQ_MAX * GH_MAX * DECODE_I32_PER_ROW) * (int)sizeof(int) \
+           + (NQ_MAX * GH_MAX * DECODE_N_BLOCKS) * (int)sizeof(float) \
+           + (BN * DECODE_I32_PER_ROW) * (int)sizeof(int) \
+           + (BN * DECODE_N_BLOCKS) * (int)sizeof(float) \
+           + (NQ_MAX * GH_MAX * BN * 2) * (int)sizeof(float) \
+           + (NQ_MAX * GH_MAX * 4) * (int)sizeof(float) \
+           + (NQ_MAX * GH_MAX) * (int)sizeof(float) \
+           + DECODE_N_BLOCKS * (int)sizeof(float) \
+           + (NQ_MAX * GH_MAX * DECODE_N_BLOCKS) * (int)sizeof(float) \
+           + (NQ_MAX * GH_MAX * DECODE_N_BLOCKS * (BN / 4)) * (int)sizeof(int); \
+    int split_size = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_PV_DOT4_LDS_A_SPLIT_SIZE", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_PACKED16_LDS_A8_SPLIT_SIZE", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_PV_DOT4_SPLIT_SIZE", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_SPLIT_SIZE", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_SPLIT_SIZE", 320))))); \
+    int n_splits = (nk + split_size - 1) / split_size; \
+    float pv_dot4_fixed_step = ggml_cuda_q8k_dot4_kq_env_float("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_PV_DOT4_FIXED_STEP", ggml_cuda_q8k_dot4_kq_env_float("GGML_CUDA_ROCM_PACKED16_LDS_A8_FIXED_STEP", 0.001f)); \
+    if (pv_dot4_fixed_step < 0.0f) pv_dot4_fixed_step = 0.0f; \
+    hipEvent_t p16_profile_start = nullptr; \
+    hipEvent_t p16_profile_after_stage1 = nullptr; \
+    hipEvent_t p16_profile_after_reduce = nullptr; \
+    unsigned long long p16_profile_call = 0; \
+    const bool p16_profile = ggml_cuda_q8k_dot4_packed16_attn_profile_begin(stream, &p16_profile_call, &p16_profile_start, &p16_profile_after_stage1, &p16_profile_after_reduce); \
+    if (!p16_profile && p16_profile_call != 0) { ggml_cuda_q8k_dot4_packed16_attn_profile_skip(packed16_decode_impl, nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, split_size, n_splits, BN, GH_MAX, NQ_MAX, sm, p16_profile_call); } \
+    dim3 g1(n_splits, n_heads_k, batch); \
+    blockfa_partial_o.alloc((size_t) batch * nq * n_heads_k * n_splits * GH_MAX * 256); \
+    blockfa_partial_m.alloc((size_t) batch * nq * n_heads_k * n_splits * GH_MAX); \
+    blockfa_partial_l.alloc((size_t) batch * nq * n_heads_k * n_splits * GH_MAX); \
+    ggml_cuda_q8k_dot4_small_verify_batched_gqa_splitk_stage1_kernel<BN, BN_VSUB, GH_MAX, NQ_MAX, false, false, false, true, false, false, true><<<g1, 256, sm, stream>>>( \
+        q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, k_payload_row_stride_i32, k_scales_row_stride_half, (const char *) V->data, \
+        mask ? (const char *) mask->data : nullptr, \
+        blockfa_partial_o.ptr, blockfa_partial_m.ptr, blockfa_partial_l.ptr, scale, \
+        V->nb[0], V->nb[1], V->nb[2], V->nb[3], \
+        mask ? mask->nb[0] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[3] : 0, mask ? mask->ne[3] : 1, \
+        nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, \
+        k_head_stride_rows, k_batch_stride_rows, split_size, n_splits, pv_dot4_fixed_step, nullptr); \
+    CUDA_CHECK(cudaGetLastError()); \
+    if (p16_profile) { CUDA_CHECK(hipEventRecord(p16_profile_after_stage1, stream)); } \
+    dim3 g2(nq * n_heads_q, batch); \
+    ggml_cuda_q8k_dot4_small_verify_gqa_splitk_reduce_kernel<GH_MAX><<<g2, 256, 0, stream>>>( \
+        blockfa_partial_o.ptr, blockfa_partial_m.ptr, blockfa_partial_l.ptr, (float *) dst->data, \
+        n_splits, nq, n_heads_q, n_heads_k, gqa_ratio, batch, nullptr); \
+    CUDA_CHECK(cudaGetLastError()); \
+    if (p16_profile) { CUDA_CHECK(hipEventRecord(p16_profile_after_reduce, stream)); ggml_cuda_q8k_dot4_packed16_attn_profile_finish(packed16_decode_impl, nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, split_size, n_splits, BN, GH_MAX, NQ_MAX, sm, p16_profile_call, p16_profile_start, p16_profile_after_stage1, p16_profile_after_reduce); } \
+}
+
+#define LAUNCH_DECODE_SMALL_VERIFY_FA2_SPARSEV_BATCHED_SPLITK(BN, BN_VSUB, GH_MAX, NQ_MAX, SPLIT_DEFAULT) { \
+    int sm = (NQ_MAX * GH_MAX * DECODE_I32_PER_ROW) * (int)sizeof(int) \
+           + (NQ_MAX * GH_MAX * DECODE_N_BLOCKS) * (int)sizeof(float) \
+           + (BN * DECODE_I32_PER_ROW) * (int)sizeof(int) \
+           + (BN * DECODE_N_BLOCKS) * (int)sizeof(float) \
+           + (NQ_MAX * GH_MAX * BN * 2) * (int)sizeof(float) \
+           + (NQ_MAX * GH_MAX * 4) * (int)sizeof(float) \
+           + BN * (int)sizeof(int); \
+    int split_size = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_SPARSEV_SPLIT_SIZE", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_SPLIT_SIZE", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_SPLIT_SIZE", SPLIT_DEFAULT))); \
+    int n_splits = (nk + split_size - 1) / split_size; \
+    float sparse_v_tau = ggml_cuda_q8k_dot4_kq_env_float("GGML_CUDA_ROCM_SMALL_VERIFY_SPARSEV_TAU", 1.0e-7f); \
+    if (sparse_v_tau < 0.0f) sparse_v_tau = 0.0f; \
+    int sparse_profile_every = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_SPARSEV_PROFILE_EVERY", 1); \
+    if (sparse_profile_every < 1) sparse_profile_every = 1; \
+    static unsigned long long sparse_profile_call_counter = 0; \
+    const unsigned long long sparse_profile_call = ++sparse_profile_call_counter; \
+    bool sparse_profile_enabled = ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_SMALL_VERIFY_SPARSEV_PROFILE") && ((sparse_profile_call % (unsigned long long) sparse_profile_every) == 0ull); \
+    if (sparse_profile_enabled) { \
+        hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone; \
+        const hipError_t capture_err = hipStreamIsCapturing(stream, &capture_status); \
+        if (capture_err == hipSuccess && capture_status != hipStreamCaptureStatusNone) { \
+            static bool sparse_profile_capture_warned = false; \
+            if (!sparse_profile_capture_warned) { sparse_profile_capture_warned = true; fprintf(stderr, "SMALL_VERIFY_SPARSEV PROFILE skipped during graph capture\n"); } \
+            sparse_profile_enabled = false; \
+        } \
+    } \
+    small_verify_fa4_profile * sparse_profile_dev = nullptr; \
+    hipEvent_t sparse_profile_start = nullptr; \
+    hipEvent_t sparse_profile_stop  = nullptr; \
+    if (sparse_profile_enabled) { \
+        CUDA_CHECK(hipMalloc((void **) &sparse_profile_dev, sizeof(small_verify_fa4_profile))); \
+        CUDA_CHECK(hipMemsetAsync(sparse_profile_dev, 0, sizeof(small_verify_fa4_profile), stream)); \
+        CUDA_CHECK(hipEventCreate(&sparse_profile_start)); \
+        CUDA_CHECK(hipEventCreate(&sparse_profile_stop)); \
+        CUDA_CHECK(hipEventRecord(sparse_profile_start, stream)); \
+    } \
+    hipEvent_t p16_profile_start = nullptr; \
+    hipEvent_t p16_profile_after_stage1 = nullptr; \
+    hipEvent_t p16_profile_after_reduce = nullptr; \
+    unsigned long long p16_profile_call = 0; \
+    const bool p16_profile = ggml_cuda_q8k_dot4_packed16_attn_profile_begin(stream, &p16_profile_call, &p16_profile_start, &p16_profile_after_stage1, &p16_profile_after_reduce); \
+    if (!p16_profile && p16_profile_call != 0) { ggml_cuda_q8k_dot4_packed16_attn_profile_skip(packed16_decode_impl, nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, split_size, n_splits, BN, GH_MAX, NQ_MAX, sm, p16_profile_call); } \
+    dim3 g1(n_splits, n_heads_k, batch); \
+    blockfa_partial_o.alloc((size_t) batch * nq * n_heads_k * n_splits * GH_MAX * 256); \
+    blockfa_partial_m.alloc((size_t) batch * nq * n_heads_k * n_splits * GH_MAX); \
+    blockfa_partial_l.alloc((size_t) batch * nq * n_heads_k * n_splits * GH_MAX); \
+    ggml_cuda_q8k_dot4_small_verify_batched_gqa_splitk_stage1_kernel<BN, BN_VSUB, GH_MAX, NQ_MAX, false, false, false, true, true><<<g1, 256, sm, stream>>>( \
+        q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, k_payload_row_stride_i32, k_scales_row_stride_half, (const char *) V->data, \
+        mask ? (const char *) mask->data : nullptr, \
+        blockfa_partial_o.ptr, blockfa_partial_m.ptr, blockfa_partial_l.ptr, scale, \
+        V->nb[0], V->nb[1], V->nb[2], V->nb[3], \
+        mask ? mask->nb[0] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[3] : 0, mask ? mask->ne[3] : 1, \
+        nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, \
+        k_head_stride_rows, k_batch_stride_rows, split_size, n_splits, sparse_v_tau, sparse_profile_dev); \
+    CUDA_CHECK(cudaGetLastError()); \
+    if (p16_profile) { CUDA_CHECK(hipEventRecord(p16_profile_after_stage1, stream)); } \
+    dim3 g2(nq * n_heads_q, batch); \
+    ggml_cuda_q8k_dot4_small_verify_gqa_splitk_reduce_kernel<GH_MAX><<<g2, 256, 0, stream>>>( \
+        blockfa_partial_o.ptr, blockfa_partial_m.ptr, blockfa_partial_l.ptr, (float *) dst->data, \
+        n_splits, nq, n_heads_q, n_heads_k, gqa_ratio, batch, sparse_profile_dev); \
+    CUDA_CHECK(cudaGetLastError()); \
+    if (p16_profile) { CUDA_CHECK(hipEventRecord(p16_profile_after_reduce, stream)); ggml_cuda_q8k_dot4_packed16_attn_profile_finish(packed16_decode_impl, nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, split_size, n_splits, BN, GH_MAX, NQ_MAX, sm, p16_profile_call, p16_profile_start, p16_profile_after_stage1, p16_profile_after_reduce); } \
+    if (sparse_profile_enabled) { \
+        CUDA_CHECK(hipEventRecord(sparse_profile_stop, stream)); \
+        small_verify_fa4_profile sparse_profile_host = {}; \
+        CUDA_CHECK(hipMemcpyAsync(&sparse_profile_host, sparse_profile_dev, sizeof(sparse_profile_host), hipMemcpyDeviceToHost, stream)); \
+        CUDA_CHECK(hipStreamSynchronize(stream)); \
+        float sparse_kernel_ms = 0.0f; \
+        CUDA_CHECK(hipEventElapsedTime(&sparse_kernel_ms, sparse_profile_start, sparse_profile_stop)); \
+        const unsigned long long sparse_total = sparse_profile_host.sparse_v_kept + sparse_profile_host.sparse_v_skipped; \
+        const double sparse_skip_pct = sparse_total ? (100.0 * (double) sparse_profile_host.sparse_v_skipped / (double) sparse_total) : 0.0; \
+        fprintf(stderr, "SMALL_VERIFY_SPARSEV PROFILE: impl=small_verify_fa2_sparsev_tune call=%llu every=%d tau=%.9g nq=%d nk=%d hq=%d hk=%d batch=%d gqa=%d split_size=%d n_splits=%d kernel_ms=%.3f qk_cycles=%llu softmax_cycles=%llu pv_cycles=%llu write_cycles=%llu reduce_cycles=%llu sparse_v_kept=%llu sparse_v_skipped=%llu sparse_v_skip_pct=%.2f\n", \
+            (unsigned long long) sparse_profile_call, sparse_profile_every, (double) sparse_v_tau, nq, nk, n_heads_q, n_heads_k, batch, gqa_ratio, split_size, n_splits, (double) sparse_kernel_ms, \
+            (unsigned long long) sparse_profile_host.qk_cycles, \
+            (unsigned long long) sparse_profile_host.softmax_cycles, \
+            (unsigned long long) sparse_profile_host.pv_cycles, \
+            (unsigned long long) sparse_profile_host.write_cycles, \
+            (unsigned long long) sparse_profile_host.reduce_cycles, \
+            (unsigned long long) sparse_profile_host.sparse_v_kept, \
+            (unsigned long long) sparse_profile_host.sparse_v_skipped, sparse_skip_pct); \
+        CUDA_CHECK(hipEventDestroy(sparse_profile_start)); \
+        CUDA_CHECK(hipEventDestroy(sparse_profile_stop)); \
+        CUDA_CHECK(hipFree(sparse_profile_dev)); \
+    } \
+}
+
+#define LAUNCH_DECODE_SMALL_VERIFY_FA2_PVWMMA_BATCHED_SPLITK(BN, BN_VSUB, GH_MAX, NQ_MAX, SPLIT_DEFAULT) { \
+    int sm = (NQ_MAX * GH_MAX * DECODE_I32_PER_ROW) * (int)sizeof(int) \
+           + (NQ_MAX * GH_MAX * DECODE_N_BLOCKS) * (int)sizeof(float) \
+           + (BN * DECODE_I32_PER_ROW) * (int)sizeof(int) \
+           + (BN * DECODE_N_BLOCKS) * (int)sizeof(float) \
+           + (NQ_MAX * GH_MAX * BN * 2) * (int)sizeof(float) \
+           + (NQ_MAX * GH_MAX * 4) * (int)sizeof(float); \
+    int split_size = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_PVWMMA_SPLIT_SIZE", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_SPLIT_SIZE", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_SPLIT_SIZE", SPLIT_DEFAULT))); \
+    int n_splits = (nk + split_size - 1) / split_size; \
+    dim3 g1(n_splits, n_heads_k, batch); \
+    blockfa_partial_o.alloc((size_t) batch * nq * n_heads_k * n_splits * GH_MAX * 256); \
+    blockfa_partial_m.alloc((size_t) batch * nq * n_heads_k * n_splits * GH_MAX); \
+    blockfa_partial_l.alloc((size_t) batch * nq * n_heads_k * n_splits * GH_MAX); \
+    ggml_cuda_q8k_dot4_small_verify_batched_gqa_splitk_stage1_kernel<BN, BN_VSUB, GH_MAX, NQ_MAX, false, true><<<g1, 256, sm, stream>>>( \
+        q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, k_payload_row_stride_i32, k_scales_row_stride_half, (const char *) V->data, \
+        mask ? (const char *) mask->data : nullptr, \
+        blockfa_partial_o.ptr, blockfa_partial_m.ptr, blockfa_partial_l.ptr, scale, \
+        V->nb[0], V->nb[1], V->nb[2], V->nb[3], \
+        mask ? mask->nb[0] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[3] : 0, mask ? mask->ne[3] : 1, \
+        nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, \
+        k_head_stride_rows, k_batch_stride_rows, split_size, n_splits, 0.0f, nullptr); \
     CUDA_CHECK(cudaGetLastError()); \
     dim3 g2(nq * n_heads_q, batch); \
     ggml_cuda_q8k_dot4_small_verify_gqa_splitk_reduce_kernel<GH_MAX><<<g2, 256, 0, stream>>>( \
         blockfa_partial_o.ptr, blockfa_partial_m.ptr, blockfa_partial_l.ptr, (float *) dst->data, \
-        n_splits, nq, n_heads_q, n_heads_k, gqa_ratio, batch); \
+        n_splits, nq, n_heads_q, n_heads_k, gqa_ratio, batch, nullptr); \
     CUDA_CHECK(cudaGetLastError()); \
+}
+
+#define LAUNCH_DECODE_SMALL_VERIFY_FA3_BATCHED_SPLITK(BN, BN_VSUB, GH_MAX, NQ_MAX, SPLIT_DEFAULT) { \
+    int sm = (NQ_MAX * GH_MAX * DECODE_I32_PER_ROW) * (int)sizeof(int) \
+           + (NQ_MAX * GH_MAX * DECODE_N_BLOCKS) * (int)sizeof(float) \
+           + (BN * DECODE_I32_PER_ROW) * (int)sizeof(int) \
+           + (BN * DECODE_N_BLOCKS) * (int)sizeof(float) \
+           + (NQ_MAX * GH_MAX * BN * 2) * (int)sizeof(float) \
+           + (NQ_MAX * GH_MAX * 4) * (int)sizeof(float); \
+    int split_size = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA3_SPLIT_SIZE", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_SPLIT_SIZE", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_SPLIT_SIZE", SPLIT_DEFAULT))); \
+    int n_splits = (nk + split_size - 1) / split_size; \
+    dim3 g1(n_splits, n_heads_k, batch); \
+    blockfa_partial_o.alloc((size_t) batch * nq * n_heads_k * n_splits * GH_MAX * 256); \
+    blockfa_partial_m.alloc((size_t) batch * nq * n_heads_k * n_splits * GH_MAX); \
+    blockfa_partial_l.alloc((size_t) batch * nq * n_heads_k * n_splits * GH_MAX); \
+    ggml_cuda_q8k_dot4_small_verify_batched_gqa_splitk_stage1_kernel<BN, BN_VSUB, GH_MAX, NQ_MAX, false, false, true><<<g1, 256, sm, stream>>>( \
+        q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, k_payload_row_stride_i32, k_scales_row_stride_half, (const char *) V->data, \
+        mask ? (const char *) mask->data : nullptr, \
+        blockfa_partial_o.ptr, blockfa_partial_m.ptr, blockfa_partial_l.ptr, scale, \
+        V->nb[0], V->nb[1], V->nb[2], V->nb[3], \
+        mask ? mask->nb[0] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[3] : 0, mask ? mask->ne[3] : 1, \
+        nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, \
+        k_head_stride_rows, k_batch_stride_rows, split_size, n_splits, 0.0f, nullptr); \
+    CUDA_CHECK(cudaGetLastError()); \
+    dim3 g2(nq * n_heads_q, batch); \
+    ggml_cuda_q8k_dot4_small_verify_gqa_splitk_reduce_kernel<GH_MAX><<<g2, 256, 0, stream>>>( \
+        blockfa_partial_o.ptr, blockfa_partial_m.ptr, blockfa_partial_l.ptr, (float *) dst->data, \
+        n_splits, nq, n_heads_q, n_heads_k, gqa_ratio, batch, nullptr); \
+    CUDA_CHECK(cudaGetLastError()); \
+}
+
+#define LAUNCH_DECODE_SMALL_VERIFY_FA4_BATCHED_SPLITK(BN, BN_VSUB, GH_MAX, NQ_MAX, SPLIT_DEFAULT, PVWMMA) { \
+    int sm = (NQ_MAX * GH_MAX * DECODE_I32_PER_ROW) * (int)sizeof(int) \
+           + (NQ_MAX * GH_MAX * DECODE_N_BLOCKS) * (int)sizeof(float) \
+           + (BN * DECODE_I32_PER_ROW) * (int)sizeof(int) \
+           + (BN * DECODE_N_BLOCKS) * (int)sizeof(float) \
+           + (NQ_MAX * GH_MAX * BN * 2) * (int)sizeof(float) \
+           + (NQ_MAX * GH_MAX * 4) * (int)sizeof(float); \
+    int split_size = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA4_SPLIT_SIZE", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA2_SPLIT_SIZE", ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_SPLITK_SIZE", SPLIT_DEFAULT))); \
+    int n_splits = (nk + split_size - 1) / split_size; \
+    int fa4_profile_every = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_SMALL_VERIFY_FA4_PROFILE_EVERY", 1); \
+    if (fa4_profile_every < 1) fa4_profile_every = 1; \
+    static unsigned long long fa4_profile_call_counter = 0; \
+    const unsigned long long fa4_profile_call = ++fa4_profile_call_counter; \
+    bool fa4_profile_enabled = ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_SMALL_VERIFY_FA4_PROFILE") && ((fa4_profile_call % (unsigned long long) fa4_profile_every) == 0ull); \
+    if (fa4_profile_enabled) { \
+        hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone; \
+        const hipError_t capture_err = hipStreamIsCapturing(stream, &capture_status); \
+        if (capture_err == hipSuccess && capture_status != hipStreamCaptureStatusNone) { \
+            static bool fa4_profile_capture_warned = false; \
+            if (!fa4_profile_capture_warned) { fa4_profile_capture_warned = true; fprintf(stderr, "SMALL_VERIFY_FA4 PROFILE skipped during graph capture\n"); } \
+            fa4_profile_enabled = false; \
+        } \
+    } \
+    small_verify_fa4_profile * fa4_profile_dev = nullptr; \
+    hipEvent_t fa4_profile_start = nullptr; \
+    hipEvent_t fa4_profile_stop  = nullptr; \
+    if (fa4_profile_enabled) { \
+        CUDA_CHECK(hipMalloc((void **) &fa4_profile_dev, sizeof(small_verify_fa4_profile))); \
+        CUDA_CHECK(hipMemsetAsync(fa4_profile_dev, 0, sizeof(small_verify_fa4_profile), stream)); \
+        CUDA_CHECK(hipEventCreate(&fa4_profile_start)); \
+        CUDA_CHECK(hipEventCreate(&fa4_profile_stop)); \
+        CUDA_CHECK(hipEventRecord(fa4_profile_start, stream)); \
+    } \
+    dim3 g1(n_splits, n_heads_k, batch); \
+    blockfa_partial_o.alloc((size_t) batch * nq * n_heads_k * n_splits * GH_MAX * 256); \
+    blockfa_partial_m.alloc((size_t) batch * nq * n_heads_k * n_splits * GH_MAX); \
+    blockfa_partial_l.alloc((size_t) batch * nq * n_heads_k * n_splits * GH_MAX); \
+    ggml_cuda_q8k_dot4_small_verify_batched_gqa_splitk_stage1_kernel<BN, BN_VSUB, GH_MAX, NQ_MAX, true, PVWMMA><<<g1, 256, sm, stream>>>( \
+        q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, k_payload_row_stride_i32, k_scales_row_stride_half, (const char *) V->data, \
+        mask ? (const char *) mask->data : nullptr, \
+        blockfa_partial_o.ptr, blockfa_partial_m.ptr, blockfa_partial_l.ptr, scale, \
+        V->nb[0], V->nb[1], V->nb[2], V->nb[3], \
+        mask ? mask->nb[0] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[3] : 0, mask ? mask->ne[3] : 1, \
+        nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, \
+        k_head_stride_rows, k_batch_stride_rows, split_size, n_splits, 0.0f, fa4_profile_dev); \
+    CUDA_CHECK(cudaGetLastError()); \
+    dim3 g2(nq * n_heads_q, batch); \
+    ggml_cuda_q8k_dot4_small_verify_gqa_splitk_reduce_kernel<GH_MAX><<<g2, 256, 0, stream>>>( \
+        blockfa_partial_o.ptr, blockfa_partial_m.ptr, blockfa_partial_l.ptr, (float *) dst->data, \
+        n_splits, nq, n_heads_q, n_heads_k, gqa_ratio, batch, fa4_profile_dev); \
+    CUDA_CHECK(cudaGetLastError()); \
+    if (fa4_profile_enabled) { \
+        CUDA_CHECK(hipEventRecord(fa4_profile_stop, stream)); \
+        small_verify_fa4_profile fa4_profile_host = {}; \
+        CUDA_CHECK(hipMemcpyAsync(&fa4_profile_host, fa4_profile_dev, sizeof(fa4_profile_host), hipMemcpyDeviceToHost, stream)); \
+        CUDA_CHECK(hipStreamSynchronize(stream)); \
+        float fa4_kernel_ms = 0.0f; \
+        CUDA_CHECK(hipEventElapsedTime(&fa4_kernel_ms, fa4_profile_start, fa4_profile_stop)); \
+        fprintf(stderr, "SMALL_VERIFY_FA4 PROFILE: impl=%s call=%llu every=%d nq=%d nk=%d hq=%d hk=%d batch=%d gqa=%d split_size=%d n_splits=%d kernel_ms=%.3f qk_cycles=%llu softmax_cycles=%llu pv_cycles=%llu write_cycles=%llu reduce_cycles=%llu\n", \
+            PVWMMA ? "small_verify_fa4_pvwmma" : "small_verify_fa4", \
+            (unsigned long long) fa4_profile_call, fa4_profile_every, nq, nk, n_heads_q, n_heads_k, batch, gqa_ratio, split_size, n_splits, (double) fa4_kernel_ms, \
+            (unsigned long long) fa4_profile_host.qk_cycles, \
+            (unsigned long long) fa4_profile_host.softmax_cycles, \
+            (unsigned long long) fa4_profile_host.pv_cycles, \
+            (unsigned long long) fa4_profile_host.write_cycles, \
+            (unsigned long long) fa4_profile_host.reduce_cycles); \
+        CUDA_CHECK(hipEventDestroy(fa4_profile_start)); \
+        CUDA_CHECK(hipEventDestroy(fa4_profile_stop)); \
+        CUDA_CHECK(hipFree(fa4_profile_dev)); \
+    } \
+}
+
+#define LAUNCH_DECODE_BM_DOT4_PAGES(BN, BN_VSUB, GH_MAX, ROW_BLOCK, NQ_MAX, PV_IMPL) { \
+    int n_pages = (nk + BN - 1) / BN; \
+    int row_blocks_per_hk = (nq * gqa_ratio + ROW_BLOCK - 1) / ROW_BLOCK; \
+    int sm = (ROW_BLOCK * DECODE_I32_PER_ROW) * (int)sizeof(int) \
+           + (ROW_BLOCK * DECODE_N_BLOCKS) * (int)sizeof(float) \
+           + (BN * DECODE_I32_PER_ROW) * (int)sizeof(int) \
+           + (BN * DECODE_N_BLOCKS) * (int)sizeof(float) \
+           + (ROW_BLOCK * BN * 2) * (int)sizeof(float) \
+           + (ROW_BLOCK * 4) * (int)sizeof(float); \
+    int profile_every = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_BM_DOT4_PAGES_PROFILE_EVERY", 1); \
+    if (profile_every < 1) profile_every = 1; \
+    static unsigned long long profile_call_counter = 0; \
+    const unsigned long long profile_call = ++profile_call_counter; \
+    bool profile_enabled = ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_BM_DOT4_PAGES_PROFILE") && ((profile_call % (unsigned long long) profile_every) == 0ull); \
+    if (profile_enabled) { \
+        hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone; \
+        const hipError_t capture_err = hipStreamIsCapturing(stream, &capture_status); \
+        if (capture_err == hipSuccess && capture_status != hipStreamCaptureStatusNone) { \
+            static bool capture_warned = false; \
+            if (!capture_warned) { capture_warned = true; fprintf(stderr, "BM_DOT4_PAGES PROFILE skipped during graph capture\n"); } \
+            profile_enabled = false; \
+        } \
+    } \
+    small_verify_fa4_profile * profile_dev = nullptr; \
+    hipEvent_t profile_start = nullptr; \
+    hipEvent_t profile_stop  = nullptr; \
+    if (profile_enabled) { \
+        CUDA_CHECK(hipMalloc((void **) &profile_dev, sizeof(small_verify_fa4_profile))); \
+        CUDA_CHECK(hipMemsetAsync(profile_dev, 0, sizeof(small_verify_fa4_profile), stream)); \
+        CUDA_CHECK(hipEventCreate(&profile_start)); \
+        CUDA_CHECK(hipEventCreate(&profile_stop)); \
+        CUDA_CHECK(hipEventRecord(profile_start, stream)); \
+    } \
+    dim3 g1(n_pages, n_heads_k * row_blocks_per_hk, batch); \
+    blockfa_partial_o.alloc((size_t) batch * nq * n_heads_k * n_pages * GH_MAX * 256); \
+    blockfa_partial_m.alloc((size_t) batch * nq * n_heads_k * n_pages * GH_MAX); \
+    blockfa_partial_l.alloc((size_t) batch * nq * n_heads_k * n_pages * GH_MAX); \
+    ggml_cuda_q8k_dot4_bm_dot4_pages_stage1_kernel<BN, BN_VSUB, GH_MAX, ROW_BLOCK, NQ_MAX, PV_IMPL><<<g1, 128, sm, stream>>>( \
+        q_payload.ptr, q_scales.ptr, k_payload.ptr, k_scales.ptr, k_payload_row_stride_i32, k_scales_row_stride_half, (const char *) V->data, \
+        mask ? (const char *) mask->data : nullptr, \
+        blockfa_partial_o.ptr, blockfa_partial_m.ptr, blockfa_partial_l.ptr, scale, \
+        V->nb[0], V->nb[1], V->nb[2], V->nb[3], \
+        mask ? mask->nb[0] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[3] : 0, mask ? mask->ne[3] : 1, \
+        nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, q_offset, \
+        k_head_stride_rows, k_batch_stride_rows, n_pages, profile_dev); \
+    CUDA_CHECK(cudaGetLastError()); \
+    dim3 g2(nq * n_heads_q, batch); \
+    ggml_cuda_q8k_dot4_small_verify_gqa_splitk_reduce_kernel<GH_MAX><<<g2, 256, 0, stream>>>( \
+        blockfa_partial_o.ptr, blockfa_partial_m.ptr, blockfa_partial_l.ptr, (float *) dst->data, \
+        n_pages, nq, n_heads_q, n_heads_k, gqa_ratio, batch, profile_dev); \
+    CUDA_CHECK(cudaGetLastError()); \
+    if (profile_enabled) { \
+        CUDA_CHECK(hipEventRecord(profile_stop, stream)); \
+        small_verify_fa4_profile profile_host = {}; \
+        CUDA_CHECK(hipMemcpyAsync(&profile_host, profile_dev, sizeof(profile_host), hipMemcpyDeviceToHost, stream)); \
+        CUDA_CHECK(hipStreamSynchronize(stream)); \
+        float kernel_ms = 0.0f; \
+        CUDA_CHECK(hipEventElapsedTime(&kernel_ms, profile_start, profile_stop)); \
+        fprintf(stderr, "BM_DOT4_PAGES PROFILE: impl=%s call=%llu every=%d nq=%d nk=%d hq=%d hk=%d batch=%d gqa=%d BM=%d row_block=%d row_blocks_per_hk=%d pages=%d ctas=%d kernel_ms=%.3f qk_cycles=%llu softmax_cycles=%llu pv_cycles=%llu write_cycles=%llu reduce_cycles=%llu\n", \
+            ((PV_IMPL) == BM_DOT4_PAGES_PV_IMPL_INTFLASH_VFRAG_WMMA ? "bm_dot4_pages_intflash_vfrag_wmma" : ((PV_IMPL) == BM_DOT4_PAGES_PV_IMPL_INTFLASH_VFRAG_DOT4 ? "bm_dot4_pages_intflash_vfrag_dot4" : ((PV_IMPL) == BM_DOT4_PAGES_PV_IMPL_PINT8PV_DOT4 ? "bm_dot4_pages_pint8pv_dot4" : ((PV_IMPL) == BM_DOT4_PAGES_PV_IMPL_PINT8PV ? "bm_dot4_pages_pint8pv" : ((PV_IMPL) == BM_DOT4_PAGES_PV_IMPL_PVWMMA ? "bm_dot4_pages_pvwmma" : "bm_dot4_pages"))))), \
+            (unsigned long long) profile_call, profile_every, nq, nk, n_heads_q, n_heads_k, batch, gqa_ratio, BN, ROW_BLOCK, row_blocks_per_hk, n_pages, n_pages * n_heads_k * row_blocks_per_hk * batch, (double) kernel_ms, \
+            (unsigned long long) profile_host.qk_cycles, \
+            (unsigned long long) profile_host.softmax_cycles, \
+            (unsigned long long) profile_host.pv_cycles, \
+            (unsigned long long) profile_host.write_cycles, \
+            (unsigned long long) profile_host.reduce_cycles); \
+        CUDA_CHECK(hipEventDestroy(profile_start)); \
+        CUDA_CHECK(hipEventDestroy(profile_stop)); \
+        CUDA_CHECK(hipFree(profile_dev)); \
+    } \
 }
 
 #define LAUNCH_DECODE_GQA_PVWMMA(BN, GH_MAX) { \
