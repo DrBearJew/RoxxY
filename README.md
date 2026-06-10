@@ -42,9 +42,10 @@ That is the normal MTP path. You do not need to set the internal
 `LLAMA_MTP_MMVQ_*` route knobs by hand.
 
 `q4_0` is the recommended V-cache choice for the fast MTP path. `q8_0` also
-works, but it uses more VRAM and was slower in the 27B MTP decode smoke; use it
-only when you want the higher V precision tradeoff. If switching to `q8_0`,
-change both the main and draft V types:
+works, but it uses more VRAM and remains slower than `q4_0` on the measured 27B
+MTP path. If you want the higher V precision tradeoff, change both the main and
+draft V types; the launcher will pick the measured q8_0 policy for known 27B
+layouts:
 
 ```bash
 --cache-type-v q8_0 \
@@ -57,8 +58,9 @@ RoxxY packed16 runtime layout.
 What the launcher does:
 
 - known tested GGUFs get the measured fast MMVQ policy;
+- known 27B layouts using `q8_0` V get the measured q8_0 policy;
 - unknown GGUFs stay on the safe baseline;
-- stale MMVQ env vars from old experiments are cleared before launch.
+- stale MMVQ/PDMQ env vars from old experiments are cleared before launch.
 
 If you want to see what it picked:
 
@@ -105,7 +107,7 @@ Use one of these V choices:
 
 ```text
 --cache-type-v q4_0       # default: 4.5 bits/V-value; 2.25-bit contribution to total K+V average
---cache-type-v q8_0       # higher V precision: 8.5 bits/V-value; more VRAM, not the fastest MTP default
+--cache-type-v q8_0       # higher V precision: 8.5 bits/V-value; more VRAM, slower than q4_0 in MTP smoke
 ```
 
 The intended q4 architecture is **not i16 V**. It is packed q4 V payload plus

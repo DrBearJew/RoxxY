@@ -10,7 +10,7 @@ script gives users one safe entry point:
 Behavior:
   * known/cached GGUF layout: apply the measured policy
   * unknown GGUF layout: leave interleaved routes off unless a policy is forced
-  * always clears stale managed LLAMA_MTP_MMVQ_* env before applying a policy
+  * always clears stale managed MMVQ/PDMQ env before applying a policy
 
 This script does not benchmark unknown models by itself.  It is a safe policy
 applier/cache layer; use --policy to force a developer-tested policy and
@@ -31,7 +31,19 @@ from typing import Dict, Iterable, List, Mapping, MutableMapping, Tuple
 
 
 MANAGED_VARS: Tuple[str, ...] = tuple(
-    ["LLAMA_MTP_MMVQ_INTERLEAVED_ACT_MULTI_TYPE_NWARPS_UNSAFE"]
+    [
+        "LLAMA_MTP_MMVQ_INTERLEAVED_ACT_MULTI_TYPE_NWARPS_UNSAFE",
+        "GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_Q8V_N64",
+        "GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_IMPL",
+        "GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_VPATH",
+        "GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_SHAPE",
+        "GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_SHAPE_AUTO",
+        "GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQA_GROUP",
+        "GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQA_REQUIRE",
+        "GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQAX_SPLITK",
+        "GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQAX_SPLITK_ROOF_CAP",
+        "GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQAX_SPLITK_COMPACT_EMPTY",
+    ]
     + [
         f"LLAMA_MTP_MMVQ_{family}_INTERLEAVED_ACT{suffix}"
         for family in ("Q4K", "Q5K", "Q6K")
@@ -52,6 +64,16 @@ POLICIES: Mapping[str, Mapping[str, str]] = {
         "LLAMA_MTP_MMVQ_Q4K_INTERLEAVED_ACT": "1",
         "LLAMA_MTP_MMVQ_Q6K_INTERLEAVED_ACT": "1",
         "LLAMA_MTP_MMVQ_Q4K_INTERLEAVED_ACT_NWARPS": "2",
+    },
+    # Same 27B Q4_K_M weight policy, but for users explicitly running q8_0 V.
+    # q8_0 V baseline was ~52 tok/s; q8v-n64 was 56.4/57.2 tok/s with a
+    # different prompt-x trajectory. Auto-selected only when the command/env
+    # asks for q8_0 V on this known model.
+    "q4q6-27b-q8v-fast": {
+        "LLAMA_MTP_MMVQ_Q4K_INTERLEAVED_ACT": "1",
+        "LLAMA_MTP_MMVQ_Q6K_INTERLEAVED_ACT": "1",
+        "LLAMA_MTP_MMVQ_Q4K_INTERLEAVED_ACT_NWARPS": "2",
+        "GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_Q8V_N64": "1",
     },
     # Measured on Qwen3.6-27B Heretic Native-MTP i1-Q6_K prompt-x n512:
     # baseline 84.66 tok/s; q6 nw4 89.62/90.94 tok/s, SHA-clean.
@@ -160,6 +182,36 @@ def builtin_policy_for_name(name: str) -> Tuple[str, str] | None:
     return None
 
 
+def command_option_value(cmd: List[str], names: Tuple[str, ...]) -> str | None:
+    for i, token in enumerate(cmd):
+        for name in names:
+            if token == name and i + 1 < len(cmd):
+                return cmd[i + 1]
+            prefix = name + "="
+            if token.startswith(prefix):
+                return token[len(prefix):]
+    return None
+
+
+def requested_v_cache_type(cmd: List[str], env: Mapping[str, str]) -> str | None:
+    # Main V first, then draft V. The q8_0 policy only needs to know whether the
+    # user is intentionally running q8_0 V; normal q4_0 launches stay on the q4
+    # fast policy.
+    value = command_option_value(cmd, ("--cache-type-v", "-ctv"))
+    if value:
+        return value.lower()
+    value = command_option_value(cmd, ("--cache-type-v-draft", "--spec-draft-type-v", "-ctvd"))
+    if value:
+        return value.lower()
+    value = env.get("LLAMA_ARG_CACHE_TYPE_V")
+    if value:
+        return value.lower()
+    value = env.get("LLAMA_ARG_CACHE_TYPE_V_DRAFT")
+    if value:
+        return value.lower()
+    return None
+
+
 def resolve_policy(args: argparse.Namespace, fp: Mapping[str, object], cache: Mapping[str, object]) -> Tuple[str, str]:
     if args.policy != "auto":
         return args.policy, f"forced by --policy={args.policy}"
@@ -247,6 +299,13 @@ def main(argv: Iterable[str] = sys.argv[1:]) -> int:
     fp = model_fingerprint(model)
     cache = load_cache(args.cache)
     policy_name, reason = resolve_policy(args, fp, cache)
+
+    if args.policy == "auto" and policy_name == "q4q6-27b-fast":
+        v_cache_type = requested_v_cache_type(args.cmd, os.environ)
+        if v_cache_type == "q8_0":
+            policy_name = "q4q6-27b-q8v-fast"
+            reason = f"{reason}; command/env requests q8_0 V"
+
     policy = dict(POLICIES[policy_name])
 
     if args.trust_policy:

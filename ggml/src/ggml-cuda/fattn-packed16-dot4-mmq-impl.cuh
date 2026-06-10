@@ -96,6 +96,10 @@ static inline bool pdmq_kshared_enabled() {
     const char * v = pdmq_impl_env();
     return strcmp(v, "kshared") == 0 || strcmp(v, "kshared_stagev") == 0 || strcmp(v, "kshared_directv") == 0;
 }
+static inline bool pdmq_q8v_n64_enabled() {
+    const char * v = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_Q8V_N64");
+    return v && atoi(v) != 0;
+}
 
 enum packed16_dot4_mmq_v_type {
     PACKED16_DOT4_MMQ_V_Q4_0,
@@ -2046,6 +2050,14 @@ static inline pdmq_shape pdmq_select_shape_auto(
         // tg128 MTP workflow. Keep the prior narrow defaults for GQA6/GQA8
         // models where M4N64 regressed or was not route-proven.
         return PDMQ_SHAPE_M4N64;
+    }
+    if (v_type == GGML_TYPE_Q8_0 && pdmq_q8v_n64_enabled()) {
+        // Default-off q8_0 V experiment: on Qwen3.6-27B Q4_K_M MTP, forcing
+        // M1N64 for q8_0 V avoids the staged-f32 V path across the PDMQ verify
+        // roles and improves q8_0 V speed without changing q4_0/f16 defaults.
+        // Keep behind an explicit env because the trajectory differs from the
+        // conservative q8_0/f16 stage-f32 path.
+        return PDMQ_SHAPE_M1N64;
     }
     if (nq <= 1) {
         return PDMQ_SHAPE_M1N32;
