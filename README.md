@@ -41,9 +41,10 @@ scripts/mtp-mmvq-interleaved-auto.py --model "$MODEL" -- \
 That is the normal MTP path. You do not need to set the internal
 `LLAMA_MTP_MMVQ_*` route knobs by hand.
 
-`q4_0` is the default V-cache choice because it is the tested compression path.
-It is **not** the only option. If you want higher V precision, use `q8_0` for
-both the main and draft V types:
+`q4_0` is the recommended V-cache choice for the fast MTP path. `q8_0` also
+works, but it uses more VRAM and was slower in the 27B MTP decode smoke; use it
+only when you want the higher V precision tradeoff. If switching to `q8_0`,
+change both the main and draft V types:
 
 ```bash
 --cache-type-v q8_0 \
@@ -104,7 +105,7 @@ Use one of these V choices:
 
 ```text
 --cache-type-v q4_0       # default: 4.5 bits/V-value; 2.25-bit contribution to total K+V average
---cache-type-v q8_0       # higher precision: 8.5 bits/V-value; 4.25-bit contribution to total K+V average
+--cache-type-v q8_0       # higher V precision: 8.5 bits/V-value; more VRAM, not the fastest MTP default
 ```
 
 The intended q4 architecture is **not i16 V**. It is packed q4 V payload plus
