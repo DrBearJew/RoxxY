@@ -4237,7 +4237,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             ggml_cuda_dp16_fa_emit_packed16_mtp_draft_trace_if_needed(dst, cc);
             const bool standard_mtp_q4_pdmq_decode =
                 inst == GGML_FATTN_INST_MTP_DRAFT_DECODE_QK && V->type == GGML_TYPE_Q4_0;
-            if ((standard_mtp_q4_pdmq_decode || v_requires_dot4_mmq) &&
+            const bool typed_v_pdmq_decode = V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_F16;
+            if ((standard_mtp_q4_pdmq_decode || typed_v_pdmq_decode || v_requires_dot4_mmq) &&
                     ggml_cuda_packed16_dot4_mmq_supported(cc, dst)) {
                 return BEST_FATTN_KERNEL_PACKED16_DOT4_MMQ;
             }

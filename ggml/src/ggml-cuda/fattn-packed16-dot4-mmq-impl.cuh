@@ -82,7 +82,7 @@ static constexpr int PDMQ_V_Q4_BLOCKS   = PDMQ_D / QK4_0;
 
 // ── Experiment envs ──────────────────────────────────────────────
 // PDMQ_IMPL:  baseline | kshared | kshared_stagev | kshared_directv
-// PDMQ_VPATH: stage_f32 | direct_pv_q4 | raw_lds_q4
+// PDMQ_VPATH: stage_f32 | direct_pv_q4 | direct_legacy | raw_lds_q4
 // Explicit legacy PDMQ_IMPL stage/direct spellings remain honored when PDMQ_VPATH is unset.
 static const char * pdmq_impl_env() {
     const char * v = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_IMPL");
@@ -804,10 +804,12 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqa2
 
             PDMQ_PROFILE_PHASE_BEGIN();
 
-            // PV accumulate. For q4 direct-V, run kk-major so each V[k,d]
-            // is decoded once per thread lane and reused across query rows.
+            // PV accumulate. For direct-V, run kk-major so each V[k,d]
+            // is decoded/loaded once per thread lane and reused across query rows.
+            // q4_0 can optionally source the raw block from LDS; q8_0/f16 use the
+            // same reuse pattern through their typed direct decoders.
             if (tid < D) {
-                if constexpr (!STAGE_V && V_TYPE == PACKED16_DOT4_MMQ_V_Q4_0) {
+                if constexpr (!STAGE_V) {
                     float acc[BM];
                     for (int qr = 0; qr < BM; ++qr) {
                         const int q = q0 + qr;
@@ -817,7 +819,7 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqa2
                         const float vv = kk < tile_n
                             ? (RAW_Q4_LDS
                                 ? pdmq_decode_v_q4_0_raw_lds<D>(v_raw_tile, kk, tid)
-                                : pdmq_decode_v_q4_0(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k0 + kk, hk, b, tid))
+                                : pdmq_decode_v<V_TYPE>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k0 + kk, hk, b, tid))
                             : 0.0f;
                         for (int qr = 0; qr < BM; ++qr) {
                             const int q = q0 + qr;
@@ -837,9 +839,9 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqa2
                         float acc = out[s][qr] * old_s[s][qr];
                         for (int kk = 0; kk < BN; ++kk) {
                             const float p = logits[qr][kk];
-                            if (p != 0.0f)
-                                acc += p * (STAGE_V ? v_tile[kk * (D + 1) + tid]
-                                                   : pdmq_decode_v<V_TYPE>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k0 + kk, hk, b, tid));
+                            if (p != 0.0f) {
+                                acc += p * v_tile[kk * (D + 1) + tid];
+                            }
                         }
                         out[s][qr] = acc;
                     }
@@ -1425,7 +1427,7 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_kern
         PDMQ_PROFILE_PHASE_BEGIN();
 
         if (tid < D) {
-            if constexpr (!STAGE_V && V_TYPE == PACKED16_DOT4_MMQ_V_Q4_0) {
+            if constexpr (!STAGE_V) {
                 float acc[BM];
 #pragma unroll
                 for (int qr = 0; qr < BM; ++qr) {
@@ -1437,7 +1439,7 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_kern
                     const float vv = kk < tile_n
                         ? (RAW_Q4_LDS
                             ? pdmq_decode_v_q4_0_raw_lds<D>(v_raw_tile, kk, tid)
-                            : pdmq_decode_v_q4_0(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k0 + kk, hk, b, tid))
+                            : pdmq_decode_v<V_TYPE>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k0 + kk, hk, b, tid))
                         : 0.0f;
 #pragma unroll
                     for (int qr = 0; qr < BM; ++qr) {
@@ -1470,10 +1472,7 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_kern
                     for (int kk = 0; kk < BN; ++kk) {
                         const float p = logits[qr][kk];
                         if (p != 0.0f) {
-                            const float vv = STAGE_V
-                                ? v_tile[kk * (D + 1) + tid]
-                                : pdmq_decode_v<V_TYPE>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k0 + kk, hk, b, tid);
-                            acc += p * vv;
+                            acc += p * v_tile[kk * (D + 1) + tid];
                         }
                     }
                     out[qr] = acc;
@@ -2028,10 +2027,13 @@ static inline pdmq_v_path pdmq_parse_v_path_env(const char * env) {
     if (strcmp(env, "direct_pv_q4") == 0 || strcmp(env, "direct_q4") == 0 || strcmp(env, "directv") == 0) {
         return PDMQ_V_DIRECT_PV_Q4;
     }
+    if (strcmp(env, "direct_legacy") == 0 || strcmp(env, "direct_typed") == 0) {
+        return PDMQ_V_DIRECT_LEGACY;
+    }
     if (strcmp(env, "raw_lds_q4") == 0 || strcmp(env, "raw_q4") == 0) {
         return PDMQ_V_RAW_LDS_Q4;
     }
-    GGML_ABORT("packed16_dot4_mmq: bad GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_VPATH=%s, expected stage_f32, direct_pv_q4, or raw_lds_q4", env);
+    GGML_ABORT("packed16_dot4_mmq: bad GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_VPATH=%s, expected stage_f32, direct_pv_q4/directv, direct_legacy/direct_typed, or raw_lds_q4", env);
 }
 
 static inline pdmq_shape pdmq_select_shape_auto(
@@ -2111,8 +2113,7 @@ static inline pdmq_v_path pdmq_select_v_path(
             GGML_ABORT("packed16_dot4_mmq: raw_lds_q4 requires V=q4_0, got V=%s", ggml_type_name(v_type));
         }
         if (requested == PDMQ_V_DIRECT_PV_Q4 && v_type != GGML_TYPE_Q4_0) {
-            // direct_pv_q4 is a q4 policy; keep other V types on the proven f32-stage path.
-            return PDMQ_V_STAGE_F32;
+            return PDMQ_V_DIRECT_LEGACY;
         }
         return requested;
     }
@@ -2127,10 +2128,13 @@ static inline pdmq_v_path pdmq_select_v_path(
     }
 
     // Patch 4: with the production-constrained ubatch=1024 top case, raw LDS q4
-    // wins over f32 V staging for MTP small-Q roles. Keep direct_pv_q4 explicit;
-    // it remains slower in the same A/B.
+    // wins over f32 V staging for MTP small-Q roles. q8_0/f16 cannot use raw q4
+    // LDS, but they should still use the same kk-major direct-V reuse pattern.
     if (v_type == GGML_TYPE_Q4_0 && nq <= 8) {
         return PDMQ_V_RAW_LDS_Q4;
+    }
+    if ((v_type == GGML_TYPE_Q8_0 || v_type == GGML_TYPE_F16) && nq <= 8) {
+        return PDMQ_V_DIRECT_LEGACY;
     }
 
     return PDMQ_V_STAGE_F32;

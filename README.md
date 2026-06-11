@@ -37,8 +37,9 @@ MODEL=/path/to/Qwen3.6-27B-Q4_K_M-mtp.gguf
 That is the normal MTP path. You do not need to set internal MTP, PDMQ,
 packed16, MMVQ, backend-top-k, or route assertion environment variables.
 
-`q4_0` is the recommended V-cache choice for the fast MTP path. `q8_0` uses
-more VRAM and remains slower than `q4_0` on the measured 27B MTP path.
+`q4_0` is the recommended V-cache choice for the fast MTP path. `q8_0` and
+`f16` are supported higher-precision V-cache choices; they use more VRAM and
+remain slower than `q4_0` on the measured 27B MTP path.
 
 Do not add `--cache-type-k` for the packed16/I32 path; K is selected by the
 RoxxY packed16 runtime layout.
@@ -50,6 +51,18 @@ Expected q4 evidence on the measured 27B path is approximately:
 standard n512 smoke. Draft KV should be about 65 MiB at ctx 40960: packed16 K
 payload+scales around 42.5 MiB plus q4_0 V around 22.5 MiB.
 ```
+
+Expected higher-precision typed-V evidence on the same direct/clean command,
+with only the V cache type changed, is approximately:
+
+```text
+q8_0: ~51 tok/s, draft acceptance around 399/565, no selected=587/588
+f16:  ~50 tok/s, draft acceptance around 399/565, no selected=587/588
+```
+
+Route-log canaries should show `rocm_packed16_dot4_mmq` / `PDMQ2 ... K=i32
+V=q8_0` or `V=f16` for the small-Q typed-V path; the old
+`rocm_packed16_decode` lane is not the typed-V solution.
 
 ---
 
@@ -78,14 +91,15 @@ Use one of these V choices:
 ```text
 --cache-type-v q4_0       # default: 4.5 bits/V-value; 2.25-bit contribution to total K+V average
 --cache-type-v q8_0       # higher V precision: 8.5 bits/V-value; more VRAM, slower than q4_0 in MTP smoke
+--cache-type-v f16        # highest V precision; most VRAM, similar speed to q8_0 in MTP smoke
 ```
 
 The intended q4 architecture is **not i16 V**. It is packed q4 V payload plus
 f16 scales feeding only the `P @ V` side; QK remains packed16 I32 DOT4 K.
-For users who want more V precision, `q8_0` V keeps the same packed16 I32 K path
-and raises V from 4.5 to 8.5 bits/V-value. In whole-KV VRAM accounting, q4 V
-contributes 2.25 bits to the total K+V average, while q8 V contributes 4.25 bits;
-packed16-K + q8-V is about 17 bits per K+V pair.
+For users who want more V precision, `q8_0` and `f16` V keep the same packed16
+I32 K path and raise only the `P @ V` value format. In whole-KV VRAM accounting,
+q4 V contributes 2.25 bits to the total K+V average, q8 V contributes 4.25 bits,
+and f16 V contributes 8 bits; packed16-K + q8-V is about 17 bits per K+V pair.
 
 `tbq4_0` is no longer a proper starting option. Treat it, plus `planar3_0` and
 `iso3_0`, as legacy/experimental V-format research only.
