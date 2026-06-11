@@ -1,5 +1,7 @@
 # RoxxY — Packed16 FlashAttention for RDNA3
 
+![RoxxY](assets/github-social-preview.jpg)
+
 RoxxY is the standalone GitHub home for this RDNA3-focused `llama.cpp` branch
 with packed16 K-cache FlashAttention. Clone this repository directly; it is no
 longer installed from `DrBearJew/llama.cpp`.
