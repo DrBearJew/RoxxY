@@ -7,8 +7,6 @@
 //   - FA: online softmax + P@V, with the same packed16 row convention as WMMA
 //
 // Initial target: D=256, Q=f32, K=I32 packed16, V=q4_0/q8_0/f16, dst=f32.
-// Optional experiment: V=tbq4_0 via GGML_CUDA_ROCM_PACKED16_TBQ4_V=1.
-// Planar/Iso 3-bit V formats are decoded with their inverse local rotations.
 //
 // Shapes:
 //   M16N16: prefill/MMQ-oriented default for nq >= 16. More Q rows per CTA, lower V LDS.
@@ -20,7 +18,6 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-dot4-q8k-kq.cuh"
-#include "fattn-mma-tbq4.cuh"
 #include "dot4-packed16/dp16-trace.cuh"
 
 #include <atomic>
@@ -70,6 +67,12 @@ static_assert(PDMQ_BM_PREFILL * PDMQ_BN_PREFILL == PDMQ_THREADS, "M16N16 maps on
 static_assert(PDMQ_BM_SMALL   * PDMQ_BN_SMALL   == PDMQ_THREADS, "M8N32 maps one QK logit per thread");
 static_assert(PDMQ_BM_LONGK   * PDMQ_BN_LONGK   == PDMQ_THREADS, "M4N64 maps one QK logit per thread");
 
+#ifndef GGML_HIP_PDMQ_FULL_EXPERIMENTAL_MATRIX
+#define GGML_HIP_PDMQ_FULL_EXPERIMENTAL_MATRIX 0
+#endif
+
+#define PDMQ_FULL_EXPERIMENTAL_MATRIX GGML_HIP_PDMQ_FULL_EXPERIMENTAL_MATRIX
+
 // +1 row padding mirrors the useful MMQ/RDNA LDS trick: avoid perfect
 // power-of-two row strides in shared memory without materially increasing LDS.
 // Keep this local to DOT4-MMQ; do not reuse normal MMQ env knobs here.
@@ -94,20 +97,31 @@ static const char * pdmq_vpath_env() {
 }
 static inline bool pdmq_kshared_enabled() {
     const char * v = pdmq_impl_env();
+#if !PDMQ_FULL_EXPERIMENTAL_MATRIX
+    if (v && *v) {
+        GGML_ABORT("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_IMPL requires -DGGML_HIP_PDMQ_FULL_EXPERIMENTAL_MATRIX=ON in this compact PDMQ build");
+    }
+    return false;
+#else
     return strcmp(v, "kshared") == 0 || strcmp(v, "kshared_stagev") == 0 || strcmp(v, "kshared_directv") == 0;
+#endif
 }
 static inline bool pdmq_q8v_n64_enabled() {
     const char * v = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_Q8V_N64");
+#if !PDMQ_FULL_EXPERIMENTAL_MATRIX
+    if (v && atoi(v) != 0) {
+        GGML_ABORT("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_Q8V_N64 requires -DGGML_HIP_PDMQ_FULL_EXPERIMENTAL_MATRIX=ON in this compact PDMQ build");
+    }
+    return false;
+#else
     return v && atoi(v) != 0;
+#endif
 }
 
 enum packed16_dot4_mmq_v_type {
     PACKED16_DOT4_MMQ_V_Q4_0,
     PACKED16_DOT4_MMQ_V_Q8_0,
     PACKED16_DOT4_MMQ_V_F16,
-    PACKED16_DOT4_MMQ_V_TBQ4_0,
-    PACKED16_DOT4_MMQ_V_PLANAR3_0,
-    PACKED16_DOT4_MMQ_V_ISO3_0,
 };
 
 // Helpers shared by host (probe validation) and device (kernel). Pure math, no HIP deps.
@@ -161,11 +175,6 @@ bool ggml_cuda_packed16_dot4_mmq_enabled() {
     return ggml_cuda_q8k_dot4_packed16_k_cache_enabled();
 }
 
-bool ggml_cuda_packed16_tbq4_v_enabled() {
-    const char * v = getenv("GGML_CUDA_ROCM_PACKED16_TBQ4_V");
-    return v && atoi(v) != 0;
-}
-
 static inline bool pdmq_packed16_sidecar_valid(
         const ggml_tensor * K,
         const ggml_tensor * packed16_payload,
@@ -216,10 +225,7 @@ static inline bool ggml_cuda_packed16_dot4_mmq_sidecar_ready(const ggml_tensor *
 bool ggml_cuda_packed16_dot4_mmq_v_supported(const ggml_type type) {
     return type == GGML_TYPE_Q4_0 ||
            type == GGML_TYPE_Q8_0 ||
-           type == GGML_TYPE_F16  ||
-           type == GGML_TYPE_PLANAR3_0 ||
-           type == GGML_TYPE_ISO3_0 ||
-           (type == GGML_TYPE_TBQ4_0 && ggml_cuda_packed16_tbq4_v_enabled());
+           type == GGML_TYPE_F16;
 }
 
 bool ggml_cuda_packed16_dot4_mmq_supported(const int cc, const ggml_tensor * dst) {
@@ -242,8 +248,7 @@ bool ggml_cuda_packed16_dot4_mmq_supported(const int cc, const ggml_tensor * dst
     if (Q->ne[0] != PDMQ_D || V->ne[0] != PDMQ_D || dst->ne[0] != PDMQ_D) {
         return false;
     }
-    const bool v_needs_mmq_decode = V->type == GGML_TYPE_TBQ4_0 || V->type == GGML_TYPE_PLANAR3_0 || V->type == GGML_TYPE_ISO3_0;
-    if (Q->ne[1] <= 0 && !v_needs_mmq_decode && !ggml_cuda_packed16_dot4_mmq_route_required()) {
+    if (Q->ne[1] <= 0 && !ggml_cuda_packed16_dot4_mmq_route_required()) {
         // nq==1 MTP q4 decode is now a standard PDMQ path; route-require is no
         // longer needed just to make the support check accept decode.
         return false;
@@ -409,98 +414,6 @@ static __device__ __forceinline__ float pdmq_decode_v_q8_0(
     return pdmq_decode_v_q8_0_block(*bq, in);
 }
 
-static __device__ __forceinline__ uint8_t pdmq_unpack_3bit_planar_iso(
-        const uint8_t * __restrict__ qs,
-        const uint8_t * __restrict__ signs,
-        const int j) {
-    const uint8_t low = (qs[j / 4] >> ((j % 4) * 2)) & 0x3;
-    const uint8_t hi  = (signs[j / 8] >> (j % 8)) & 0x1;
-    return low | (hi << 2);
-}
-
-static __device__ __forceinline__ float pdmq_decode_v_planar3_0(
-        const char * __restrict__ V,
-        const int64_t v_nb10,
-        const int64_t v_nb11,
-        const int64_t v_nb12,
-        const int64_t v_nb13,
-        const int64_t v_ne13,
-        const int k,
-        const int hk,
-        const int b,
-        const int d) {
-    const int vb = v_ne13 > 1 ? (b % v_ne13) : 0;
-    const char * ptr = V + int64_t(vb) * v_nb13 + int64_t(hk) * v_nb12 + int64_t(k) * v_nb11;
-    const int ib = d / QK_PLANAR3;
-    const int j  = d % QK_PLANAR3;
-    const int p  = j / 2;
-    const block_planar3_0 * bp = (const block_planar3_0 *) (ptr + int64_t(ib) * v_nb10);
-    const int j0 = p * 2;
-    const float q0 = PI_CENTROIDS_3BIT[pdmq_unpack_3bit_planar_iso(bp->qs, bp->signs, j0 + 0)];
-    const float q1 = PI_CENTROIDS_3BIT[pdmq_unpack_3bit_planar_iso(bp->qs, bp->signs, j0 + 1)];
-    const float c = PI_COS[p];
-    const float s = PI_SIN[p];
-    const float v0 =  c * q0 + s * q1;
-    const float v1 = -s * q0 + c * q1;
-    return (j & 1 ? v1 : v0) * __half2float(bp->d);
-}
-
-static __device__ __forceinline__ float pdmq_decode_v_iso3_0(
-        const char * __restrict__ V,
-        const int64_t v_nb10,
-        const int64_t v_nb11,
-        const int64_t v_nb12,
-        const int64_t v_nb13,
-        const int64_t v_ne13,
-        const int k,
-        const int hk,
-        const int b,
-        const int d) {
-    const int vb = v_ne13 > 1 ? (b % v_ne13) : 0;
-    const char * ptr = V + int64_t(vb) * v_nb13 + int64_t(hk) * v_nb12 + int64_t(k) * v_nb11;
-    const int ib = d / QK_ISO3;
-    const int j  = d % QK_ISO3;
-    const int g  = j / 4;
-    const int off = j & 3;
-    const block_iso3_0 * bi = (const block_iso3_0 *) (ptr + int64_t(ib) * v_nb10);
-    const int j0 = g * 4;
-    const float q0 = PI_CENTROIDS_3BIT[pdmq_unpack_3bit_planar_iso(bi->qs, bi->signs, j0 + 0)];
-    const float q1 = PI_CENTROIDS_3BIT[pdmq_unpack_3bit_planar_iso(bi->qs, bi->signs, j0 + 1)];
-    const float q2 = PI_CENTROIDS_3BIT[pdmq_unpack_3bit_planar_iso(bi->qs, bi->signs, j0 + 2)];
-    const float q3 = PI_CENTROIDS_3BIT[pdmq_unpack_3bit_planar_iso(bi->qs, bi->signs, j0 + 3)];
-    const float qw = PI_QW[g];
-    const float qx = -PI_QX[g];
-    const float qy = -PI_QY[g];
-    const float qz = -PI_QZ[g];
-    const float r0 = qw*q0 - qx*q1 - qy*q2 - qz*q3;
-    const float r1 = qw*q1 + qx*q0 + qy*q3 - qz*q2;
-    const float r2 = qw*q2 - qx*q3 + qy*q0 + qz*q1;
-    const float r3 = qw*q3 + qx*q2 - qy*q1 + qz*q0;
-    const float norm = __half2float(bi->d);
-    return (off == 0 ? r0 : off == 1 ? r1 : off == 2 ? r2 : r3) * norm;
-}
-
-static __device__ __forceinline__ float pdmq_decode_v_tbq4_0(
-        const char * __restrict__ V,
-        const int64_t v_nb10,
-        const int64_t v_nb11,
-        const int64_t v_nb12,
-        const int64_t v_nb13,
-        const int64_t v_ne13,
-        const int k,
-        const int hk,
-        const int b,
-        const int d) {
-    const int vb = v_ne13 > 1 ? (b % v_ne13) : 0;
-    const char * ptr = V + int64_t(vb) * v_nb13 + int64_t(hk) * v_nb12 + int64_t(k) * v_nb11;
-    const int ib = d / QK_TBQ4;
-    const int j  = d % QK_TBQ4;
-    const block_tbq4_0 * bt = (const block_tbq4_0 *) (ptr + int64_t(ib) * v_nb10);
-    const uint8_t packed = bt->qs[j / 2];
-    const uint8_t idx = (j & 1) ? (packed >> 4) : (packed & 0x0f);
-    return d_tbq4_centroids[idx] * __half2float(bt->d);
-}
-
 static __device__ __forceinline__ const half * pdmq_v_f16_ptr(
         const char * __restrict__ V,
         const int64_t v_nb10,
@@ -554,12 +467,6 @@ static __device__ __forceinline__ float pdmq_decode_v(
         return pdmq_decode_v_q4_0(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k, hk, b, d);
     } else if constexpr (V_TYPE == PACKED16_DOT4_MMQ_V_Q8_0) {
         return pdmq_decode_v_q8_0(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k, hk, b, d);
-    } else if constexpr (V_TYPE == PACKED16_DOT4_MMQ_V_TBQ4_0) {
-        return pdmq_decode_v_tbq4_0(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k, hk, b, d);
-    } else if constexpr (V_TYPE == PACKED16_DOT4_MMQ_V_PLANAR3_0) {
-        return pdmq_decode_v_planar3_0(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k, hk, b, d);
-    } else if constexpr (V_TYPE == PACKED16_DOT4_MMQ_V_ISO3_0) {
-        return pdmq_decode_v_iso3_0(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k, hk, b, d);
     } else {
         return pdmq_decode_v_f16(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k, hk, b, d);
     }
@@ -1833,8 +1740,13 @@ static inline int ggml_cuda_rocm_packed16_dot4_mmq_gqa_group() {
     const char * s = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQA_GROUP");
     if (!s || !*s) return 1;
     const int g = atoi(s);
+#if !PDMQ_FULL_EXPERIMENTAL_MATRIX
+    if (g == 1) return 1;
+    GGML_ABORT("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQA_GROUP=%s requires -DGGML_HIP_PDMQ_FULL_EXPERIMENTAL_MATRIX=ON in this compact PDMQ build", s);
+#else
     if (g == 1 || g == 2 || g == 4 || g == 6) return g;
     GGML_ABORT("invalid GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQA_GROUP=%s; expected 1, 2, 4, or 6", s);
+#endif
 }
 
 static inline int ggml_cuda_rocm_packed16_dot4_mmq_gqax_splitk() {
@@ -2190,6 +2102,7 @@ static inline pdmq_shape pdmq_parse_shape_env(const char * env) {
     if (strcmp(env, "2x32") == 0 || strcmp(env, "m2n32") == 0) {
         return PDMQ_SHAPE_M2N32;
     }
+#if PDMQ_FULL_EXPERIMENTAL_MATRIX
     if (strcmp(env, "4x32") == 0 || strcmp(env, "m4n32") == 0) {
         return PDMQ_SHAPE_M4N32;
     }
@@ -2199,16 +2112,21 @@ static inline pdmq_shape pdmq_parse_shape_env(const char * env) {
     if (strcmp(env, "2x64") == 0 || strcmp(env, "m2n64") == 0) {
         return PDMQ_SHAPE_M2N64;
     }
+#endif
     if (strcmp(env, "16x16") == 0 || strcmp(env, "m16n16") == 0) {
         return PDMQ_SHAPE_M16N16;
     }
     if (strcmp(env, "8x32") == 0 || strcmp(env, "m8n32") == 0) {
         return PDMQ_SHAPE_M8N32;
     }
+#if PDMQ_FULL_EXPERIMENTAL_MATRIX
     if (strcmp(env, "4x64") == 0 || strcmp(env, "m4n64") == 0) {
         return PDMQ_SHAPE_M4N64;
     }
     GGML_ABORT("packed16_dot4_mmq: bad GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_SHAPE=%s, expected 1x32, 2x32, 4x32, 1x64, 2x64, 16x16, 8x32, or 4x64", env);
+#else
+    GGML_ABORT("packed16_dot4_mmq compact build: shape=%s requires -DGGML_HIP_PDMQ_FULL_EXPERIMENTAL_MATRIX=ON; compact shapes are 1x32, 2x32, 8x32, and 16x16", env);
+#endif
 }
 
 static inline pdmq_v_path pdmq_parse_v_path_env(const char * env) {
@@ -2242,6 +2160,7 @@ static inline pdmq_shape pdmq_select_shape_auto(
     // Role-specialized MTP shapes. Decode and tiny verify should not share the
     // prefill/small-prefill policy: they have one to four Q rows and benefit
     // from wider K tiles with less inactive-M overhead.
+#if PDMQ_FULL_EXPERIMENTAL_MATRIX
     if (nq <= 4 && v_type == GGML_TYPE_Q4_0 && n_heads_q == 16 && n_heads_k == 4) {
         // 9B shape canary (hq=16,hk=4,GQA4,V=q4_0) favored M4N64 for both
         // verifier rows and the PDMQ decode-role rows that appear inside the
@@ -2257,6 +2176,10 @@ static inline pdmq_shape pdmq_select_shape_auto(
         // conservative q8_0/f16 stage-f32 path.
         return PDMQ_SHAPE_M1N64;
     }
+#else
+    GGML_UNUSED(n_heads_q);
+    GGML_UNUSED(n_heads_k);
+#endif
     if (nq <= 1) {
         return PDMQ_SHAPE_M1N32;
     }
@@ -2298,38 +2221,7 @@ static inline pdmq_role pdmq_select_role(const int nq) {
     return PDMQ_ROLE_PREFILL;
 }
 
-static inline pdmq_v_path pdmq_select_v_path(
-        const int nq,
-        const int nk,
-        const ggml_type v_type) {
-    GGML_UNUSED(nk);
-
-    if (const char * env = pdmq_vpath_env(); env && *env) {
-        const pdmq_v_path requested = pdmq_parse_v_path_env(env);
-        if (requested == PDMQ_V_RAW_LDS_Q4 && v_type != GGML_TYPE_Q4_0) {
-            GGML_ABORT("packed16_dot4_mmq: raw_lds_q4 requires V=q4_0, got V=%s", ggml_type_name(v_type));
-        }
-        if (requested == PDMQ_V_RAW_LDS_Q8_0 && v_type != GGML_TYPE_Q8_0) {
-            GGML_ABORT("packed16_dot4_mmq: raw_lds_q8_0 requires V=q8_0, got V=%s", ggml_type_name(v_type));
-        }
-        if (requested == PDMQ_V_RAW_LDS_F16 && v_type != GGML_TYPE_F16) {
-            GGML_ABORT("packed16_dot4_mmq: raw_lds_f16 requires V=f16, got V=%s", ggml_type_name(v_type));
-        }
-        if (requested == PDMQ_V_DIRECT_PV_Q4 && v_type != GGML_TYPE_Q4_0) {
-            return PDMQ_V_DIRECT_LEGACY;
-        }
-        return requested;
-    }
-
-    const char * impl = pdmq_impl_env();
-    if (impl && *impl) {
-        if (strcmp(impl, "kshared_directv") == 0) {
-            return v_type == GGML_TYPE_Q4_0 ? PDMQ_V_DIRECT_PV_Q4 : PDMQ_V_DIRECT_LEGACY;
-        }
-        // Preserve explicit legacy baseline/kshared/kshared_stagev semantics for A/B tests.
-        return PDMQ_V_STAGE_F32;
-    }
-
+static inline pdmq_v_path pdmq_default_v_path(const int nq, const ggml_type v_type) {
     // Raw compressed-q4 LDS wins over f32 V staging for both small-Q verify/decode
     // and long-context prefill. Keeping q4 compressed in LDS avoids expanding the
     // full V tile to float before PV; q8_0/f16 keep their raw LDS paths limited to
@@ -2343,8 +2235,56 @@ static inline pdmq_v_path pdmq_select_v_path(
     if (v_type == GGML_TYPE_F16 && nq <= 8) {
         return PDMQ_V_RAW_LDS_F16;
     }
-
     return PDMQ_V_STAGE_F32;
+}
+
+static inline pdmq_v_path pdmq_select_v_path(
+        const int nq,
+        const int nk,
+        const ggml_type v_type) {
+    GGML_UNUSED(nk);
+
+    const pdmq_v_path default_path = pdmq_default_v_path(nq, v_type);
+
+    if (const char * env = pdmq_vpath_env(); env && *env) {
+        const pdmq_v_path requested = pdmq_parse_v_path_env(env);
+        if (requested == PDMQ_V_RAW_LDS_Q4 && v_type != GGML_TYPE_Q4_0) {
+            GGML_ABORT("packed16_dot4_mmq: raw_lds_q4 requires V=q4_0, got V=%s", ggml_type_name(v_type));
+        }
+        if (requested == PDMQ_V_RAW_LDS_Q8_0 && v_type != GGML_TYPE_Q8_0) {
+            GGML_ABORT("packed16_dot4_mmq: raw_lds_q8_0 requires V=q8_0, got V=%s", ggml_type_name(v_type));
+        }
+        if (requested == PDMQ_V_RAW_LDS_F16 && v_type != GGML_TYPE_F16) {
+            GGML_ABORT("packed16_dot4_mmq: raw_lds_f16 requires V=f16, got V=%s", ggml_type_name(v_type));
+        }
+#if !PDMQ_FULL_EXPERIMENTAL_MATRIX
+        if (requested != default_path) {
+            GGML_ABORT("packed16_dot4_mmq compact build: VPATH=%s for V=%s nq=%d requires -DGGML_HIP_PDMQ_FULL_EXPERIMENTAL_MATRIX=ON; compact build supports only the default vpath=%s",
+                       env, ggml_type_name(v_type), nq, pdmq_v_path_name(default_path));
+        }
+        return requested;
+#else
+        if (requested == PDMQ_V_DIRECT_PV_Q4 && v_type != GGML_TYPE_Q4_0) {
+            return PDMQ_V_DIRECT_LEGACY;
+        }
+        return requested;
+#endif
+    }
+
+    const char * impl = pdmq_impl_env();
+    if (impl && *impl) {
+#if !PDMQ_FULL_EXPERIMENTAL_MATRIX
+        GGML_ABORT("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_IMPL=%s requires -DGGML_HIP_PDMQ_FULL_EXPERIMENTAL_MATRIX=ON in this compact PDMQ build", impl);
+#else
+        if (strcmp(impl, "kshared_directv") == 0) {
+            return v_type == GGML_TYPE_Q4_0 ? PDMQ_V_DIRECT_PV_Q4 : PDMQ_V_DIRECT_LEGACY;
+        }
+        // Preserve explicit legacy baseline/kshared/kshared_stagev semantics for A/B tests.
+        return PDMQ_V_STAGE_F32;
+#endif
+    }
+
+    return default_path;
 }
 
 static inline pdmq_plan pdmq_make_plan(
@@ -2461,9 +2401,15 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     // of the CTA on invalid rows and tanks llama-bench tg at every depth.
     const bool qwen27b_gqa6_q4_decode =
         V->type == GGML_TYPE_Q4_0 && nq <= 1 && n_heads_q == 24 && n_heads_k == 4 && (n_heads_q / n_heads_k) == 6;
+#if PDMQ_FULL_EXPERIMENTAL_MATRIX
     if (qwen27b_gqa6_q4_decode && shape != PDMQ_SHAPE_M1N32 && shape != PDMQ_SHAPE_M1N64) {
         shape = nk >= 4096 ? PDMQ_SHAPE_M1N64 : PDMQ_SHAPE_M1N32;
     }
+#else
+    if (qwen27b_gqa6_q4_decode && shape != PDMQ_SHAPE_M1N32) {
+        shape = PDMQ_SHAPE_M1N32;
+    }
+#endif
 
     int requested_gqa_group = requested_gqa_group_raw;
     // Group all six Q heads that share one K/V head for decode when the caller
@@ -2730,6 +2676,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
         nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, profile_dev)
 
+#if PDMQ_FULL_EXPERIMENTAL_MATRIX
 #define PDMQ_LAUNCH_GQAX_SHAPE(GROUP_VAL, VT, BM_VAL, BN_VAL, CAUSAL, STAGE_V_VAL, RAW_LDS_Q4_VAL, KSHARED_VAL) \
     packed16_dot4_mmq_gqax_kernel<VT, BM_VAL, BN_VAL, PDMQ_D, CAUSAL, STAGE_V_VAL, RAW_LDS_Q4_VAL, KSHARED_VAL, GROUP_VAL><<<grid, block, 0, stream>>>( \
         (const float *) Q->data, (const char *) V->data, (float *) dst->data, nullptr, nullptr, nullptr, \
@@ -2936,6 +2883,106 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     } \
 } while (0)
 
+#else
+
+#define PDMQ_COMPACT_MATRIX_ABORT(WHAT) \
+    GGML_ABORT("packed16_dot4_mmq compact build does not compile " WHAT "; reconfigure with -DGGML_HIP_PDMQ_FULL_EXPERIMENTAL_MATRIX=ON")
+
+#define PDMQ_LAUNCH_GQAX_SHAPE(GROUP_VAL, VT, BM_VAL, BN_VAL, CAUSAL, STAGE_V_VAL, RAW_LDS_Q4_VAL, KSHARED_VAL) do { \
+    GGML_UNUSED(GROUP_VAL); GGML_UNUSED(VT); GGML_UNUSED(BM_VAL); GGML_UNUSED(BN_VAL); \
+    GGML_UNUSED(CAUSAL); GGML_UNUSED(STAGE_V_VAL); GGML_UNUSED(RAW_LDS_Q4_VAL); GGML_UNUSED(KSHARED_VAL); \
+    PDMQ_COMPACT_MATRIX_ABORT("experimental grouped-GQA non-split kernels"); \
+} while (0)
+
+#define PDMQ_LAUNCH_GQAX_SPLITK_SHAPE(GROUP_VAL, VT, BM_VAL, BN_VAL, CAUSAL, RAW_LDS_Q4_VAL, PM, PL, PO) do { \
+    if constexpr (GROUP_VAL == 1) { \
+        packed16_dot4_mmq_gqax_kernel<VT, BM_VAL, BN_VAL, PDMQ_D, CAUSAL, false, RAW_LDS_Q4_VAL, false, 1><<<grid, block, 0, stream>>>( \
+            (const float *) Q->data, (const char *) V->data, (float *) dst->data, PM, PL, PO, \
+            Q->nb[1], Q->nb[2], Q->nb[3], \
+            V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
+            mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+            (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
+            nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, batch, gqax_splitk_active, profile_dev); \
+    } else { \
+        PDMQ_COMPACT_MATRIX_ABORT("experimental grouped-GQA split-K kernels"); \
+    } \
+} while (0)
+
+#define PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE(GROUP_VAL, VT, CAUSAL, PM, PL, PO) do { \
+    if (shape == PDMQ_SHAPE_M1N32) { \
+        PDMQ_LAUNCH_GQAX_SPLITK_SHAPE(GROUP_VAL, VT, PDMQ_BM_DECODE32, PDMQ_BN_DECODE32, CAUSAL, true, PM, PL, PO); \
+    } else if (shape == PDMQ_SHAPE_M2N32) { \
+        PDMQ_LAUNCH_GQAX_SPLITK_SHAPE(GROUP_VAL, VT, PDMQ_BM_VERIFY2_32, PDMQ_BN_VERIFY2_32, CAUSAL, true, PM, PL, PO); \
+    } else if (shape == PDMQ_SHAPE_M8N32) { \
+        PDMQ_LAUNCH_GQAX_SPLITK_SHAPE(GROUP_VAL, VT, PDMQ_BM_SMALL, PDMQ_BN_SMALL, CAUSAL, true, PM, PL, PO); \
+    } else { \
+        PDMQ_COMPACT_MATRIX_ABORT("non-standard split-K shapes"); \
+    } \
+} while (0)
+
+#define PDMQ_LAUNCH_GQA4_IMPL(VT, BM_VAL, BN_VAL, CAUSAL, kshared_var, raw_lds_q4_var) \
+    PDMQ_COMPACT_MATRIX_ABORT("GQA4 kernels")
+#define PDMQ_LAUNCH_GQA4(VT, CAUSAL, kshared_var, raw_lds_q4_var) \
+    PDMQ_COMPACT_MATRIX_ABORT("GQA4 kernels")
+#define PDMQ_LAUNCH_GQA6_IMPL(VT, BM_VAL, BN_VAL, CAUSAL, kshared_var, raw_lds_q4_var) \
+    PDMQ_COMPACT_MATRIX_ABORT("GQA6 kernels")
+#define PDMQ_LAUNCH_GQA6(VT, CAUSAL, kshared_var, raw_lds_q4_var) \
+    PDMQ_COMPACT_MATRIX_ABORT("GQA6 kernels")
+#define PDMQ_LAUNCH_GQA2X_IMPL(VT, BM_VAL, BN_VAL, CAUSAL, kshared_var, raw_lds_q4_var) \
+    PDMQ_COMPACT_MATRIX_ABORT("GQA2X kernels")
+#define PDMQ_LAUNCH_GQA2X(VT, CAUSAL, kshared_var, raw_lds_q4_var) \
+    PDMQ_COMPACT_MATRIX_ABORT("GQA2X kernels")
+#define PDMQ_LAUNCH_GQA2_IMPL(VT, BM_VAL, BN_VAL, CAUSAL, kshared_var, directv_var, raw_lds_q4_var) \
+    PDMQ_COMPACT_MATRIX_ABORT("GQA2 kernels")
+#define PDMQ_LAUNCH_GQA2(VT, CAUSAL, kshared_var, directv_var, raw_lds_q4_var) \
+    PDMQ_COMPACT_MATRIX_ABORT("GQA2 kernels")
+#define PDMQ_LAUNCH_GQA2_NO_RAW(VT, CAUSAL, kshared_var, directv_var) \
+    PDMQ_COMPACT_MATRIX_ABORT("GQA2 kernels")
+
+#define PDMQ_LAUNCH_TYPED_IMPL(VT, CAUSAL, kshared_val, stagev_val, raw_lds_q4_val) do { \
+    if (shape == PDMQ_SHAPE_M1N32) { \
+        PDMQ_LAUNCH_SHAPE(VT, PDMQ_BM_DECODE32, PDMQ_BN_DECODE32, CAUSAL, stagev_val, raw_lds_q4_val, kshared_val); \
+    } else if (shape == PDMQ_SHAPE_M2N32) { \
+        PDMQ_LAUNCH_SHAPE(VT, PDMQ_BM_VERIFY2_32, PDMQ_BN_VERIFY2_32, CAUSAL, stagev_val, raw_lds_q4_val, kshared_val); \
+    } else if (shape == PDMQ_SHAPE_M16N16) { \
+        PDMQ_LAUNCH_SHAPE(VT, PDMQ_BM_PREFILL, PDMQ_BN_PREFILL, CAUSAL, stagev_val, raw_lds_q4_val, kshared_val); \
+    } else if (shape == PDMQ_SHAPE_M8N32) { \
+        PDMQ_LAUNCH_SHAPE(VT, PDMQ_BM_SMALL, PDMQ_BN_SMALL, CAUSAL, stagev_val, raw_lds_q4_val, kshared_val); \
+    } else { \
+        PDMQ_COMPACT_MATRIX_ABORT("non-standard GQA1 shapes"); \
+    } \
+} while (0)
+
+#define PDMQ_LAUNCH_TYPED(VT, CAUSAL, kshared_var, directv_var, raw_lds_q4_var) do { \
+    if (kshared_var) { \
+        PDMQ_COMPACT_MATRIX_ABORT("kshared PDMQ variants"); \
+    } else if constexpr (VT == PACKED16_DOT4_MMQ_V_Q4_0) { \
+        if (raw_lds_q4_var) { \
+            PDMQ_LAUNCH_TYPED_IMPL(VT, CAUSAL, false, false, true); \
+        } else { \
+            PDMQ_COMPACT_MATRIX_ABORT("q4 non-raw V paths"); \
+        } \
+    } else { \
+        if (raw_lds_q4_var) { \
+            PDMQ_LAUNCH_TYPED_IMPL(VT, CAUSAL, false, false, true); \
+        } else if (!directv_var) { \
+            PDMQ_LAUNCH_TYPED_IMPL(VT, CAUSAL, false, true, false); \
+        } else { \
+            PDMQ_COMPACT_MATRIX_ABORT("direct non-raw q8/f16 V paths"); \
+        } \
+    } \
+} while (0)
+
+#define PDMQ_LAUNCH_TYPED_NO_RAW(VT, CAUSAL, kshared_var, directv_var) do { \
+    if (kshared_var || directv_var) { \
+        PDMQ_COMPACT_MATRIX_ABORT("non-standard no-raw PDMQ variants"); \
+    } else { \
+        PDMQ_LAUNCH_TYPED_IMPL(VT, CAUSAL, false, true, false); \
+    } \
+} while (0)
+
+#endif // PDMQ_FULL_EXPERIMENTAL_MATRIX
+
 if (is_gqa1_splitk) {
     GGML_ASSERT(raw_lds && !kshared);
     const size_t partial_rows = size_t(gqax_splitk_active) * size_t(batch) * size_t(nq) * size_t(n_heads_q);
@@ -3077,9 +3124,6 @@ if (is_gqa1_splitk) {
             case GGML_TYPE_Q4_0:      PDMQ_LAUNCH_GQA2(PACKED16_DOT4_MMQ_V_Q4_0,      true, kshared, directv, raw_lds); break;
             case GGML_TYPE_Q8_0:      PDMQ_LAUNCH_GQA2(PACKED16_DOT4_MMQ_V_Q8_0,      true, kshared, directv, raw_lds); break;
             case GGML_TYPE_F16:       PDMQ_LAUNCH_GQA2(PACKED16_DOT4_MMQ_V_F16,       true, kshared, directv, raw_lds); break;
-            case GGML_TYPE_TBQ4_0:    PDMQ_LAUNCH_GQA2_NO_RAW(PACKED16_DOT4_MMQ_V_TBQ4_0,    true, kshared, directv); break;
-            case GGML_TYPE_PLANAR3_0: PDMQ_LAUNCH_GQA2_NO_RAW(PACKED16_DOT4_MMQ_V_PLANAR3_0, true, kshared, directv); break;
-            case GGML_TYPE_ISO3_0:    PDMQ_LAUNCH_GQA2_NO_RAW(PACKED16_DOT4_MMQ_V_ISO3_0,    true, kshared, directv); break;
             default: GGML_ABORT("packed16_dot4_mmq gqa2: unsupported V type");
         }
     } else {
@@ -3087,9 +3131,6 @@ if (is_gqa1_splitk) {
             case GGML_TYPE_Q4_0:      PDMQ_LAUNCH_GQA2(PACKED16_DOT4_MMQ_V_Q4_0,      false, kshared, directv, raw_lds); break;
             case GGML_TYPE_Q8_0:      PDMQ_LAUNCH_GQA2(PACKED16_DOT4_MMQ_V_Q8_0,      false, kshared, directv, raw_lds); break;
             case GGML_TYPE_F16:       PDMQ_LAUNCH_GQA2(PACKED16_DOT4_MMQ_V_F16,       false, kshared, directv, raw_lds); break;
-            case GGML_TYPE_TBQ4_0:    PDMQ_LAUNCH_GQA2_NO_RAW(PACKED16_DOT4_MMQ_V_TBQ4_0,    false, kshared, directv); break;
-            case GGML_TYPE_PLANAR3_0: PDMQ_LAUNCH_GQA2_NO_RAW(PACKED16_DOT4_MMQ_V_PLANAR3_0, false, kshared, directv); break;
-            case GGML_TYPE_ISO3_0:    PDMQ_LAUNCH_GQA2_NO_RAW(PACKED16_DOT4_MMQ_V_ISO3_0,    false, kshared, directv); break;
             default: GGML_ABORT("packed16_dot4_mmq gqa2: unsupported V type");
         }
     }
@@ -3099,9 +3140,6 @@ if (is_gqa1_splitk) {
         case GGML_TYPE_Q4_0:      PDMQ_LAUNCH_TYPED(PACKED16_DOT4_MMQ_V_Q4_0,      CAUSAL, kshared, directv, raw_lds); break; \
         case GGML_TYPE_Q8_0:      PDMQ_LAUNCH_TYPED(PACKED16_DOT4_MMQ_V_Q8_0,      CAUSAL, kshared, directv, raw_lds); break; \
         case GGML_TYPE_F16:       PDMQ_LAUNCH_TYPED(PACKED16_DOT4_MMQ_V_F16,       CAUSAL, kshared, directv, raw_lds); break; \
-        case GGML_TYPE_TBQ4_0:    PDMQ_LAUNCH_TYPED_NO_RAW(PACKED16_DOT4_MMQ_V_TBQ4_0,    CAUSAL, kshared, directv); break; \
-        case GGML_TYPE_PLANAR3_0: PDMQ_LAUNCH_TYPED_NO_RAW(PACKED16_DOT4_MMQ_V_PLANAR3_0, CAUSAL, kshared, directv); break; \
-        case GGML_TYPE_ISO3_0:    PDMQ_LAUNCH_TYPED_NO_RAW(PACKED16_DOT4_MMQ_V_ISO3_0,    CAUSAL, kshared, directv); break; \
         default: GGML_ABORT("packed16_dot4_mmq: unsupported V type"); \
     }
 
@@ -3129,6 +3167,7 @@ if (is_gqa1_splitk) {
 #undef PDMQ_LAUNCH_GQAX_SPLITK_SHAPE
 #undef PDMQ_LAUNCH_GQAX_SHAPE
 #undef PDMQ_LAUNCH_SHAPE
+#undef PDMQ_COMPACT_MATRIX_ABORT
 
     CUDA_CHECK(hipGetLastError());
     if (profile_enabled) {
@@ -3144,11 +3183,6 @@ if (is_gqa1_splitk) {
         CUDA_CHECK(hipFree(profile_dev));
     }
 
-    if (V->type == GGML_TYPE_TBQ4_0) {
-        const int64_t nrows = Q->ne[1] * Q->ne[2] * Q->ne[3];
-        tbq4_rotate_output_cuda((float *) dst->data, nrows, (int) V->ne[0], stream);
-    }
-
     CUDA_CHECK(hipGetLastError());
 }
 
@@ -3158,16 +3192,10 @@ static inline bool ggml_cuda_packed16_dot4_mmq_enabled() {
     return false;
 }
 
-static inline bool ggml_cuda_packed16_tbq4_v_enabled() {
-    return false;
-}
-
 static inline bool ggml_cuda_packed16_dot4_mmq_v_supported(const ggml_type type) {
     return type == GGML_TYPE_Q4_0 ||
            type == GGML_TYPE_Q8_0 ||
-           type == GGML_TYPE_F16  ||
-           type == GGML_TYPE_PLANAR3_0 ||
-           type == GGML_TYPE_ISO3_0;
+           type == GGML_TYPE_F16;
 }
 
 static inline bool ggml_cuda_packed16_dot4_mmq_supported(const int cc, const ggml_tensor * dst) {

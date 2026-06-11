@@ -12,7 +12,6 @@
 #if defined(GGML_USE_HIP)
 
 bool ggml_cuda_packed16_dot4_mmq_enabled();
-bool ggml_cuda_packed16_tbq4_v_enabled();
 bool ggml_cuda_packed16_dot4_mmq_v_supported(ggml_type type);
 bool ggml_cuda_packed16_dot4_mmq_supported(int cc, const ggml_tensor * dst);
 
@@ -26,16 +25,10 @@ static inline bool ggml_cuda_packed16_dot4_mmq_enabled() {
     return false;
 }
 
-static inline bool ggml_cuda_packed16_tbq4_v_enabled() {
-    return false;
-}
-
 static inline bool ggml_cuda_packed16_dot4_mmq_v_supported(const ggml_type type) {
     return type == GGML_TYPE_Q4_0 ||
            type == GGML_TYPE_Q8_0 ||
-           type == GGML_TYPE_F16  ||
-           type == GGML_TYPE_PLANAR3_0 ||
-           type == GGML_TYPE_ISO3_0;
+           type == GGML_TYPE_F16;
 }
 
 static inline bool ggml_cuda_packed16_dot4_mmq_supported(const int cc, const ggml_tensor * dst) {

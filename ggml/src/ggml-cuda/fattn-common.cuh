@@ -3,15 +3,12 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
-#include "fattn-mma-tbq4.cuh"
 #include "fattn-packed16-common.cuh"
 
 // AMD_BFE: recognized by ROCm LLVM codegen as v_bfe_u32
 #ifndef AMD_BFE
 #define AMD_BFE(val, offset, width) (((val) >> (offset)) & ((1u << (width)) - 1u))
 #endif
-#include "planar-iso-constants.cuh"
-#include "fattn-planar-iso.cuh"
 
 #include <cstdint>
 #include <cstdlib>
@@ -54,33 +51,6 @@ typedef void (* fattn_kernel_t)(
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
-
-static inline bool ggml_cuda_tbq4_vec_norm_hoist_enabled() {
-#ifdef GGML_USE_HIP
-    const char * env = getenv("GGML_CUDA_TBQ4_VEC_NORM_HOIST");
-    return env != nullptr && atoi(env) != 0;
-#else
-    return false;
-#endif
-}
-
-static inline bool ggml_cuda_sparse_v_dequant_enabled() {
-#ifdef GGML_USE_HIP
-    const char * env = getenv("GGML_CUDA_SPARSE_V_DEQUANT");
-    return env != nullptr && atoi(env) != 0;
-#else
-    return false;
-#endif
-}
-
-static inline bool ggml_cuda_tbq4_lds_route_d_k_enabled() {
-#ifdef GGML_USE_HIP
-    const char * env = getenv("GGML_CUDA_TBQ4_LDS_ROUTE");
-    return env != nullptr && strcmp(env, "D_K") == 0;
-#else
-    return false;
-#endif
-}
 
 static inline bool ggml_cuda_q8k_dot4_packed16_vec_route_required() {
 #ifdef GGML_USE_HIP
@@ -170,48 +140,6 @@ static inline bool ggml_cuda_q8k_dot4_packed16_vec_supported(const int cc, const
 #else
     GGML_UNUSED(cc); GGML_UNUSED(dst);
     return false;
-#endif
-}
-
-static constexpr int GGML_CUDA_TBQ4_LDS_D_K_PACKED_STAGES = 2;
-
-template <int D>
-static constexpr int ggml_cuda_tbq4_lds_d_k_tile_rows() {
-    return D == 256 ? 48 : (D == 128 ? 96 : 0);
-}
-
-template <int D>
-static constexpr int ggml_cuda_tbq4_lds_d_k_packed_stride() {
-    constexpr int raw = (D / QK_TBQ4) * int(sizeof(block_tbq4_0));
-    return (raw + 15) & ~15;
-}
-
-template <int D>
-static constexpr int ggml_cuda_tbq4_lds_d_k_f16_stride_half2() {
-    return D/2 + 2;
-}
-
-template <int D>
-static constexpr int ggml_cuda_tbq4_lds_d_k_shared_bytes() {
-    return GGML_CUDA_TBQ4_LDS_D_K_PACKED_STAGES * ggml_cuda_tbq4_lds_d_k_tile_rows<D>() * ggml_cuda_tbq4_lds_d_k_packed_stride<D>() +
-        ggml_cuda_tbq4_lds_d_k_tile_rows<D>() * ggml_cuda_tbq4_lds_d_k_f16_stride_half2<D>() * int(sizeof(half2));
-}
-
-static constexpr int GGML_CUDA_TBQ4_LDS_D_K_TILE_ROWS        = ggml_cuda_tbq4_lds_d_k_tile_rows<128>();
-static constexpr int GGML_CUDA_TBQ4_LDS_D_K_PACKED_STRIDE    = ggml_cuda_tbq4_lds_d_k_packed_stride<128>();
-static constexpr int GGML_CUDA_TBQ4_LDS_D_K_F16_STRIDE_HALF2 = ggml_cuda_tbq4_lds_d_k_f16_stride_half2<128>();
-static constexpr int GGML_CUDA_TBQ4_LDS_D_K_SHARED_BYTES     = ggml_cuda_tbq4_lds_d_k_shared_bytes<128>();
-
-static inline int ggml_cuda_sparse_v_tau_level() {
-#ifdef GGML_USE_HIP
-    const char * env = getenv("GGML_CUDA_SPARSE_V_TAU_LEVEL");
-    if (env == nullptr) {
-        return 0;
-    }
-    const int level = atoi(env);
-    return level < 0 ? 0 : (level > 5 ? 5 : level);
-#else
-    return 0;
 #endif
 }
 
@@ -517,202 +445,6 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0_packed16(
     return sum;
 }
 
-// TBQ4 KQ dot product: dequant TBQ4 blocks inline, dot with Q (float2/half2)
-template <int D, int nthreads>
-static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_0(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
-
-    const block_tbq4_0 * K_tbq4 = (const block_tbq4_0 *) K_c;
-    GGML_UNUSED(Q_q8);
-    GGML_UNUSED(Q_ds_v);
-
-    constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
-    constexpr int cpy_ne = cpy_nb / 4;
-
-    float sum = 0.0f;
-
-#pragma unroll
-    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
-#pragma unroll
-        for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
-            const int k_KQ = k_KQ_0 + (threadIdx.x % nthreads)*cpy_ne + k_KQ_1;
-
-            const int elem0 = k_KQ * 2;
-            const int ib    = elem0 / QK_TBQ4;
-            const int j0    = elem0 % QK_TBQ4;
-
-            const float   norm    = __half2float(K_tbq4[ib].d);
-            const uint8_t qs_byte = K_tbq4[ib].qs[j0 / 2];
-
-            const uint8_t idx0 = AMD_BFE(qs_byte, 0, 4);
-            const uint8_t idx1 = AMD_BFE(qs_byte, 4, 4);
-
-            float2 kv;
-            kv.x = d_tbq4_centroids[idx0] * norm;
-            kv.y = d_tbq4_centroids[idx1] * norm;
-
-#ifdef V_DOT2_F32_F16_AVAILABLE
-            const half2 qv = ((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
-            ggml_cuda_mad(sum, make_float2(kv.x, kv.y), __half22float2(qv));
-#else
-            const float2 qv = ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
-            sum += kv.x * qv.x + kv.y * qv.y;
-#endif
-        }
-    }
-
-    return sum;
-}
-
-// Gated TBQ4 KQ dot product variant: same dequant math as baseline, but keep
-// the current block norm in registers while a lane stays inside one TBQ4 block.
-template <int D, int nthreads>
-static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_0_norm_hoist(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
-
-    const block_tbq4_0 * K_tbq4 = (const block_tbq4_0 *) K_c;
-    GGML_UNUSED(Q_q8);
-    GGML_UNUSED(Q_ds_v);
-
-    constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
-    constexpr int cpy_ne = cpy_nb / 4;
-
-    float sum = 0.0f;
-    int last_ib = -1;
-    float last_norm = 0.0f;
-
-#pragma unroll
-    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
-#pragma unroll
-        for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
-            const int k_KQ = k_KQ_0 + (threadIdx.x % nthreads)*cpy_ne + k_KQ_1;
-
-            const int elem0 = k_KQ * 2;
-            const int ib    = elem0 / QK_TBQ4;
-            const int j0    = elem0 % QK_TBQ4;
-
-            if (ib != last_ib) {
-                last_ib = ib;
-                last_norm = __half2float(K_tbq4[ib].d);
-            }
-            const float   norm    = last_norm;
-            const uint8_t qs_byte = K_tbq4[ib].qs[j0 / 2];
-
-            const uint8_t idx0 = AMD_BFE(qs_byte, 0, 4);
-            const uint8_t idx1 = AMD_BFE(qs_byte, 4, 4);
-
-            float2 kv;
-            kv.x = d_tbq4_centroids[idx0] * norm;
-            kv.y = d_tbq4_centroids[idx1] * norm;
-
-#ifdef V_DOT2_F32_F16_AVAILABLE
-            const half2 qv = ((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
-            ggml_cuda_mad(sum, make_float2(kv.x, kv.y), __half22float2(qv));
-#else
-            const float2 qv = ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
-            sum += kv.x * qv.x + kv.y * qv.y;
-#endif
-        }
-    }
-
-    return sum;
-}
-
-template <int D, int nthreads>
-static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_0_lds_f16(
-    const half2 * __restrict__ K_h2, const void * __restrict__ Q_v) {
-
-    static_assert(D == 128 || D == 256, "TBQ4 LDS D_K is currently implemented for D128/D256");
-
-    constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
-    constexpr int cpy_ne = cpy_nb / 4;
-
-    float sum = 0.0f;
-
-#pragma unroll
-    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
-#pragma unroll
-        for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
-            const int k_KQ = k_KQ_0 + (threadIdx.x % nthreads)*cpy_ne + k_KQ_1;
-            const half2 kv = K_h2[k_KQ];
-#ifdef V_DOT2_F32_F16_AVAILABLE
-            const half2 qv = ((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
-            ggml_cuda_mad(sum, kv, qv);
-#else
-            const float2 qv = ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
-            const float2 kv_f = __half22float2(kv);
-            sum += kv_f.x*qv.x + kv_f.y*qv.y;
-#endif // V_DOT2_F32_F16_AVAILABLE
-        }
-    }
-
-    return sum;
-}
-
-template <int D>
-static __device__ __forceinline__ void tbq4_lds_d_k_copy_and_materialize(
-        const char * __restrict__ K,
-        const int64_t nb11,
-        const int rows_this_tile,
-        const int packed_stage,
-        uint8_t * __restrict__ packed_smem,
-        half2 * __restrict__ f16_smem) {
-
-    static_assert(D == 128 || D == 256, "TBQ4 LDS D_K is currently implemented for D128/D256");
-    constexpr int rows          = ggml_cuda_tbq4_lds_d_k_tile_rows<D>();
-    constexpr int packed_stride = ggml_cuda_tbq4_lds_d_k_packed_stride<D>();
-    constexpr int f16_stride    = ggml_cuda_tbq4_lds_d_k_f16_stride_half2<D>();
-    constexpr int row_bytes     = (D / QK_TBQ4) * int(sizeof(block_tbq4_0));
-    constexpr int D_half2       = D/2;
-    constexpr int nthreads      = 128;
-
-    const int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
-    uint8_t * __restrict__ packed = packed_smem + packed_stage*rows*packed_stride;
-
-    for (int linear = tid; linear < rows*packed_stride; linear += nthreads) {
-        const int row = linear / packed_stride;
-        const int col = linear - row*packed_stride;
-        uint8_t value = 0;
-        if (row < rows_this_tile && col < row_bytes) {
-            value = ((const uint8_t *) (K + int64_t(row)*nb11))[col];
-        }
-        packed[linear] = value;
-    }
-
-    __syncthreads();
-
-    for (int linear = tid; linear < rows*D_half2; linear += nthreads) {
-        const int row = linear / D_half2;
-        const int k   = linear - row*D_half2;
-        half2 value = make_half2(0.0f, 0.0f);
-        if (row < rows_this_tile) {
-            const uint8_t * __restrict__ src = packed + row*packed_stride;
-            const int elem0 = k*2;
-            const int ib = elem0 / QK_TBQ4;
-            const int j0 = elem0 - ib*QK_TBQ4;
-            const uint8_t * __restrict__ block = src + ib*int(sizeof(block_tbq4_0));
-            half norm_h;
-            ggml_cuda_memcpy_1<sizeof(half)>(&norm_h, block);
-            const float norm = __half2float(norm_h);
-            const uint8_t qs_byte = block[sizeof(half) + j0/2];
-            const uint8_t idx0 = AMD_BFE(qs_byte, 0, 4);
-            const uint8_t idx1 = AMD_BFE(qs_byte, 4, 4);
-            value = make_half2(
-                __float2half(d_tbq4_centroids[idx0] * norm),
-                __float2half(d_tbq4_centroids[idx1] * norm));
-        }
-        f16_smem[row*f16_stride + k] = value;
-    }
-
-    for (int linear = tid; linear < rows*(f16_stride - D_half2); linear += nthreads) {
-        const int row = linear / (f16_stride - D_half2);
-        const int pad = linear - row*(f16_stride - D_half2);
-        f16_smem[row*f16_stride + D_half2 + pad] = make_half2(0.0f, 0.0f);
-    }
-
-    __syncthreads();
-}
-
 template <typename Tds, int ni>
 static __device__ __forceinline__ void quantize_q8_1_to_shared(
     const float * __restrict__ x, const float scale, int * __restrict__ yq32, void * __restrict__ yds) {
@@ -1002,7 +734,7 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     }
 }
 
-template <ggml_type type_K, int D, int nthreads, bool tbq4_vec_norm_hoist = false>
+template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
         return vec_dot_fattn_vec_KQ_f16<D, nthreads>;
@@ -1018,96 +750,20 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
-    } else if constexpr (type_K == GGML_TYPE_PLANAR3_0) {
-        return vec_dot_fattn_vec_KQ_planar3_0<D, nthreads>;
-    } else if constexpr (type_K == GGML_TYPE_ISO3_0) {
-        return vec_dot_fattn_vec_KQ_iso3_0<D, nthreads>;
-    } else if constexpr (type_K == GGML_TYPE_PLANAR4_0) {
-        return vec_dot_fattn_vec_KQ_planar4_0<D, nthreads>;
-    } else if constexpr (type_K == GGML_TYPE_ISO4_0) {
-        return vec_dot_fattn_vec_KQ_iso4_0<D, nthreads>;
-    } else if constexpr (type_K == GGML_TYPE_TBQ4_0) {
-        if constexpr (tbq4_vec_norm_hoist) {
-            return vec_dot_fattn_vec_KQ_tbq4_0_norm_hoist<D, nthreads>;
-        } else {
-            return vec_dot_fattn_vec_KQ_tbq4_0<D, nthreads>;
-        }
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
     }
 }
 
-template <ggml_type type_K, int D, int nthreads, bool tbq4_vec_norm_hoist = false, bool q8k_dot4_packed16_vec = false>
+template <ggml_type type_K, int D, int nthreads, bool q8k_dot4_packed16_vec = false>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ_selected() {
     if constexpr (q8k_dot4_packed16_vec) {
         static_assert(type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_I32, "packed16 VEC KQ is only valid for q8_0 K or packed16 I32 sidecar K");
         static_assert(D == 256, "packed16 VEC KQ is currently D256-only");
         return nullptr;
     } else {
-        return get_vec_dot_KQ<type_K, D, nthreads, tbq4_vec_norm_hoist>();
-    }
-}
-
-template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_tbq4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
-    const block_tbq4_0 * x = (const block_tbq4_0 *) vx;
-
-    const int64_t ib = i0 / QK_TBQ4;
-    const int j0 = i0 % QK_TBQ4;
-    const float norm = __half2float(x[ib].d);
-
-    static_assert(ne == 2 || ne == 4, "bad ne");
-
-    if constexpr (ne == 4) {
-        const uint8_t qs_byte0 = x[ib].qs[j0 / 2];
-        const uint8_t qs_byte1 = x[ib].qs[j0 / 2 + 1];
-
-        const uint8_t idx0 = AMD_BFE(qs_byte0, 0, 4);
-        const uint8_t idx1 = AMD_BFE(qs_byte0, 4, 4);
-        const uint8_t idx2 = AMD_BFE(qs_byte1, 0, 4);
-        const uint8_t idx3 = AMD_BFE(qs_byte1, 4, 4);
-
-#ifdef FP16_AVAILABLE
-        if constexpr (std::is_same_v<T, half>) {
-            ((half2 *) dst)[0] = make_half2(
-                __float2half(d_tbq4_centroids[idx0] * norm),
-                __float2half(d_tbq4_centroids[idx1] * norm));
-            ((half2 *) dst)[1] = make_half2(
-                __float2half(d_tbq4_centroids[idx2] * norm),
-                __float2half(d_tbq4_centroids[idx3] * norm));
-        } else
-#endif // FP16_AVAILABLE
-        if constexpr (std::is_same_v<T, float>) {
-            ((float2 *) dst)[0] = make_float2(
-                d_tbq4_centroids[idx0] * norm,
-                d_tbq4_centroids[idx1] * norm);
-            ((float2 *) dst)[1] = make_float2(
-                d_tbq4_centroids[idx2] * norm,
-                d_tbq4_centroids[idx3] * norm);
-        } else {
-            static_assert(std::is_same_v<T, void>, "bad type");
-        }
-    } else { // ne == 2
-        const int j1 = j0 + 1;
-        const uint8_t qs_byte0 = x[ib].qs[j0 / 2];
-        const uint8_t qs_byte1 = x[ib].qs[j1 / 2];
-        const uint8_t idx0 = (j0 & 1) ? (qs_byte0 >> 4) : (qs_byte0 & 0xF);
-        const uint8_t idx1 = (j1 & 1) ? (qs_byte1 >> 4) : (qs_byte1 & 0xF);
-
-#ifdef FP16_AVAILABLE
-        if constexpr (std::is_same_v<T, half>) {
-            ((half2 *) dst)[0] = make_half2(
-                __float2half(d_tbq4_centroids[idx0] * norm),
-                __float2half(d_tbq4_centroids[idx1] * norm));
-        } else
-#endif // FP16_AVAILABLE
-        if constexpr (std::is_same_v<T, float>) {
-            ((float *) dst)[0] = d_tbq4_centroids[idx0] * norm;
-            ((float *) dst)[1] = d_tbq4_centroids[idx1] * norm;
-        } else {
-            static_assert(std::is_same_v<T, void>, "bad type");
-        }
+        return get_vec_dot_KQ<type_K, D, nthreads>();
     }
 }
 
@@ -1127,16 +783,6 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q8_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
-    } else if constexpr (type_V == GGML_TYPE_PLANAR3_0) {
-        return dequantize_V_planar3_0<T, ne>;
-    } else if constexpr (type_V == GGML_TYPE_ISO3_0) {
-        return dequantize_V_iso3_0<T, ne>;
-    } else if constexpr (type_V == GGML_TYPE_PLANAR4_0) {
-        return dequantize_V_planar4_0<T, ne>;
-    } else if constexpr (type_V == GGML_TYPE_ISO4_0) {
-        return dequantize_V_iso4_0<T, ne>;
-    } else if constexpr (type_V == GGML_TYPE_TBQ4_0) {
-        return dequantize_V_tbq4_0<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;
@@ -1444,9 +1090,6 @@ static const char * ggml_cuda_fattn_rocm_quant_prefill_f16_env() {
     if (!env) {
         env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_WMMA");
     }
-    if (!env) {
-        env = getenv("TBQ4_PREFILL_WMMA");
-    }
     return env;
 #else
     return nullptr;
@@ -1577,11 +1220,9 @@ static ggml_cuda_rocm_quant_prefill_f16_policy ggml_cuda_fattn_rocm_quant_prefil
     const bool forced = ggml_cuda_fattn_rocm_quant_prefill_f16_enabled() && Q->ne[1] > 2;
     const bool automatic = ggml_cuda_fattn_rocm_quant_prefill_f16_auto_enabled() &&
         Q->ne[0] == 256 && Q->ne[1] > 2 && K->ne[1] >= 1024 && K->type == GGML_TYPE_Q8_0 &&
-        (V->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_TBQ4_0 || V->type == GGML_TYPE_Q8_0);
+        (V->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_Q8_0);
 
-    const bool contiguous_ok =
-        (K->type != GGML_TYPE_TBQ4_0 || ggml_is_contiguously_allocated(K)) &&
-        (V->type != GGML_TYPE_TBQ4_0 || ggml_is_contiguously_allocated(V));
+    const bool contiguous_ok = true;
 
     const int64_t max_mib = ggml_cuda_fattn_rocm_quant_prefill_f16_max_mib();
     const int64_t tmp_bytes = ggml_cuda_fattn_f16_tmp_bytes(K, V);

@@ -57,6 +57,8 @@ endif()
 
 message(STATUS "HIP and hipBLAS found")
 
+option(GGML_HIP_PDMQ_FULL_EXPERIMENTAL_MATRIX "Compile the full experimental packed16 DOT4-MMQ/PDMQ GQA/shape/vpath specialization matrix" OFF)
+
 file(GLOB   GGML_HEADERS_ROCM "../ggml-cuda/*.cuh")
 list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
 
@@ -88,6 +90,10 @@ ggml_add_backend_library(ggml-hip
                          ${GGML_HEADERS_ROCM}
                          ${GGML_SOURCES_ROCM}
                         )
+
+if (GGML_HIP_PDMQ_FULL_EXPERIMENTAL_MATRIX)
+    target_compile_definitions(ggml-hip PRIVATE GGML_HIP_PDMQ_FULL_EXPERIMENTAL_MATRIX=1)
+endif()
 
 # TODO: do not use CUDA definitions for HIP
 if (NOT GGML_BACKEND_DL)
