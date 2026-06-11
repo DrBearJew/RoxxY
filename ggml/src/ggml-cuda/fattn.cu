@@ -4127,6 +4127,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             // ── Packed16 PWMMA auto-selection ──────────
             // Use DBV PV-WMMA for long-context prefill; keep BM32 direct-V for shorter chunks.
             const char * explicit_impl = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL");
+            const bool impl_autoset =
+                getenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL_AUTOSET") &&
+                atoi(getenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL_AUTOSET")) != 0;
             const bool impl_is_wmma =
                 explicit_impl && (
                     strcmp(explicit_impl, "bm32_regout_directv") == 0 ||
@@ -4145,7 +4148,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                     strcmp(explicit_impl, "bm64_i8qk_pvwmma_512t_wavegate_stagev") == 0 ||
                     strcmp(explicit_impl, "bm64_i8qk_pvwmma_bn32_512t_wavegate_stagev") == 0 ||
                     strcmp(explicit_impl, "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev") == 0);
-            const bool impl_auto = (!explicit_impl || !*explicit_impl || strcmp(explicit_impl, "smem") == 0);
+            const bool impl_auto = impl_autoset || !explicit_impl || !*explicit_impl || strcmp(explicit_impl, "smem") == 0;
             // Qwen 27B-like shape: gqa_ratio=6, heads_q=24, heads_k=4.
             // Qwen 35B-like shape: gqa_ratio=8, heads_q=16, heads_k=2.
             // A/B showed BM32 reg-out direct-V already wins at pp512 for these
@@ -4162,15 +4165,19 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             const bool use_bm32_regout = !use_pvwmma && impl_auto && wmma_available && (is_big_q || is_27b_like || is_35b_like || is_long_context);
             const bool use_auto_wmma = use_pvwmma || use_bm32_regout;
 
-            // Once we auto-select WMMA for long context, keep using it for
-            // subsequent calls (IMPL is already set).
+            // IMPL is process-global because the launcher reads it, but auto-set
+            // values remain mutable: short chunks can use BM32 and later long-context
+            // chunks can promote to DBV. A user-supplied IMPL has no AUTOSET marker
+            // and stays fixed.
             if (use_auto_wmma || (impl_is_wmma && wmma_available)) {
                 if (use_pvwmma) {
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL", "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev", 1);
+                    setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL_AUTOSET", "1", 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM", "64", 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_CAUSAL_SKIP", "1", 1);
                 } else if (use_bm32_regout) {
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL", "bm32_regout_directv", 1);
+                    setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL_AUTOSET", "1", 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM", "32", 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_CAUSAL_SKIP", "1", 1);
                 }
@@ -4198,15 +4205,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             packed16_kernel = BEST_FATTN_KERNEL_PACKED16_WMMA_TILE;
             // Auto-select DBV PV-WMMA for long context and BM32 regout for short context.
             const char * explicit_impl = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL");
-            const bool impl_auto = (!explicit_impl || !*explicit_impl || strcmp(explicit_impl, "smem") == 0);
+            const bool impl_autoset =
+                getenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL_AUTOSET") &&
+                atoi(getenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL_AUTOSET")) != 0;
+            const bool impl_auto = impl_autoset || !explicit_impl || !*explicit_impl || strcmp(explicit_impl, "smem") == 0;
             if (impl_auto) {
                 if (K->ne[1] >= 1024) {
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL", "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev", 1);
+                    setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL_AUTOSET", "1", 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM", "64", 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_CAUSAL_SKIP", "1", 1);
                     packed16_route_name = "pwmma_bm64_i8qk_pvwmma_dbv";
                 } else {
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL", "bm32_regout_directv", 1);
+                    setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL_AUTOSET", "1", 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM", "32", 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_CAUSAL_SKIP", "1", 1);
                     packed16_route_name = "pwmma_bm32_regout_directv";
