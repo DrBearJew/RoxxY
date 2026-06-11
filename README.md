@@ -71,50 +71,48 @@ solution.
 
 ## Cache/layout notes — I32 packed16 FlashAttention
 
-The copy/paste MTP launch command is the one above. These are the rules behind
-it:
+Use the launch command above for normal MTP runs. The rule is simple:
+**K uses RoxxY's packed16/I32 layout; V is the precision you choose.**
 
-- **K is the packed16/I32 route.** Do not pass a K cache-type flag; in
-  particular, do not use `--cache-type-k q8_0` for this path.
-- Use the V cache type to choose the value format. Packed16 allocates the
-  physical I32 K payload/scales automatically.
-- For normal use, do not force FlashAttention routes with environment variables;
-  the packed16 route is selected automatically when the shape and cache layout
-  match.
+- Do **not** pass `--cache-type-k` for this path. `--cache-type-k q8_0` means
+  you are testing a different K layout.
+- Pick V precision with `--cache-type-v`. For MTP, set `--cache-type-v-draft`
+  the same way when you want the draft context to match.
+- Packed16 allocates the physical I32 K payload/scales automatically.
+- Let the runtime selector choose the FlashAttention kernel; no route-forcing
+  environment variables are needed for normal use.
 
-The generic quantized-matmul/f16-temp knobs `LLAMA_MTP_PREFILL_FORCE_MMQ` and
-`GGML_CUDA_ROCM_QUANT_PREFILL_F16` are intentionally omitted here. The old
-packed16 route toggles are also not part of the normal command line:
-`GGML_CUDA_ROCM_PACKED16_DOT4_MMQ=1` is redundant on HIP, and
-`GGML_CUDA_FA_ROUTE_REQUIRE=rocm_packed16_dot4_mmq` is a CI/canary assertion,
-not a production runtime knob.
+| V cache | Use case | V storage | Contribution to K+V average |
+|---|---|---:|---:|
+| `q4_0` | Recommended fast MTP default | 4.5 bits/value | 2.25 bits |
+| `q8_0` | Higher V precision | 8.5 bits/value | 4.25 bits |
+| `f16` | Highest V precision | 16 bits/value | 8 bits |
 
-Use one of these V choices:
+`q4_0` V is **not i16 V**. It stores packed q4 payload plus f16 scales for the
+`P @ V` side only; QK stays on packed16 I32 DOT4 K. Choosing `q8_0` or `f16`
+raises only the `P @ V` value format while keeping the same packed16/I32 K path.
+Packed16-K + q8-V is about 17 bits per K+V pair.
 
-```text
---cache-type-v q4_0       # default: 4.5 bits/V-value; 2.25-bit contribution to total K+V average
---cache-type-v q8_0       # higher V precision: 8.5 bits/V-value; more VRAM, slower than q4_0 in MTP smoke
---cache-type-v f16        # highest V precision; most VRAM, similar speed to q8_0 in MTP smoke
-```
+`tbq4_0`, `planar3_0`, and `iso3_0` are legacy/experimental V-format research,
+not proper starting options.
 
-The intended q4 architecture is **not i16 V**. It is packed q4 V payload plus
-f16 scales feeding only the `P @ V` side; QK remains packed16 I32 DOT4 K.
-For users who want more V precision, `q8_0` and `f16` V keep the same packed16
-I32 K path and raise only the `P @ V` value format. In whole-KV VRAM accounting,
-q4 V contributes 2.25 bits to the total K+V average, q8 V contributes 4.25 bits,
-and f16 V contributes 8 bits; packed16-K + q8-V is about 17 bits per K+V pair.
+Route evidence should look like this:
 
-`tbq4_0` is no longer a proper starting option. Treat it, plus `planar3_0` and
-`iso3_0`, as legacy/experimental V-format research only.
+- Normal long prefill usually selects the PWMMA packed16/I32 family:
 
-Expected route evidence for normal long prefill is the packed16/I32 family, usually the production auto PWMMA prefill route on target Qwen shapes:
+  ```text
+  selected=pwmma_bm64_i8qk_pvwmma_dbv ... K=I32 V=<value-type>
+  FATTN COMPUTE SELECT selected=... name=rocm_packed16_wmma_tile
+  ```
 
-```text
-selected=pwmma_bm64_i8qk_pvwmma_dbv ... K=I32 V=<value-type>
-FATTN COMPUTE SELECT selected=... name=rocm_packed16_wmma_tile
-```
+- Small-Q/MTP validation may select the DOT4-MMQ/PDMQ family:
 
-`rocm_packed16_dot4_mmq`/`PDMQ2 ... K=i32 V=<value-type>` remains the DOT4-MMQ/PDMQ route for small-Q/MTP validation, experimental V formats, and CI/canary route assertions. If the log says K is q8_0 for FlashAttention, you are not validating this packed16/I32 path.
+  ```text
+  rocm_packed16_dot4_mmq / PDMQ2 ... K=i32 V=<value-type>
+  ```
+
+If the FlashAttention log says `K=q8_0`, you are not validating the
+packed16/I32 path.
 
 ### Fast WikiText quality smoke
 
