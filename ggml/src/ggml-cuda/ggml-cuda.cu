@@ -2612,7 +2612,10 @@ static void ggml_cuda_mtp_router_mmvf_log(const char * site, const ggml_tensor *
 }
 
 static bool ggml_cuda_mtp_force_ffn_up_mmq_enabled() {
-    static const bool enabled = ggml_cuda_env_flag_enabled("LLAMA_MTP_FORCE_FFN_UP_MMQ");
+    static const bool enabled = []() {
+        const char * env = getenv("LLAMA_MTP_FORCE_FFN_UP_MMQ");
+        return env ? atoi(env) != 0 : true;
+    }();
     return enabled;
 }
 

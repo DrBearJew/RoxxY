@@ -516,11 +516,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         backend_topk_enabled = []() {
             const char * env = getenv("LLAMA_MTP_BACKEND_TOPK");
-            return env && atoi(env) != 0;
+            return env ? atoi(env) != 0 : true;
         }();
-        backend_topk_require = []() {
+        backend_topk_require = [this]() {
             const char * env = getenv("LLAMA_MTP_BACKEND_TOPK_REQUIRE");
-            return env && atoi(env) != 0;
+            return env ? atoi(env) != 0 : backend_topk_enabled;
         }();
         backend_topk_verify = []() {
             const char * env = getenv("LLAMA_MTP_TOPK_VERIFY");

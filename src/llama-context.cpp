@@ -1611,7 +1611,13 @@ llama_context::llama_context(
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
                 // Packed16 K cache with DOT4 FA supports quantized V without cparams.flash_attn.
-                const bool packed16_active = (bool)(getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE") && atoi(getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE")) != 0);
+#ifdef GGML_USE_HIP
+                const bool packed16_default_enabled = true;
+#else
+                const bool packed16_default_enabled = false;
+#endif
+                const char * packed16_env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE");
+                const bool packed16_active = packed16_env ? atoi(packed16_env) != 0 : packed16_default_enabled;
                 if (!packed16_active) {
                     throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
                 }
@@ -3628,10 +3634,12 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     // Allocate backend sampling output buffers if there are backend samplers configured.
     const bool has_sampling = !sampling.samplers.empty();
-    const bool has_target_top1_sampled = []() {
+    const bool has_target_top1_sampled = [this]() {
         const char * env = getenv("LLAMA_MTP_TARGET_LM_HEAD_TOPK_ACTIVE");
         const char * raw = getenv("LLAMA_MTP_TARGET_LM_HEAD_TOPK_ACTIVE_RAW_UNSAFE");
-        return env && atoi(env) != 0 && raw && atoi(raw) != 0;
+        const bool active = env ? atoi(env) != 0 : cparams.embeddings_pre_norm;
+        const bool raw_active = raw ? atoi(raw) != 0 : cparams.embeddings_pre_norm;
+        return active && raw_active;
     }();
     if (has_sampling) {
         backend_float_count = 2 * n_vocab * n_outputs_max;      // logits + probs

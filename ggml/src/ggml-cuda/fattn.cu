@@ -4024,6 +4024,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
         const ggml_fattn_instruction inst = (ggml_fattn_instruction)fa_inst_i32;
 
+        if (fa_inst_i32 == GGML_FATTN_INST_NONE && V->type == GGML_TYPE_Q4_0 &&
+                ggml_cuda_packed16_dot4_mmq_supported(cc, dst)) {
+            return BEST_FATTN_KERNEL_PACKED16_DOT4_MMQ;
+        }
+
         const char * packed16_fa2_vec_min_nk_env = getenv("GGML_CUDA_ROCM_PACKED16_LDS_A8_MIN_NK");
         const int packed16_fa2_vec_min_nk = packed16_fa2_vec_min_nk_env ? atoi(packed16_fa2_vec_min_nk_env) : 12288;
         const bool packed16_fa2_vec_long_context = K->ne[1] >= packed16_fa2_vec_min_nk;
@@ -4189,18 +4194,21 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             required_route &&
             (strcmp(required_route, "rocm_packed16_dot4_mmq") == 0 ||
              strcmp(required_route, "packed16_dot4_mmq") == 0);
-        if (require_packed16_dot4_mmq) {
-            // Route-require is a hard contract, including nq==1 decode.  This is
-            // the opt-in path for validating packed16 I32 K + q4_0 V entirely in
-            // the DOT4/MMQ attention family instead of silently falling back to
-            // the older q8k_dot4_kq decode kernel.
+        const bool standard_packed16_q4_dot4_mmq = V->type == GGML_TYPE_Q4_0;
+        if (require_packed16_dot4_mmq || standard_packed16_q4_dot4_mmq) {
+            // Packed16 I32 K + q4_0 V is the standard DOT4/MMQ attention family.
+            // The env route remains a hard assertion; the default path falls
+            // back only if the support check rejects an unexpected shape.
             if (!ggml_cuda_packed16_dot4_mmq_supported(cc, dst)) {
-                GGML_ABORT("required rocm_packed16_dot4_mmq route was not selected; Q=[%lld,%lld,%lld,%lld] K=[%lld,%lld,%lld,%lld] V=%s",
-                    (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3],
-                    (long long) K->ne[0], (long long) K->ne[1], (long long) K->ne[2], (long long) K->ne[3],
-                    ggml_type_name(V->type));
+                if (require_packed16_dot4_mmq) {
+                    GGML_ABORT("required rocm_packed16_dot4_mmq route was not selected; Q=[%lld,%lld,%lld,%lld] K=[%lld,%lld,%lld,%lld] V=%s",
+                        (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3],
+                        (long long) K->ne[0], (long long) K->ne[1], (long long) K->ne[2], (long long) K->ne[3],
+                        ggml_type_name(V->type));
+                }
+            } else {
+                return BEST_FATTN_KERNEL_PACKED16_DOT4_MMQ;
             }
-            return BEST_FATTN_KERNEL_PACKED16_DOT4_MMQ;
         }
         if (require_packed16_wmma && ggml_cuda_packed16_wmma_tile_enabled()) {
             if (Q->ne[1] == 1) {
@@ -4227,7 +4235,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         // inside the packed16 decode launcher via GGML_CUDA_ROCM_PACKED16_DECODE_IMPL.
         if (Q->ne[1] == 1) {
             ggml_cuda_dp16_fa_emit_packed16_mtp_draft_trace_if_needed(dst, cc);
-            if (v_requires_dot4_mmq && ggml_cuda_packed16_dot4_mmq_supported(cc, dst)) {
+            const bool standard_mtp_q4_pdmq_decode =
+                inst == GGML_FATTN_INST_MTP_DRAFT_DECODE_QK && V->type == GGML_TYPE_Q4_0;
+            if ((standard_mtp_q4_pdmq_decode || v_requires_dot4_mmq) &&
+                    ggml_cuda_packed16_dot4_mmq_supported(cc, dst)) {
                 return BEST_FATTN_KERNEL_PACKED16_DOT4_MMQ;
             }
             return BEST_FATTN_KERNEL_PACKED16_DECODE;

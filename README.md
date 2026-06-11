@@ -16,70 +16,40 @@ values, while f16 scales remain separate.
 
 ## Start here: recommended MTP server launch
 
-Set your model path once, then run the normal MTP server command through the
-RoxxY launcher:
+Set your model path once, then run `llama-server` directly:
 
 ```bash
 MODEL=/path/to/Qwen3.6-27B-Q4_K_M-mtp.gguf
 
-LLAMA_MTP_ENABLE_FA=1 \
-LLAMA_MTP_PREFILL_CHUNK=2048 \
-scripts/mtp-mmvq-interleaved-auto.py --model "$MODEL" -- \
-  ./build-rocm/bin/llama-server \
-    --device ROCm0 \
-    --model "$MODEL" \
-    --flash-attn on \
-    --cache-type-v q4_0 \
-    --ctx-size 40960 --batch-size 2048 --ubatch-size 1024 \
-    --parallel 1 --no-warmup \
-    --spec-type draft-mtp --spec-default \
-    --spec-draft-n-max 3 --spec-draft-p-min 0 \
-    --spec-draft-type-v q4_0 \
-    --spec-draft-prio 2 --spec-draft-prio-batch 2
+./build-rocm/bin/llama-server \
+  --device ROCm0 \
+  --model "$MODEL" \
+  --flash-attn on \
+  --cache-type-v q4_0 \
+  --cache-type-v-draft q4_0 \
+  --ctx-size 40960 --batch-size 2048 --ubatch-size 512 \
+  --parallel 1 --no-warmup \
+  --spec-type draft-mtp --spec-default \
+  --spec-draft-n-max 4 --spec-draft-p-min 0 \
+  --spec-draft-prio 2 --spec-draft-prio-batch 2
 ```
 
-That is the normal MTP path. You do not need to set the internal
-`LLAMA_MTP_MMVQ_*` route knobs by hand.
+That is the normal MTP path. You do not need to set internal MTP, PDMQ,
+packed16, MMVQ, backend-top-k, or route assertion environment variables.
 
-`q4_0` is the recommended V-cache choice for the fast MTP path. `q8_0` also
-works, but it uses more VRAM and remains slower than `q4_0` on the measured 27B
-MTP path. If you want the higher V precision tradeoff, change both the main and
-draft V types; the launcher will pick the measured q8_0 policy for known 27B
-layouts:
-
-```bash
---cache-type-v q8_0 \
---spec-draft-type-v q8_0
-```
+`q4_0` is the recommended V-cache choice for the fast MTP path. `q8_0` uses
+more VRAM and remains slower than `q4_0` on the measured 27B MTP path.
 
 Do not add `--cache-type-k` for the packed16/I32 path; K is selected by the
 RoxxY packed16 runtime layout.
 
-What the launcher does:
+Expected q4 evidence on the measured 27B path is approximately:
 
-- known tested GGUFs get the measured fast MMVQ policy;
-- known 27B layouts using `q8_0` V get the measured q8_0 policy;
-- unknown GGUFs stay on the safe baseline;
-- stale MMVQ/PDMQ env vars from old experiments are cleared before launch.
-
-If you want to see what it picked:
-
-```bash
-scripts/mtp-mmvq-interleaved-auto.py --model "$MODEL" --explain --shell
+```text
+~60 tok/s or better, draft acceptance around 410/459, SHA f460e459... for the
+standard n512 smoke. Draft KV should be about 65 MiB at ctx 40960: packed16 K
+payload+scales around 42.5 MiB plus q4_0 V around 22.5 MiB.
 ```
-
-Developer-only examples:
-
-```bash
-# Print JSON details.
-scripts/mtp-mmvq-interleaved-auto.py --model "$MODEL" --json
-
-# Force and cache a measured policy for this exact GGUF.
-scripts/mtp-mmvq-interleaved-auto.py --model "$MODEL" --policy q6k-nw4 --trust-policy --shell
-```
-
-If the launcher does not recognize a model, it does **not** guess. It runs the
-safe baseline unless you explicitly force/cache a policy.
 
 ---
 

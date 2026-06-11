@@ -341,7 +341,7 @@ static int ggml_cuda_mtp_mmvq_q6k_reuse_weight_rows() {
 
 static bool ggml_cuda_mtp_mmvq_q6k_interleaved_act_enabled() {
     const char * env = getenv("LLAMA_MTP_MMVQ_Q6K_INTERLEAVED_ACT");
-    return env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0 && strcmp(env, "off") != 0 && strcmp(env, "false") != 0;
+    return env == nullptr || env[0] == '\0' || (strcmp(env, "0") != 0 && strcmp(env, "off") != 0 && strcmp(env, "false") != 0);
 }
 
 static bool ggml_cuda_mtp_mmvq_q6k_interleaved_act_log_enabled() {
@@ -414,7 +414,7 @@ static int ggml_cuda_mtp_mmvq_interleaved_act_rows(const char * env_name) {
 static int ggml_cuda_mtp_mmvq_interleaved_act_nwarps_raw(const char * env_name) {
     const char * env = getenv(env_name);
     if (env == nullptr || env[0] == '\0') {
-        return 1;
+        return strcmp(env_name, "LLAMA_MTP_MMVQ_Q4K_INTERLEAVED_ACT_NWARPS") == 0 ? 2 : 1;
     }
     char * end = nullptr;
     const long v = strtol(env, &end, 10);
@@ -586,7 +586,7 @@ static bool ggml_cuda_mtp_mmvq_lowk_interleaved_act_ncols_allowed(const int ncol
 
 static bool ggml_cuda_mtp_mmvq_q4k_interleaved_act_enabled() {
     const char * env = getenv("LLAMA_MTP_MMVQ_Q4K_INTERLEAVED_ACT");
-    return env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0 && strcmp(env, "off") != 0 && strcmp(env, "false") != 0;
+    return env == nullptr || env[0] == '\0' || (strcmp(env, "0") != 0 && strcmp(env, "off") != 0 && strcmp(env, "false") != 0);
 }
 
 static bool ggml_cuda_mtp_mmvq_q4k_interleaved_act_log_enabled() {
@@ -1737,7 +1737,7 @@ struct ggml_cuda_dp16_mmvq_mtp_q8_dot4_scope_guard {
 
 static inline bool ggml_cuda_mtp_q8_dot4_mmvq_env_enabled() {
     const char * enabled = getenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ");
-    return enabled && atoi(enabled) != 0;
+    return !enabled || atoi(enabled) != 0;
 }
 
 static inline bool ggml_cuda_mtp_q8_dot4_mmvq_log_enabled() {
@@ -1783,27 +1783,27 @@ static inline void ggml_cuda_mtp_q8_dot4_mmvq_log_route_reject_capture(
 
 static inline bool ggml_cuda_mtp_q8_dot4_mmvq_packed_glu_enabled() {
     const char * enabled = getenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_PACKED_GLU");
-    return ggml_cuda_mtp_q8_dot4_mmvq_env_enabled() && enabled && atoi(enabled) != 0;
+    return ggml_cuda_mtp_q8_dot4_mmvq_env_enabled() && (!enabled || atoi(enabled) != 0);
 }
 
 static inline bool ggml_cuda_mtp_q8_dot4_mmvq_packed_eh_enabled() {
     const char * enabled = getenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_PACKED_EH");
-    return ggml_cuda_mtp_q8_dot4_mmvq_env_enabled() && enabled && atoi(enabled) != 0;
+    return ggml_cuda_mtp_q8_dot4_mmvq_env_enabled() && (!enabled || atoi(enabled) != 0);
 }
 
 static inline bool ggml_cuda_mtp_q8_dot4_mmvq_packed_down_enabled() {
     const char * enabled = getenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_PACKED_DOWN");
-    return ggml_cuda_mtp_q8_dot4_mmvq_env_enabled() && enabled && atoi(enabled) != 0;
+    return ggml_cuda_mtp_q8_dot4_mmvq_env_enabled() && (!enabled || atoi(enabled) != 0);
 }
 
 static inline bool ggml_cuda_mtp_q8_dot4_mmvq_packed_qkv_enabled() {
     const char * enabled = getenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_PACKED_QKV");
-    return ggml_cuda_mtp_q8_dot4_mmvq_env_enabled() && enabled && atoi(enabled) != 0;
+    return ggml_cuda_mtp_q8_dot4_mmvq_env_enabled() && (!enabled || atoi(enabled) != 0);
 }
 
 static inline bool ggml_cuda_mtp_q8_dot4_mmvq_packed_attn_out_enabled() {
     const char * enabled = getenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_PACKED_ATTN_OUT");
-    return ggml_cuda_mtp_q8_dot4_mmvq_env_enabled() && enabled && atoi(enabled) != 0;
+    return ggml_cuda_mtp_q8_dot4_mmvq_env_enabled() && (!enabled || atoi(enabled) != 0);
 }
 
 static inline bool ggml_cuda_mtp_q8_dot4_mmvq_stream_is_capturing(cudaStream_t stream) {
@@ -7081,8 +7081,10 @@ void ggml_cuda_mul_mat_vec_q(
     if (fusion) {
         const char * mtp_fuse_glu = getenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_FUSE_GLU");
         const char * mtp_packed_glu = getenv("GGML_CUDA_ROCM_MTP_Q8_DOT4_MMVQ_PACKED_GLU");
+        const bool allow_mtp_fuse_glu = !mtp_fuse_glu || atoi(mtp_fuse_glu) != 0;
+        const bool allow_mtp_packed_glu = !mtp_packed_glu || atoi(mtp_packed_glu) != 0;
         const bool allow_mtp_fused_n1_4 = !ids && dst->ne[1] >= 1 && dst->ne[1] <= 4 &&
-            ((mtp_fuse_glu && atoi(mtp_fuse_glu) != 0) || (mtp_packed_glu && atoi(mtp_packed_glu) != 0)) &&
+            (allow_mtp_fuse_glu || allow_mtp_packed_glu) &&
             ggml_cuda_mtp_q8_dot4_mmvq_tensor_allowed(src0);
         const bool allow_mtp_reuse_n_xbias = false;
         GGML_ASSERT( !ids || (dst->ne[2] > 0 && dst->ne[2] <= MMVQ_MAX_BATCH_SIZE));

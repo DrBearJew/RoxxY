@@ -58,21 +58,16 @@ MANAGED_VARS: Tuple[str, ...] = tuple(
 
 POLICIES: Mapping[str, Mapping[str, str]] = {
     "off": {},
-    # Measured on Qwen3.6-27B-Q4_K_M-mtp.gguf prompt-x n512:
-    # 60.295 tok/s, SHA-clean for that prompt; legacy/q5/lowk intentionally off.
-    "q4q6-27b-fast": {
-        "LLAMA_MTP_MMVQ_Q4K_INTERLEAVED_ACT": "1",
-        "LLAMA_MTP_MMVQ_Q6K_INTERLEAVED_ACT": "1",
-        "LLAMA_MTP_MMVQ_Q4K_INTERLEAVED_ACT_NWARPS": "2",
-    },
+    # Qwen3.6-27B-Q4_K_M-mtp.gguf q4 fast path is now a core default:
+    # packed16 K, PDMQ, backend top-k, FFN/MMVQ, and q4/q6 interleaved-act
+    # policy are selected by the runtime.  Keep the policy name for cache/backward
+    # compatibility, but do not export q4 magic env from the launcher.
+    "q4q6-27b-fast": {},
     # Same 27B Q4_K_M weight policy, but for users explicitly running q8_0 V.
     # q8_0 V baseline was ~52 tok/s; q8v-n64 was 56.4/57.2 tok/s with a
     # different prompt-x trajectory. Auto-selected only when the command/env
     # asks for q8_0 V on this known model.
     "q4q6-27b-q8v-fast": {
-        "LLAMA_MTP_MMVQ_Q4K_INTERLEAVED_ACT": "1",
-        "LLAMA_MTP_MMVQ_Q6K_INTERLEAVED_ACT": "1",
-        "LLAMA_MTP_MMVQ_Q4K_INTERLEAVED_ACT_NWARPS": "2",
         "GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_Q8V_N64": "1",
     },
     # Measured on Qwen3.6-27B Heretic Native-MTP i1-Q6_K prompt-x n512:

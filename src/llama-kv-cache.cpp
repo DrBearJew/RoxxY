@@ -259,49 +259,34 @@ llama_kv_cache::llama_kv_cache(
             }
         }
 
-        // Keep graph-facing K in the requested cache type by default. The
-        // reference/daily build does not silently replace target K with the
-        // experimental packed16/I32 sidecar cache; doing so changes greedy
-        // target decode output and makes no-spec/spec equivalence meaningless.
+        // Packed16/I32 K is the standard ROCm packed16 path.  Keep explicit
+        // disable envs for emergency fallback, but do not require users to set
+        // the old opt-in knobs just to get the measured route.
         //
-        // Persistent packed16 K remains explicit opt-in for non-MTP/target
-        // probes.  For MTP draft contexts the I32+scale sidecar is demoted
-        // behind an unsafe force flag: dense qwen35 rank probes showed that
-        // enabling it via LLAMA_MTP_DISABLE_PACKED16_FA=0 changes draft logits
-        // and collapses acceptance while the f16K/q4V route preserves the exact
-        // target trajectory.  Keep the experimental sidecar reachable, but do
-        // not let the legacy double-negative opt-in silently poison draft
-        // quality.
-        //   - MTP draft hot/cold sidecar experiment: LLAMA_MTP_ENABLE_FA=1
-        //       LLAMA_MTP_PACKED16_HOTCOLD_K=1 (FP16 graph-facing K + route-private sidecar)
-        //   - old packed16 graph-facing unsafe experiment: LLAMA_MTP_ENABLE_FA=1
-        //       LLAMA_MTP_DISABLE_PACKED16_FA=0 LLAMA_MTP_PACKED16_DRAFT_K_UNSAFE=1
-        //   - non-MTP/target probe: GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE=1
+        // MTP draft default: packed16-only K payload+scales.  The old hot/cold
+        // mode (LLAMA_MTP_PACKED16_HOTCOLD_K=1) still exists as an explicit
+        // f16-shadow experiment, but it is not the q4 standard path.
+#ifdef GGML_USE_HIP
+        const bool packed16_default_enabled = true;
+#else
+        const bool packed16_default_enabled = false;
+#endif
+        const char * mtp_enable_fa_env = getenv("LLAMA_MTP_ENABLE_FA");
+        const bool mtp_fa_enabled = is_mtp_draft && (!mtp_enable_fa_env || atoi(mtp_enable_fa_env) != 0);
         const char * mtp_disable_p16_env = getenv("LLAMA_MTP_DISABLE_PACKED16_FA");
-        const bool mtp_packed16_requested = is_mtp_draft &&
-            getenv("LLAMA_MTP_ENABLE_FA") && atoi(getenv("LLAMA_MTP_ENABLE_FA")) != 0 &&
-            mtp_disable_p16_env && atoi(mtp_disable_p16_env) == 0;
-        const char * mtp_packed16_unsafe_env = getenv("LLAMA_MTP_PACKED16_DRAFT_K_UNSAFE");
-        const bool mtp_packed16_unsafe = mtp_packed16_unsafe_env && atoi(mtp_packed16_unsafe_env) != 0;
-        const bool mtp_packed16_experiment = mtp_packed16_requested && mtp_packed16_unsafe;
-        const bool mtp_packed16_hotcold_k = is_mtp_draft &&
-            getenv("LLAMA_MTP_ENABLE_FA") && atoi(getenv("LLAMA_MTP_ENABLE_FA")) != 0 &&
+        const bool mtp_packed16_disabled = mtp_disable_p16_env && atoi(mtp_disable_p16_env) != 0;
+        const bool mtp_packed16_requested = mtp_fa_enabled && packed16_default_enabled && !mtp_packed16_disabled;
+        const bool mtp_packed16_hotcold_k = mtp_packed16_requested &&
             getenv("LLAMA_MTP_PACKED16_HOTCOLD_K") && atoi(getenv("LLAMA_MTP_PACKED16_HOTCOLD_K")) != 0;
-        if (mtp_packed16_requested && !mtp_packed16_unsafe && !mtp_packed16_hotcold_k) {
-            static bool warned = false;
-            if (!warned) {
-                LLAMA_LOG_WARN("%s: ignoring LLAMA_MTP_DISABLE_PACKED16_FA=0 for MTP draft K; "
-                        "packed16 draft K is demoted after acceptance/rank regression. "
-                        "Set LLAMA_MTP_PACKED16_DRAFT_K_UNSAFE=1 for the old experimental sidecar.\n", __func__);
-                warned = true;
-            }
-        }
+        const bool mtp_packed16_only = mtp_packed16_requested && !mtp_packed16_hotcold_k;
+
         const char * packed16_k_cache_env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE");
-        const bool packed16_k_cache_opt_in = packed16_k_cache_env && atoi(packed16_k_cache_env) != 0;
+        const bool packed16_k_cache_enabled = packed16_k_cache_env ?
+            atoi(packed16_k_cache_env) != 0 : packed16_default_enabled;
         const bool packed16_disabled = getenv("GGML_CUDA_ROCM_PACKED16_DISABLE") &&
             atoi(getenv("GGML_CUDA_ROCM_PACKED16_DISABLE")) != 0;
         const bool packed16_active = has_k && !packed16_disabled &&
-            (mtp_packed16_experiment || mtp_packed16_hotcold_k || (!is_mtp_draft && packed16_k_cache_opt_in));
+            (mtp_packed16_only || mtp_packed16_hotcold_k || (!is_mtp_draft && packed16_k_cache_enabled));
 
         ggml_tensor * k = (has_k && (!packed16_active || mtp_packed16_hotcold_k)) ?
             ggml_new_tensor_3d(ctx, mtp_packed16_hotcold_k ? GGML_TYPE_F16 : type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;

@@ -67,7 +67,8 @@ bool qwen35_prefix_accepted_row_only_commit_enabled() {
 
 void qwen35_lm_head_top1_apply_eog_mask(const llama_model & model, ggml_tensor * top1) {
     top1->op_params[0] = 0;
-    if (!qwen35_env_enabled("LLAMA_MTP_TARGET_LM_HEAD_TOPK_EOG_MASK")) {
+    const char * eog_mask_env = getenv("LLAMA_MTP_TARGET_LM_HEAD_TOPK_EOG_MASK");
+    if (eog_mask_env && atoi(eog_mask_env) == 0) {
         return;
     }
 
@@ -351,11 +352,11 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     const bool lm_head_top1_direct_supported =
             (model.output->type == GGML_TYPE_Q6_K || model.output->type == GGML_TYPE_Q8_0) &&
             (loras == nullptr || loras->empty());
-    const bool target_top1_active_enabled = target_top1_active && atoi(target_top1_active) != 0 &&
-            target_top1_active_raw && atoi(target_top1_active_raw) != 0 &&
-            lm_head_top1_direct_supported;
-    const bool target_top1_active_from_logits = target_top1_active_enabled &&
-            target_top1_active_logits && atoi(target_top1_active_logits) != 0;
+    const bool target_top1_active_flag = target_top1_active ? atoi(target_top1_active) != 0 : cparams.embeddings_pre_norm;
+    const bool target_top1_raw_flag = target_top1_active_raw ? atoi(target_top1_active_raw) != 0 : cparams.embeddings_pre_norm;
+    const bool target_top1_logits_flag = target_top1_active_logits ? atoi(target_top1_active_logits) != 0 : cparams.embeddings_pre_norm;
+    const bool target_top1_active_enabled = target_top1_active_flag && target_top1_raw_flag && lm_head_top1_direct_supported;
+    const bool target_top1_active_from_logits = target_top1_active_enabled && target_top1_logits_flag;
     if (target_top1_active_enabled && !target_top1_active_from_logits) {
         ggml_tensor * sampled = ggml_lm_head_top_k(ctx0, model.output, lm_head_input, 1);
         cb(sampled, "target_lm_head_top1_active", -1);
@@ -706,12 +707,13 @@ llama_model_qwen35::graph_prefix_verify::graph_prefix_verify(const llama_model &
     const bool lm_head_top1_direct_supported =
             (model.output->type == GGML_TYPE_Q6_K || model.output->type == GGML_TYPE_Q8_0) &&
             (loras == nullptr || loras->empty());
+    const bool target_top1_active_flag = target_top1_active_env ? atoi(target_top1_active_env) != 0 : true;
+    const bool target_top1_raw_flag = target_top1_active_raw_env ? atoi(target_top1_active_raw_env) != 0 : true;
+    const bool target_top1_logits_flag = target_top1_active_logits_env ? atoi(target_top1_active_logits_env) != 0 : true;
     const bool target_top1_active = !commit_only &&
-            target_top1_active_env && atoi(target_top1_active_env) != 0 &&
-            target_top1_active_raw_env && atoi(target_top1_active_raw_env) != 0 &&
+            target_top1_active_flag && target_top1_raw_flag &&
             lm_head_top1_direct_supported;
-    const bool target_top1_active_from_logits = target_top1_active &&
-            target_top1_active_logits_env && atoi(target_top1_active_logits_env) != 0;
+    const bool target_top1_active_from_logits = target_top1_active && target_top1_logits_flag;
     // Accepted-row-only mode cannot know the accepted length until after
     // sampling.  Materialize a small suffix of verifier rows into rollback
     // slots during verifier decode; covered rollback values can commit without

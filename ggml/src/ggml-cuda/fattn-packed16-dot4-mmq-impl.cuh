@@ -243,10 +243,9 @@ bool ggml_cuda_packed16_dot4_mmq_supported(const int cc, const ggml_tensor * dst
         return false;
     }
     const bool v_needs_mmq_decode = V->type == GGML_TYPE_TBQ4_0 || V->type == GGML_TYPE_PLANAR3_0 || V->type == GGML_TYPE_ISO3_0;
-    if (Q->ne[1] <= 1 && !v_needs_mmq_decode && !ggml_cuda_packed16_dot4_mmq_route_required()) {
-        // Keep default decode on the existing BN64/split-K DOT4 route for established V types.
-        // A route-require opt-in is a contract and may force this MMQ kernel for q4_0/q8_0/f16 decode too.
-        // The 3-bit/TBQ V experiments use this kernel for nq==1 because q8k_dot4_kq's V loaders do not support them.
+    if (Q->ne[1] <= 0 && !v_needs_mmq_decode && !ggml_cuda_packed16_dot4_mmq_route_required()) {
+        // nq==1 MTP q4 decode is now a standard PDMQ path; route-require is no
+        // longer needed just to make the support check accept decode.
         return false;
     }
     if (Q->ne[2] <= 0 || K->ne[2] <= 0 || Q->ne[2] % K->ne[2] != 0 || Q->ne[3] != K->ne[3]) {

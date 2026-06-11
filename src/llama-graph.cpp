@@ -2270,11 +2270,16 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
             if (packed16_mtp_draft_decode) {
                 // Persistent packed16 source-K MTP draft decode, when present,
-                // is a real scalar token-mode decode carrying inp->h. Multi-token
-                // MTP catch-up/verify stays upstream-like unless explicitly forced
-                // below.
+                // is a real scalar token-mode decode carrying inp->h.
                 inst = GGML_FATTN_INST_MTP_DRAFT_DECODE_QK;
                 inst_reason = "auto_packed16_mtp_draft_decode";
+            } else if (!packed16_mtp_disabled && ubatch.n_tokens > 1 && n_outputs > 0 &&
+                    q->ne[0] == 256 && v_for_fa->ne[0] == 256 &&
+                    k->type == GGML_TYPE_I32 && v_for_fa->type == GGML_TYPE_Q4_0) {
+                // Persistent packed16 q4 MTP verify is a validated PDMQ lane;
+                // do not require LLAMA_MTP_FA_INST=verify for the standard path.
+                inst = GGML_FATTN_INST_MTP_VERIFY_QK;
+                inst_reason = "auto_packed16_mtp_verify_q4";
             }
 
             const char * mtp_f16k_q4v_vec_env = getenv("GGML_CUDA_ROCM_MTP_F16K_Q4V_VEC");

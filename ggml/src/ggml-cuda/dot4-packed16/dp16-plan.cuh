@@ -259,6 +259,28 @@ static inline dp16_fa_plan dp16_plan_mtp_fa(const dp16_fa_problem & p) {
     if (p.is_mtp && is_decode && p.nq == 1 && p.d_head == 256) {
         if (dot4_enabled &&
                 p.k_layout == DP16_LAYOUT_PACKED16_I32_SCALED &&
+                p.packed16_k_ready &&
+                p.v_type == GGML_TYPE_Q4_0 &&
+                p.v_layout == DP16_LAYOUT_Q4_0_BLOCK32) {
+            dp16_fa_plan plan = {};
+            plan.valid = true;
+            plan.selected = true;
+            plan.capture_safe = true;
+            plan.experimental = true;
+            plan.fallback = false;
+            plan.plane = DP16_FA_PLANE_FA2_PDMQ;
+            plan.backend = DP16_BACKEND_FA2_PACKED16_DOT4_MMQ_VERIFY;
+            plan.k_repr = DP16_K_REPR_PACKED16_I32_PERSISTENT;
+            plan.shape = DP16_FA_SHAPE_1X64;
+            plan.vpath = DP16_FA_VPATH_RAW_LDS_Q4;
+            plan.route = DP16_ROUTE_FA_PACKED16_MMQ;
+            plan.reason = "mtp_draft_decode_pdmq_q4";
+            plan.k_tile = 64;
+            return plan;
+        }
+
+        if (dot4_enabled &&
+                p.k_layout == DP16_LAYOUT_PACKED16_I32_SCALED &&
                 p.packed16_k_ready) {
             dp16_fa_plan plan = {};
             plan.valid = true;
