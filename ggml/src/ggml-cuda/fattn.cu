@@ -2900,6 +2900,73 @@ static void ggml_cuda_dp16_fa_abort_route_mismatch(
         ggml_type_name(problem.v_type));
 }
 
+static bool ggml_cuda_dp16_fa_plan_owns_packed16_compute(
+        const dp16_fa_plan & plan) {
+    return plan.selected && !plan.fallback &&
+        plan.k_repr == DP16_K_REPR_PACKED16_I32_PERSISTENT &&
+        (plan.backend == DP16_BACKEND_FA2_PACKED16_DOT4_DECODE ||
+         plan.backend == DP16_BACKEND_FA2_PACKED16_DOT4_MMQ_VERIFY ||
+         plan.backend == DP16_BACKEND_FA2_PACKED16_WMMA_PREFILL);
+}
+
+static bool ggml_cuda_fattn_kernel_is_packed16_compute_owner(
+        const best_fattn_kernel kernel) {
+    return kernel == BEST_FATTN_KERNEL_PACKED16_DOT4_MMQ ||
+           kernel == BEST_FATTN_KERNEL_PACKED16_WMMA_TILE ||
+           kernel == BEST_FATTN_KERNEL_PACKED16_FA2_VEC ||
+           kernel == BEST_FATTN_KERNEL_PACKED16_DECODE;
+}
+
+static void ggml_cuda_dp16_fa_enforce_final_packed16_contract(
+        const ggml_tensor * dst,
+        const best_fattn_kernel selected) {
+#ifdef GGML_USE_HIP
+    if (g_fattn_select_ctx != GGML_CUDA_FATTN_SELECT_DISPATCH || !dst) {
+        return;
+    }
+
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    if (!Q || !K || !V) {
+        return;
+    }
+    if (K->type != GGML_TYPE_I32) {
+        return;
+    }
+
+    const dp16_fa_problem problem =
+        ggml_cuda_make_dp16_fa_problem(dst, 0, ggml_cuda_fattn_capture_active());
+    const dp16_fa_plan plan = dp16_plan_mtp_fa(problem);
+    if (!ggml_cuda_dp16_fa_plan_owns_packed16_compute(plan)) {
+        return;
+    }
+    ggml_cuda_dp16_fa_emit_plan_trace_if_needed(problem, plan);
+    if (ggml_cuda_fattn_kernel_is_packed16_compute_owner(selected)) {
+        return;
+    }
+
+    dp16_trace_emit_fa_plan(problem, plan);
+    GGML_ABORT(
+        "DP16 packed16 compute contract violation: plan route=%s backend=%s k_repr=%s reason=%s but final selected=%s; refusing silent f16/generic fallback for compressed KV (inst=%s nq=%lld nk=%lld d=%lld K=%s k_phys=%s V=%s)",
+        plan.route ? plan.route : "none",
+        dp16_backend_name(plan.backend),
+        dp16_k_repr_name(plan.k_repr),
+        plan.reason ? plan.reason : "none",
+        ggml_cuda_fattn_kernel_name(selected),
+        ggml_cuda_fattn_instruction_name((ggml_fattn_instruction) ggml_cuda_fattn_get_instruction(dst)),
+        (long long) Q->ne[1],
+        (long long) K->ne[1],
+        (long long) Q->ne[0],
+        ggml_type_name(K->type),
+        ggml_cuda_fattn_k_physical_repr_name(K),
+        ggml_type_name(V->type));
+#else
+    GGML_UNUSED(dst);
+    GGML_UNUSED(selected);
+#endif
+}
+
 // ── MTP instruction selector ────────────────────────────────────────
 //
 // MTP_VERIFY_QK is a semantic FlashAttention instruction.
@@ -4734,6 +4801,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         fprintf(stderr, "FATTN COMPUTE SELECT selected=%d name=%s dst=%p\n", (int)best_kernel, ggml_cuda_fattn_kernel_name(best_kernel), (void*)dst); fflush(stderr);
     }
     ggml_cuda_fattn_log_selection(best_kernel, dst);
+    ggml_cuda_dp16_fa_enforce_final_packed16_contract(dst, best_kernel);
 
 #ifdef GGML_USE_HIP
     // Final dispatch-level proof for packed16 small-Q FA2 routes. Some of the
