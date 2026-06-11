@@ -56,13 +56,14 @@ Expected higher-precision typed-V evidence on the same direct/clean command,
 with only the V cache type changed, is approximately:
 
 ```text
-q8_0: ~51 tok/s, draft acceptance around 399/565, no selected=587/588
-f16:  ~50 tok/s, draft acceptance around 399/565, no selected=587/588
+q8_0: ~51-52 tok/s, draft acceptance around 399/565, no selected=587/588
+f16:  ~52 tok/s, draft acceptance around 399/565, no selected=587/588
 ```
 
 Route-log canaries should show `rocm_packed16_dot4_mmq` / `PDMQ2 ... K=i32
-V=q8_0` or `V=f16` for the small-Q typed-V path; the old
-`rocm_packed16_decode` lane is not the typed-V solution.
+V=q8_0 ... vpath=raw_lds_q8_0` or `V=f16 ... vpath=raw_lds_f16` for the
+small-Q typed-V path; the old `rocm_packed16_decode` lane is not the typed-V
+solution.
 
 ---
 
