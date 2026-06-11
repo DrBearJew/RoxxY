@@ -2068,8 +2068,10 @@ private:
             params_dft.n_gpu_layers = params_spec.n_gpu_layers;
             // TODO: find a better way to expose that the cache is shared
             if (spec_mtp) {
-                params_dft.cache_type_k = params_base.cache_type_k;
-                params_dft.cache_type_v = params_base.cache_type_v;
+                // Integrated MTP defaults to the target cache types for backward-compatible
+                // one-flag launches, but honor explicit draft cache-type overrides.
+                params_dft.cache_type_k = params_spec.cache_type_k_set ? params_spec.cache_type_k : params_base.cache_type_k;
+                params_dft.cache_type_v = params_spec.cache_type_v_set ? params_spec.cache_type_v : params_base.cache_type_v;
             } else {
                 params_dft.cache_type_k = params_spec.cache_type_k;
                 params_dft.cache_type_v = params_spec.cache_type_v;
@@ -2118,6 +2120,15 @@ private:
             auto cparams_mtp = common_context_params_to_llama(params_base);
             cparams_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
             cparams_mtp.n_rs_seq = 0;
+            // Preserve the standard path where the MTP draft inherits target KV
+            // types, but make the documented --cache-type-*-draft options real
+            // for explicit diagnostics / mixed main-draft cache experiments.
+            if (params_base.speculative.draft.cache_type_k_set) {
+                cparams_mtp.type_k = params_base.speculative.draft.cache_type_k;
+            }
+            if (params_base.speculative.draft.cache_type_v_set) {
+                cparams_mtp.type_v = params_base.speculative.draft.cache_type_v;
+            }
 
             ctx_dft.reset(llama_init_from_model(model_tgt, cparams_mtp));
             if (ctx_dft == nullptr) {

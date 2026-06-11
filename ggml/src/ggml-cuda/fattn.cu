@@ -4310,6 +4310,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 K->type == GGML_TYPE_I32 && V->type == GGML_TYPE_Q4_0) {
             return BEST_FATTN_KERNEL_PACKED16_DOT4_MMQ;
         }
+        const bool typed_v_pdmq_smallq = V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_F16;
+        if (typed_v_pdmq_smallq && prefill_or_verify && dot4_sup &&
+                Q->ne[1] >= 2 && Q->ne[1] <= 8 && K->type == GGML_TYPE_I32) {
+            return BEST_FATTN_KERNEL_PACKED16_DOT4_MMQ;
+        }
         const bool small_verify_decode_opt_in =
             getenv("LLAMA_MTP_FA_ROUTE") &&
             (packed16_fa2_env ||
