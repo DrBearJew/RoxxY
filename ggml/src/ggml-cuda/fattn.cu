@@ -3984,11 +3984,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             required_route &&
             (strcmp(required_route, "rocm_packed16_dot4_mmq") == 0 ||
              strcmp(required_route, "packed16_dot4_mmq") == 0);
-        const bool standard_packed16_q4_dot4_mmq = V->type == GGML_TYPE_Q4_0;
-        if (require_packed16_dot4_mmq || standard_packed16_q4_dot4_mmq) {
-            // Packed16 I32 K + q4_0 V is the standard DOT4/MMQ attention family.
-            // The env route remains a hard assertion; the default path falls
-            // back only if the support check rejects an unexpected shape.
+        const bool standard_packed16_q4_dot4_mmq_smallq =
+            V->type == GGML_TYPE_Q4_0 && Q->ne[1] <= small_verify_max_nq;
+        if (require_packed16_dot4_mmq || standard_packed16_q4_dot4_mmq_smallq) {
+            // Packed16 I32 K + q4_0 V defaults to DOT4/MMQ only for the compact
+            // small-Q lane.  Larger prefill has enough Q rows to amortize tiled
+            // PWMMA setup, so it must fall through to the packed16 WMMA auto
+            // selector below unless PDMQ is explicitly route-required.
             if (!ggml_cuda_packed16_dot4_mmq_supported(cc, dst)) {
                 if (require_packed16_dot4_mmq) {
                     GGML_ABORT("required rocm_packed16_dot4_mmq route was not selected; Q=[%lld,%lld,%lld,%lld] K=[%lld,%lld,%lld,%lld] V=%s",
@@ -4152,11 +4154,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             const bool is_35b_like = (gqa_ratio == 8 && K->ne[1] >= 512);
             // General/unknown shapes keep the more conservative threshold at
             // nk >= 1024 (context length, not query chunk size).
+            const bool is_big_q = (Q->ne[1] >= 16);
             const bool is_long_context = (K->ne[1] >= 1024);
             const bool is_pvwmma_context = (K->ne[1] >= 1024);
             const bool wmma_available = wmma_sup;
             const bool use_pvwmma = impl_auto && wmma_available && is_pvwmma_context;
-            const bool use_bm32_regout = !use_pvwmma && impl_auto && wmma_available && (is_27b_like || is_35b_like || is_long_context);
+            const bool use_bm32_regout = !use_pvwmma && impl_auto && wmma_available && (is_big_q || is_27b_like || is_35b_like || is_long_context);
             const bool use_auto_wmma = use_pvwmma || use_bm32_regout;
 
             // Once we auto-select WMMA for long context, keep using it for
