@@ -3603,7 +3603,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         raw_lds,
         directv);
     qblock_program.pvblock_mode = pdmq_pvblock_mode;
-    const bool pdmq_v4_144_pv4_req = pdmq_v4_144_pv4_requested();
+    const bool pdmq_v4_144_pv4_req = v4_k16d16_144_persistent && pdmq_v4_144_pv4_requested();
     const bool pdmq_v4_144_pv4_supported = v4_k16d16_144_persistent && directv && !stage_v &&
         !pdmq_pv_wmma_active && !pdmq_pv_i8_wmma_active && !pdmq_pv_i4_wmma_active;
     if (pdmq_v4_144_pv4_req && !pdmq_v4_144_pv4_supported) {
