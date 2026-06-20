@@ -3290,6 +3290,10 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     }
 
     const bool v4_144_pv4_requested = V->type == GGML_TYPE_V4_K16D16_144 && pdmq_v4_144_pv4_requested();
+    const bool v4_144_draft_v_cache_requested = []() {
+        const char * v = getenv("GGML_CUDA_ROCM_V4_K16D16_144_MTP_DRAFT_V_CACHE");
+        return v && atoi(v) != 0;
+    }();
     const bool qwen27b_gqa6_row_serial_pdmq =
         qwen27b_gqa6_topology &&
         (V->type == GGML_TYPE_Q4_0 || v4_144_pv4_requested) &&
@@ -3297,10 +3301,11 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         (ggml_cuda_packed16_dot4_mmq_route_required() || v4_144_pv4_requested);
     if (qwen27b_gqa6_row_serial_pdmq) {
         // Normal q4 uses PWMMA/DBV for these rows. When q4 is explicitly forced
-        // through PDMQ, or V4_144 PV4 must use PDMQ, keep the row-serial shape
-        // that preserves the q4 sampling trajectory. Auto M8/M16 is faster for
-        // isolated kernels but changes long-context MTP output by n46/n128.
-        shape = PDMQ_SHAPE_M1N32;
+        // through PDMQ, or V4_144 PV4 must use PDMQ, avoid auto M8/M16 because
+        // it changes long-context MTP output by n46/n128. Draft-V cache has more
+        // all-V4 rows, and clean n128 gates show M2N32 preserves the q4 hash while
+        // reducing V4 draft overhead; target-only and forced q4 stay on M1N32.
+        shape = v4_144_pv4_requested && v4_144_draft_v_cache_requested ? PDMQ_SHAPE_M2N32 : PDMQ_SHAPE_M1N32;
     }
 
     // m8n32 is a useful shallow/promptfill GQA2 shape, but deep pp2048
