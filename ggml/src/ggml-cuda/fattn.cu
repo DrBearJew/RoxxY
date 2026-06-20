@@ -3053,7 +3053,8 @@ static best_fattn_kernel ggml_cuda_select_mtp_draft_decode_fattn(
 
     if (plan.backend == DP16_BACKEND_FA2_PACKED16_DOT4_DECODE &&
             !((K->type == GGML_TYPE_I32 && K->ne[0] * 4 == Q->ne[0] &&
-               (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0)) ||
+               (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0 ||
+                V->type == GGML_TYPE_V4_K16D16_144)) ||
               hotcold_sidecar_decode)) {
         plan = dp16_make_fa1_vec_fallback("packed16_decode_not_ready");
     }
@@ -3603,8 +3604,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             if (!ggml_cuda_dp16_fa_route_contract_matches_plan(required_route, problem, plan)) {
                 ggml_cuda_dp16_fa_abort_route_mismatch(required_route, problem, plan);
             }
-            return ggml_cuda_packed16_dot4_mmq_supported(cc, dst) ?
-                BEST_FATTN_KERNEL_PACKED16_DOT4_MMQ : BEST_FATTN_KERNEL_NONE;
+            if (plan.backend == DP16_BACKEND_FA2_PACKED16_DOT4_DECODE) {
+                return BEST_FATTN_KERNEL_PACKED16_DECODE;
+            }
+            if (plan.backend == DP16_BACKEND_FA2_PACKED16_DOT4_MMQ_VERIFY) {
+                return ggml_cuda_packed16_dot4_mmq_supported(cc, dst) ?
+                    BEST_FATTN_KERNEL_PACKED16_DOT4_MMQ : BEST_FATTN_KERNEL_NONE;
+            }
+            return BEST_FATTN_KERNEL_NONE;
         }
 
         const bool require_packed16_decode_alias =
@@ -3772,7 +3779,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 Q->ne[0] == 256 && V->ne[0] == 256 && K->ne[0] * 4 == Q->ne[0] &&
                 Q->ne[2] % K->ne[2] == 0 && packed16_decode_enabled;
             const bool v4_144_nomtp_packed16_decode =
-                (inst == GGML_FATTN_INST_NONE || inst == GGML_FATTN_INST_DECODE_QK || inst == GGML_FATTN_INST_PREFILL_QK) &&
+                (inst == GGML_FATTN_INST_NONE || inst == GGML_FATTN_INST_DECODE_QK ||
+                 inst == GGML_FATTN_INST_PREFILL_QK || inst == GGML_FATTN_INST_MTP_DRAFT_DECODE_QK) &&
                 K->type == GGML_TYPE_I32 && V->type == GGML_TYPE_V4_K16D16_144 &&
                 Q->ne[0] == 256 && V->ne[0] == 256 && K->ne[0] * 4 == Q->ne[0] &&
                 Q->ne[2] % K->ne[2] == 0 && packed16_decode_enabled;
@@ -3887,9 +3895,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         const bool v4_144_nomtp_prefill =
             V->type == GGML_TYPE_V4_K16D16_144 &&
             (inst == GGML_FATTN_INST_NONE || inst == GGML_FATTN_INST_PREFILL_QK);
+        const bool v4_144_mtp_batched =
+            V->type == GGML_TYPE_V4_K16D16_144 &&
+            (inst == GGML_FATTN_INST_MTP_VERIFY_QK || inst == GGML_FATTN_INST_MTP_QBLOCK_VERIFY_QK ||
+             inst == GGML_FATTN_INST_MTP_DRAFT);
+        const bool v4_144_mtp_pwmma =
+            v4_144_mtp_batched && ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_V4_K16D16_144_PWMMA_MTP");
         const bool v4_144_pwmma_prefill =
             V->type == GGML_TYPE_V4_K16D16_144 &&
-            (v4_144_nomtp_prefill || ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_V4_K16D16_144_PWMMA_PREFILL"));
+            (v4_144_nomtp_prefill || v4_144_mtp_pwmma ||
+             (!v4_144_mtp_batched && ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_V4_K16D16_144_PWMMA_PREFILL")));
         const bool wmma_sup = (!v4_k16d16_v || v4_144_pwmma_prefill) && ggml_cuda_packed16_wmma_tile_enabled();
         best_fattn_kernel packed16_kernel = BEST_FATTN_KERNEL_NONE;
         const char * packed16_route_name = "none";
@@ -3936,7 +3951,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             const bool dbv_auto_enabled = !dbv_auto_env || atoi(dbv_auto_env) != 0;
             const bool use_pvwmma = dbv_auto_enabled && impl_auto && wmma_available && is_pvwmma_context;
             const bool use_bm32_regout = !use_pvwmma && impl_auto && wmma_available &&
-                (v4_144_nomtp_prefill || is_big_q || is_27b_like || is_35b_like || is_long_context);
+                (v4_144_nomtp_prefill || v4_144_mtp_pwmma || is_big_q || is_27b_like || is_35b_like || is_long_context);
             const bool use_auto_wmma = use_pvwmma || use_bm32_regout;
 
             // IMPL is process-global because the launcher reads it, but auto-set

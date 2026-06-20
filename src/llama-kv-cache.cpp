@@ -290,11 +290,19 @@ llama_kv_cache::llama_kv_cache(
 
         const char * v4_k16d16_env = getenv("GGML_CUDA_ROCM_V4_K16D16_V_CACHE");
         const char * v4_k16d16_144_env = getenv("GGML_CUDA_ROCM_V4_K16D16_144_V_CACHE");
+        const char * v4_k16d16_144_mtp_env = getenv("GGML_CUDA_ROCM_V4_K16D16_144_MTP_DRAFT_V_CACHE");
 #ifdef GGML_USE_HIP
+        const bool v4_k16d16_144_mtp_draft_enabled =
+            !is_mtp_draft || (v4_k16d16_144_mtp_env && atoi(v4_k16d16_144_mtp_env) != 0);
         const bool v4_k16d16_active = has_v && !v_trans && n_stream == 1 && type_v_layer == GGML_TYPE_Q4_0 &&
             v4_k16d16_env && atoi(v4_k16d16_env) != 0 && hparams.n_embd_head_v(il) == 256;
+        // The MTP draft cache is acceptance-sensitive: using V4_144 for the draft
+        // layer preserves final hashes but collapses speculative depth and roughly
+        // halves throughput. Keep the draft layer on q4_0 by default; the opt-in
+        // env keeps the V4_144 MTP route available for diagnostics.
         const bool v4_k16d16_144_active = has_v && !v4_k16d16_active && !v_trans && n_stream == 1 && type_v_layer == GGML_TYPE_Q4_0 &&
-            v4_k16d16_144_env && atoi(v4_k16d16_144_env) != 0 && hparams.n_embd_head_v(il) == 256 && (kv_size % 16) == 0;
+            v4_k16d16_144_mtp_draft_enabled && v4_k16d16_144_env && atoi(v4_k16d16_144_env) != 0 &&
+            hparams.n_embd_head_v(il) == 256 && (kv_size % 16) == 0;
 #else
         const bool v4_k16d16_active = false;
         const bool v4_k16d16_144_active = false;

@@ -2377,14 +2377,17 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 const char * disable = getenv("LLAMA_MTP_DISABLE_PACKED16_FA");
                 return disable && atoi(disable) != 0;
             }();
+            const bool packed16_mtp_v =
+                v_for_fa->type == GGML_TYPE_Q4_0 ||
+                v_for_fa->type == GGML_TYPE_V4_K16D16_144;
             const bool packed16_mtp_draft_decode =
                 real_mtp_token_decode && !packed16_mtp_disabled &&
                 q->ne[0] == 256 && v_for_fa->ne[0] == 256 &&
-                k->type == GGML_TYPE_I32 && v_for_fa->type == GGML_TYPE_Q4_0;
+                k->type == GGML_TYPE_I32 && packed16_mtp_v;
             const bool packed16_mtp_q4_batched =
                 !packed16_mtp_disabled && ubatch.n_tokens > 1 &&
                 q->ne[0] == 256 && v_for_fa->ne[0] == 256 &&
-                k->type == GGML_TYPE_I32 && v_for_fa->type == GGML_TYPE_Q4_0;
+                k->type == GGML_TYPE_I32 && packed16_mtp_v;
 
             if (packed16_mtp_draft_decode) {
                 // Persistent packed16 source-K MTP draft decode, when present,
@@ -2401,8 +2404,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 // upstream-like MTP attention.
                 inst = qblock_active ? GGML_FATTN_INST_MTP_QBLOCK_VERIFY_QK : GGML_FATTN_INST_MTP_VERIFY_QK;
                 inst_reason = qblock_active
-                    ? (n_outputs > 0 ? "auto_packed16_mtp_qblock_verify_q4" : "auto_packed16_mtp_qblock_prefix_verify_q4")
-                    : "auto_packed16_mtp_verify_q4";
+                    ? (n_outputs > 0 ? "auto_packed16_mtp_qblock_verify" : "auto_packed16_mtp_qblock_prefix_verify")
+                    : "auto_packed16_mtp_verify";
             }
 
             const char * mtp_f16k_q4v_vec_env = getenv("GGML_CUDA_ROCM_MTP_F16K_Q4V_VEC");
