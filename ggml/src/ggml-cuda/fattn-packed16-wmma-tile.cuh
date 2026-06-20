@@ -47,6 +47,19 @@ static int ggml_cuda_rocm_packed16_wmma_gqa_group() {
     GGML_ABORT("invalid GGML_CUDA_ROCM_PACKED16_WMMA_GQA_GROUP=%s; expected 1 or 2", s);
 }
 
+static inline bool ggml_cuda_pwmma_self_probes_enabled() {
+    const char * v = getenv("GGML_CUDA_PWMMA_SELF_PROBES");
+    if (!v) {
+        v = getenv("GGML_CUDA_PWMMA_DEBUG_SELF_PROBES");
+    }
+    return v && atoi(v) != 0;
+}
+
+static inline bool ggml_cuda_pwmma_log_enabled() {
+    const char * v = getenv("COMPRESSED_KV_FATTN_LOG");
+    return v && atoi(v) != 0;
+}
+
 static int ggml_cuda_rocm_packed16_wmma_impl() {
     const char * s = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL");
     if (!s || !*s) return 0;  // 0 = smem (default, known-good)
@@ -74,6 +87,7 @@ enum packed16_wmma_v_type {
     PACKED16_WMMA_V_Q4_0,
     PACKED16_WMMA_V_Q8_0,
     PACKED16_WMMA_V_F16,
+    PACKED16_WMMA_V4_K16D16_144,
 };
 
 // Layout modes for V tensor: FA = [D,n_kv,heads,batch], TRANS = [n_kv,heads,D,batch]
@@ -169,6 +183,25 @@ static __device__ __forceinline__ float pwmma_decode_v_f16(
     const int vb = v_ne13 > 1 ? (b % v_ne13) : 0;
     const char * ptr = V + int64_t(vb)*v_nb13 + int64_t(hk)*v_nb12 + int64_t(k)*v_nb11;
     return __half2float(*(const half *)(ptr + int64_t(d)*v_nb10));
+}
+
+static constexpr int PWMMA_V4_K16D16_144_K = 16;
+static constexpr int PWMMA_V4_K16D16_144_D32 = 32;
+static constexpr int PWMMA_V4_K16D16_144_PAYLOAD_BYTES = 2048;
+static constexpr int PWMMA_V4_K16D16_144_WORDS_PER_D = 2;
+
+static __device__ __forceinline__ float pwmma_decode_v_v4_k16d16_144(
+        const char * __restrict__ V, int64_t v_nb10, int64_t v_nb11, int64_t v_nb12,
+        int64_t v_nb13, int64_t v_ne13, int k, int hk, int b, int d) {
+    GGML_UNUSED(v_nb10);
+    const int vb = v_ne13 > 1 ? (b % v_ne13) : 0;
+    const int k16_base = k & ~(PWMMA_V4_K16D16_144_K - 1);
+    const int slot = k & (PWMMA_V4_K16D16_144_K - 1);
+    const char * block = V + int64_t(vb)*v_nb13 + int64_t(hk)*v_nb12 + int64_t(k16_base)*v_nb11;
+    const uint32_t word = ((const uint32_t *) block)[d * PWMMA_V4_K16D16_144_WORDS_PER_D + (slot >> 3)];
+    const int q = int((word >> (4 * (slot & 7))) & 0x0fu) - 8;
+    const half * scales = (const half *) (block + PWMMA_V4_K16D16_144_PAYLOAD_BYTES);
+    return float(q) * __half2float(scales[(d / PWMMA_V4_K16D16_144_D32) * PWMMA_V4_K16D16_144_K + slot]);
 }
 
 // ── Mask helper ──────────────────────────────────────────────────
@@ -314,6 +347,7 @@ struct pwmma_debug_error {
     int q_tile, hq, hk;
     int k0, valid_k, k, d;
     int head_stride, packed_rows, k_row;
+    float got, ref;
 };
 
 // ── BM16 constants ──────────────────────────────────────────────
@@ -691,6 +725,8 @@ static __device__ __forceinline__ float pwmma_v_element(
         const int blk = d / QK8_0;
         const block_q8_0 * bq = (const block_q8_0 *)(row_base + int64_t(blk)*v_nb10);
         return float(bq->qs[d & (QK8_0 - 1)]) * __half2float(bq->d);
+    } else if constexpr (V_TYPE == PACKED16_WMMA_V4_K16D16_144) {
+        return pwmma_decode_v_v4_k16d16_144(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k, hk, b, d);
     } else { // PACKED16_WMMA_V_Q4_0
         const char * row_base = V + int64_t(vb)*v_nb13 + int64_t(hk)*v_nb12 + int64_t(k)*v_nb11;
         const int blk = d / QK4_0, in = d & (QK4_0 - 1);
@@ -955,7 +991,12 @@ static __global__ void packed16_wmma_tile_bm32_regout_directv_kernel(
         // Online softmax
         for (int r = threadIdx.x; r < PWMMA_BM32; r += blockDim.x) {
             const int qq = q_tile * PWMMA_BM32 + r;
-            if (qq >= nq) { alpha_smem[r] = 0.0f; continue; }
+            if (qq >= nq) {
+                alpha_smem[r] = 0.0f;
+                #pragma unroll
+                for (int c = 0; c < PWMMA_BN; ++c) probs_f32[r][c] = 0.0f;
+                continue;
+            }
             float tile_max = -FLT_MAX;
             #pragma unroll
             for (int c = 0; c < valid_k; ++c) tile_max = fmaxf(tile_max, logits_f32[r][c]);
@@ -2257,10 +2298,12 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_512t_wavegate_stagev_kernel(
             const int d_tile  = (threadIdx.x >> 5) & 15;
             #pragma unroll
             for (int rb = 0; rb < 4; ++rb) {
-                #pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    const int global_r = rb * 16 + pbwmma_f16_d_row_from_acc(i, lane_hi);
-                    out_pv[rb][i] *= alpha_smem[global_r];
+                if (wave_active[rb]) {
+                    #pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const int global_r = rb * 16 + pbwmma_f16_d_row_from_acc(i, lane_hi);
+                        out_pv[rb][i] *= alpha_smem[global_r];
+                    }
                 }
                 #pragma unroll
                 for (int kc_base = 0; kc_base < BN_TILE; kc_base += 16) {
@@ -2291,12 +2334,14 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_512t_wavegate_stagev_kernel(
                     #pragma unroll
                     for (int i = 0; i < 8; ++i) {
                         const int global_r = rb * 16 + pbwmma_f16_d_row_from_acc(i, lane_hi);
-                        if (bounds_err && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && kt == 0 && d_tile == 0) {
+                        if (bounds_err && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
                             float ref = 0.0f;
-                            #pragma unroll
-                            for (int c = 0; c < 16; ++c) {
-                                const int kc = kc_base + c;
-                                if (kc < valid_k) ref += __half2float(probs[global_r][kc]) * __half2float(v_tile_f16[kc][lane_lo]);
+                            if (wave_active[rb]) {
+                                #pragma unroll
+                                for (int c = 0; c < 16; ++c) {
+                                    const int kc = kc_base + c;
+                                    if (kc < valid_k) ref += __half2float(probs[global_r][kc]) * __half2float(v_tile_f16[kc][d_tile * 16 + lane_lo]);
+                                }
                             }
                             const float tol = 2.5e-2f * fmaxf(1.0f, fabsf(ref));
                             if (fabsf(pv_acc[i] - ref) > tol && atomicCAS(&bounds_err->flag, 0, 1) == 0) {
@@ -2321,6 +2366,8 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_512t_wavegate_stagev_kernel(
                                 bounds_err->head_stride = head_stride;
                                 bounds_err->packed_rows = packed_rows;
                                 bounds_err->k_row = global_r;
+                                bounds_err->got = pv_acc[i];
+                                bounds_err->ref = ref;
                             }
                         }
                         out_pv[rb][i] += pv_acc[i];
@@ -2683,7 +2730,15 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
 
         for (int r = threadIdx.x; r < PWMMA_BM64; r += blockDim.x) {
             const int wave_id = r >> 4, qq = q0 + r;
-            if (qq >= nq || !wave_active[wave_id]) { alpha_smem[r] = 0.0f; continue; }
+            if (qq >= nq || !wave_active[wave_id]) {
+                alpha_smem[r] = 0.0f;
+                #pragma unroll
+                for (int c = 0; c < BN_TILE; ++c) {
+                    if constexpr (PROBS_F16) probs[r][c] = __float2half(0.0f);
+                    else probs[r][c] = 0.0f;
+                }
+                continue;
+            }
             float tile_max = -FLT_MAX;
             #pragma unroll
             for (int c = 0; c < valid_k; ++c) tile_max = fmaxf(tile_max, logits_f32[r][c]);
@@ -2710,10 +2765,12 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
             const int d_tile  = (threadIdx.x >> 5) & 15;
             #pragma unroll
             for (int rb = 0; rb < 4; ++rb) {
-                #pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    const int global_r = rb * 16 + pbwmma_f16_d_row_from_acc(i, lane_hi);
-                    out_pv[rb][i] *= alpha_smem[global_r];
+                if (wave_active[rb]) {
+                    #pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const int global_r = rb * 16 + pbwmma_f16_d_row_from_acc(i, lane_hi);
+                        out_pv[rb][i] *= alpha_smem[global_r];
+                    }
                 }
             }
             #pragma unroll
@@ -2749,12 +2806,14 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
                     #pragma unroll
                     for (int i = 0; i < 8; ++i) {
                         const int global_r = rb * 16 + pbwmma_f16_d_row_from_acc(i, lane_hi);
-                        if (bounds_err && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && kt == 0 && d_tile == 0) {
+                        if (bounds_err && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
                             float ref = 0.0f;
-                            #pragma unroll
-                            for (int c = 0; c < 16; ++c) {
-                                const int kc = kc_base + c;
-                                if (kc < valid_k) ref += __half2float(probs[global_r][kc]) * __half2float(v_tile_f16_db[kt & 1][kc][lane_lo]);
+                            if (wave_active[rb]) {
+                                #pragma unroll
+                                for (int c = 0; c < 16; ++c) {
+                                    const int kc = kc_base + c;
+                                    if (kc < valid_k) ref += __half2float(probs[global_r][kc]) * __half2float(v_tile_f16_db[kt & 1][kc][d_tile * 16 + lane_lo]);
+                                }
                             }
                             const float tol = 2.5e-2f * fmaxf(1.0f, fabsf(ref));
                             if (fabsf(pv_acc[i] - ref) > tol && atomicCAS(&bounds_err->flag, 0, 1) == 0) {
@@ -2779,6 +2838,8 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
                                 bounds_err->head_stride = head_stride;
                                 bounds_err->packed_rows = packed_rows;
                                 bounds_err->k_row = global_r;
+                                bounds_err->got = pv_acc[i];
+                                bounds_err->ref = ref;
                             }
                         }
                         out_pv[rb][i] += pv_acc[i];
@@ -3161,10 +3222,12 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_bn32_512t_wavegate_st
             const int d_tile  = (threadIdx.x >> 5) & 15;
             #pragma unroll
             for (int rb = 0; rb < 4; ++rb) {
-                #pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    const int global_r = rb * 16 + pbwmma_f16_d_row_from_acc(i, lane_hi);
-                    out_pv[rb][i] *= alpha_smem[global_r];
+                if (wave_active[rb]) {
+                    #pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const int global_r = rb * 16 + pbwmma_f16_d_row_from_acc(i, lane_hi);
+                        out_pv[rb][i] *= alpha_smem[global_r];
+                    }
                 }
                 #pragma unroll
                 for (int kc_base = 0; kc_base < BN_TILE; kc_base += 16) {
@@ -3195,12 +3258,14 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_bn32_512t_wavegate_st
                     #pragma unroll
                     for (int i = 0; i < 8; ++i) {
                         const int global_r = rb * 16 + pbwmma_f16_d_row_from_acc(i, lane_hi);
-                        if (bounds_err && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && kt == 0 && d_tile == 0) {
+                        if (bounds_err && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
                             float ref = 0.0f;
-                            #pragma unroll
-                            for (int c = 0; c < 16; ++c) {
-                                const int kc = kc_base + c;
-                                if (kc < valid_k) ref += __half2float(probs[global_r][kc]) * __half2float(v_tile_f16[kc][lane_lo]);
+                            if (wave_active[rb]) {
+                                #pragma unroll
+                                for (int c = 0; c < 16; ++c) {
+                                    const int kc = kc_base + c;
+                                    if (kc < valid_k) ref += __half2float(probs[global_r][kc]) * __half2float(v_tile_f16[kc][d_tile * 16 + lane_lo]);
+                                }
                             }
                             const float tol = 2.5e-2f * fmaxf(1.0f, fabsf(ref));
                             if (fabsf(pv_acc[i] - ref) > tol && atomicCAS(&bounds_err->flag, 0, 1) == 0) {
@@ -3225,6 +3290,8 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_bn32_512t_wavegate_st
                                 bounds_err->head_stride = head_stride;
                                 bounds_err->packed_rows = packed_rows;
                                 bounds_err->k_row = global_r;
+                                bounds_err->got = pv_acc[i];
+                                bounds_err->ref = ref;
                             }
                         }
                         out_pv[rb][i] += pv_acc[i];
@@ -3695,7 +3762,10 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     const ggml_tensor * Q = dst->src[0], * K = dst->src[1], * V = dst->src[2], * mask = dst->src[3];
-    fprintf(stderr, "PWMMA ENTRY: Q_ne=(%lld,%lld) K_ne=(%lld,%lld) V_ne=(%lld,%lld)\n", (long long)Q->ne[0], (long long)Q->ne[1], (long long)K->ne[0], (long long)K->ne[1], (long long)V->ne[0], (long long)V->ne[1]);
+    const bool pwmma_log = ggml_cuda_pwmma_log_enabled();
+    if (pwmma_log) {
+        fprintf(stderr, "PWMMA ENTRY: Q_ne=(%lld,%lld) K_ne=(%lld,%lld) V_ne=(%lld,%lld)\n", (long long)Q->ne[0], (long long)Q->ne[1], (long long)K->ne[0], (long long)K->ne[1], (long long)V->ne[0], (long long)V->ne[1]);
+    }
 
     // V layout detection
     const bool v_layout_fa =
@@ -3733,10 +3803,12 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
             (long long)V->nb[0], (long long)V->nb[1], (long long)V->nb[2], (long long)V->nb[3],
             (long long)Q->ne[0], (long long)K->ne[1], (long long)K->ne[2]);
     }
-    fprintf(stderr, "PWMMA V layout=%s ne=(%lld,%lld,%lld,%lld) nb=(%lld,%lld,%lld,%lld)\n",
-        v_layout == PWMMA_V_LAYOUT_FA ? "FA" : "TRANS",
-        (long long)V->ne[0], (long long)V->ne[1], (long long)V->ne[2], (long long)V->ne[3],
-        (long long)V->nb[0], (long long)V->nb[1], (long long)V->nb[2], (long long)V->nb[3]);
+    if (pwmma_log) {
+        fprintf(stderr, "PWMMA V layout=%s ne=(%lld,%lld,%lld,%lld) nb=(%lld,%lld,%lld,%lld)\n",
+            v_layout == PWMMA_V_LAYOUT_FA ? "FA" : (v_layout == PWMMA_V_LAYOUT_TRANS ? "TRANS" : "NATIVE_KDH"),
+            (long long)V->ne[0], (long long)V->ne[1], (long long)V->ne[2], (long long)V->ne[3],
+            (long long)V->nb[0], (long long)V->nb[1], (long long)V->nb[2], (long long)V->nb[3]);
+    }
 
     // ── Contract check ───────────────────────────────────────
     const char * contract_env = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_CONTRACT_CHECK");
@@ -3756,7 +3828,7 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
         GGML_ABORT("PWMMA layout debug abort");
     }
     GGML_ASSERT(Q->ne[1] > 1 && Q->ne[2] % K->ne[2] == 0);
-    GGML_ASSERT(V->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_F16);
+    GGML_ASSERT(V->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_V4_K16D16_144);
 
     float max_bias = 0.0f, logit_softcap = 0.0f;
     memcpy(&max_bias, (const float*)dst->op_params+1, sizeof(float));
@@ -3919,15 +3991,17 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
     }
 
     { static bool once = false; if (!once) { once = true;
-        fprintf(stderr, "PWMMA v0.6 variant=%s BM=%d GQA_GROUP=%d IMPL=%s Q4fix=%d nq=%d nk=%d hq=%d hk=%d b=%d sc=%g "
-                "gqa_ratio=%d grid_y_old=%d grid_y_new=%d payload_ne1=%lld payload_ne2=%lld packed_kv_size=%d head_stride=%d payload_stride_i32=%d scales_stride_half=%d\n",
-                is_gqa2 ? "BM16_GQA2" : (is_bm64 ? "BM64_X4" : (is_bm32 ? "BM32_2W" : "BM16_1W")), bm, gqa_group,
-                impl_name,
-                PWMMA_Q4_LAYOUT_FIXED, nq, nk, n_heads_q, n_heads_k, batch, (double)attention_scale,
-                gqa_ratio, grid_y_old, is_gqa2 ? grid_y_gqa2 : grid_y_old,
-                (long long)packed16_payload->ne[1], (long long)packed16_payload->ne[2],
-                packed_kv_size, packed_kv_size / n_heads_k,
-                k_payload_row_stride_i32, k_scales_row_stride_half);
+        if (pwmma_log) {
+            fprintf(stderr, "PWMMA v0.6 variant=%s BM=%d GQA_GROUP=%d IMPL=%s Q4fix=%d nq=%d nk=%d hq=%d hk=%d b=%d sc=%g "
+                    "gqa_ratio=%d grid_y_old=%d grid_y_new=%d payload_ne1=%lld payload_ne2=%lld packed_kv_size=%d head_stride=%d payload_stride_i32=%d scales_stride_half=%d\n",
+                    is_gqa2 ? "BM16_GQA2" : (is_bm64 ? "BM64_X4" : (is_bm32 ? "BM32_2W" : "BM16_1W")), bm, gqa_group,
+                    impl_name,
+                    PWMMA_Q4_LAYOUT_FIXED, nq, nk, n_heads_q, n_heads_k, batch, (double)attention_scale,
+                    gqa_ratio, grid_y_old, is_gqa2 ? grid_y_gqa2 : grid_y_old,
+                    (long long)packed16_payload->ne[1], (long long)packed16_payload->ne[2],
+                    packed_kv_size, packed_kv_size / n_heads_k,
+                    k_payload_row_stride_i32, k_scales_row_stride_half);
+        }
         // Dump packed16 via device kernel (host can't deref device ptrs)
         if (getenv("GGML_CUDA_PWMMA_DUMP_PACKED16")) {
             pwmma_packed16_dump_kernel<<<1, 1, 0, stream>>>(
@@ -3940,15 +4014,18 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
                 CUDA_CHECK(hipStreamSynchronize(stream));
             }
         }
-        if (!pbwmma_qk_probe_pass(stream)) GGML_ABORT("PBWMMA QK probe failed");
-        if (impl_i8qk && !pbwmma_i8_qk_probe_pass(stream)) GGML_ABORT("PBWMMA I8 QK probe failed");
-        if (impl_pvwmma && !pbwmma_pv_probe_pass(stream)) GGML_ABORT("PBWMMA PV WMMA probe failed");
-        if (impl_i8qk && getenv("GGML_CUDA_PWMMA_I8_DOT4_SHADOW_PROBE") &&
+        const bool self_probes = ggml_cuda_pwmma_self_probes_enabled();
+        if (self_probes && !pbwmma_qk_probe_pass(stream)) GGML_ABORT("PBWMMA QK probe failed");
+        if (self_probes && impl_i8qk && !pbwmma_i8_qk_probe_pass(stream)) GGML_ABORT("PBWMMA I8 QK probe failed");
+        if (self_probes && impl_pvwmma && !pbwmma_pv_probe_pass(stream)) GGML_ABORT("PBWMMA PV WMMA probe failed");
+        if (self_probes && impl_pvwmma && getenv("GGML_CUDA_PWMMA_PV_MULTI_PROBE") &&
+                !pbwmma_pv_probe_bm64_d256_pass(stream)) GGML_ABORT("PBWMMA BM64_D256 PV WMMA probe failed");
+        if (self_probes && impl_i8qk && getenv("GGML_CUDA_PWMMA_I8_DOT4_SHADOW_PROBE") &&
                 !pbwmma_i8_dot4_shadow_probe_pass(stream)) GGML_ABORT("PBWMMA I8 DOT4 shadow probe failed");
-        if (is_bm32 && !pbwmma_qk_probe_bm32_pass(stream)) GGML_ABORT("PBWMMA BM32_2W QK probe failed");
-        if (is_gqa2 && !pbwmma_qk_probe_gqa2_pass(stream)) GGML_ABORT("PBWMMA GQA2 QK probe failed");
-        // BM64 probe disabled by default — enable with GGML_CUDA_PWMMA_BM64_PROBE=1
-        if (getenv("GGML_CUDA_PWMMA_BM64_PROBE")) {
+        if (self_probes && is_bm32 && !pbwmma_qk_probe_bm32_pass(stream)) GGML_ABORT("PBWMMA BM32_2W QK probe failed");
+        if (self_probes && is_gqa2 && !pbwmma_qk_probe_gqa2_pass(stream)) GGML_ABORT("PBWMMA GQA2 QK probe failed");
+        // BM64 probe disabled by default — enable with GGML_CUDA_PWMMA_SELF_PROBES=1 GGML_CUDA_PWMMA_BM64_PROBE=1
+        if (self_probes && getenv("GGML_CUDA_PWMMA_BM64_PROBE")) {
             static bool bm64_probed = false; if (!bm64_probed) { bm64_probed = true;
                 pbwmma_qk_probe_bm64_x4_pass(stream);
             }
@@ -4126,6 +4203,7 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
                 case GGML_TYPE_Q4_0: LAUNCH_BM64_I8QK_DBV(PACKED16_WMMA_V_Q4_0); break;
                 case GGML_TYPE_Q8_0: LAUNCH_BM64_I8QK_DBV(PACKED16_WMMA_V_Q8_0); break;
                 case GGML_TYPE_F16:  LAUNCH_BM64_I8QK_DBV(PACKED16_WMMA_V_F16);  break;
+                case GGML_TYPE_V4_K16D16_144: LAUNCH_BM64_I8QK_DBV(PACKED16_WMMA_V4_K16D16_144); break;
                 default: GGML_ABORT("pwmma bm64 i8qk pvwmma dbv: unsupported V type");
             }
 #undef LAUNCH_BM64_I8QK_DBV
@@ -4209,6 +4287,7 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
             case GGML_TYPE_Q4_0: LAUNCH_BM32_REGOUT_DV(PACKED16_WMMA_V_Q4_0); break;
             case GGML_TYPE_Q8_0: LAUNCH_BM32_REGOUT_DV(PACKED16_WMMA_V_Q8_0); break;
             case GGML_TYPE_F16:  LAUNCH_BM32_REGOUT_DV(PACKED16_WMMA_V_F16);  break;
+            case GGML_TYPE_V4_K16D16_144: LAUNCH_BM32_REGOUT_DV(PACKED16_WMMA_V4_K16D16_144); break;
             default: GGML_ABORT("pwmma bm32 regout_directv: unsupported V type");
         }
 #undef LAUNCH_BM32_REGOUT_DV
@@ -4265,18 +4344,20 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
             impl_name,
             hipGetErrorString(launch_err));
     }
-    // hipDeviceSynchronize is NOT graph-capture safe.
-    // Only synchronize if the stream is not capturing.
-    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
-    hipError_t capture_err = hipStreamIsCapturing(stream, &capture_status);
-    if (capture_err == hipSuccess && capture_status == hipStreamCaptureStatusNone) {
-        hipError_t sync_err = hipStreamSynchronize(stream);
-        if (sync_err != hipSuccess) {
-            GGML_ABORT("PWMMA sync failed: call=%d nq=%d nk=%d hq=%d hk=%d D=256 variant=%s impl=%s err=%s",
-                this_call_id, nq, nk, n_heads_q, n_heads_k,
-                is_gqa2 ? "BM16_GQA2" : (is_bm64 ? "BM64_X4" : (is_bm32 ? "BM32_2W" : "BM16_1W")),
-                impl_name,
-                hipGetErrorString(sync_err));
+    if (sync_debug) {
+        // hipDeviceSynchronize is NOT graph-capture safe.
+        // Only synchronize if the stream is not capturing.
+        hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+        hipError_t capture_err = hipStreamIsCapturing(stream, &capture_status);
+        if (capture_err == hipSuccess && capture_status == hipStreamCaptureStatusNone) {
+            hipError_t sync_err = hipStreamSynchronize(stream);
+            if (sync_err != hipSuccess) {
+                GGML_ABORT("PWMMA sync failed: call=%d nq=%d nk=%d hq=%d hk=%d D=256 variant=%s impl=%s err=%s",
+                    this_call_id, nq, nk, n_heads_q, n_heads_k,
+                    is_gqa2 ? "BM16_GQA2" : (is_bm64 ? "BM64_X4" : (is_bm32 ? "BM32_2W" : "BM16_1W")),
+                    impl_name,
+                    hipGetErrorString(sync_err));
+            }
         }
     }
 
@@ -4302,10 +4383,10 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
         CUDA_CHECK(hipMemcpy(&h_err, d_live_shadow_err, sizeof(h_err), hipMemcpyDeviceToHost));
         CUDA_CHECK(hipFree(d_live_shadow_err));
         if (h_err.flag) {
-            GGML_ABORT("PBWMMA live shadow FAILED: code=%d variant=%d block=(%d,%d,%d) thread=%d nq=%d nk=%d hq=%d hk=%d k0=%d k=%d d=%d head_stride=%d packed_rows=%d k_row=%d",
+            GGML_ABORT("PBWMMA live shadow FAILED: code=%d variant=%d block=(%d,%d,%d) thread=%d nq=%d nk=%d hq=%d hk=%d k0=%d k=%d d=%d head_stride=%d packed_rows=%d k_row=%d got=%g ref=%g",
                 h_err.code, h_err.variant, h_err.block_x, h_err.block_y, h_err.block_z, h_err.thread_x,
                 h_err.nq, h_err.nk, h_err.hq, h_err.hk, h_err.k0, h_err.k, h_err.d,
-                h_err.head_stride, h_err.packed_rows, h_err.k_row);
+                h_err.head_stride, h_err.packed_rows, h_err.k_row, (double) h_err.got, (double) h_err.ref);
         }
         fprintf(stderr, "%s\n", live_pv_shadow_requested ? "PBWMMA PV WMMA live shadow PASSED" : "PBWMMA I8 live DOT4 shadow PASSED");
     }
@@ -4319,7 +4400,10 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
             (unsigned long long)h_skip, (unsigned long long)(is_gqa2 ? h_skip : h_skip),
             (unsigned long long)(is_gqa2 ? h_skip * 2 * 16 : (is_bm64 ? h_skip * 64 : h_skip * bm)), nq, nk, PWMMA_BN);
     }
-    fprintf(stderr, "PWMMA EXIT OK\n"); fflush(stderr);
+    if (pwmma_log) {
+        fprintf(stderr, "PWMMA EXIT OK\n");
+        fflush(stderr);
+    }
 }
 
 #else

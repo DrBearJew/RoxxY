@@ -188,18 +188,6 @@ GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE=1 \
   -fa 1 -ngl 99 -p 512,1024,2048 -n 1
 ```
 
-### Test KSHARED
-
-```bash
-GGML_CUDA_FA_ROUTE_REQUIRE=rocm_packed16_dot4_mmq \
-GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_IMPL=kshared \
-GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE=1 \
-./build-rocm/bin/llama-bench \
-  -m /path/to/Qwen3.6-35B-A3B-IQ4_XS.gguf \
-  -fa 1 -ngl 99 -p 512,1024 -n 1
-```
-
-
 ## Runtime flags
 
 | Flag | Purpose |
@@ -209,7 +197,6 @@ GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE=1 \
 | `GGML_CUDA_ROCM_PACKED16_DISABLE=1` | Disable all packed16 K-cache allocation |
 | `GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE=1` | Log route decisions; recommended for benchmarks |
 | `GGML_CUDA_ROCM_PACKED16_DOT4_MMQ=0` | Disable DOT4-MMQ and fall back to DOT4-KQ oracle path |
-| `GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_IMPL=kshared` | Opt into KSHARED DOT4-MMQ variant |
 | `GGML_CUDA_ROCM_PACKED16_WMMA_TILE=0` | Disable PWMMA route family |
 | `GGML_CUDA_FA_ROUTE_REQUIRE=rocm_packed16_wmma_tile` | Require PWMMA route; abort if unavailable |
 | `GGML_CUDA_FA_ROUTE_REQUIRE=rocm_packed16_dot4_mmq` | Require DOT4-MMQ route; abort if unavailable |

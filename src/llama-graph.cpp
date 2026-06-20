@@ -221,6 +221,58 @@ bool llm_graph_input_pos::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_out_pos::set_input(const llama_ubatch * ubatch) {
+    if (ubatch->pos && pos) {
+        const int64_t n_tokens = ubatch->n_tokens;
+
+        GGML_ASSERT(ggml_backend_buffer_is_host(pos->buffer));
+
+        std::vector<llama_pos> pos_data((size_t) n_outputs*n_pos_per_embd);
+
+        const auto copy_pos = [&](uint32_t src, uint32_t dst) {
+            if (ubatch->token && n_pos_per_embd == 4) {
+                pos_data[                  dst] = ubatch->pos[src];
+                pos_data[    n_outputs + dst] = ubatch->pos[src];
+                pos_data[2 * n_outputs + dst] = ubatch->pos[src];
+                pos_data[3 * n_outputs + dst] = 0;
+            } else {
+                for (uint32_t d = 0; d < n_pos_per_embd; ++d) {
+                    pos_data[(size_t) d*n_outputs + dst] = ubatch->pos[(size_t) d*n_tokens + src];
+                }
+            }
+        };
+
+        if (n_outputs == n_tokens) {
+            for (uint32_t i = 0; i < n_outputs; ++i) {
+                copy_pos(i, i);
+            }
+        } else {
+            GGML_ASSERT(ubatch->output);
+
+            uint32_t out = 0;
+            for (uint32_t i = 0; i < n_tokens; ++i) {
+                if (!ubatch->output[i]) {
+                    continue;
+                }
+                GGML_ASSERT(out < n_outputs);
+                copy_pos(i, out++);
+            }
+            GGML_ASSERT(out == n_outputs);
+        }
+
+        ggml_backend_tensor_set(pos, pos_data.data(), 0, pos_data.size()*ggml_element_size(pos));
+    }
+}
+
+bool llm_graph_input_out_pos::can_reuse(const llm_graph_params & params) {
+    bool res = true;
+
+    res &= n_outputs == params.n_outputs;
+    res &= pos->ne[0] == params.n_outputs*n_pos_per_embd;
+
+    return res;
+}
+
 void llm_graph_input_attn_temp::set_input(const llama_ubatch * ubatch) {
     if (ubatch->pos && attn_scale) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -574,6 +626,32 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+
+    return res;
+}
+
+void llm_graph_input_attn_kv_update::set_input(const llama_ubatch * ubatch) {
+    mctx->set_input_k_idxs(self_k_idxs, ubatch);
+    mctx->set_input_v_idxs(self_v_idxs, ubatch);
+
+    if (self_k_rot) {
+        mctx->set_input_k_rot(self_k_rot);
+    }
+
+    if (self_v_rot) {
+        mctx->set_input_v_rot(self_v_rot);
+    }
+}
+
+bool llm_graph_input_attn_kv_update::can_reuse(const llm_graph_params & params) {
+    const auto * mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
+
+    this->mctx = mctx;
+
+    bool res = true;
+
+    res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
+  //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     return res;
 }
@@ -1966,6 +2044,20 @@ ggml_tensor * llm_graph_context::build_inp_pos() const {
     return cur;
 }
 
+ggml_tensor * llm_graph_context::build_inp_out_pos() const {
+    auto inp = std::make_unique<llm_graph_input_out_pos>(hparams.n_pos_per_embd(), n_outputs);
+
+    auto & cur = inp->pos;
+
+    cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) n_outputs*hparams.n_pos_per_embd());
+    ggml_set_input(cur);
+    ggml_set_name(cur, "inp_out_pos");
+
+    res->add_input(std::move(inp));
+
+    return cur;
+}
+
 ggml_tensor * llm_graph_context::build_inp_attn_scale() const {
     auto inp = std::make_unique<llm_graph_input_attn_temp>(hparams.n_attn_temp_floor_scale, hparams.f_attn_temp_scale, hparams.f_attn_temp_offset);
 
@@ -2113,7 +2205,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
                float   kq_scale,
                  int   il) const {
-    const bool v_trans = v->nb[1] > v->nb[2];
+    // Persistent V4_K16D16 formats are stored head-major in compact rows, so
+    // nb[1] > nb[2] even though their logical FA view is non-transposed
+    // [D, n_kv, n_head_kv, stream]. Do not apply the v_trans undo-transpose path
+    // after the global FA permute.
+    const bool v_persistent_k16d16 = v->type == GGML_TYPE_V4_K16D16 || v->type == GGML_TYPE_V4_K16D16_144;
+    const bool v_trans = v_persistent_k16d16 ? false : v->nb[1] > v->nb[2];
     const bool k_is_tbq = k->type == GGML_TYPE_TBQ3_0 || k->type == GGML_TYPE_TBQ4_0;
     const bool v_is_tbq = v->type == GGML_TYPE_TBQ3_0 || v->type == GGML_TYPE_TBQ4_0;
     // packed16 I32 K cannot use non-flash ggml_mul_mat path; force FA.
@@ -2183,14 +2280,17 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     }
     // PWMMA can consume native v_trans V [n_kv, heads, D, batch] directly.
-    // Skip the global permute for PWMMA+v_trans to keep native layout.
+    // Persistent V4_K16D16 caches are already exposed as FA layout
+    // [D, n_kv, n_head_kv, stream]; do not swap kv/head back.
     const bool pwmma_forced = []() {
         const char * req = getenv("GGML_CUDA_FA_ROUTE_REQUIRE");
         return req &&
             (strcmp(req, "rocm_packed16_wmma_tile") == 0 ||
              strcmp(req, "packed16_wmma_tile") == 0);
     }();
-    v = ggml_permute(ctx0, v, 0, 2, 1, 3);  // global permute for all paths
+    if (!v_persistent_k16d16) {
+        v = ggml_permute(ctx0, v, 0, 2, 1, 3);  // global permute for standard V paths
+    }
 
     ggml_tensor * cur;
 
@@ -2231,8 +2331,18 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         // speculative verify (nq>1 with spec context). DOT4 recthist/decode
         // paths fire when legal; fallback to existing policy otherwise.
         if (gtype != LLM_GRAPH_TYPE_DECODER_MTP) {
-            // TODO: speculative verify graph type when available.
-            if (ubatch.n_tokens > 1) {
+            // QBlock verification is scoped by the server around the target
+            // verifier decode even when the graph type is the ordinary decoder.
+            // Stamp it before generic prefill classification so CUDA can apply
+            // QBlock-specific packed16/PDMQ policy and invariants.
+            const bool qblock_active = []() {
+                const char * env = getenv("LLAMA_MTP_QBLOCK_ACTIVE");
+                return env && atoi(env) != 0;
+            }();
+            const int64_t n_query = q->ne[1];
+            if (qblock_active && n_query > 1) {
+                ggml_flash_attn_ext_set_instruction(cur, GGML_FATTN_INST_MTP_QBLOCK_VERIFY_QK);
+            } else if (n_query > 1) {
                 ggml_flash_attn_ext_set_instruction(cur, GGML_FATTN_INST_PREFILL_QK);
             } else {
                 ggml_flash_attn_ext_set_instruction(cur, GGML_FATTN_INST_DECODE_QK);
@@ -2254,6 +2364,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
             ggml_fattn_instruction inst = GGML_FATTN_INST_NONE;
             const char * inst_reason = "upstream_like_none";
+            const bool qblock_active = []() {
+                const char * env = getenv("LLAMA_MTP_QBLOCK_ACTIVE");
+                return env && atoi(env) != 0;
+            }();
 
             const bool scalar_mtp_decode_shape = ubatch.n_tokens == 1 && n_outputs > 0;
             const bool real_mtp_token_decode =
@@ -2267,19 +2381,28 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 real_mtp_token_decode && !packed16_mtp_disabled &&
                 q->ne[0] == 256 && v_for_fa->ne[0] == 256 &&
                 k->type == GGML_TYPE_I32 && v_for_fa->type == GGML_TYPE_Q4_0;
+            const bool packed16_mtp_q4_batched =
+                !packed16_mtp_disabled && ubatch.n_tokens > 1 &&
+                q->ne[0] == 256 && v_for_fa->ne[0] == 256 &&
+                k->type == GGML_TYPE_I32 && v_for_fa->type == GGML_TYPE_Q4_0;
 
             if (packed16_mtp_draft_decode) {
                 // Persistent packed16 source-K MTP draft decode, when present,
                 // is a real scalar token-mode decode carrying inp->h.
                 inst = GGML_FATTN_INST_MTP_DRAFT_DECODE_QK;
                 inst_reason = "auto_packed16_mtp_draft_decode";
-            } else if (!packed16_mtp_disabled && ubatch.n_tokens > 1 && n_outputs > 0 &&
-                    q->ne[0] == 256 && v_for_fa->ne[0] == 256 &&
-                    k->type == GGML_TYPE_I32 && v_for_fa->type == GGML_TYPE_Q4_0) {
-                // Persistent packed16 q4 MTP verify is a validated PDMQ lane;
-                // do not require LLAMA_MTP_FA_INST=verify for the standard path.
-                inst = GGML_FATTN_INST_MTP_VERIFY_QK;
-                inst_reason = "auto_packed16_mtp_verify_q4";
+            } else if (packed16_mtp_q4_batched && (n_outputs > 0 || qblock_active)) {
+                // Persistent packed16 q4 MTP verify is a validated PDMQ lane.
+                // QBlock recurrent-prefix full-attention batching has no sampler
+                // output rows at the FA node (`n_outputs == 0`), but the server
+                // scopes LLAMA_MTP_QBLOCK_ACTIVE around the exact QBlock rows.
+                // Honor that semantic scope so long-context prefix FA can take
+                // the QBlock packed16 route instead of looking like generic
+                // upstream-like MTP attention.
+                inst = qblock_active ? GGML_FATTN_INST_MTP_QBLOCK_VERIFY_QK : GGML_FATTN_INST_MTP_VERIFY_QK;
+                inst_reason = qblock_active
+                    ? (n_outputs > 0 ? "auto_packed16_mtp_qblock_verify_q4" : "auto_packed16_mtp_qblock_prefix_verify_q4")
+                    : "auto_packed16_mtp_verify_q4";
             }
 
             const char * mtp_f16k_q4v_vec_env = getenv("GGML_CUDA_ROCM_MTP_F16K_Q4V_VEC");
@@ -2323,6 +2446,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 } else if (strcmp(force, "verify") == 0 && ubatch.n_tokens > 1 && n_outputs > 0) {
                     inst = GGML_FATTN_INST_MTP_VERIFY_QK;
                     inst_reason = "forced_verify";
+                } else if (strcmp(force, "qblock") == 0 && ubatch.n_tokens > 1 && n_outputs > 0) {
+                    inst = GGML_FATTN_INST_MTP_QBLOCK_VERIFY_QK;
+                    inst_reason = "forced_qblock_verify";
                 } else if (strcmp(force, "none") == 0) {
                     inst = GGML_FATTN_INST_NONE;
                     inst_reason = "forced_none";
@@ -2333,13 +2459,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
             // Hard guards for impossible/ambiguous optimized MTP instructions.
             GGML_ASSERT(inst != GGML_FATTN_INST_MTP_VERIFY_QK || (ubatch.n_tokens > 1 && n_outputs > 0));
+            GGML_ASSERT(inst != GGML_FATTN_INST_MTP_QBLOCK_VERIFY_QK || (ubatch.n_tokens > 1 && (n_outputs > 0 || qblock_active)));
             GGML_ASSERT(inst != GGML_FATTN_INST_MTP_DRAFT_DECODE_QK || scalar_mtp_decode_shape);
             GGML_ASSERT(inst != GGML_FATTN_INST_MTP_DRAFT || ubatch.n_tokens > 1);
 
             if (getenv("LLAMA_MTP_FA_ROUTE")) {
                 fprintf(stderr,
-                    "MTP_FA_ROUTE: graph_inst=%d reason=%s token=%d embd=%d n_tokens=%u n_outputs=%d Q=%s K=%s V=%s q_d=%lld k_n=%lld v_d=%lld\n",
-                    (int) inst, inst_reason,
+                    "MTP_FA_ROUTE: node=%s layer=%d graph_inst=%d reason=%s token=%d embd=%d n_tokens=%u n_outputs=%d Q=%s K=%s V=%s q_d=%lld k_n=%lld v_d=%lld\n",
+                    cur->name[0] ? cur->name : "-", il, (int) inst, inst_reason,
                     ubatch.token != nullptr ? 1 : 0,
                     ubatch.embd  != nullptr ? 1 : 0,
                     ubatch.n_tokens, n_outputs,

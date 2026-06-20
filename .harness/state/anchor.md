@@ -1,1 +1,0 @@
-/home/mrtrent/.harness/state/anchor.md

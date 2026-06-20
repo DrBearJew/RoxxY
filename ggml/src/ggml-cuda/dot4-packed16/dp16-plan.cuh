@@ -88,11 +88,13 @@ struct dp16_fa_plan {
     dp16_k_repr k_repr;
     dp16_fa_shape shape;
     dp16_fa_vpath vpath;
+    dp16_fa_q_stage q_stage;
 
     int qtok_tile;
     int gqa_tile;
     int logical_q;
     int k_tile;
+    int k_shards_per_q_stage;
 
     const char * route;
     const char * reason;
@@ -105,6 +107,7 @@ struct dp16_fa_graph_key {
     dp16_k_repr k_repr;
     dp16_fa_shape shape;
     dp16_fa_vpath vpath;
+    dp16_fa_q_stage q_stage;
 
     int nq;
     int nk_bucket;
@@ -126,6 +129,7 @@ struct dp16_fa_graph_key {
     int gqa_tile;
     int logical_q;
     int k_tile;
+    int k_shards_per_q_stage;
 
     bool causal;
     bool has_mask;
@@ -244,6 +248,242 @@ static inline dp16_fa_plan dp16_make_fa1_vec_fallback(const char * reason) {
     return plan;
 }
 
+static inline dp16_fa_shape dp16_parse_pdmq_shape_env(const char * env) {
+    if (!env || !*env) {
+        return DP16_FA_SHAPE_NONE;
+    }
+    if (strcmp(env, "1x32") == 0 || strcmp(env, "m1n32") == 0) {
+        return DP16_FA_SHAPE_1X32;
+    }
+    if (strcmp(env, "2x32") == 0 || strcmp(env, "m2n32") == 0) {
+        return DP16_FA_SHAPE_2X32;
+    }
+    if (strcmp(env, "4x32") == 0 || strcmp(env, "m4n32") == 0) {
+        return DP16_FA_SHAPE_4X32;
+    }
+    if (strcmp(env, "8x32") == 0 || strcmp(env, "m8n32") == 0) {
+        return DP16_FA_SHAPE_8X32;
+    }
+    if (strcmp(env, "16x16") == 0 || strcmp(env, "m16n16") == 0) {
+        return DP16_FA_SHAPE_16X16;
+    }
+    GGML_ABORT("DP16 FA planner: bad GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_SHAPE=%s", env);
+}
+
+static inline dp16_fa_shape dp16_pdmq_shape_for_problem(const dp16_fa_problem & p) {
+    // Keep the planner/graph-key shape contract aligned with the PDMQ launcher.
+    // Explicit shape knobs must win first because they choose a different kernel
+    // specialization even when nq/gqa/vpath are otherwise identical.
+    if (const char * env = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_SHAPE"); env && *env) {
+        return dp16_parse_pdmq_shape_env(env);
+    }
+
+    if (const char * env = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_PV_ROWS"); env && *env && p.nq <= 4) {
+        const int pv_rows = atoi(env);
+        if (pv_rows != 1 && pv_rows != 2 && pv_rows != 4) {
+            GGML_ABORT("DP16 FA planner: invalid GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_PV_ROWS=%s; expected 1, 2, or 4", env);
+        }
+        // For 27B GQA6, PV_ROWS is a max/verify tile hint, not a reason to
+        // run decode as mostly-zero M4. Match active M rows: 6/12/24.
+        if (p.v_type == GGML_TYPE_Q4_0 && p.n_heads_q == 24 && p.n_heads_kv == 4 && p.gqa_ratio == 6) {
+            return p.nq <= 1 ? DP16_FA_SHAPE_1X32 : (p.nq <= 2 ? DP16_FA_SHAPE_2X32 : DP16_FA_SHAPE_4X32);
+        }
+        if (pv_rows == 1) {
+            return DP16_FA_SHAPE_1X32;
+        }
+        if (pv_rows == 2) {
+            return DP16_FA_SHAPE_2X32;
+        }
+        return DP16_FA_SHAPE_4X32;
+    }
+
+    const char * shape_auto_env = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_SHAPE_AUTO");
+    const bool shape_auto = !shape_auto_env || atoi(shape_auto_env) != 0;
+    if (!shape_auto) {
+        return p.nq >= 16 ? DP16_FA_SHAPE_16X16 : DP16_FA_SHAPE_8X32;
+    }
+
+    const char * requested_gqa_env = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQA_GROUP");
+    const int requested_gqa_group = requested_gqa_env && *requested_gqa_env ? atoi(requested_gqa_env) : 1;
+    const char * qwen27b_min_env = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQAX_SPLITK_MIN_NK");
+    const int qwen27b_gqa6_min_nk = qwen27b_min_env && *qwen27b_min_env ? atoi(qwen27b_min_env) : 12288;
+    const bool qwen27b_gqa6_pvmma = p.nq <= 4 && p.nk_bucket >= qwen27b_gqa6_min_nk && p.v_type == GGML_TYPE_Q4_0 &&
+        p.n_heads_q == 24 && p.n_heads_kv == 4 && p.gqa_ratio == 6 &&
+        (dp16_env_enabled("GGML_CUDA_DP16_FA_PV_WMMA") || requested_gqa_group == 6);
+    if (qwen27b_gqa6_pvmma) {
+        return p.nq <= 1 ? DP16_FA_SHAPE_1X32 : DP16_FA_SHAPE_2X32;
+    }
+
+    if (p.nq <= 1) {
+        return DP16_FA_SHAPE_1X32;
+    }
+    if (p.nq <= 4) {
+        return p.nq == 2 ? DP16_FA_SHAPE_2X32 : DP16_FA_SHAPE_8X32;
+    }
+    if (p.nq >= 16) {
+        return DP16_FA_SHAPE_16X16;
+    }
+    if (p.nq >= 8 && p.v_type != GGML_TYPE_F16) {
+        return DP16_FA_SHAPE_16X16;
+    }
+    if (p.nk_bucket <= 32 && p.nq >= 4) {
+        return DP16_FA_SHAPE_16X16;
+    }
+    return DP16_FA_SHAPE_8X32;
+}
+
+static inline int dp16_fa_shape_qtok_tile(const dp16_fa_shape shape) {
+    switch (shape) {
+        case DP16_FA_SHAPE_1X32:
+        case DP16_FA_SHAPE_1X64:        return 1;
+        case DP16_FA_SHAPE_2X32:
+        case DP16_FA_SHAPE_2X64:
+        case DP16_FA_SHAPE_Q2_GQA2_K32: return 2;
+        case DP16_FA_SHAPE_4X32:
+        case DP16_FA_SHAPE_4X64:        return 4;
+        case DP16_FA_SHAPE_8X32:        return 8;
+        case DP16_FA_SHAPE_16X16:       return 16;
+        default:                        return 0;
+    }
+}
+
+static inline int dp16_fa_shape_k_tile(const dp16_fa_shape shape) {
+    switch (shape) {
+        case DP16_FA_SHAPE_1X64:
+        case DP16_FA_SHAPE_2X64:
+        case DP16_FA_SHAPE_4X64: return 64;
+        case DP16_FA_SHAPE_16X16:return 16;
+        case DP16_FA_SHAPE_1X32:
+        case DP16_FA_SHAPE_2X32:
+        case DP16_FA_SHAPE_4X32:
+        case DP16_FA_SHAPE_8X32:
+        case DP16_FA_SHAPE_Q2_GQA2_K32:
+            return 32;
+        default:
+            return 0;
+    }
+}
+
+struct dp16_pdmq_q_stage_plan {
+    dp16_fa_q_stage q_stage;
+    int k_shards_per_q_stage;
+    int gqa_tile;
+};
+
+static inline int dp16_pdmq_splitk_roof_pow2(const int nk) {
+    constexpr int min_tokens_per_split = 64;
+    if (nk >= 8 * min_tokens_per_split) return 8;
+    if (nk >= 4 * min_tokens_per_split) return 4;
+    if (nk >= 2 * min_tokens_per_split) return 2;
+    return 1;
+}
+
+static inline int dp16_pdmq_gqax_splitk_requested() {
+    const char * s = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQAX_SPLITK");
+    if (!s || !*s) {
+        return 1;
+    }
+    const int split_k = atoi(s);
+    if (split_k == 1 || split_k == 2 || split_k == 4 || split_k == 8 || split_k == 16 || split_k == 32 || split_k == 64) {
+        return split_k;
+    }
+    GGML_ABORT("invalid GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQAX_SPLITK=%s; expected 1, 2, 4, 8, 16, 32, or 64", s);
+}
+
+static inline int dp16_pdmq_requested_gqa_group() {
+    const char * s = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQA_GROUP");
+    if (!s || !*s) {
+        return 1;
+    }
+    const int g = atoi(s);
+    if (g == 1 || g == 2 || g == 4 || g == 6) {
+        return g;
+    }
+    GGML_ABORT("invalid GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQA_GROUP=%s; expected 1, 2, 4, or 6", s);
+}
+
+static inline bool dp16_pdmq_kshared_requested() {
+    return false;
+}
+
+static inline dp16_pdmq_q_stage_plan dp16_pdmq_q_stage_for_problem(
+        const dp16_fa_problem & p,
+        const dp16_fa_shape shape) {
+    dp16_pdmq_q_stage_plan out = {};
+    out.q_stage = DP16_FA_Q_STAGE_INLINE;
+    out.k_shards_per_q_stage = 1;
+    out.gqa_tile = 1;
+
+    if (!dp16_fa_qpack_i8_enabled()) {
+        return out;
+    }
+    if (p.nq > 8 || p.nk_bucket < dp16_fa_qpack_i8_min_nk()) {
+        return out;
+    }
+    const int requested_gqa_group = dp16_pdmq_requested_gqa_group();
+    const bool requested_gqa4_9b = requested_gqa_group == 4 &&
+        p.n_heads_q == 16 && p.n_heads_kv == 4 && p.gqa_ratio == 4;
+    const bool requested_gqa6_27b =
+        (requested_gqa_group == 6 ||
+         (requested_gqa_group == 1 && dp16_env_enabled("GGML_CUDA_DP16_FA_PV_WMMA"))) &&
+        p.n_heads_q == 24 && p.n_heads_kv == 4 && p.gqa_ratio == 6;
+    const bool gqa4_split_shape = requested_gqa4_9b &&
+        (shape == DP16_FA_SHAPE_1X32 || shape == DP16_FA_SHAPE_2X32 || shape == DP16_FA_SHAPE_4X32 ||
+         shape == DP16_FA_SHAPE_8X32 || shape == DP16_FA_SHAPE_16X16);
+    const bool gqa6_split_shape = requested_gqa6_27b &&
+        (shape == DP16_FA_SHAPE_1X32 || shape == DP16_FA_SHAPE_2X32);
+    const bool gqa1_qpack_shape = requested_gqa_group == 1 && !requested_gqa6_27b;
+    if (!(gqa1_qpack_shape || gqa4_split_shape || gqa6_split_shape) || dp16_pdmq_kshared_requested()) {
+        return out;
+    }
+    if (!(p.v_type == GGML_TYPE_Q4_0 && p.v_layout == DP16_LAYOUT_Q4_0_BLOCK32)) {
+        return out;
+    }
+
+    const int k_tile = dp16_fa_shape_k_tile(shape);
+    if (k_tile <= 0) {
+        return out;
+    }
+
+    const char * split_env = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQAX_SPLITK");
+    const bool split_env_set = split_env && *split_env;
+    int split_requested = dp16_pdmq_gqax_splitk_requested();
+
+    const char * gqax_min_env = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQAX_SPLITK_MIN_NK");
+    const int gqax_splitk_min_nk = gqax_min_env && *gqax_min_env ? atoi(gqax_min_env) : 12288;
+    if (split_requested > 1 && p.nk_bucket < gqax_splitk_min_nk) {
+        split_requested = 1;
+    }
+
+    const char * auto_env = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQA1_SPLITK_AUTO");
+    const bool auto_enabled = !auto_env || atoi(auto_env) != 0;
+    const char * gqa1_min_env = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQA1_SPLITK_MIN_NK");
+    const int gqa1_splitk_min_nk = gqa1_min_env && *gqa1_min_env ? atoi(gqa1_min_env) : 12288;
+    if (((requested_gqa_group == 1 && !requested_gqa6_27b) || requested_gqa6_27b) && auto_enabled && !split_env_set && p.nk_bucket >= gqa1_splitk_min_nk) {
+        split_requested = 32;
+    }
+
+    const bool roof_cap = dp16_env_enabled("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQAX_SPLITK_ROOF_CAP");
+    const int roof = dp16_pdmq_splitk_roof_pow2(p.nk_bucket);
+    const int split_effective = roof_cap && split_requested > roof ? roof : split_requested;
+    const int k_blocks_total_raw = (p.nk_bucket + k_tile - 1) / k_tile;
+    const int k_blocks_total = k_blocks_total_raw > 0 ? k_blocks_total_raw : 1;
+    const bool compact_empty = dp16_env_enabled("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQAX_SPLITK_COMPACT_EMPTY");
+    const int split_active_raw = (compact_empty && split_effective > k_blocks_total) ? k_blocks_total : split_effective;
+    if (split_active_raw <= 1) {
+        return out;
+    }
+
+    out.k_shards_per_q_stage = dp16_fa_k_shards_per_q_stage();
+    const int split_coarsened = (split_active_raw + out.k_shards_per_q_stage - 1) / out.k_shards_per_q_stage;
+    const int split_active = out.k_shards_per_q_stage > 1 ? (split_coarsened > 1 ? split_coarsened : 1) : split_active_raw;
+    if (split_active > 1) {
+        out.q_stage = DP16_FA_Q_STAGE_QPACK_I8_BLOCK32;
+        out.gqa_tile = gqa6_split_shape ? 6 : (gqa4_split_shape ? 4 : 1);
+    }
+    return out;
+}
+
 static inline dp16_fa_plan dp16_plan_mtp_fa(const dp16_fa_problem & p) {
     if (dp16_mtp_force_vec_fallback()) {
         return dp16_make_fa1_vec_fallback("forced_vec_safety_fallback");
@@ -271,11 +511,17 @@ static inline dp16_fa_plan dp16_plan_mtp_fa(const dp16_fa_problem & p) {
             plan.plane = DP16_FA_PLANE_FA2_PDMQ;
             plan.backend = DP16_BACKEND_FA2_PACKED16_DOT4_MMQ_VERIFY;
             plan.k_repr = DP16_K_REPR_PACKED16_I32_PERSISTENT;
-            plan.shape = DP16_FA_SHAPE_1X64;
+            plan.shape = dp16_pdmq_shape_for_problem(p);
             plan.vpath = DP16_FA_VPATH_RAW_LDS_Q4;
+            const dp16_pdmq_q_stage_plan q_stage_plan = dp16_pdmq_q_stage_for_problem(p, plan.shape);
+            plan.q_stage = q_stage_plan.q_stage;
             plan.route = DP16_ROUTE_FA_PACKED16_MMQ;
             plan.reason = "mtp_draft_decode_pdmq_q4";
-            plan.k_tile = 64;
+            plan.qtok_tile = dp16_fa_shape_qtok_tile(plan.shape);
+            plan.gqa_tile = q_stage_plan.gqa_tile;
+            plan.logical_q = plan.qtok_tile * plan.gqa_tile;
+            plan.k_tile = dp16_fa_shape_k_tile(plan.shape);
+            plan.k_shards_per_q_stage = q_stage_plan.k_shards_per_q_stage;
             return plan;
         }
 
@@ -345,13 +591,15 @@ static inline dp16_fa_plan dp16_plan_mtp_fa(const dp16_fa_problem & p) {
         return dp16_make_fa1_vec_fallback("dot4_decode_not_available_fallback_vec");
     }
 
-    // MTP verify nq=2..4: PDMQ/DOT4-MMQ owns the fast lane for persistent
-    // packed16 K + q4_0 V. VEC is only fallback/control.
+    // MTP verify nq=2..8: PDMQ/DOT4-MMQ owns the fast lane for persistent
+    // packed16 K + q4_0 V. VEC is only fallback/control. Keep this planner
+    // contract aligned with the launcher, which routes Qwen3.5 GQA4 and late
+    // MTP verify groups (including nq=5) through GQA1 split-K.
     if (p.is_mtp &&
             is_verify &&
-            p.nq >= 2 && p.nq <= 4 &&
+            p.nq >= 2 && p.nq <= 8 &&
             p.d_head == 256 &&
-            (p.gqa_ratio == 6 || p.gqa_ratio == 8) &&
+            (p.gqa_ratio == 4 || p.gqa_ratio == 6 || p.gqa_ratio == 8) &&
             p.v_type == GGML_TYPE_Q4_0 &&
             p.v_layout == DP16_LAYOUT_Q4_0_BLOCK32 &&
             p.k_layout == DP16_LAYOUT_PACKED16_I32_SCALED &&
@@ -366,14 +614,17 @@ static inline dp16_fa_plan dp16_plan_mtp_fa(const dp16_fa_problem & p) {
         plan.plane = DP16_FA_PLANE_FA2_PDMQ;
         plan.backend = DP16_BACKEND_FA2_PACKED16_DOT4_MMQ_VERIFY;
         plan.k_repr = DP16_K_REPR_PACKED16_I32_PERSISTENT;
-        plan.shape = DP16_FA_SHAPE_Q2_GQA2_K32;
+        plan.shape = dp16_pdmq_shape_for_problem(p);
         plan.vpath = DP16_FA_VPATH_RAW_LDS_Q4;
+        const dp16_pdmq_q_stage_plan q_stage_plan = dp16_pdmq_q_stage_for_problem(p, plan.shape);
+        plan.q_stage = q_stage_plan.q_stage;
         plan.route = DP16_ROUTE_FA_PACKED16_MMQ;
         plan.reason = "mtp_verify_smallq_pdmq_q4";
-        plan.qtok_tile = 2;
-        plan.gqa_tile = 2;
-        plan.logical_q = 4;
-        plan.k_tile = 32;
+        plan.qtok_tile = dp16_fa_shape_qtok_tile(plan.shape);
+        plan.gqa_tile = q_stage_plan.gqa_tile;
+        plan.logical_q = plan.qtok_tile * plan.gqa_tile;
+        plan.k_tile = dp16_fa_shape_k_tile(plan.shape);
+        plan.k_shards_per_q_stage = q_stage_plan.k_shards_per_q_stage;
         return plan;
     }
 
@@ -417,6 +668,7 @@ static inline dp16_fa_graph_key dp16_make_fa_graph_key(
     key.k_repr = plan.k_repr;
     key.shape = plan.shape;
     key.vpath = plan.vpath;
+    key.q_stage = plan.q_stage;
     key.nq = p.nq;
     key.nk_bucket = p.nk_bucket;
     key.d_head = p.d_head;
@@ -434,6 +686,7 @@ static inline dp16_fa_graph_key dp16_make_fa_graph_key(
     key.gqa_tile = plan.gqa_tile;
     key.logical_q = plan.logical_q;
     key.k_tile = plan.k_tile;
+    key.k_shards_per_q_stage = plan.k_shards_per_q_stage;
     key.causal = p.causal;
     key.has_mask = p.has_mask;
     key.has_sliding_window = p.has_sliding_window;
@@ -457,6 +710,7 @@ static inline uint64_t dp16_hash_fa_graph_key(const dp16_fa_graph_key & key) {
     mix((uint64_t) key.k_repr);
     mix((uint64_t) key.shape);
     mix((uint64_t) key.vpath);
+    mix((uint64_t) key.q_stage);
     mix((uint64_t) key.nq);
     mix((uint64_t) key.nk_bucket);
     mix((uint64_t) key.d_head);
@@ -474,6 +728,7 @@ static inline uint64_t dp16_hash_fa_graph_key(const dp16_fa_graph_key & key) {
     mix((uint64_t) key.gqa_tile);
     mix((uint64_t) key.logical_q);
     mix((uint64_t) key.k_tile);
+    mix((uint64_t) key.k_shards_per_q_stage);
     mix(key.causal ? 1u : 0u);
     mix(key.has_mask ? 1u : 0u);
     mix(key.has_sliding_window ? 1u : 0u);

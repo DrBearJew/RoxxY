@@ -288,9 +288,27 @@ llama_kv_cache::llama_kv_cache(
         const bool packed16_active = has_k && !packed16_disabled &&
             (mtp_packed16_only || mtp_packed16_hotcold_k || (!is_mtp_draft && packed16_k_cache_enabled));
 
+        const char * v4_k16d16_env = getenv("GGML_CUDA_ROCM_V4_K16D16_V_CACHE");
+        const char * v4_k16d16_144_env = getenv("GGML_CUDA_ROCM_V4_K16D16_144_V_CACHE");
+#ifdef GGML_USE_HIP
+        const bool v4_k16d16_active = has_v && !v_trans && n_stream == 1 && type_v_layer == GGML_TYPE_Q4_0 &&
+            v4_k16d16_env && atoi(v4_k16d16_env) != 0 && hparams.n_embd_head_v(il) == 256;
+        const bool v4_k16d16_144_active = has_v && !v4_k16d16_active && !v_trans && n_stream == 1 && type_v_layer == GGML_TYPE_Q4_0 &&
+            v4_k16d16_144_env && atoi(v4_k16d16_144_env) != 0 && hparams.n_embd_head_v(il) == 256 && (kv_size % 16) == 0;
+#else
+        const bool v4_k16d16_active = false;
+        const bool v4_k16d16_144_active = false;
+#endif
+
         ggml_tensor * k = (has_k && (!packed16_active || mtp_packed16_hotcold_k)) ?
             ggml_new_tensor_3d(ctx, mtp_packed16_hotcold_k ? GGML_TYPE_F16 : type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v_layer, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+        ggml_tensor * v = has_v ? (v4_k16d16_active ?
+            ggml_new_tensor_3d(ctx, GGML_TYPE_V4_K16D16, hparams.n_embd_head_v(il), kv_size * hparams.n_head_kv(il), n_stream) :
+            (v4_k16d16_144_active ?
+                ggml_new_tensor_3d(ctx, GGML_TYPE_V4_K16D16_144, hparams.n_embd_head_v(il), kv_size * hparams.n_head_kv(il), n_stream) :
+                ggml_new_tensor_3d(ctx, type_v_layer, n_embd_v_gqa, kv_size, n_stream))) : nullptr;
+        ggml_tensor * v4_tail = v4_k16d16_active ?
+            ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hparams.n_embd_head_v(il), 16 * hparams.n_head_kv(il), n_stream) : nullptr;
 
         ggml_tensor * k_payload = nullptr;
         ggml_tensor * k_scales  = nullptr;
@@ -313,13 +331,20 @@ llama_kv_cache::llama_kv_cache(
 
         has_k && k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
+        v4_tail && ggml_format_name(v4_tail, "cache_v4_tail_l%d", il);
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
             k_stream.push_back((has_k && k) ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
-            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
+            if (has_v && v && (v->type == GGML_TYPE_V4_K16D16 || v->type == GGML_TYPE_V4_K16D16_144)) {
+                const int64_t n_head_kv = hparams.n_head_kv(il);
+                const size_t row_bytes = ggml_row_size(v->type, hparams.n_embd_head_v(il));
+                v_stream.push_back(ggml_view_2d(ctx, v, hparams.n_embd_head_v(il), kv_size * n_head_kv, row_bytes, s*v->nb[2]));
+            } else {
+                v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
+            }
             if (k_payload) {
                 const int64_t n_head_kv2 = (int64_t) hparams.n_head_kv(il);
                 k_payload_stream.push_back(ggml_view_2d(ctx, k_payload, k_payload->ne[0], kv_size * n_head_kv2, k_payload->nb[1], s*k_payload->nb[2]));
@@ -329,7 +354,7 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_payload, k_scales, k_stream, v_stream, k_payload_stream, k_scales_stream, });
+        layers.push_back({ il, k, v, k_payload, k_scales, v4_tail, k_stream, v_stream, k_payload_stream, k_scales_stream, });
     }
 
     if (reuse) {
@@ -377,20 +402,22 @@ llama_kv_cache::llama_kv_cache(
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
-    // Register packed16 K tensors for DOT4 FA dispatch lookup. Opt-in MTP
-    // hot/cold mode keeps exact FP16 K as the graph-facing cache while a
-    // packed16/I32 sidecar is available only to DOT4-aware decode routes.
-    const bool register_mtp_hotcold_shadow = getenv("LLAMA_MTP_PACKED16_HOTCOLD_K") &&
-        atoi(getenv("LLAMA_MTP_PACKED16_HOTCOLD_K")) != 0;
+    // Register packed16 K tensors for DOT4 FA dispatch lookup. Hot/cold mode
+    // keeps exact FP16 K as the graph-facing cache, and the normal K->data
+    // registry entry below maps that F16 cache to its packed16 sidecar.
     for (auto & layer : layers) {
         if (layer.k_payload && layer.k_scales) {
-            if (register_mtp_hotcold_shadow && layer.k && layer.k->type == GGML_TYPE_F16) {
-                llama_kv_cache_register_packed16_shadow(layer.k_payload->data, layer.k_payload, layer.k_scales, layer.k);
-            } else {
-                llama_kv_cache_register_packed16(layer.k_payload->data, layer.k_payload, layer.k_scales);
-            }
+            llama_kv_cache_register_packed16(layer.k_payload->data, layer.k_payload, layer.k_scales);
             if (layer.k) {
                 llama_kv_cache_register_packed16(layer.k->data, layer.k_payload, layer.k_scales);
+            }
+        }
+        if (layer.v && layer.v->type == GGML_TYPE_V4_K16D16 && layer.v4_tail) {
+            llama_kv_cache_register_v4_k16d16(layer.v->data, layer.v, layer.v4_tail);
+            for (auto * v_view : layer.v_stream) {
+                if (v_view) {
+                    llama_kv_cache_register_v4_k16d16(v_view->data, layer.v, layer.v4_tail);
+                }
             }
         }
     }
@@ -1239,6 +1266,119 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     }
 }
 
+bool llama_kv_cache::direct_tx_begin(const llama_ubatch & ubatch, llama_kv_cache_direct_tx & tx) {
+    tx = llama_kv_cache_direct_tx{};
+
+    if (ubatch.n_tokens == 0 || ubatch.n_seqs_unq != 1 || ubatch.seq_id_unq == nullptr ||
+            ubatch.pos == nullptr || ubatch.n_seq_id == nullptr || ubatch.seq_id == nullptr) {
+        return false;
+    }
+
+    const llama_seq_id seq_id = ubatch.seq_id_unq[0];
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return false;
+    }
+
+    const llama_pos p0 = ubatch.pos[0];
+    if (p0 < 0) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.pos[i] != p0 + (llama_pos) i || ubatch.n_seq_id[i] != 1 ||
+                ubatch.seq_id[i] == nullptr || ubatch.seq_id[i][0] != seq_id) {
+            return false;
+        }
+    }
+
+    slot_info sinfo_new = find_slot(ubatch, false);
+    if (sinfo_new.empty() || sinfo_new.n_stream() != 1 || sinfo_new.size() != ubatch.n_tokens) {
+        return false;
+    }
+
+    tx.seq_id = seq_id;
+    tx.p0 = p0;
+    tx.p1 = p0 + (llama_pos) ubatch.n_tokens;
+    tx.sinfo = std::move(sinfo_new);
+    tx.v_heads_old = v_heads;
+    tx.v_cells_old = v_cells;
+    tx.begun = true;
+    tx.rollback_ready = true;
+    tx.target_cells_empty = true;
+
+    for (uint32_t s = 0; s < tx.sinfo.n_stream(); ++s) {
+        const auto & cells = v_cells[tx.sinfo.strm[s]];
+        for (uint32_t idx : tx.sinfo.idxs[s]) {
+            tx.target_cells_empty = tx.target_cells_empty && cells.is_empty(idx);
+        }
+    }
+
+    return true;
+}
+
+bool llama_kv_cache::direct_tx_apply_metadata(const llama_ubatch & ubatch, llama_kv_cache_direct_tx & tx) {
+    if (!tx.begun || !tx.rollback_ready || tx.committed || tx.applied_metadata || tx.sinfo.empty() ||
+            ubatch.n_tokens != tx.sinfo.size()) {
+        return false;
+    }
+
+    apply_ubatch(tx.sinfo, ubatch);
+    tx.applied_metadata = true;
+    return true;
+}
+
+bool llama_kv_cache::direct_tx_validate_metadata(const llama_kv_cache_direct_tx & tx) const {
+    if (!tx.begun || !tx.rollback_ready || tx.committed || !tx.applied_metadata || tx.sinfo.empty() ||
+            tx.seq_id < 0 || tx.p0 < 0 || tx.p1 <= tx.p0 || tx.sinfo.n_stream() != 1) {
+        return false;
+    }
+
+    uint32_t row = 0;
+    for (uint32_t s = 0; s < tx.sinfo.n_stream(); ++s) {
+        const auto & cells = v_cells[tx.sinfo.strm[s]];
+        for (uint32_t idx : tx.sinfo.idxs[s]) {
+            if (idx >= cells.size() || cells.is_empty(idx) || !cells.seq_has(idx, tx.seq_id) ||
+                    cells.pos_get(idx) != tx.p0 + (llama_pos) row) {
+                return false;
+            }
+            ++row;
+        }
+    }
+
+    return row == (uint32_t) (tx.p1 - tx.p0);
+}
+
+void llama_kv_cache::direct_tx_rollback(llama_kv_cache_direct_tx & tx) {
+    if (!tx.rollback_ready) {
+        tx = llama_kv_cache_direct_tx{};
+        return;
+    }
+
+    v_heads = tx.v_heads_old;
+    v_cells = tx.v_cells_old;
+
+    tx.applied_metadata = false;
+    tx.begun = false;
+    tx.rollback_ready = false;
+    tx.committed = false;
+    tx.sinfo.clear();
+    tx.v_heads_old.clear();
+    tx.v_cells_old.clear();
+}
+
+void llama_kv_cache::direct_tx_commit(llama_kv_cache_direct_tx & tx) {
+    if (!tx.begun || !tx.applied_metadata || !tx.rollback_ready) {
+        return;
+    }
+
+    tx.committed = true;
+    tx.begun = false;
+    tx.rollback_ready = false;
+    tx.sinfo.clear();
+    tx.v_heads_old.clear();
+    tx.v_cells_old.clear();
+}
+
 bool llama_kv_cache::get_can_shift() const {
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {
@@ -1248,6 +1388,10 @@ bool llama_kv_cache::get_can_shift() const {
         return false;
     }
     return true;
+}
+
+llama_kv_cache * llama_kv_cache::get_direct_kv_cache() {
+    return this;
 }
 
 uint32_t llama_kv_cache::get_size() const {
@@ -1363,14 +1507,27 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_v_gqa = v->ne[0];
 
-    // [TAG_V_CACHE_VARIABLE]
-    assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
-
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
     const bool use_trans = (layout == LLAMA_KV_V_LAYOUT_DEFAULT)
         ? v_trans
         : (layout == LLAMA_KV_V_LAYOUT_FOR_NON_FA);
+
+    if (v->type == GGML_TYPE_V4_K16D16 || v->type == GGML_TYPE_V4_K16D16_144) {
+        GGML_ASSERT(layout != LLAMA_KV_V_LAYOUT_FOR_NON_FA && "V4_K16D16 V cache is FA-only");
+        GGML_ASSERT(hparams.n_embd_head_v(il) == 256);
+        const int64_t n_head_kv = hparams.n_head_kv(il);
+        const size_t row_bytes = ggml_row_size(v->type, hparams.n_embd_head_v(il));
+        return ggml_view_4d(ctx, v,
+                hparams.n_embd_head_v(il), n_kv, n_head_kv, ns,
+                row_bytes,
+                row_bytes * kv_size,
+                row_bytes * kv_size * n_head_kv,
+                row_bytes * kv_size * n_head_kv * sinfo.s0);
+    }
+
+    // [TAG_V_CACHE_VARIABLE]
+    assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
 
     if (v->type == GGML_TYPE_TBQ3_0 || v->type == GGML_TYPE_TBQ4_0) {
         ggml_tensor * v_view = ggml_view_3d(ctx, v,
@@ -1483,6 +1640,17 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * v = layers[ikv].v;
+    auto * v4_tail = layers[ikv].v4_tail;
+
+    if (v && v->type == GGML_TYPE_V4_K16D16) {
+        GGML_ASSERT(v4_tail && "V4_K16D16 cache requires a tail buffer");
+        GGML_ASSERT(!v_trans && "V4_K16D16 cache is FA/non-transposed only");
+        return ggml_pack_v4_k16d16(ctx, v_cur, v, v4_tail, v_idxs);
+    }
+    if (v && v->type == GGML_TYPE_V4_K16D16_144) {
+        GGML_ASSERT(!v_trans && "V4_K16D16_144 cache is FA/non-transposed only");
+        return ggml_pack_v4_k16d16_144(ctx, v_cur, v, v_idxs);
+    }
 
     const int64_t n_embd_head = v_cur->ne[0];
     const int64_t n_head      = v_cur->ne[1];
@@ -1531,6 +1699,14 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     v_cur = ggml_reshape_2d(ctx, v_cur, 1, ggml_nelements(v_cur));
 
     return ggml_set_rows(ctx, v_view, v_cur, v_idxs);
+}
+
+ggml_tensor * llama_kv_cache::direct_cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const llama_kv_cache_direct_tx & tx) const {
+    return cpy_k(ctx, k_cur, k_idxs, il, tx.sinfo);
+}
+
+ggml_tensor * llama_kv_cache::direct_cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const llama_kv_cache_direct_tx & tx) const {
+    return cpy_v(ctx, v_cur, v_idxs, il, tx.sinfo);
 }
 
 ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
@@ -2042,6 +2218,7 @@ size_t llama_kv_cache::size_v_bytes() const {
 
     for (const auto & layer : layers) {
         size_v_bytes += layer.v ? ggml_nbytes(layer.v) : 0;
+        size_v_bytes += layer.v4_tail ? ggml_nbytes(layer.v4_tail) : 0;
     }
 
     return size_v_bytes;
