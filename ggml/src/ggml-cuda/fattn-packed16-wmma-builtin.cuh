@@ -28,6 +28,7 @@ static constexpr int PBWMMA_BN = 16;
 
 using pbwmma_v16fp16 = _Float16 __attribute__((ext_vector_type(16)));
 using pbwmma_v8fp32  = float    __attribute__((ext_vector_type(8)));
+using pbwmma_v2i32   = int      __attribute__((ext_vector_type(2)));
 using pbwmma_v4i32   = int      __attribute__((ext_vector_type(4)));
 using pbwmma_v8i32   = int      __attribute__((ext_vector_type(8)));
 
@@ -39,6 +40,16 @@ static __device__ __forceinline__ pbwmma_v8fp32 pbwmma_mma(
 static __device__ __forceinline__ pbwmma_v8i32 pbwmma_mma_i8(
         pbwmma_v4i32 a, pbwmma_v4i32 b, pbwmma_v8i32 c) {
     return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, c, false);
+}
+
+static __device__ __forceinline__ pbwmma_v8i32 pbwmma_mma_i4(
+        pbwmma_v2i32 a, pbwmma_v2i32 b, pbwmma_v8i32 c) {
+    return __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true, a, true, b, c, false);
+}
+
+static __device__ __forceinline__ pbwmma_v8i32 pbwmma_mma_u4s4(
+        pbwmma_v2i32 a, pbwmma_v2i32 b, pbwmma_v8i32 c) {
+    return __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, a, true, b, c, false);
 }
 
 static __device__ __forceinline__ int pbwmma_extract_s8(
@@ -68,6 +79,16 @@ static __device__ __forceinline__ int pbwmma_dot4_i8_i8(
 // DOT4 shadow probes validate this contract against the actual WMMA builtin.
 static constexpr int PBWMMA_I8_WORDS_PER_K16 = 4;
 static constexpr int PBWMMA_I8_BYTES_PER_WORD = 4;
+static constexpr int PBWMMA_I4_WORDS_PER_K16 = 2;
+static constexpr int PBWMMA_I4_NIBBLES_PER_WORD = 8;
+
+static __device__ __forceinline__ int pbwmma_i4_k_word(const int k) {
+    return k >> 3;
+}
+
+static __device__ __forceinline__ int pbwmma_i4_k_nibble(const int k) {
+    return k & 7;
+}
 
 static __device__ __forceinline__ int pbwmma_i8_k_word(const int k) {
     return k >> 2;
@@ -340,6 +361,121 @@ static bool pbwmma_pv_probe_pass(hipStream_t stream) {
         return false;
     }
     fprintf(stderr, "PBWMMA PV WMMA probe PASSED: max_err=%f\n", max_err);
+    return true;
+}
+
+// ── PV multi-wave probe: one CTA computes P[64x16] * V[16x256] ──
+// Mirrors the BM64 PV-WMMA column mapping: wave d_tile owns 16 output D cols.
+static __global__ void pbwmma_pv_probe_bm64_d256_kernel(
+        const half  * __restrict__ p_probe,
+        const half  * __restrict__ v_probe,
+        float       * __restrict__ out) {
+
+    __shared__ half p_s[64][16];
+    __shared__ half v_s[16][256];
+
+    for (int idx = threadIdx.x; idx < 64 * 16; idx += blockDim.x) {
+        p_s[idx / 16][idx % 16] = p_probe[idx];
+    }
+    for (int idx = threadIdx.x; idx < 16 * 256; idx += blockDim.x) {
+        v_s[idx / 256][idx % 256] = v_probe[idx];
+    }
+    __syncthreads();
+
+    const int lane    = threadIdx.x & 31;
+    const int lane_lo = lane & 15;
+    const int lane_hi = lane >> 4;
+    const int d_tile  = (threadIdx.x >> 5) & 15;
+    const int dd      = d_tile * 16 + lane_lo;
+
+#pragma unroll
+    for (int rb = 0; rb < 4; ++rb) {
+        pbwmma_v16fp16 a;
+        pbwmma_v16fp16 b;
+#pragma unroll
+        for (int kk = 0; kk < 16; ++kk) {
+            a[kk] = p_s[rb * 16 + pbwmma_f16_a_row_from_lane_lo(lane_lo)][kk];
+            b[kk] = v_s[kk][d_tile * 16 + pbwmma_f16_b_col_from_lane_lo(lane_lo)];
+        }
+        pbwmma_v8fp32 acc = {0,0,0,0,0,0,0,0};
+        acc = pbwmma_mma(a, b, acc);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int rr = rb * 16 + pbwmma_f16_d_row_from_acc(i, lane_hi);
+            out[rr * 256 + dd] = acc[i];
+        }
+    }
+}
+
+static bool pbwmma_pv_probe_bm64_d256_pass(hipStream_t stream) {
+    constexpr int NR = 64;
+    constexpr int NK = 16;
+    constexpr int ND = 256;
+    constexpr size_t p_bytes   = NR * NK * sizeof(half);
+    constexpr size_t v_bytes   = NK * ND * sizeof(half);
+    constexpr size_t out_bytes = NR * ND * sizeof(float);
+
+    half  * h_p   = (half  *) malloc(p_bytes);
+    half  * h_v   = (half  *) malloc(v_bytes);
+    float * h_ref = (float *) malloc(out_bytes);
+    float * h_gpu = (float *) malloc(out_bytes);
+
+    srand(271828);
+    for (int i = 0; i < NR * NK; ++i) {
+        const float v = ((float)rand() / RAND_MAX * 2.0f - 1.0f);
+        h_p[i] = __float2half(v);
+    }
+    for (int i = 0; i < NK * ND; ++i) {
+        const float v = ((float)rand() / RAND_MAX * 2.0f - 1.0f) * 2.0f;
+        h_v[i] = __float2half(v);
+    }
+
+    for (int r = 0; r < NR; ++r) {
+        for (int d = 0; d < ND; ++d) {
+            float sum = 0.0f;
+            for (int k = 0; k < NK; ++k) {
+                sum += __half2float(h_p[r * NK + k]) * __half2float(h_v[k * ND + d]);
+            }
+            h_ref[r * ND + d] = sum;
+        }
+    }
+
+    half  * d_p = nullptr;
+    half  * d_v = nullptr;
+    float * d_out = nullptr;
+    CUDA_CHECK(hipMalloc(&d_p, p_bytes));
+    CUDA_CHECK(hipMalloc(&d_v, v_bytes));
+    CUDA_CHECK(hipMalloc(&d_out, out_bytes));
+    CUDA_CHECK(hipMemcpyAsync(d_p, h_p, p_bytes, hipMemcpyHostToDevice, stream));
+    CUDA_CHECK(hipMemcpyAsync(d_v, h_v, v_bytes, hipMemcpyHostToDevice, stream));
+    CUDA_CHECK(hipMemsetAsync(d_out, 0, out_bytes, stream));
+
+    pbwmma_pv_probe_bm64_d256_kernel<<<1, 512, 0, stream>>>(d_p, d_v, d_out);
+    CUDA_CHECK(hipGetLastError());
+    CUDA_CHECK(hipMemcpyAsync(h_gpu, d_out, out_bytes, hipMemcpyDeviceToHost, stream));
+    CUDA_CHECK(hipStreamSynchronize(stream));
+
+    float max_err = 0.0f;
+    int max_i = 0;
+    for (int i = 0; i < NR * ND; ++i) {
+        const float diff = fabsf(h_gpu[i] - h_ref[i]);
+        if (diff > max_err) { max_err = diff; max_i = i; }
+    }
+
+    const float max_ref = h_ref[max_i];
+    const float max_got = h_gpu[max_i];
+
+    CUDA_CHECK(hipFree(d_p));
+    CUDA_CHECK(hipFree(d_v));
+    CUDA_CHECK(hipFree(d_out));
+    free(h_p); free(h_v); free(h_ref); free(h_gpu);
+
+    if (max_err > 1e-2f) {
+        fprintf(stderr, "PBWMMA BM64_D256 PV WMMA probe FAILED: max_err=%f r=%d d=%d ref=%f got=%f\n",
+                max_err, max_i / ND, max_i % ND, max_ref, max_got);
+        return false;
+    }
+    fprintf(stderr, "PBWMMA BM64_D256 PV WMMA probe PASSED: max_err=%f\n", max_err);
     return true;
 }
 

@@ -12,6 +12,7 @@ struct llama_cparams;
 struct llama_hparams;
 struct llama_model;
 struct llama_context;
+struct llama_kv_cache_direct_tx;
 
 // Consumer-requested V layout for get_v() overload.
 // DEFAULT delegates to the legacy v_trans heuristic.
@@ -136,6 +137,8 @@ public:
 
     bool get_can_shift() const override;
 
+    llama_kv_cache * get_direct_kv_cache();
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
@@ -180,6 +183,17 @@ public:
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
+
+    // sanctioned direct KV metadata transaction API for fail-closed direct verifiers.
+    bool direct_tx_begin(const llama_ubatch & ubatch, llama_kv_cache_direct_tx & tx);
+    bool direct_tx_apply_metadata(const llama_ubatch & ubatch, llama_kv_cache_direct_tx & tx);
+    bool direct_tx_validate_metadata(const llama_kv_cache_direct_tx & tx) const;
+    void direct_tx_rollback(llama_kv_cache_direct_tx & tx);
+    void direct_tx_commit(llama_kv_cache_direct_tx & tx);
+
+    // Direct graph write helpers. These only build write nodes; callers own graph allocation/compute/rollback ordering.
+    ggml_tensor * direct_cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const llama_kv_cache_direct_tx & tx) const;
+    ggml_tensor * direct_cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const llama_kv_cache_direct_tx & tx) const;
 
     //
     // preparation API
@@ -236,6 +250,9 @@ private:
         // Stores quantized K in INT8-packed I32 payload + F16 scales, ready for DOT4 FA kernel.
         ggml_tensor * k_payload = nullptr;  // GGML_TYPE_I32, [D/4, n_tokens]
         ggml_tensor * k_scales  = nullptr;  // GGML_TYPE_F16, [D/32, n_tokens]
+
+        // Experimental sealed V4_K16D16 V cache (default-off, FA-only).
+        ggml_tensor * v4_tail = nullptr;    // GGML_TYPE_F16, [D, 16 * n_heads]
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
@@ -330,6 +347,22 @@ private:
 
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
+};
+
+struct llama_kv_cache_direct_tx {
+    llama_seq_id seq_id = -1;
+    llama_pos    p0     = -1;
+    llama_pos    p1     = -1;
+
+    llama_kv_cache::slot_info sinfo;
+    std::vector<uint32_t> v_heads_old;
+    std::vector<llama_kv_cells> v_cells_old;
+
+    bool begun              = false;
+    bool rollback_ready     = false;
+    bool target_cells_empty = false;
+    bool applied_metadata   = false;
+    bool committed          = false;
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {
@@ -461,6 +494,8 @@ void llama_kv_cache_register_packed16(const void * k_view_data, struct ggml_tens
 void llama_kv_cache_register_packed16_shadow(const void * k_view_data, struct ggml_tensor * payload, struct ggml_tensor * scales, struct ggml_tensor * shadow_k);
 void llama_kv_cache_get_packed16_tensors(const void * k_view_data, struct ggml_tensor ** payload, struct ggml_tensor ** scales);
 void llama_kv_cache_get_packed16_shadow_k(const void * k_view_data, struct ggml_tensor ** shadow_k);
+void llama_kv_cache_register_v4_k16d16(const void * v_view_data, struct ggml_tensor * v_cache, struct ggml_tensor * v_tail);
+void llama_kv_cache_get_v4_k16d16_tensors(const void * v_view_data, struct ggml_tensor ** v_cache, struct ggml_tensor ** v_tail);
 #ifdef __cplusplus
 }
 #endif

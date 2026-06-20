@@ -12,8 +12,7 @@ set -euo pipefail
 # Fast compile defaults to -O1 for the giant PDMQ HIP TU. Use
 #   QWEN35_DEV_FAST_COMPILE=OFF
 # for O3/performance-validation builds, or set QWEN35_DEV_HIP_FAST_OPT=-O1/-O2.
-# Default dev matrix skips PVBlock-exact, legacy V4_130, approximate V4 PV-WMMA,
-# and the old QBlock PV-DOT4 scout. QBlock itself remains in scope.
+# Default dev matrix skips PVBlock-exact unless explicitly requested.
 # The only live V prototype knob here is exact V4_144 PV4:
 #   QWEN35_DEV_COMPILE_V4_144_PV4=ON
 #   GGML_CUDA_ROCM_V4_K16D16_144_PV4=1
@@ -35,11 +34,7 @@ cmake -S "$repo_root" -B "$build_dir" -G Ninja \
   -DGPU_TARGETS="${GPU_TARGETS:-gfx1100}" \
   -DGGML_HIP_PDMQ_QWEN35_DEBUG_ONLY=ON \
   -DGGML_HIP_PDMQ_COMPILE_PVBLOCK_EXACT="${QWEN35_DEV_COMPILE_PVBLOCK_EXACT:-OFF}" \
-  -DGGML_HIP_PDMQ_COMPILE_V4_K16D16=OFF \
-  -DGGML_HIP_PDMQ_COMPILE_V4_APPROX_PV=OFF \
-  -DGGML_HIP_PDMQ_COMPILE_QBLOCK_PV_DOT4=OFF \
   -DGGML_HIP_PDMQ_COMPILE_V4_144_PV4="${QWEN35_DEV_COMPILE_V4_144_PV4:-OFF}" \
-  -DGGML_HIP_PDMQ_COMPILE_V4_144_PV_DOT4_I8=OFF \
   -DGGML_HIP_PDMQ_FAST_COMPILE="${QWEN35_DEV_FAST_COMPILE:-ON}" \
   -DGGML_HIP_PDMQ_FAST_COMPILE_OPT="${QWEN35_DEV_HIP_FAST_OPT:--O1}" \
   -DGGML_HIP_ROCWMMA_FATTN=ON \

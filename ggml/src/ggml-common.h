@@ -188,6 +188,19 @@ typedef struct {
 } block_q4_0;
 static_assert(sizeof(block_q4_0) == sizeof(ggml_half) + QK4_0 / 2, "wrong q4_0 block size/padding");
 
+// Internal FA-only V cache layouts. One logical D256 row is physically
+// grouped by K16 blocks with signed-i4 payload plus fp16 scales.
+#define QK_V4_K16D16 256
+typedef struct {
+    uint8_t bytes[130];
+} block_v4_k16d16;
+static_assert(sizeof(block_v4_k16d16) == 130, "wrong v4_k16d16 block size/padding");
+
+typedef struct {
+    uint8_t bytes[144];
+} block_v4_k16d16_144;
+static_assert(sizeof(block_v4_k16d16_144) == 144, "wrong v4_k16d16_144 block size/padding");
+
 #define QK4_1 32
 typedef struct {
     GGML_EXTENSION union {

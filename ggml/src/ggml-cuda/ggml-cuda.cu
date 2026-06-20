@@ -3377,6 +3377,13 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_PACK_K_PACKED16:
             ggml_cuda_op_pack_k_packed16(ctx, dst);
             break;
+        case GGML_OP_PACK_V4_K16D16:
+            if (dst->type == GGML_TYPE_V4_K16D16_144) {
+                ggml_cuda_op_pack_v4_k16d16_144(ctx, dst);
+            } else {
+                ggml_cuda_op_pack_v4_k16d16(ctx, dst);
+            }
+            break;
         case GGML_OP_SET:
             ggml_cuda_op_set(ctx, dst);
             break;
@@ -5833,6 +5840,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 return op->type == GGML_TYPE_I32 &&
                        (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32) &&
                        op->src[1]->type == GGML_TYPE_F16 &&
+                       op->src[2] != nullptr &&
+                       (op->src[2]->type == GGML_TYPE_I64 || op->src[2]->type == GGML_TYPE_I32);
+            } break;
+        case GGML_OP_PACK_V4_K16D16:
+            {
+                const bool v4_k16d16 = op->type == GGML_TYPE_V4_K16D16 && op->src[1] && op->src[1]->type == GGML_TYPE_F16;
+                const bool v4_144 = op->type == GGML_TYPE_V4_K16D16_144;
+                return (v4_k16d16 || v4_144) &&
+                       (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32) &&
                        op->src[2] != nullptr &&
                        (op->src[2]->type == GGML_TYPE_I64 || op->src[2]->type == GGML_TYPE_I32);
             } break;

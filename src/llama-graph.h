@@ -161,6 +161,22 @@ public:
 };
 
 // temperature tuning, used by llama4
+class llm_graph_input_out_pos : public llm_graph_input_i {
+public:
+    llm_graph_input_out_pos(uint32_t n_pos_per_embd, uint32_t n_outputs) :
+        n_pos_per_embd(n_pos_per_embd), n_outputs(n_outputs) {}
+    virtual ~llm_graph_input_out_pos() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * pos = nullptr; // I32 [n_outputs]
+
+    const uint32_t n_pos_per_embd = 1;
+    const uint32_t n_outputs = 0;
+};
+
 class llm_graph_input_attn_temp : public llm_graph_input_i {
 public:
     llm_graph_input_attn_temp(uint32_t n_attn_temp_floor_scale, float f_attn_temp_scale, float f_attn_temp_offset)
@@ -342,6 +358,41 @@ public:
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
     //       llm_graph_params from a previous batch, causing stack-use-after-return
+    const llama_hparams hparams;
+    const llama_cparams cparams;
+
+    const llama_kv_cache_context * mctx;
+};
+
+// K/V-cache update input without an attention mask. Used by explicit cache-update
+// graphs that do not run attention; avoids allocating a KQ mask that set_input()
+// would otherwise try to populate without a graph-reachable buffer.
+class llm_graph_input_attn_kv_update : public llm_graph_input_i {
+public:
+    llm_graph_input_attn_kv_update(
+            const llama_hparams & hparams,
+            const llama_cparams & cparams,
+            const llama_kv_cache_context * mctx) :
+        hparams(hparams),
+        cparams(cparams),
+        mctx(mctx) {
+    }
+    ~llm_graph_input_attn_kv_update() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * get_k_idxs() const { return self_k_idxs; }
+    ggml_tensor * get_v_idxs() const { return self_v_idxs; }
+
+    ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
+    ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
+
+    // note: assumes v_rot^2 == I
+    ggml_tensor * self_k_rot = nullptr;
+    ggml_tensor * self_v_rot = nullptr;
+
     const llama_hparams hparams;
     const llama_cparams cparams;
 
@@ -997,6 +1048,7 @@ struct llm_graph_context {
 
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
     ggml_tensor * build_inp_pos() const;
+    ggml_tensor * build_inp_out_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
     ggml_tensor * build_inp_mean() const;

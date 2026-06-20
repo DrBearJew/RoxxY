@@ -26,8 +26,6 @@ Default-off, HIP-only storage bring-up for persistent V cache candidates. The 13
 | --- | --- | --- | --- | --- |
 | `GGML_CUDA_ROCM_V4_K16D16_V_CACHE` | `0` | candidate | KV cache / CUDA pack op | Allocates experimental internal `GGML_TYPE_V4_K16D16` V storage for D=256 q4_0 V layers and packs/seals full K16 blocks with a small F16 tail buffer. FA-only and fail-closed for non-FA access. Not production evidence until native FA consumption, strict quality gates, and VRAM accounting pass. |
 | `GGML_CUDA_ROCM_V4_K16D16_144_V_CACHE` | `0` | candidate | KV cache / CUDA pack op | Allocates internal `GGML_TYPE_V4_K16D16_144` storage for D=256 q4_0 V layers. This is intended to be q4_0-exact 144 B/row persistent K16D16 layout with no VRAM saving; current scalar PDMQ A/B still mismatches q4_0, so DOT4/PV promotion remains blocked. |
-| `GGML_CUDA_ROCM_V4_K16D16_PV_I4_SPLITK_CANDIDATE` | unset | candidate | PDMQ V4 PV-I4 | No-MTP/small-Q scoped split-K request for persistent V4 PV-I4. Applies when `V=v4_k16d16` or `V=v4_k16d16_144`, PV-WMMA and PV-I4 are requested, and `nq<=8`; selects padded-row IU4 `P_u4 x V_s4` WMMA for small-Q and does not affect large prefill. Route smoke for V4_144 passes, but scalar hash equivalence is still required before promotion. |
-| `GGML_CUDA_ROCM_V4_K16D16_PV_I4_SPLITK_CANDIDATE_MIN_NK` | global split-K min or `12288` | candidate | PDMQ V4 PV-I4 | Optional min-`nk` threshold for the scoped V4-family PV-I4 split-K candidate. |
 
 ## Rules
 
@@ -158,7 +156,6 @@ Forced UBATCH1 verifier decode now regenerates recurrent rollback snapshot rows 
 | `LLAMA_MTP_QBLOCK_Q_PRECISION` | alias | qpack | backend | Alias for QBlock Q precision. |
 | `GGML_CUDA_DP16_FA_QBLOCK_ROWMAP_MODE` | route default | qprog | backend | QBlock rowmap mode, e.g. `identity`. |
 | `LLAMA_MTP_QBLOCK_ROWMAP_MODE` | alias | qprog | backend | Alias for QBlock rowmap mode. |
-| `GGML_CUDA_DP16_FA_QBLOCK_PV_DOT4` | `0` | experimental | backend | QBlock PV-DOT4 experiment. Not part of strict default route. |
 | `GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_PVBLOCK_EXACT` | `1` | standard | backend | Exact scalar PVBlock specialization for packed16 DOT4/MMQ. Default-on when supported (`q4_0` raw-LDS V, no staged V, no competing PV candidate); set `0` to force the old scalar PV accumulator path for A/B or rollback. |
 | `GGML_CUDA_ROCM_PACKED16_K_SCALE_GROUP_QBLOCKS` | route default | scale | backend | K scale grouping. Contract-sensitive. |
 | `LLAMA_MTP_PACKED16_K_SCALE_GROUP_QBLOCKS` | alias | scale | backend | Alias for K scale grouping. |

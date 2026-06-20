@@ -2421,7 +2421,7 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_pack_v4_k16d16_144_in
 
 void ggml_cuda_op_pack_v4_k16d16_144(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_tensor * v_cur  = dst->src[0];
-    ggml_tensor * v_idxs = dst->src[1];
+    ggml_tensor * v_idxs = dst->src[2];
     ggml_tensor * v144   = dst;
 
     GGML_ASSERT(v144->type == GGML_TYPE_V4_K16D16_144);

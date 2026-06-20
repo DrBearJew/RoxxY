@@ -82,31 +82,15 @@ static_assert(PDMQ_BM_SMALL   * PDMQ_BN_SMALL   == PDMQ_THREADS, "M8N32 maps one
 #ifndef GGML_HIP_PDMQ_COMPILE_PVBLOCK_EXACT
 #define GGML_HIP_PDMQ_COMPILE_PVBLOCK_EXACT 0
 #endif
-#ifndef GGML_HIP_PDMQ_COMPILE_V4_K16D16
-#define GGML_HIP_PDMQ_COMPILE_V4_K16D16 0
-#endif
-#ifndef GGML_HIP_PDMQ_COMPILE_V4_APPROX_PV
-#define GGML_HIP_PDMQ_COMPILE_V4_APPROX_PV 0
-#endif
-#ifndef GGML_HIP_PDMQ_COMPILE_QBLOCK_PV_DOT4
-#define GGML_HIP_PDMQ_COMPILE_QBLOCK_PV_DOT4 0
-#endif
 #ifndef GGML_HIP_PDMQ_COMPILE_V4_144_PV4
 #define GGML_HIP_PDMQ_COMPILE_V4_144_PV4 0
-#endif
-#ifndef GGML_HIP_PDMQ_COMPILE_V4_144_PV_DOT4_I8
-#define GGML_HIP_PDMQ_COMPILE_V4_144_PV_DOT4_I8 0
 #endif
 
 #define PDMQ_QWEN35_DEBUG_ONLY GGML_HIP_PDMQ_QWEN35_DEBUG_ONLY
 #define PDMQ_COMPILE_PVBLOCK_EXACT GGML_HIP_PDMQ_COMPILE_PVBLOCK_EXACT
-#define PDMQ_COMPILE_V4_130 GGML_HIP_PDMQ_COMPILE_V4_K16D16
-#define PDMQ_COMPILE_V4_APPROX_PV GGML_HIP_PDMQ_COMPILE_V4_APPROX_PV
-#define PDMQ_COMPILE_QBLOCK_PV_DOT4 GGML_HIP_PDMQ_COMPILE_QBLOCK_PV_DOT4
 #define PDMQ_COMPILE_V4_144_PV4 GGML_HIP_PDMQ_COMPILE_V4_144_PV4
-#define PDMQ_COMPILE_V4_144_PV_DOT4_I8 GGML_HIP_PDMQ_COMPILE_V4_144_PV_DOT4_I8
-#define PDMQ_COMPILE_V4_144 (PDMQ_COMPILE_V4_144_PV4 || PDMQ_COMPILE_V4_144_PV_DOT4_I8)
-#define PDMQ_COMPILE_V4_ANY (PDMQ_COMPILE_V4_130 || PDMQ_COMPILE_V4_144)
+#define PDMQ_COMPILE_V4_144 PDMQ_COMPILE_V4_144_PV4
+#define PDMQ_COMPILE_V4_ANY PDMQ_COMPILE_V4_144
 
 // +1 row padding mirrors the useful MMQ/RDNA LDS trick: avoid perfect
 // power-of-two row strides in shared memory without materially increasing LDS.
@@ -145,30 +129,6 @@ static inline bool pdmq_pv_i4_cache_requested() {
     return v && atoi(v) != 0;
 }
 
-static inline bool pdmq_qblock_pv_dot4_requested() {
-    const char * v = getenv("GGML_CUDA_DP16_FA_QBLOCK_PV_DOT4");
-#if !PDMQ_COMPILE_QBLOCK_PV_DOT4
-    if (v && atoi(v) != 0) {
-        GGML_ABORT("GGML_CUDA_DP16_FA_QBLOCK_PV_DOT4 requires -DGGML_HIP_PDMQ_COMPILE_QBLOCK_PV_DOT4=ON; only the old PV-DOT4 scout is compile-gated off by default, QBlock remains supported");
-    }
-    return false;
-#else
-    return v && atoi(v) != 0;
-#endif
-}
-
-static inline bool pdmq_v4_approx_pv_allowed() {
-    const char * v = getenv("GGML_CUDA_ROCM_V4_K16D16_APPROX_PV");
-#if !PDMQ_COMPILE_V4_APPROX_PV
-    if (v && atoi(v) != 0) {
-        GGML_ABORT("GGML_CUDA_ROCM_V4_K16D16_APPROX_PV requires -DGGML_HIP_PDMQ_COMPILE_V4_APPROX_PV=ON; scalar/direct V4 is the hash-preserving path");
-    }
-    return false;
-#else
-    return v && atoi(v) != 0;
-#endif
-}
-
 static inline bool pdmq_v4_144_pv4_requested() {
     const char * old_v = getenv("GGML_CUDA_ROCM_V4_K16D16_144_Q4_LDS");
     if (old_v && atoi(old_v) != 0) {
@@ -178,18 +138,6 @@ static inline bool pdmq_v4_144_pv4_requested() {
 #if !PDMQ_COMPILE_V4_144_PV4
     if (v && atoi(v) != 0) {
         GGML_ABORT("GGML_CUDA_ROCM_V4_K16D16_144_PV4 requires -DGGML_HIP_PDMQ_COMPILE_V4_144_PV4=ON; direct scalar V4 remains the default A path");
-    }
-    return false;
-#else
-    return v && atoi(v) != 0;
-#endif
-}
-
-static inline bool pdmq_v4_144_pv_dot4_i8_requested() {
-    const char * v = getenv("GGML_CUDA_ROCM_V4_K16D16_144_PV_DOT4_I8");
-#if !PDMQ_COMPILE_V4_144_PV_DOT4_I8
-    if (v && atoi(v) != 0) {
-        GGML_ABORT("GGML_CUDA_ROCM_V4_K16D16_144_PV_DOT4_I8 requires -DGGML_HIP_PDMQ_COMPILE_V4_144_PV_DOT4_I8=ON; scalar/direct V4 remains the hash-preserving path");
     }
     return false;
 #else
@@ -250,7 +198,6 @@ enum packed16_dot4_mmq_v_type {
     PACKED16_DOT4_MMQ_V_Q4_0,
     PACKED16_DOT4_MMQ_V_Q8_0,
     PACKED16_DOT4_MMQ_V_F16,
-    PACKED16_DOT4_MMQ_V4_K16D16,
     PACKED16_DOT4_MMQ_V4_K16D16_144,
 };
 
@@ -757,73 +704,10 @@ static __device__ __forceinline__ float pdmq_decode_v_f16(
     return __half2float(*pdmq_v_f16_ptr(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k, hk, b, d));
 }
 
-static constexpr int PDMQ_V4_K16D16_K = 16;
-static constexpr int PDMQ_V4_K16D16_D_TILE = 16;
-static constexpr int PDMQ_V4_K16D16_WORDS_PER_D = 2;
-static constexpr int PDMQ_V4_K16D16_PAYLOAD_BYTES = PDMQ_D * PDMQ_V4_K16D16_WORDS_PER_D * (int) sizeof(uint32_t);
 static constexpr int PDMQ_V4_K16D16_144_K = 16;
 static constexpr int PDMQ_V4_K16D16_144_D32 = 32;
 static constexpr int PDMQ_V4_K16D16_144_WORDS_PER_D = 2;
 static constexpr int PDMQ_V4_K16D16_144_PAYLOAD_BYTES = PDMQ_D * PDMQ_V4_K16D16_144_WORDS_PER_D * (int) sizeof(uint32_t);
-
-static __device__ __forceinline__ const char * pdmq_v_v4_k16d16_block_ptr(
-        const char * __restrict__ V,
-        const int64_t v_nb11,
-        const int64_t v_nb12,
-        const int64_t v_nb13,
-        const int64_t v_ne13,
-        const int k16_base,
-        const int hk,
-        const int b) {
-    const int vb = v_ne13 > 1 ? (b % v_ne13) : 0;
-    return V + int64_t(vb) * v_nb13 + int64_t(hk) * v_nb12 + int64_t(k16_base) * v_nb11;
-}
-
-static __device__ __forceinline__ int pdmq_decode_v_v4_k16d16_block_i4(
-        const char * __restrict__ block,
-        const int slot,
-        const int d) {
-    const uint32_t word = ((const uint32_t *) (block + int64_t(d) * PDMQ_V4_K16D16_WORDS_PER_D * (int64_t) sizeof(uint32_t)))[slot >> 3];
-    return int((word >> (4 * (slot & 7))) & 0x0fu) - 8;
-}
-
-static __device__ __forceinline__ float pdmq_v_v4_k16d16_block_scale(
-        const char * __restrict__ block,
-        const int d) {
-    const int d_tile = d / PDMQ_V4_K16D16_D_TILE;
-    return __half2float(((const half *) (block + PDMQ_V4_K16D16_PAYLOAD_BYTES))[d_tile]);
-}
-
-static __device__ __forceinline__ float pdmq_decode_v_v4_k16d16(
-        const char * __restrict__ V,
-        const half * __restrict__ V4_tail,
-        const int64_t v_nb11,
-        const int64_t v_nb12,
-        const int64_t v_nb13,
-        const int64_t v_ne13,
-        const int64_t v4_tail_nb10,
-        const int64_t v4_tail_nb11,
-        const int64_t v4_tail_nb12,
-        const int k,
-        const int hk,
-        const int b,
-        const int d,
-        const int v4_live_nk) {
-    const int vb = v_ne13 > 1 ? (b % v_ne13) : 0;
-    const int k16_base = k & ~(PDMQ_V4_K16D16_K - 1);
-    const int slot = k & (PDMQ_V4_K16D16_K - 1);
-    if (k16_base + PDMQ_V4_K16D16_K > v4_live_nk) {
-        if (!V4_tail) {
-            return 0.0f;
-        }
-        const char * tail = (const char *) V4_tail + int64_t(vb) * v4_tail_nb12 + int64_t(hk * PDMQ_V4_K16D16_K + slot) * v4_tail_nb11 + int64_t(d) * v4_tail_nb10;
-        return __half2float(*(const half *) tail);
-    }
-
-    const char * block = pdmq_v_v4_k16d16_block_ptr(V, v_nb11, v_nb12, v_nb13, v_ne13, k16_base, hk, b);
-    const int q = pdmq_decode_v_v4_k16d16_block_i4(block, slot, d);
-    return float(q) * pdmq_v_v4_k16d16_block_scale(block, d);
-}
 
 static __device__ __forceinline__ const char * pdmq_v_v4_k16d16_144_block_ptr(
         const char * __restrict__ V,
@@ -966,9 +850,6 @@ static __device__ __forceinline__ float pdmq_decode_v(
     } else if constexpr (V_TYPE == PACKED16_DOT4_MMQ_V_Q8_0) {
         GGML_UNUSED(V4_tail); GGML_UNUSED(v4_tail_nb10); GGML_UNUSED(v4_tail_nb11); GGML_UNUSED(v4_tail_nb12); GGML_UNUSED(v4_live_nk);
         return pdmq_decode_v_q8_0(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k, hk, b, d);
-    } else if constexpr (V_TYPE == PACKED16_DOT4_MMQ_V4_K16D16) {
-        GGML_UNUSED(v_nb10);
-        return pdmq_decode_v_v4_k16d16(V, V4_tail, v_nb11, v_nb12, v_nb13, v_ne13, v4_tail_nb10, v4_tail_nb11, v4_tail_nb12, k, hk, b, d, v4_live_nk);
     } else if constexpr (V_TYPE == PACKED16_DOT4_MMQ_V4_K16D16_144) {
         GGML_UNUSED(v_nb10); GGML_UNUSED(V4_tail); GGML_UNUSED(v4_tail_nb10); GGML_UNUSED(v4_tail_nb11); GGML_UNUSED(v4_tail_nb12); GGML_UNUSED(v4_live_nk);
         return pdmq_decode_v_v4_k16d16_144(V, v_nb11, v_nb12, v_nb13, v_ne13, k, hk, b, d);
@@ -1980,66 +1861,8 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
                     if (d_tile >= D_TILES) {
                         continue;
                     }
-                    if constexpr (!PV_I8_WMMA && !PV_I4_WMMA && V_TYPE == PACKED16_DOT4_MMQ_V4_K16D16_144) {
-                        // V4_144-only exactness candidate: keep persistent compact
-                        // V4_144 storage, decode q4*scale to transient f16 B, keep
-                        // softmax P as f16 A, and accumulate PV with f16 WMMA -> fp32.
-                        if (!PV_I8_FULL_TILES_ONLY || row_block + 16 <= PV_WMMA_ROWS) {
-                            const int d_col = d_tile * 16 + pbwmma_f16_b_col_from_lane_lo(lane_lo);
-                            pbwmma_v8fp32 pv_acc = {0,0,0,0,0,0,0,0};
-#pragma unroll
-                            for (int kc_base = 0; kc_base < BN; kc_base += 16) {
-                                pbwmma_v16fp16 a_frag;
-                                pbwmma_v16fp16 b_frag;
-                                const bool use_v4_144_block = kc_base < tile_n;
-                                const char * v4_block = use_v4_144_block ? pdmq_v_v4_k16d16_144_block_ptr(V, v_nb11, v_nb12, v_nb13, v_ne13, k0 + kc_base, hk, b) : nullptr;
-#pragma unroll
-                                for (int kk = 0; kk < 16; ++kk) {
-                                    const int kc = kc_base + kk;
-                                    const int p_row = row_block + pbwmma_f16_a_row_from_lane_lo(lane_lo);
-                                    if (p_row < PV_WMMA_ROWS && kc < tile_n) {
-                                        const int slot = p_row / BM;
-                                        const int qr   = p_row - slot * BM;
-                                        const int hq   = dp16_fa_qblock_program_hq(qblock_program, hq_base, slot);
-                                        const int q    = dp16_fa_qblock_program_q(qblock_program, q0, qr);
-                                        a_frag[kk] = (dp16_fa_qblock_program_head_live(qblock_program, hq, slot, hk, n_heads_q, gqa_ratio) &&
-                                                dp16_fa_qblock_program_row_live(qblock_program, q, qr, nq))
-                                            ? __float2half(logits[slot][qr][kc]) : __float2half(0.0f);
-                                    } else {
-                                        a_frag[kk] = __float2half(0.0f);
-                                    }
-                                    if (kc < tile_n && use_v4_144_block) {
-                                        const int vq = pdmq_decode_v_v4_k16d16_144_block_i4(v4_block, kk, d_col);
-                                        const float vs = pdmq_v_v4_k16d16_144_block_scale(v4_block, kk, d_col);
-                                        b_frag[kk] = __float2half(float(vq) * vs);
-                                    } else {
-                                        b_frag[kk] = __float2half(0.0f);
-                                    }
-                                }
-                                pv_acc = pbwmma_mma(a_frag, b_frag, pv_acc);
-                            }
-#pragma unroll
-                            for (int i = 0; i < 8; ++i) {
-                                const int p_row = row_block + pbwmma_f16_d_row_from_acc(i, lane_hi);
-                                if (p_row >= PV_WMMA_ROWS) {
-                                    continue;
-                                }
-                                const int slot = p_row / BM;
-                                const int qr   = p_row - slot * BM;
-                                const int hq   = dp16_fa_qblock_program_hq(qblock_program, hq_base, slot);
-                                const int q    = dp16_fa_qblock_program_q(qblock_program, q0, qr);
-                                if (dp16_fa_qblock_program_head_live(qblock_program, hq, slot, hk, n_heads_q, gqa_ratio) &&
-                                        dp16_fa_qblock_program_row_live(qblock_program, q, qr, nq)) {
-                                    const int out_idx = p_row * D + d_col;
-                                    out_wmma[out_idx] = out_wmma[out_idx] * old_s[slot][qr] + pv_acc[i];
-                                }
-                            }
-                        }
-                    } else if constexpr (PV_I4_WMMA && (RAW_Q4_LDS || V_TYPE == PACKED16_DOT4_MMQ_V4_K16D16 || V_TYPE == PACKED16_DOT4_MMQ_V4_K16D16_144)) {
-                        // Native RDNA3 i4 PV in INT-FA form. Legacy q4/raw and
-                        // 130B V4 use P_u4 x V_s4 with one post scale per K16 x D.
-                        // V4_K16D16_144 keeps q4_0 row-D32 scale semantics by using
-                        // signed A_i4 = quant(P * scale(k,d32)) and exact V_s4 payload.
+                    if constexpr (PV_I4_WMMA && RAW_Q4_LDS) {
+                        // Native RDNA3 i4 PV in INT-FA form for raw q4 LDS.
                         if (!PV_I8_FULL_TILES_ONLY || row_block + 16 <= PV_WMMA_ROWS) {
                             const int d_col = d_tile * 16 + pbwmma_i8_b_col_from_lane_lo(lane_lo);
                             float pv_acc_f[8] = {0,0,0,0,0,0,0,0};
@@ -2048,291 +1871,34 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
                                 pbwmma_v2i32 a_frag;
                                 pbwmma_v2i32 b_frag;
                                 const int a_p_row = row_block + pbwmma_i8_a_row_from_lane_lo(lane_lo);
-                                constexpr bool PV_I4_V4_K16D16_130 = V_TYPE == PACKED16_DOT4_MMQ_V4_K16D16;
-                                constexpr bool PV_I4_V4_K16D16_144 = V_TYPE == PACKED16_DOT4_MMQ_V4_K16D16_144;
-                                constexpr bool PV_I4_V4_K16D16_ANY = PV_I4_V4_K16D16_130 || PV_I4_V4_K16D16_144;
-                                const bool use_v_i4_cache = !PV_I4_V4_K16D16_ANY && v_i4_cache_words != nullptr && v_i4_cache_scales != nullptr &&
-                                    v_i4_cache_k_blocks > 0 && ((k0 + kc_base) >> 4) < v_i4_cache_k_blocks;
                                 const int vb = v_ne13 > 1 ? (b % int(v_ne13)) : 0;
                                 const int k16_abs = (k0 + kc_base) >> 4;
-                                const bool use_v4_130_sealed_block = PV_I4_V4_K16D16_130 && kc_base + 16 <= tile_n && k0 + kc_base + 16 <= v4_live_nk;
-                                const bool use_v4_144_block = PV_I4_V4_K16D16_144 && kc_base < tile_n;
-                                const char * v4_block = nullptr;
-                                if constexpr (PV_I4_V4_K16D16_130) {
-                                    v4_block = use_v4_130_sealed_block ? pdmq_v_v4_k16d16_block_ptr(V, v_nb11, v_nb12, v_nb13, v_ne13, k0 + kc_base, hk, b) : nullptr;
-                                } else if constexpr (PV_I4_V4_K16D16_144) {
-                                    v4_block = use_v4_144_block ? pdmq_v_v4_k16d16_144_block_ptr(V, v_nb11, v_nb12, v_nb13, v_ne13, k0 + kc_base, hk, b) : nullptr;
-                                }
-
-                                if constexpr (PV_I4_V4_K16D16_144) {
-                                    float a_absmax_lane = 0.0f;
-                                    if (a_p_row < PV_WMMA_ROWS && use_v4_144_block) {
-                                        const int slot = a_p_row / BM;
-                                        const int qr   = a_p_row - slot * BM;
-                                        const int hq   = dp16_fa_qblock_program_hq(qblock_program, hq_base, slot);
-                                        const int q    = dp16_fa_qblock_program_q(qblock_program, q0, qr);
-                                        if (dp16_fa_qblock_program_head_live(qblock_program, hq, slot, hk, n_heads_q, gqa_ratio) &&
-                                                dp16_fa_qblock_program_row_live(qblock_program, q, qr, nq)) {
+                                const bool use_v_i4_cache = v_i4_cache_words != nullptr && v_i4_cache_scales != nullptr &&
+                                    v_i4_cache_k_blocks > 0 && k16_abs < v_i4_cache_k_blocks;
+                                const size_t vci = use_v_i4_cache
+                                    ? pdmq_v_i4_cache_index(vb, hk, k16_abs, d_col, n_heads_k, v_i4_cache_k_blocks)
+                                    : size_t(0);
+                                float vmax_lane = 0.0f;
+                                if (!use_v_i4_cache) {
 #pragma unroll
-                                            for (int kk = 0; kk < 16; ++kk) {
-                                                const int kc = kc_base + kk;
-                                                if (kc < tile_n) {
-                                                    const float vs = pdmq_v_v4_k16d16_144_block_scale(v4_block, kk, d_col);
-                                                    a_absmax_lane = fmaxf(a_absmax_lane, fabsf(logits[slot][qr][kc] * vs));
-                                                }
-                                            }
-                                        }
-                                    }
-                                    const float a_scale_lane = a_absmax_lane > 0.0f ? a_absmax_lane / 7.0f : 1.0f;
-#pragma unroll
-                                    for (int g = 0; g < PBWMMA_I4_WORDS_PER_K16; ++g) {
-                                        int av[8];
-                                        int bv[8];
-#pragma unroll
-                                        for (int j = 0; j < 8; ++j) {
-                                            const int kk = 8 * g + j;
-                                            const int kc = kc_base + kk;
-                                            if (a_p_row < PV_WMMA_ROWS && kc < tile_n && use_v4_144_block) {
-                                                const int slot = a_p_row / BM;
-                                                const int qr   = a_p_row - slot * BM;
-                                                const int hq   = dp16_fa_qblock_program_hq(qblock_program, hq_base, slot);
-                                                const int q    = dp16_fa_qblock_program_q(qblock_program, q0, qr);
-                                                const float af = (dp16_fa_qblock_program_head_live(qblock_program, hq, slot, hk, n_heads_q, gqa_ratio) &&
-                                                        dp16_fa_qblock_program_row_live(qblock_program, q, qr, nq))
-                                                    ? logits[slot][qr][kc] : 0.0f;
-                                                const float vs = pdmq_v_v4_k16d16_144_block_scale(v4_block, kk, d_col);
-                                                av[j] = pdmq_clamp_i4_signed((int) lrintf((af * vs) / a_scale_lane)) & 0x0f;
-                                                bv[j] = pdmq_decode_v_v4_k16d16_144_block_i4(v4_block, kk, d_col) & 0x0f;
-                                            } else {
-                                                av[j] = 0;
-                                                bv[j] = 0;
-                                            }
-                                        }
-                                        a_frag[g] = pdmq_pack_i4x8_unsigned(av[0], av[1], av[2], av[3], av[4], av[5], av[6], av[7]);
-                                        b_frag[g] = pdmq_pack_i4x8_unsigned(bv[0], bv[1], bv[2], bv[3], bv[4], bv[5], bv[6], bv[7]);
-                                    }
-                                    pbwmma_v8i32 pv_acc_i = {0,0,0,0,0,0,0,0};
-                                    pv_acc_i = pbwmma_mma_i4(a_frag, b_frag, pv_acc_i);
-#pragma unroll
-                                    for (int i = 0; i < 8; ++i) {
-                                        const int p_row = row_block + pbwmma_i8_d_row_from_acc(i, lane_hi);
-                                        if (p_row < PV_WMMA_ROWS && use_v4_144_block) {
-                                            const int slot = p_row / BM;
-                                            const int qr   = p_row - slot * BM;
-                                            const int hq   = dp16_fa_qblock_program_hq(qblock_program, hq_base, slot);
-                                            const int q    = dp16_fa_qblock_program_q(qblock_program, q0, qr);
-                                            if (dp16_fa_qblock_program_head_live(qblock_program, hq, slot, hk, n_heads_q, gqa_ratio) &&
-                                                    dp16_fa_qblock_program_row_live(qblock_program, q, qr, nq)) {
-                                                float a_absmax_out = 0.0f;
-#pragma unroll
-                                                for (int kk = 0; kk < 16; ++kk) {
-                                                    const int kc = kc_base + kk;
-                                                    if (kc < tile_n) {
-                                                        const float vs = pdmq_v_v4_k16d16_144_block_scale(v4_block, kk, d_col);
-                                                        a_absmax_out = fmaxf(a_absmax_out, fabsf(logits[slot][qr][kc] * vs));
-                                                    }
-                                                }
-                                                const float a_scale_out = a_absmax_out > 0.0f ? a_absmax_out / 7.0f : 1.0f;
-                                                if ((d_col & 15) == 15) {
-                                                    float pv_acc_scalar = 0.0f;
-#pragma unroll
-                                                    for (int kk = 0; kk < 16; ++kk) {
-                                                        const int kc = kc_base + kk;
-                                                        if (kc < tile_n) {
-                                                            const float p = logits[slot][qr][kc];
-                                                            const int vq = pdmq_decode_v_v4_k16d16_144_block_i4(v4_block, kk, d_col);
-                                                            const float vs = pdmq_v_v4_k16d16_144_block_scale(v4_block, kk, d_col);
-                                                            pv_acc_scalar += p * float(vq) * vs;
-                                                        }
-                                                    }
-                                                    pv_acc_f[i] += pv_acc_scalar;
-                                                } else {
-                                                    pv_acc_f[i] += float(pv_acc_i[i]) * a_scale_out;
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    const size_t vci = use_v_i4_cache
-                                        ? pdmq_v_i4_cache_index(vb, hk, k16_abs, d_col, n_heads_k, v_i4_cache_k_blocks)
-                                        : size_t(0);
-                                    float vmax_lane = 0.0f;
-                                    if (!use_v_i4_cache && !use_v4_130_sealed_block) {
-#pragma unroll
-                                        for (int kk = 0; kk < 16; ++kk) {
-                                            const int kc = kc_base + kk;
-                                            if (kc < tile_n) {
-                                                const float vv = PV_I4_V4_K16D16_130
-                                                    ? pdmq_decode_v<V_TYPE>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k0 + kc, hk, b, d_col, V4_tail, v4_tail_nb10, v4_tail_nb11, v4_tail_nb12, v4_live_nk)
-                                                    : pdmq_decode_v_q4_0_raw_lds<D>(v_raw_tile, kc, d_col);
-                                                vmax_lane = fmaxf(vmax_lane, fabsf(vv));
-                                            }
-                                        }
-                                    }
-                                    const float v_scale_lane = use_v_i4_cache ? v_i4_cache_scales[vci] :
-                                        (use_v4_130_sealed_block ? pdmq_v_v4_k16d16_block_scale(v4_block, d_col) : (vmax_lane > 0.0f ? vmax_lane / 7.0f : 1.0f));
-#pragma unroll
-                                    for (int g = 0; g < PBWMMA_I4_WORDS_PER_K16; ++g) {
-                                        int av[8];
-                                        int bv[8];
-#pragma unroll
-                                        for (int j = 0; j < 8; ++j) {
-                                            const int kk = 8 * g + j;
-                                            const int kc = kc_base + kk;
-                                            if (a_p_row < PV_WMMA_ROWS && kc < tile_n) {
-                                                const int slot = a_p_row / BM;
-                                                const int qr   = a_p_row - slot * BM;
-                                                const int hq   = dp16_fa_qblock_program_hq(qblock_program, hq_base, slot);
-                                                const int q    = dp16_fa_qblock_program_q(qblock_program, q0, qr);
-                                                const float af = (dp16_fa_qblock_program_head_live(qblock_program, hq, slot, hk, n_heads_q, gqa_ratio) && dp16_fa_qblock_program_row_live(qblock_program, q, qr, nq))
-                                                    ? logits[slot][qr][kc] : 0.0f;
-                                                const int aq = (int) lrintf(15.0f * af);
-                                                av[j] = aq < 0 ? 0 : (aq > 15 ? 15 : aq);
-                                            } else {
-                                                av[j] = 0;
-                                            }
-                                            if (!use_v_i4_cache) {
-                                                if (kc < tile_n) {
-                                                    if constexpr (PV_I4_V4_K16D16_130) {
-                                                        if (use_v4_130_sealed_block) {
-                                                            bv[j] = pdmq_decode_v_v4_k16d16_block_i4(v4_block, kk, d_col) & 0x0f;
-                                                        } else {
-                                                            const float vv = pdmq_decode_v<V_TYPE>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k0 + kc, hk, b, d_col, V4_tail, v4_tail_nb10, v4_tail_nb11, v4_tail_nb12, v4_live_nk);
-                                                            bv[j] = pdmq_clamp_i4_signed((int) lrintf(vv / v_scale_lane)) & 0x0f;
-                                                        }
-                                                    } else {
-                                                        const float vv = pdmq_decode_v_q4_0_raw_lds<D>(v_raw_tile, kc, d_col);
-                                                        bv[j] = pdmq_clamp_i4_signed((int) lrintf(vv / v_scale_lane)) & 0x0f;
-                                                    }
-                                                } else {
-                                                    bv[j] = 0;
-                                                }
-                                            }
-                                        }
-                                        a_frag[g] = pdmq_pack_i4x8_unsigned(av[0], av[1], av[2], av[3], av[4], av[5], av[6], av[7]);
-                                        b_frag[g] = use_v_i4_cache
-                                            ? v_i4_cache_words[vci * size_t(PBWMMA_I4_WORDS_PER_K16) + size_t(g)]
-                                            : pdmq_pack_i4x8_unsigned(bv[0], bv[1], bv[2], bv[3], bv[4], bv[5], bv[6], bv[7]);
-                                    }
-                                    pbwmma_v8i32 pv_acc_i = {0,0,0,0,0,0,0,0};
-                                    pv_acc_i = pbwmma_mma_u4s4(a_frag, b_frag, pv_acc_i);
-#pragma unroll
-                                    for (int i = 0; i < 8; ++i) {
-                                        const int p_row = row_block + pbwmma_i8_d_row_from_acc(i, lane_hi);
-                                        if (p_row < PV_WMMA_ROWS) {
-                                            const int slot = p_row / BM;
-                                            const int qr   = p_row - slot * BM;
-                                            const int hq   = dp16_fa_qblock_program_hq(qblock_program, hq_base, slot);
-                                            const int q    = dp16_fa_qblock_program_q(qblock_program, q0, qr);
-                                            if (dp16_fa_qblock_program_head_live(qblock_program, hq, slot, hk, n_heads_q, gqa_ratio) && dp16_fa_qblock_program_row_live(qblock_program, q, qr, nq)) {
-                                                pv_acc_f[i] += float(pv_acc_i[i]) * (v_scale_lane / 15.0f);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-#pragma unroll
-                            for (int i = 0; i < 8; ++i) {
-                                const int p_row = row_block + pbwmma_i8_d_row_from_acc(i, lane_hi);
-                                if (p_row >= PV_WMMA_ROWS) {
-                                    continue;
-                                }
-                                const int slot = p_row / BM;
-                                const int qr   = p_row - slot * BM;
-                                const int hq   = dp16_fa_qblock_program_hq(qblock_program, hq_base, slot);
-                                const int q    = dp16_fa_qblock_program_q(qblock_program, q0, qr);
-                                if (dp16_fa_qblock_program_head_live(qblock_program, hq, slot, hk, n_heads_q, gqa_ratio) && dp16_fa_qblock_program_row_live(qblock_program, q, qr, nq)) {
-                                    const int out_idx = p_row * D + d_col;
-                                    out_wmma[out_idx] = out_wmma[out_idx] * old_s[slot][qr] + pv_acc_f[i];
-                                    if constexpr (V_TYPE == PACKED16_DOT4_MMQ_V4_K16D16_144) {
-                                    }
-                                }
-                            }
-                        } else {
-                            const int d_col = d_tile * 16 + pbwmma_f16_b_col_from_lane_lo(lane_lo);
-                        pbwmma_v8fp32 pv_acc = {0,0,0,0,0,0,0,0};
-#pragma unroll
-                        for (int kc_base = 0; kc_base < BN; kc_base += 16) {
-                            pbwmma_v16fp16 a_frag;
-                            pbwmma_v16fp16 b_frag;
-#pragma unroll
-                            for (int kk = 0; kk < 16; ++kk) {
-                                const int kc = kc_base + kk;
-                                const int p_row = row_block + pbwmma_f16_a_row_from_lane_lo(lane_lo);
-                                if (p_row < PV_WMMA_ROWS && kc < tile_n) {
-                                    const int slot = p_row / BM;
-                                    const int qr   = p_row - slot * BM;
-                                    const int hq   = dp16_fa_qblock_program_hq(qblock_program, hq_base, slot);
-                                    const int q    = dp16_fa_qblock_program_q(qblock_program, q0, qr);
-                                    a_frag[kk] = (dp16_fa_qblock_program_head_live(qblock_program, hq, slot, hk, n_heads_q, gqa_ratio) && dp16_fa_qblock_program_row_live(qblock_program, q, qr, nq))
-                                        ? __float2half(logits[slot][qr][kc]) : __float2half(0.0f);
-                                } else {
-                                    a_frag[kk] = __float2half(0.0f);
-                                }
-                                b_frag[kk] = kc < tile_n ? v_wmma_tile[kc * D + d_col] : __float2half(0.0f);
-                            }
-                            pv_acc = pbwmma_mma(a_frag, b_frag, pv_acc);
-                        }
-#pragma unroll
-                        for (int i = 0; i < 8; ++i) {
-                            const int p_row = row_block + pbwmma_f16_d_row_from_acc(i, lane_hi);
-                            if (p_row >= PV_WMMA_ROWS) {
-                                continue;
-                            }
-                            const int slot = p_row / BM;
-                            const int qr   = p_row - slot * BM;
-                            const int hq   = dp16_fa_qblock_program_hq(qblock_program, hq_base, slot);
-                            const int q    = dp16_fa_qblock_program_q(qblock_program, q0, qr);
-                            if (dp16_fa_qblock_program_head_live(qblock_program, hq, slot, hk, n_heads_q, gqa_ratio) && dp16_fa_qblock_program_row_live(qblock_program, q, qr, nq)) {
-                                const int out_idx = p_row * D + d_col;
-                                out_wmma[out_idx] = out_wmma[out_idx] * old_s[slot][qr] + pv_acc[i];
-                            }
-                        }
-                        }
-                    } else if constexpr (PV_I8_WMMA && V_TYPE == PACKED16_DOT4_MMQ_V4_K16D16_144) {
-                        // V4_144-only candidate: keep the persistent 144B V cache, but
-                        // use signed i8 WMMA for PV.  The V operand is the existing q4
-                        // payload sign-extended to i8; the P operand quantizes
-                        // softmax(P) * V_scale(k,d32) to i8, so no q4_0/raw-V template
-                        // support is added here.
-                        if (!PV_I8_FULL_TILES_ONLY || row_block + 16 <= PV_WMMA_ROWS) {
-                            const int d_col = d_tile * 16 + pbwmma_i8_b_col_from_lane_lo(lane_lo);
-                            float pv_acc_f[8] = {0,0,0,0,0,0,0,0};
-#pragma unroll
-                            for (int kc_base = 0; kc_base < BN; kc_base += 16) {
-                                pbwmma_v4i32 a_frag;
-                                pbwmma_v4i32 b_frag;
-                                const int a_p_row = row_block + pbwmma_i8_a_row_from_lane_lo(lane_lo);
-                                const bool use_v4_144_block = kc_base < tile_n;
-                                const char * v4_block = use_v4_144_block ? pdmq_v_v4_k16d16_144_block_ptr(V, v_nb11, v_nb12, v_nb13, v_ne13, k0 + kc_base, hk, b) : nullptr;
-                                float a_absmax_lane = 0.0f;
-                                if (a_p_row < PV_WMMA_ROWS && use_v4_144_block) {
-                                    const int slot = a_p_row / BM;
-                                    const int qr   = a_p_row - slot * BM;
-                                    const int hq   = dp16_fa_qblock_program_hq(qblock_program, hq_base, slot);
-                                    const int q    = dp16_fa_qblock_program_q(qblock_program, q0, qr);
-                                    if (dp16_fa_qblock_program_head_live(qblock_program, hq, slot, hk, n_heads_q, gqa_ratio) &&
-                                            dp16_fa_qblock_program_row_live(qblock_program, q, qr, nq)) {
-#pragma unroll
-                                        for (int kk = 0; kk < 16; ++kk) {
-                                            const int kc = kc_base + kk;
-                                            if (kc < tile_n) {
-                                                const float vs = pdmq_v_v4_k16d16_144_block_scale(v4_block, kk, d_col);
-                                                a_absmax_lane = fmaxf(a_absmax_lane, fabsf(logits[slot][qr][kc] * vs));
-                                            }
-                                        }
-                                    }
-                                }
-                                const float a_scale_lane = a_absmax_lane > 0.0f ? a_absmax_lane / 127.0f : 1.0f;
-#pragma unroll
-                                for (int g = 0; g < PBWMMA_I8_WORDS_PER_K16; ++g) {
-                                    int av[4];
-                                    int bv[4];
-#pragma unroll
-                                    for (int j = 0; j < 4; ++j) {
-                                        const int kk = 4 * g + j;
+                                    for (int kk = 0; kk < 16; ++kk) {
                                         const int kc = kc_base + kk;
-                                        if (a_p_row < PV_WMMA_ROWS && kc < tile_n && use_v4_144_block) {
+                                        if (kc < tile_n) {
+                                            const float vv = pdmq_decode_v_q4_0_raw_lds<D>(v_raw_tile, kc, d_col);
+                                            vmax_lane = fmaxf(vmax_lane, fabsf(vv));
+                                        }
+                                    }
+                                }
+                                const float v_scale_lane = use_v_i4_cache ? v_i4_cache_scales[vci] : (vmax_lane > 0.0f ? vmax_lane / 7.0f : 1.0f);
+#pragma unroll
+                                for (int g = 0; g < PBWMMA_I4_WORDS_PER_K16; ++g) {
+                                    int av[8];
+                                    int bv[8];
+#pragma unroll
+                                    for (int j = 0; j < 8; ++j) {
+                                        const int kk = 8 * g + j;
+                                        const int kc = kc_base + kk;
+                                        if (a_p_row < PV_WMMA_ROWS && kc < tile_n) {
                                             const int slot = a_p_row / BM;
                                             const int qr   = a_p_row - slot * BM;
                                             const int hq   = dp16_fa_qblock_program_hq(qblock_program, hq_base, slot);
@@ -2340,40 +1906,38 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
                                             const float af = (dp16_fa_qblock_program_head_live(qblock_program, hq, slot, hk, n_heads_q, gqa_ratio) &&
                                                     dp16_fa_qblock_program_row_live(qblock_program, q, qr, nq))
                                                 ? logits[slot][qr][kc] : 0.0f;
-                                            const float vs = pdmq_v_v4_k16d16_144_block_scale(v4_block, kk, d_col);
-                                            av[j] = pdmq_clamp_i8((int) lrintf((af * vs) / a_scale_lane));
-                                            bv[j] = pdmq_decode_v_v4_k16d16_144_block_i4(v4_block, kk, d_col);
+                                            const int aq = (int) lrintf(15.0f * af);
+                                            av[j] = aq < 0 ? 0 : (aq > 15 ? 15 : aq);
                                         } else {
                                             av[j] = 0;
-                                            bv[j] = 0;
+                                        }
+                                        if (!use_v_i4_cache) {
+                                            if (kc < tile_n) {
+                                                const float vv = pdmq_decode_v_q4_0_raw_lds<D>(v_raw_tile, kc, d_col);
+                                                bv[j] = pdmq_clamp_i4_signed((int) lrintf(vv / v_scale_lane)) & 0x0f;
+                                            } else {
+                                                bv[j] = 0;
+                                            }
                                         }
                                     }
-                                    a_frag[g] = pdmq_pack_i8x4(av[0], av[1], av[2], av[3]);
-                                    b_frag[g] = pdmq_pack_i8x4(bv[0], bv[1], bv[2], bv[3]);
+                                    a_frag[g] = pdmq_pack_i4x8_unsigned(av[0], av[1], av[2], av[3], av[4], av[5], av[6], av[7]);
+                                    b_frag[g] = use_v_i4_cache
+                                        ? v_i4_cache_words[vci * size_t(PBWMMA_I4_WORDS_PER_K16) + size_t(g)]
+                                        : pdmq_pack_i4x8_unsigned(bv[0], bv[1], bv[2], bv[3], bv[4], bv[5], bv[6], bv[7]);
                                 }
                                 pbwmma_v8i32 pv_acc_i = {0,0,0,0,0,0,0,0};
-                                pv_acc_i = pbwmma_mma_i8(a_frag, b_frag, pv_acc_i);
+                                pv_acc_i = pbwmma_mma_u4s4(a_frag, b_frag, pv_acc_i);
 #pragma unroll
                                 for (int i = 0; i < 8; ++i) {
                                     const int p_row = row_block + pbwmma_i8_d_row_from_acc(i, lane_hi);
-                                    if (p_row < PV_WMMA_ROWS && use_v4_144_block) {
+                                    if (p_row < PV_WMMA_ROWS) {
                                         const int slot = p_row / BM;
                                         const int qr   = p_row - slot * BM;
                                         const int hq   = dp16_fa_qblock_program_hq(qblock_program, hq_base, slot);
                                         const int q    = dp16_fa_qblock_program_q(qblock_program, q0, qr);
                                         if (dp16_fa_qblock_program_head_live(qblock_program, hq, slot, hk, n_heads_q, gqa_ratio) &&
                                                 dp16_fa_qblock_program_row_live(qblock_program, q, qr, nq)) {
-                                            float a_absmax_out = 0.0f;
-#pragma unroll
-                                            for (int kk = 0; kk < 16; ++kk) {
-                                                const int kc = kc_base + kk;
-                                                if (kc < tile_n) {
-                                                    const float vs = pdmq_v_v4_k16d16_144_block_scale(v4_block, kk, d_col);
-                                                    a_absmax_out = fmaxf(a_absmax_out, fabsf(logits[slot][qr][kc] * vs));
-                                                }
-                                            }
-                                            const float a_scale_out = a_absmax_out > 0.0f ? a_absmax_out / 127.0f : 1.0f;
-                                            pv_acc_f[i] += float(pv_acc_i[i]) * a_scale_out;
+                                            pv_acc_f[i] += float(pv_acc_i[i]) * (v_scale_lane / 15.0f);
                                         }
                                     }
                                 }
@@ -2395,7 +1959,7 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
                                 }
                             }
                         }
-                    } else if constexpr (PV_I8_WMMA && RAW_Q4_LDS) {
+                    }  else if constexpr (PV_I8_WMMA && RAW_Q4_LDS) {
                         // INT-FA-style PV: P_i8 = round(127 * softmax(P)); V is
                         // quantized per K16/output-column tile to int8 and rescaled as
                         // O += (P_i8 @ V_i8) * V_scale / 127. Use complete 16-row PV
@@ -2576,111 +2140,10 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
                     }
                 }
 
-                bool pv_dot4_done = false;
-                if constexpr (PDMQ_COMPILE_V4_144_PV_DOT4_I8 && V_TYPE == PACKED16_DOT4_MMQ_V4_K16D16_144) {
-                    if (qblock_program.pv_dot4_mode == DP16_FA_QBLOCK_PV_DOT4_PSCALE_I8) {
-#pragma unroll
-                        for (int slot = 0; slot < GQA_GROUP; ++slot) {
-#pragma unroll
-                            for (int qr = 0; qr < BM; ++qr) {
-                                const int hq = dp16_fa_qblock_program_hq(qblock_program, hq_base, slot);
-                                const int q  = dp16_fa_qblock_program_q(qblock_program, q0, qr);
-                                if (!dp16_fa_qblock_program_head_live(qblock_program, hq, slot, hk, n_heads_q, gqa_ratio) ||
-                                        !dp16_fa_qblock_program_row_live(qblock_program, q, qr, nq)) {
-                                    continue;
-                                }
-#pragma unroll
-                                for (int kk_base = 0; kk_base < BN; kk_base += 4) {
-                                    float a_val[4];
-                                    int   b_val[4];
-                                    float a_abs_max = 0.0f;
-#pragma unroll
-                                    for (int j = 0; j < 4; ++j) {
-                                        const int kk = kk_base + j;
-                                        if (kk < tile_n) {
-                                            const int k_abs = k0 + kk;
-                                            const int k16_base = k_abs & ~(PDMQ_V4_K16D16_144_K - 1);
-                                            const int slot16 = k_abs & (PDMQ_V4_K16D16_144_K - 1);
-                                            const char * v4_block = pdmq_v_v4_k16d16_144_block_ptr(V, v_nb11, v_nb12, v_nb13, v_ne13, k16_base, hk, b);
-                                            const float p = logits[slot][qr][kk];
-                                            const float v_scale = pdmq_v_v4_k16d16_144_block_scale(v4_block, slot16, tid);
-                                            const float a = p * v_scale;
-                                            a_val[j] = a;
-                                            b_val[j] = pdmq_decode_v_v4_k16d16_144_block_i4(v4_block, slot16, tid);
-                                            a_abs_max = fmaxf(a_abs_max, fabsf(a));
-                                        } else {
-                                            a_val[j] = 0.0f;
-                                            b_val[j] = 0;
-                                        }
-                                    }
-                                    if (a_abs_max > 0.0f) {
-                                        const float inv_a_scale = 127.0f / a_abs_max;
-                                        const int a_pack = pdmq_pack_i8x4(
-                                                pdmq_quant_i8(a_val[0], inv_a_scale),
-                                                pdmq_quant_i8(a_val[1], inv_a_scale),
-                                                pdmq_quant_i8(a_val[2], inv_a_scale),
-                                                pdmq_quant_i8(a_val[3], inv_a_scale));
-                                        const int b_pack = pdmq_pack_i8x4(b_val[0], b_val[1], b_val[2], b_val[3]);
-                                        const int dot = pdmq_dot4_i8_i8(a_pack, b_pack, 0);
-                                        acc[slot][qr] += float(dot) * (a_abs_max / 127.0f);
-                                    }
-                                }
-                            }
-                        }
-                        pv_dot4_done = true;
-                    }
-                }
-                if constexpr (PDMQ_COMPILE_QBLOCK_PV_DOT4 && RAW_Q4_LDS && V_TYPE == PACKED16_DOT4_MMQ_V_Q4_0) {
-                    if (qblock_program.pv_dot4_mode == DP16_FA_QBLOCK_PV_DOT4_PSCALE_I8) {
-#pragma unroll
-                        for (int slot = 0; slot < GQA_GROUP; ++slot) {
-#pragma unroll
-                            for (int qr = 0; qr < BM; ++qr) {
-                                const int hq = dp16_fa_qblock_program_hq(qblock_program, hq_base, slot);
-                                const int q  = dp16_fa_qblock_program_q(qblock_program, q0, qr);
-                                if (!dp16_fa_qblock_program_head_live(qblock_program, hq, slot, hk, n_heads_q, gqa_ratio) ||
-                                        !dp16_fa_qblock_program_row_live(qblock_program, q, qr, nq)) {
-                                    continue;
-                                }
-#pragma unroll
-                                for (int kk_base = 0; kk_base < BN; kk_base += 4) {
-                                    float a_val[4];
-                                    int   b_val[4];
-                                    float a_abs_max = 0.0f;
-#pragma unroll
-                                    for (int j = 0; j < 4; ++j) {
-                                        const int kk = kk_base + j;
-                                        if (kk < tile_n) {
-                                            const float p = logits[slot][qr][kk];
-                                            const float v_scale = pdmq_v_q4_0_raw_lds_scale<D>(v_raw_tile, kk, tid);
-                                            const float a = p * v_scale;
-                                            a_val[j] = a;
-                                            b_val[j] = pdmq_decode_v_q4_0_raw_lds_i8<D>(v_raw_tile, kk, tid);
-                                            a_abs_max = fmaxf(a_abs_max, fabsf(a));
-                                        } else {
-                                            a_val[j] = 0.0f;
-                                            b_val[j] = 0;
-                                        }
-                                    }
-                                    if (a_abs_max > 0.0f) {
-                                        const float inv_a_scale = 127.0f / a_abs_max;
-                                        const int a_pack = dp16_fa_qpack_pack_i8x4(
-                                                pdmq_quant_i8(a_val[0], inv_a_scale),
-                                                pdmq_quant_i8(a_val[1], inv_a_scale),
-                                                pdmq_quant_i8(a_val[2], inv_a_scale),
-                                                pdmq_quant_i8(a_val[3], inv_a_scale));
-                                        const int b_pack = dp16_fa_qpack_pack_i8x4(b_val[0], b_val[1], b_val[2], b_val[3]);
-                                        const int dot = pdmq_dot4_i8_i8(a_pack, b_pack, 0);
-                                        acc[slot][qr] += float(dot) * (a_abs_max / 127.0f);
-                                    }
-                                }
-                            }
-                        }
-                        pv_dot4_done = true;
-                    }
-                }
 
-                if (!pv_dot4_done) {
+
+
+
                     if (qblock_program.pvblock_mode == DP16_FA_QBLOCK_PVBLOCK_EXACT_SCALAR) {
                         bool live[GQA_GROUP][BM];
 #pragma unroll
@@ -2746,7 +2209,7 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
                             }
                         }
                     }
-                }
+
 #pragma unroll
                 for (int slot = 0; slot < GQA_GROUP; ++slot) {
 #pragma unroll
@@ -3320,7 +2783,6 @@ enum pdmq_v_path {
     PDMQ_V_STAGE_F32,
     PDMQ_V_RAW_LDS_Q4,
     PDMQ_V_RAW_LDS_Q4_K16D16_ORACLE,
-    PDMQ_V_V4_K16D16,
     PDMQ_V_V4_K16D16_144,
     PDMQ_V_RAW_LDS_Q8_0,
     PDMQ_V_RAW_LDS_F16,
@@ -3368,7 +2830,6 @@ static inline const char * pdmq_v_path_name(const pdmq_v_path v_path) {
         case PDMQ_V_STAGE_F32:     return "stage_f32";
         case PDMQ_V_RAW_LDS_Q4:                return "raw_lds_q4";
         case PDMQ_V_RAW_LDS_Q4_K16D16_ORACLE:  return "raw_lds_q4_k16d16_oracle";
-        case PDMQ_V_V4_K16D16:                 return "v4_k16d16";
         case PDMQ_V_V4_K16D16_144:             return "v4_k16d16_144";
         case PDMQ_V_RAW_LDS_Q8_0:              return "raw_lds_q8_0";
         case PDMQ_V_RAW_LDS_F16:   return "raw_lds_f16";
@@ -3414,9 +2875,6 @@ static inline pdmq_v_path pdmq_parse_v_path_env(const char * env) {
     if (strcmp(env, "raw_lds_q4_k16d16_oracle") == 0 || strcmp(env, "v4_k16d16_oracle") == 0) {
         return PDMQ_V_RAW_LDS_Q4_K16D16_ORACLE;
     }
-    if (strcmp(env, "v4_k16d16") == 0 || strcmp(env, "persistent_v4_k16d16") == 0) {
-        return PDMQ_V_V4_K16D16;
-    }
     if (strcmp(env, "v4_k16d16_144") == 0 || strcmp(env, "persistent_v4_k16d16_144") == 0 || strcmp(env, "q4_exact_k16d16") == 0) {
         return PDMQ_V_V4_K16D16_144;
     }
@@ -3426,7 +2884,7 @@ static inline pdmq_v_path pdmq_parse_v_path_env(const char * env) {
     if (strcmp(env, "raw_lds_f16") == 0 || strcmp(env, "raw_f16") == 0) {
         return PDMQ_V_RAW_LDS_F16;
     }
-    GGML_ABORT("packed16_dot4_mmq: bad GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_VPATH=%s, expected stage_f32, raw_lds_q4, raw_lds_q4_k16d16_oracle, v4_k16d16, v4_k16d16_144, raw_lds_q8_0, or raw_lds_f16", env);
+    GGML_ABORT("packed16_dot4_mmq: bad GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_VPATH=%s, expected stage_f32, raw_lds_q4, raw_lds_q4_k16d16_oracle, v4_k16d16_144, raw_lds_q8_0, or raw_lds_f16", env);
 }
 
 static inline pdmq_shape pdmq_select_qblock_shape_auto(const int nq) {
@@ -3523,9 +2981,6 @@ static inline pdmq_v_path pdmq_default_v_path(const int nq, const ggml_type v_ty
     if (v_type == GGML_TYPE_F16 && nq <= 8) {
         return PDMQ_V_RAW_LDS_F16;
     }
-    if (v_type == GGML_TYPE_V4_K16D16) {
-        return PDMQ_V_V4_K16D16;
-    }
     if (v_type == GGML_TYPE_V4_K16D16_144) {
         return PDMQ_V_V4_K16D16_144;
     }
@@ -3545,9 +3000,6 @@ static inline pdmq_v_path pdmq_select_v_path(
         if ((requested == PDMQ_V_RAW_LDS_Q4 || requested == PDMQ_V_RAW_LDS_Q4_K16D16_ORACLE) && v_type != GGML_TYPE_Q4_0) {
             GGML_ABORT("packed16_dot4_mmq: %s requires V=q4_0, got V=%s", pdmq_v_path_name(requested), ggml_type_name(v_type));
         }
-        if (requested == PDMQ_V_V4_K16D16 && v_type != GGML_TYPE_V4_K16D16) {
-            GGML_ABORT("packed16_dot4_mmq: v4_k16d16 requires V=v4_k16d16, got V=%s", ggml_type_name(v_type));
-        }
         if (requested == PDMQ_V_V4_K16D16_144 && v_type != GGML_TYPE_V4_K16D16_144) {
             GGML_ABORT("packed16_dot4_mmq: v4_k16d16_144 requires V=v4_k16d16_144, got V=%s", ggml_type_name(v_type));
         }
@@ -3557,7 +3009,7 @@ static inline pdmq_v_path pdmq_select_v_path(
         if (requested == PDMQ_V_RAW_LDS_F16 && v_type != GGML_TYPE_F16) {
             GGML_ABORT("packed16_dot4_mmq: raw_lds_f16 requires V=f16, got V=%s", ggml_type_name(v_type));
         }
-        if (requested != default_path && requested != PDMQ_V_RAW_LDS_Q4_K16D16_ORACLE && requested != PDMQ_V_V4_K16D16 && requested != PDMQ_V_V4_K16D16_144) {
+        if (requested != default_path && requested != PDMQ_V_RAW_LDS_Q4_K16D16_ORACLE && requested != PDMQ_V_V4_K16D16_144) {
             GGML_ABORT("packed16_dot4_mmq: VPATH=%s for V=%s nq=%d is not part of the compact PDMQ route set; default vpath=%s",
                        env, ggml_type_name(v_type), nq, pdmq_v_path_name(default_path));
         }
@@ -3743,15 +3195,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
 
     ggml_tensor * v4_cache = nullptr;
     ggml_tensor * v4_tail  = nullptr;
-    if (V->type == GGML_TYPE_V4_K16D16) {
-        llama_kv_cache_get_v4_k16d16_tensors(V->data, &v4_cache, &v4_tail);
-        if (!v4_cache || !v4_tail || v4_tail->type != GGML_TYPE_F16 || v4_tail->ne[0] != PDMQ_D) {
-            GGML_ABORT("PDMQ persistent V4_K16D16 requires registered F16 tail: V=%p cache=%p tail=%p tail_type=%s tail_ne0=%lld",
-                    (const void *) V->data, (const void *) v4_cache, (const void *) v4_tail,
-                    v4_tail ? ggml_type_name(v4_tail->type) : "none",
-                    v4_tail ? (long long) v4_tail->ne[0] : 0LL);
-        }
-    }
+
 
     const int nq = (int) Q->ne[1];
     const int nk = (int) K->ne[1];
@@ -3759,15 +3203,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     const int n_heads_k = (int) K->ne[2];
     const int gqa_ratio = n_heads_q / n_heads_k;
     const int batch = (int) Q->ne[3];
-    if (V->type == GGML_TYPE_V4_K16D16 && (!v4_tail || v4_tail->ne[1] < 16 * n_heads_k || v4_tail->ne[2] < batch)) {
-        GGML_ABORT("PDMQ persistent V4_K16D16 bad tail shape: tail=%p ne=(%lld,%lld,%lld,%lld) n_heads_k=%d batch=%d",
-                (const void *) v4_tail,
-                v4_tail ? (long long) v4_tail->ne[0] : 0LL,
-                v4_tail ? (long long) v4_tail->ne[1] : 0LL,
-                v4_tail ? (long long) v4_tail->ne[2] : 0LL,
-                v4_tail ? (long long) v4_tail->ne[3] : 0LL,
-                n_heads_k, batch);
-    }
+
     const int packed_rows = (int) packed16_payload->ne[1];
     const int64_t v_ne13 = V->ne[3] > 0 ? V->ne[3] : 1;
     const float attention_scale = ((const float *) dst->op_params)[0];
@@ -3817,8 +3253,6 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         }
     }
     const bool pdmq_pv_wmma_policy_requested = pdmq_pv_wmma_requested();
-    const bool pdmq_v4_144_pv_dot4_i8_req = pdmq_v4_144_pv_dot4_i8_requested();
-    const bool v4_approx_pv_allowed = pdmq_v4_approx_pv_allowed();
     const bool qblock_tetris_shape_policy_requested = qblock_inst && pdmq_qblock_tetris_shape_policy_requested();
     const bool qwen27b_gqa6_q4_smallq =
         V->type == GGML_TYPE_Q4_0 && nq <= 4 && n_heads_q == 24 && n_heads_k == 4 && (n_heads_q / n_heads_k) == 6;
@@ -3909,37 +3343,8 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
             GGML_ABORT("invalid GGML_CUDA_ROCM_MTP_QBLOCK_SPLITK=%s; expected 1, 2, 4, 8, 16, 32, or 64", qblock_splitk_env);
         }
     }
-    // Persistent V4 PV candidates need split-K, but the global GQAX split-K knob
-    // also hits large prefill shapes and aborts there. Keep this default-off
-    // bridge scoped to no-MTP/small-Q decode/verify so prefill remains on the
-    // scalar V4 path while token decode can exercise the V4 PV candidate route.
-    const char * v4_pv_i4_splitk_env = getenv("GGML_CUDA_ROCM_V4_K16D16_PV_I4_SPLITK_CANDIDATE");
-    const bool v4_pv_i4_candidate_v =
-        (V->type == GGML_TYPE_V4_K16D16 && plan.v_path == PDMQ_V_V4_K16D16) ||
-        (V->type == GGML_TYPE_V4_K16D16_144 && plan.v_path == PDMQ_V_V4_K16D16_144);
-    const bool v4_pv_candidate_requested =
-        (v4_approx_pv_allowed && pdmq_pv_wmma_policy_requested &&
-            (pdmq_pv_i4_wmma_requested() ||
-             (V->type == GGML_TYPE_V4_K16D16_144 && (pdmq_pv_i8_wmma_requested() || !pdmq_pv_i4_wmma_requested())))) ||
-        (pdmq_v4_144_pv_dot4_i8_req && V->type == GGML_TYPE_V4_K16D16_144 && plan.v_path == PDMQ_V_V4_K16D16_144);
-    const bool v4_pv_i4_splitk_env_set =
-        !qblock_inst && v4_pv_i4_candidate_v && v4_pv_candidate_requested && nq <= 8 &&
-        v4_pv_i4_splitk_env && *v4_pv_i4_splitk_env;
-    if (v4_pv_i4_splitk_env_set) {
-        const int v4_split_k = atoi(v4_pv_i4_splitk_env);
-        if (v4_split_k == 1 || v4_split_k == 2 || v4_split_k == 4 || v4_split_k == 8 ||
-                v4_split_k == 16 || v4_split_k == 32 || v4_split_k == 64) {
-            gqax_splitk_requested = v4_split_k;
-        } else {
-            GGML_ABORT("invalid GGML_CUDA_ROCM_V4_K16D16_PV_I4_SPLITK_CANDIDATE=%s; expected 1, 2, 4, 8, 16, 32, or 64", v4_pv_i4_splitk_env);
-        }
-    }
-    const bool v4_144_exact_splitk_env_set = false;
-    const int gqax_splitk_min_nk = [qblock_inst, v4_pv_i4_splitk_env_set, v4_144_exact_splitk_env_set]() {
+    const int gqax_splitk_min_nk = [qblock_inst]() {
         const char * s = qblock_inst ? getenv("GGML_CUDA_ROCM_MTP_QBLOCK_SPLITK_MIN_NK") : nullptr;
-        if ((!s || !*s) && v4_pv_i4_splitk_env_set) {
-            s = getenv("GGML_CUDA_ROCM_V4_K16D16_PV_I4_SPLITK_CANDIDATE_MIN_NK");
-        }
         if (!s || !*s) {
             s = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQAX_SPLITK_MIN_NK");
         }
@@ -3963,15 +3368,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     const bool gqa2_supported = gqa2_xqa_supported || gqa2_legacy_supported || gqa2_splitk_plan_supported;
     const bool gqa4_non_split_supported = false;
     const bool gqa4_splitk_plan_v =
-        (V->type == GGML_TYPE_Q4_0 && plan.v_path == PDMQ_V_RAW_LDS_Q4) ||
-        ((V->type == GGML_TYPE_V4_K16D16 || V->type == GGML_TYPE_V4_K16D16_144) &&
-            (plan.v_path == PDMQ_V_V4_K16D16 || plan.v_path == PDMQ_V_V4_K16D16_144) &&
-            ((v4_approx_pv_allowed && pdmq_pv_wmma_policy_requested &&
-                (pdmq_pv_i4_wmma_requested() ||
-                 (V->type == GGML_TYPE_V4_K16D16_144 &&
-                  (pdmq_pv_i8_wmma_requested() ||
-                   (!pdmq_pv_i4_wmma_requested() && shape == PDMQ_SHAPE_M4N32))))) ||
-             (pdmq_v4_144_pv_dot4_i8_req && V->type == GGML_TYPE_V4_K16D16_144)));
+        V->type == GGML_TYPE_Q4_0 && plan.v_path == PDMQ_V_RAW_LDS_Q4;
     const bool gqa4_splitk_plan_supported = request_gqa4 && gqax_splitk_requested > 1 &&
         (shape == PDMQ_SHAPE_M1N32 || shape == PDMQ_SHAPE_M2N32 || shape == PDMQ_SHAPE_M4N32 ||
          shape == PDMQ_SHAPE_M8N32) &&
@@ -3983,17 +3380,9 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         V->type == GGML_TYPE_Q4_0 &&
         n_heads_q == 24 && n_heads_k == 4 && gqa_ratio == 6 && nq <= 1;
     const bool gqa6_m4_candidate_allowed = shape == PDMQ_SHAPE_M4N32 &&
-        (pdmq_pv_wmma_policy_requested || qblock_tetris_shape_policy_requested || pdmq_v4_144_pv_dot4_i8_req);
+        (pdmq_pv_wmma_policy_requested || qblock_tetris_shape_policy_requested);
     const bool gqa6_splitk_plan_v =
-        (V->type == GGML_TYPE_Q4_0 && plan.v_path == PDMQ_V_RAW_LDS_Q4) ||
-        ((V->type == GGML_TYPE_V4_K16D16 || V->type == GGML_TYPE_V4_K16D16_144) &&
-            (plan.v_path == PDMQ_V_V4_K16D16 || plan.v_path == PDMQ_V_V4_K16D16_144) &&
-            ((v4_approx_pv_allowed && pdmq_pv_wmma_policy_requested &&
-                (pdmq_pv_i4_wmma_requested() ||
-                 (V->type == GGML_TYPE_V4_K16D16_144 &&
-                  (pdmq_pv_i8_wmma_requested() ||
-                   (!pdmq_pv_i4_wmma_requested() && shape == PDMQ_SHAPE_M4N32))))) ||
-             (pdmq_v4_144_pv_dot4_i8_req && V->type == GGML_TYPE_V4_K16D16_144)));
+        V->type == GGML_TYPE_Q4_0 && plan.v_path == PDMQ_V_RAW_LDS_Q4;
     const bool gqa6_splitk_plan_supported = request_gqa6 && gqax_splitk_requested > 1 &&
         (shape == PDMQ_SHAPE_M1N32 || shape == PDMQ_SHAPE_M2N32 || gqa6_m4_candidate_allowed) &&
         gqa6_splitk_plan_v && !plan.kshared &&
@@ -4018,14 +3407,8 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     const bool is_gqa2_xqa = request_gqa2 && gqa2_xqa_supported;
     const bool is_gqa2 = request_gqa2 && gqa2_supported && !is_gqa2_xqa;
     const int pdmq_layer_index = pdmq_fattn_layer_from_node_name(dst);
-    const int v4_144_pv_i4_disable_layer = []() {
-        const char * v = getenv("GGML_CUDA_ROCM_V4_K16D16_144_PV_I4_DISABLE_LAYER");
-        return v && *v ? atoi(v) : -1;
-    }();
-    const bool v4_144_pv_i4_layer_disabled = V->type == GGML_TYPE_V4_K16D16_144 &&
-        v4_144_pv_i4_disable_layer >= 0 && pdmq_layer_index == v4_144_pv_i4_disable_layer;
     const bool is_gqa4 = request_gqa4 && gqa4_supported;
-    const bool is_gqa6 = request_gqa6 && gqa6_supported && !v4_144_pv_i4_layer_disabled;
+    const bool is_gqa6 = request_gqa6 && gqa6_supported;
     const bool effective_gqa1 = !is_gqa2 && !is_gqa2_xqa && !is_gqa4 && !is_gqa6;
     const bool is_gqa1 = request_gqa1 && effective_gqa1;
     const bool gqa1_splitk_auto_enabled = []() {
@@ -4071,12 +3454,10 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     const int pdmq_k_scale_group = pdmq_k_scale_group_qblocks();
     const bool stage_v_requested = plan.v_path == PDMQ_V_STAGE_F32;
     const bool v4_k16d16_oracle = plan.v_path == PDMQ_V_RAW_LDS_Q4_K16D16_ORACLE;
-    const bool v4_k16d16_persistent = plan.v_path == PDMQ_V_V4_K16D16;
     const bool v4_k16d16_144_persistent = plan.v_path == PDMQ_V_V4_K16D16_144;
 #if !PDMQ_COMPILE_V4_ANY
-    if (v4_k16d16_oracle || v4_k16d16_persistent || v4_k16d16_144_persistent ||
-            V->type == GGML_TYPE_V4_K16D16 || V->type == GGML_TYPE_V4_K16D16_144) {
-        GGML_ABORT("PDMQ V4 K16D16 requires a live V4 compile gate (PV4 for V4_144 or legacy V4_130) in this fast dev build");
+    if (v4_k16d16_oracle || v4_k16d16_144_persistent || V->type == GGML_TYPE_V4_K16D16_144) {
+        GGML_ABORT("PDMQ V4_144 exact PV4 requires -DGGML_HIP_PDMQ_COMPILE_V4_144_PV4=ON in this fast dev build");
     }
 #endif
     const bool stage_v = stage_v_requested;
@@ -4091,42 +3472,15 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     const bool pdmq_pv_i4_cache_req = pdmq_pv_i4_cache_requested();
     const bool pdmq_pv_i8_wmma_coherent = pdmq_pv_i8_wmma_coherent_requested();
     const bool pdmq_pv_i8_wmma_tiny_scalar = pdmq_pv_i8_wmma_tiny_scalar_requested();
-    const bool pdmq_pv_i4_padded_rows = pdmq_pv_i8_wmma_coherent || v4_pv_i4_splitk_env_set;
-    const bool v4_pv_i4_wmma_v = V->type == GGML_TYPE_V4_K16D16 || V->type == GGML_TYPE_V4_K16D16_144;
-    const bool v4_pv_i4_wmma_req = v4_approx_pv_allowed && (v4_k16d16_persistent || v4_k16d16_144_persistent) && pdmq_pv_wmma_req && pdmq_pv_i4_wmma_req && !pdmq_pv_i8_wmma_req;
-    const bool v4_144_pv_i8_wmma_v = V->type == GGML_TYPE_V4_K16D16_144;
-    const bool v4_144_pv_dot4_i8_wmma_req = pdmq_v4_144_pv_dot4_i8_req && v4_k16d16_144_persistent && !pdmq_pv_i4_cache_req;
-    const bool v4_144_pv_i8_wmma_req = (v4_approx_pv_allowed && v4_k16d16_144_persistent && pdmq_pv_wmma_req && pdmq_pv_i8_wmma_req && !pdmq_pv_i4_cache_req) ||
-        v4_144_pv_dot4_i8_wmma_req;
-    const bool v4_144_pv_f16_wmma_req = v4_approx_pv_allowed && v4_k16d16_144_persistent && pdmq_pv_wmma_req &&
-        !pdmq_pv_i8_wmma_req && !pdmq_pv_i4_wmma_req && !pdmq_pv_i4_cache_req && !pdmq_v4_144_pv_dot4_i8_req;
-    const bool v4_144_pv_i4_layer_allowed = !v4_144_pv_i4_layer_disabled;
-    const bool v4_pv_i4_wmma_req_for_layer = v4_pv_i4_wmma_req && v4_144_pv_i4_layer_allowed;
-    const bool v4_144_pv_i8_wmma_req_for_layer = v4_144_pv_i8_wmma_req && v4_144_pv_i4_layer_allowed;
-    const bool v4_144_pv_f16_wmma_req_for_layer = v4_144_pv_f16_wmma_req && v4_144_pv_i4_layer_allowed;
-    const bool v4_144_pv_f16_wmma_shape_supported = shape == PDMQ_SHAPE_M4N32;
-    const bool gqa1_splitk_exact_v4_supported = false;
+    const bool pdmq_pv_i4_padded_rows = pdmq_pv_i8_wmma_coherent;
     const bool gqa1_splitk_supported = effective_gqa1 && !kshared && nq <= 8 &&
-        ((raw_lds && (V->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_F16)) ||
-         gqa1_splitk_exact_v4_supported ||
-         (v4_pv_i4_wmma_req_for_layer && v4_pv_i4_wmma_v) ||
-         (v4_144_pv_i8_wmma_req_for_layer && v4_144_pv_i8_wmma_v));
+        raw_lds && (V->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_F16);
     const bool gqa2_splitk_supported = is_gqa2 && !kshared && nq <= 8 &&
-        ((raw_lds && (V->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_F16)) ||
-         (v4_pv_i4_wmma_req_for_layer && v4_pv_i4_wmma_v) ||
-         (v4_144_pv_i8_wmma_req_for_layer && v4_144_pv_i8_wmma_v));
+        raw_lds && (V->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_F16);
     const bool gqa2x_splitk_supported = is_gqa2_xqa && raw_lds_q4 && !kshared;
-    const bool gqa4_splitk_supported = is_gqa4 && !kshared &&
-        ((raw_lds_q4 && V->type == GGML_TYPE_Q4_0) ||
-         (v4_pv_i4_wmma_req_for_layer && v4_pv_i4_wmma_v) ||
-         (v4_144_pv_i8_wmma_req_for_layer && v4_144_pv_i8_wmma_v) ||
-         (v4_144_pv_f16_wmma_req_for_layer && v4_144_pv_i8_wmma_v && v4_144_pv_f16_wmma_shape_supported)) &&
+    const bool gqa4_splitk_supported = is_gqa4 && !kshared && raw_lds_q4 && V->type == GGML_TYPE_Q4_0 &&
         n_heads_q == 16 && n_heads_k == 4 && gqa_ratio == 4 && nq <= 8;
-    const bool gqa6_splitk_supported = is_gqa6 && !kshared &&
-        ((raw_lds_q4 && V->type == GGML_TYPE_Q4_0) ||
-         (v4_pv_i4_wmma_req_for_layer && v4_pv_i4_wmma_v) ||
-         (v4_144_pv_i8_wmma_req_for_layer && v4_144_pv_i8_wmma_v) ||
-         (v4_144_pv_f16_wmma_req_for_layer && v4_144_pv_i8_wmma_v && v4_144_pv_f16_wmma_shape_supported)) &&
+    const bool gqa6_splitk_supported = is_gqa6 && !kshared && raw_lds_q4 && V->type == GGML_TYPE_Q4_0 &&
         n_heads_q == 24 && n_heads_k == 4 && gqa_ratio == 6 &&
         nq <= 4 && (shape == PDMQ_SHAPE_M1N32 || shape == PDMQ_SHAPE_M2N32 || gqa6_m4_candidate_allowed);
     const bool gqax_splitk_supported = gqa1_splitk_supported || gqa2_splitk_supported || gqa2x_splitk_supported || gqa4_splitk_supported || gqa6_splitk_supported;
@@ -4160,79 +3514,31 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     const dp16_fa_q_stage q_stage = (dp16_fa_qpack_i8_enabled() && (is_gqa1_splitk || is_gqa4_splitk || is_gqa6_splitk) && nq <= 8 && nk >= dp16_fa_qpack_i8_min_nk()) ?
         DP16_FA_Q_STAGE_QPACK_I8_BLOCK32 : DP16_FA_Q_STAGE_INLINE;
     const bool dp16_qpack_stage_active = q_stage == DP16_FA_Q_STAGE_QPACK_I8_BLOCK32;
-    const bool pdmq_v4_pv_i4_wmma_route_supported = v4_pv_i4_wmma_req_for_layer && !pdmq_pv_i8_wmma_req && !pdmq_pv_i4_cache_req &&
-        is_gqax_splitk && (launch_bn % 16 == 0) && v4_pv_i4_wmma_v;
-    const bool pdmq_v4_144_pv_i8_wmma_route_supported = v4_144_pv_i8_wmma_req_for_layer &&
-        is_gqax_splitk && (launch_bn % 16 == 0) && v4_144_pv_i8_wmma_v;
-    const bool pdmq_v4_144_pv_f16_wmma_route_supported = v4_144_pv_f16_wmma_req_for_layer &&
-        v4_144_pv_f16_wmma_shape_supported && is_gqax_splitk && (launch_bn % 16 == 0) && v4_144_pv_i8_wmma_v;
-    const bool pdmq_v4_pv_wmma_route_supported = pdmq_v4_pv_i4_wmma_route_supported ||
-        pdmq_v4_144_pv_i8_wmma_route_supported || pdmq_v4_144_pv_f16_wmma_route_supported;
-    const bool pdmq_pv_wmma_route_supported = (raw_lds && !kshared && (launch_bn % 16 == 0) &&
+    const bool pdmq_pv_wmma_route_supported = raw_lds && !kshared && (launch_bn % 16 == 0) &&
         ((is_gqa1_splitk && (V->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_F16)) ||
          (is_gqa4_splitk && raw_lds_q4 && V->type == GGML_TYPE_Q4_0) ||
-         (is_gqa6_splitk && raw_lds_q4 && V->type == GGML_TYPE_Q4_0))) ||
-        pdmq_v4_pv_wmma_route_supported;
+         (is_gqa6_splitk && raw_lds_q4 && V->type == GGML_TYPE_Q4_0));
     // PV-WMMA is a small-GEMM microkernel over P[M x BN] * V[BN x D].
     // It row-blocks M in 16-row chunks, so GQA4/M4 is one full tile and
     // GQA6/M4 is 16+8 padded rows. Larger M should wait for a dedicated
     // multi-CTA row-blocked design.
     const bool pdmq_pv_wmma_shape_supported = plan.gqa_group * launch_bm <= 32;
-    const bool pdmq_pv_wmma_supported = pdmq_pv_wmma_route_supported && pdmq_pv_wmma_shape_supported && v4_144_pv_i4_layer_allowed;
+    const bool pdmq_pv_wmma_supported = pdmq_pv_wmma_route_supported && pdmq_pv_wmma_shape_supported;
     if (pdmq_pv_wmma_req && is_gqax_splitk && !pdmq_pv_wmma_route_supported) {
         GGML_ABORT("PDMQ PV-WMMA requested but unsupported on split-K route: variant=%s shape=%s(%dx%d) V=%s vpath=%s split_k=%d gqa_group=%d rows=%d kshared=%d",
                    is_gqa1_splitk ? "GQA1_SPLITK" : (is_gqa2_splitk ? "GQA2_SPLITK" : (is_gqa2_xqa_splitk ? "GQA2X_SPLITK" : (is_gqa4_splitk ? "GQA4_SPLITK" : (is_gqa6_splitk ? "GQA6_SPLITK" : "non_splitk")))),
                    pdmq_shape_name(shape), launch_bm, launch_bn, ggml_type_name(V->type), pdmq_v_path_name(plan.v_path),
                    is_gqax_splitk ? gqax_splitk_active : 0, plan.gqa_group, plan.gqa_group * launch_bm, kshared ? 1 : 0);
     }
-    const bool pdmq_pv_wmma_active = (pdmq_pv_wmma_req || v4_144_pv_dot4_i8_wmma_req) && pdmq_pv_wmma_supported;
+    const bool pdmq_pv_wmma_active = pdmq_pv_wmma_req && pdmq_pv_wmma_supported;
     const bool pdmq_pv_i8_wmma_full_tile_available = plan.role == PDMQ_ROLE_VERIFY && plan.gqa_group * launch_bm >= 16;
     const bool pdmq_pv_i4_wmma_active = pdmq_pv_wmma_active && pdmq_pv_i4_wmma_req && !pdmq_pv_i8_wmma_req &&
-        (pdmq_pv_i4_padded_rows || pdmq_pv_i8_wmma_full_tile_available) &&
-        ((raw_lds_q4 && V->type == GGML_TYPE_Q4_0) || pdmq_v4_pv_i4_wmma_route_supported);
-    const bool pdmq_pv_i8_wmma_active = !pdmq_pv_i4_wmma_active && pdmq_pv_wmma_active && (pdmq_pv_i8_wmma_req || v4_144_pv_dot4_i8_wmma_req) &&
-        (pdmq_pv_i8_wmma_coherent || pdmq_pv_i8_wmma_full_tile_available || v4_144_pv_dot4_i8_wmma_req) &&
-        ((raw_lds_q4 && V->type == GGML_TYPE_Q4_0) || pdmq_v4_144_pv_i8_wmma_route_supported);
-    const bool pdmq_pv_dot4_route_supported = plan.role == PDMQ_ROLE_VERIFY && is_gqax_splitk && raw_lds_q4 &&
-        V->type == GGML_TYPE_Q4_0 && nq <= 8 && launch_bn == 32 &&
-        !pdmq_pv_wmma_active && !pdmq_pv_i8_wmma_active && !pdmq_pv_i4_wmma_active;
-    const bool pdmq_qblock_pv_dot4_req = pdmq_qblock_pv_dot4_requested();
-    const bool pdmq_qblock_pv_dot4_supported = qblock_inst && pdmq_pv_dot4_route_supported;
-    const bool pdmq_v4_144_pv_dot4_i8_storage_ok = v4_k16d16_144_persistent && directv && !stage_v &&
-        V->type == GGML_TYPE_V4_K16D16_144;
-    const bool pdmq_v4_144_pv_dot4_i8_supported = pdmq_v4_144_pv_dot4_i8_storage_ok &&
-        nq <= 8 && (launch_bn % 4) == 0 &&
-        !pdmq_pv_wmma_active && !pdmq_pv_i8_wmma_active && !pdmq_pv_i4_wmma_active && !pdmq_qblock_pv_dot4_req;
-    if (pdmq_v4_144_pv_dot4_i8_req && !pdmq_v4_144_pv_dot4_i8_storage_ok) {
-        GGML_ABORT("GGML_CUDA_ROCM_V4_K16D16_144_PV_DOT4_I8 requires persistent V4_144 direct-V storage: V=%s vpath=%s stage_v=%d directv=%d",
-                   ggml_type_name(V->type), pdmq_v_path_name(plan.v_path), stage_v ? 1 : 0, directv ? 1 : 0);
-    }
-    const bool v4_pv_i4_experiment_requested = v4_approx_pv_allowed && (v4_k16d16_persistent || v4_k16d16_144_persistent) && pdmq_pv_wmma_req && pdmq_pv_i4_wmma_req &&
-        !pdmq_pv_i8_wmma_req && !pdmq_pv_i4_cache_req && !pdmq_qblock_pv_dot4_req;
-    const bool v4_pv_i8_candidate_requested = v4_approx_pv_allowed && v4_k16d16_144_persistent && pdmq_pv_wmma_req && pdmq_pv_i8_wmma_req &&
-        !pdmq_pv_i4_cache_req && !pdmq_qblock_pv_dot4_req;
-    const bool v4_pv_f16_candidate_requested = v4_approx_pv_allowed && v4_k16d16_144_persistent && pdmq_pv_wmma_req &&
-        !pdmq_pv_i8_wmma_req && !pdmq_pv_i4_wmma_req && !pdmq_pv_i4_cache_req && !pdmq_qblock_pv_dot4_req;
-    const bool v4_pv_i4_experiment_active = v4_pv_i4_experiment_requested && pdmq_pv_i4_wmma_active;
-    if ((v4_k16d16_oracle || v4_k16d16_persistent || v4_k16d16_144_persistent) &&
-            (pdmq_pv_wmma_req || pdmq_pv_i8_wmma_req || pdmq_pv_i4_wmma_req || pdmq_pv_i4_cache_req || pdmq_qblock_pv_dot4_req || pdmq_v4_144_pv_dot4_i8_req) &&
-            !v4_pv_i4_experiment_requested && !v4_pv_i8_candidate_requested && !v4_pv_f16_candidate_requested && !pdmq_v4_144_pv_dot4_i8_req) {
-        GGML_ABORT("PDMQ V4 K16D16 scalar/direct path is the only hash-preserving path; compile and enable GGML_CUDA_ROCM_V4_K16D16_APPROX_PV=1 only for demoted approximate PV experiments; vpath=%s", pdmq_v_path_name(plan.v_path));
-    }
-    if (pdmq_qblock_pv_dot4_req && qblock_inst && !pdmq_qblock_pv_dot4_supported) {
-        GGML_ABORT("PDMQ QBlock PV-DOT4 requested but unsupported: role=%d qblock=%d variant=%s shape=%s(%dx%d) nq=%d V=%s vpath=%s split_k=%d gqa_group=%d pv_wmma=%d pv_i8=%d pv_i4=%d",
-                   (int) plan.role, qblock_inst ? 1 : 0,
-                   is_gqa6_splitk ? "GQA6_SPLITK" : (is_gqa4_splitk ? "GQA4_SPLITK" : (is_gqa2_splitk ? "GQA2_SPLITK" : (is_gqa1_splitk ? "GQA1_SPLITK" : "non_splitk"))),
-                   pdmq_shape_name(shape), launch_bm, launch_bn, nq, ggml_type_name(V->type), pdmq_v_path_name(plan.v_path),
-                   is_gqax_splitk ? gqax_splitk_active : 0, plan.gqa_group,
-                   pdmq_pv_wmma_active ? 1 : 0, pdmq_pv_i8_wmma_active ? 1 : 0, pdmq_pv_i4_wmma_active ? 1 : 0);
-    }
-    const bool pdmq_qblock_pv_dot4_active = pdmq_qblock_pv_dot4_req && pdmq_qblock_pv_dot4_supported;
-    const bool pdmq_v4_144_pv_dot4_i8_active = pdmq_v4_144_pv_dot4_i8_req && pdmq_v4_144_pv_dot4_i8_supported;
+        (pdmq_pv_i4_padded_rows || pdmq_pv_i8_wmma_full_tile_available) && raw_lds_q4 && V->type == GGML_TYPE_Q4_0;
+    const bool pdmq_pv_i8_wmma_active = !pdmq_pv_i4_wmma_active && pdmq_pv_wmma_active && pdmq_pv_i8_wmma_req &&
+        (pdmq_pv_i8_wmma_coherent || pdmq_pv_i8_wmma_full_tile_available) && raw_lds_q4 && V->type == GGML_TYPE_Q4_0;
     const bool pdmq_pvblock_exact_env_enabled = pdmq_pvblock_exact_enabled_by_env();
     const bool pdmq_pvblock_exact_supported = raw_lds_q4 && V->type == GGML_TYPE_Q4_0 && !kshared && !stage_v &&
-        !pdmq_pv_wmma_active && !pdmq_pv_i8_wmma_active && !pdmq_pv_i4_wmma_active &&
-        !pdmq_qblock_pv_dot4_active && !pdmq_v4_144_pv_dot4_i8_active;
+        !pdmq_pv_wmma_active && !pdmq_pv_i8_wmma_active && !pdmq_pv_i4_wmma_active;
     const bool pdmq_pvblock_exact_active = pdmq_pvblock_exact_env_enabled && pdmq_pvblock_exact_supported;
     const int pdmq_pvblock_mode = pdmq_pvblock_exact_active ? DP16_FA_QBLOCK_PVBLOCK_EXACT_SCALAR : DP16_FA_QBLOCK_PVBLOCK_NONE;
     int * v_i4_cache_words = nullptr;
@@ -4296,16 +3602,15 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         stage_v,
         raw_lds,
         directv);
-    qblock_program.pv_dot4_mode = (pdmq_qblock_pv_dot4_active || pdmq_v4_144_pv_dot4_i8_active) ? DP16_FA_QBLOCK_PV_DOT4_PSCALE_I8 : DP16_FA_QBLOCK_PV_DOT4_NONE;
     qblock_program.pvblock_mode = pdmq_pvblock_mode;
     const bool pdmq_v4_144_pv4_req = pdmq_v4_144_pv4_requested();
     const bool pdmq_v4_144_pv4_supported = v4_k16d16_144_persistent && directv && !stage_v &&
-        !pdmq_pv_wmma_active && !pdmq_pv_i8_wmma_active && !pdmq_pv_i4_wmma_active && !pdmq_qblock_pv_dot4_active && !pdmq_v4_144_pv_dot4_i8_active;
+        !pdmq_pv_wmma_active && !pdmq_pv_i8_wmma_active && !pdmq_pv_i4_wmma_active;
     if (pdmq_v4_144_pv4_req && !pdmq_v4_144_pv4_supported) {
-        GGML_ABORT("GGML_CUDA_ROCM_V4_K16D16_144_PV4 requested but unsupported: V=%s vpath=%s stage_v=%d directv=%d pv_wmma=%d pv_i8=%d pv_i4=%d pv_dot4=%d",
+        GGML_ABORT("GGML_CUDA_ROCM_V4_K16D16_144_PV4 requested but unsupported: V=%s vpath=%s stage_v=%d directv=%d pv_wmma=%d pv_i8=%d pv_i4=%d",
                    ggml_type_name(V->type), pdmq_v_path_name(plan.v_path), stage_v ? 1 : 0, directv ? 1 : 0,
                    pdmq_pv_wmma_active ? 1 : 0, pdmq_pv_i8_wmma_active ? 1 : 0,
-                   pdmq_pv_i4_wmma_active ? 1 : 0, qblock_program.pv_dot4_mode == DP16_FA_QBLOCK_PV_DOT4_PSCALE_I8 ? 1 : 0);
+                   pdmq_pv_i4_wmma_active ? 1 : 0);
     }
     if (pdmq_v4_144_pv4_req) {
         qblock_program.v_decode_mode = DP16_FA_QBLOCK_V_DECODE_RAW_LDS;
@@ -4327,7 +3632,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     if (qblock_route_trace) {
         const char * qblock_nq_env = getenv("LLAMA_MTP_QBLOCK_NQ");
         fprintf(stderr,
-                "MTP_QBLOCK_ROUTE: backend=rocm_packed16_dot4_mmq node=%s layer=%d graph_inst=%d variant=%s shape=%s bm=%d bn=%d nq=%d qblock_nq_env=%s nk=%d hq=%d hk=%d gqa_ratio=%d gqa_group=%d gqa_request=%d split_k=%d split_k_requested=%d split_k_effective=%d k_shards_per_q_stage=%d q_stage=%s vpath=%s mask=%d causal=%d stage_v=%d raw_lds_q4=%d v4_k16d16_oracle=%d v4_k16d16_persistent=%d v4_k16d16_144_persistent=%d directv=%d pv_wmma=%d pv_i8_wmma=%d pv_i4_wmma=%d pv_i4_cache=%d pv_dot4=%d pvblock_exact=%d qprog=%d qprog_mode=%s qprog_qprec=%s qprog_rows=%d qprog_rowmask=0x%x qprog_kind0=%d qprog_kind1=%d qprog_qmap0=%d qprog_qmap1=%d qprog_hmap0=%d qprog_pv_inline=%d qprog_vdecode=%d qprog_o_res=%d grid=(%u,%u,%u) qblock_shape_env=%d qblock_shape_policy=%s qblock_gqa_env=%d qblock_splitk_env=%d\n",
+                "MTP_QBLOCK_ROUTE: backend=rocm_packed16_dot4_mmq node=%s layer=%d graph_inst=%d variant=%s shape=%s bm=%d bn=%d nq=%d qblock_nq_env=%s nk=%d hq=%d hk=%d gqa_ratio=%d gqa_group=%d gqa_request=%d split_k=%d split_k_requested=%d split_k_effective=%d k_shards_per_q_stage=%d q_stage=%s vpath=%s mask=%d causal=%d stage_v=%d raw_lds_q4=%d v4_k16d16_oracle=%d v4_k16d16_144_persistent=%d directv=%d pv_wmma=%d pv_i8_wmma=%d pv_i4_wmma=%d pv_i4_cache=%d pvblock_exact=%d qprog=%d qprog_mode=%s qprog_qprec=%s qprog_rows=%d qprog_rowmask=0x%x qprog_kind0=%d qprog_kind1=%d qprog_qmap0=%d qprog_qmap1=%d qprog_hmap0=%d qprog_pv_inline=%d qprog_vdecode=%d qprog_o_res=%d grid=(%u,%u,%u) qblock_shape_env=%d qblock_shape_policy=%s qblock_gqa_env=%d qblock_splitk_env=%d\n",
                 pdmq_fattn_node_name(dst),
                 pdmq_fattn_layer_from_node_name(dst),
                 fa_inst_i32,
@@ -4354,14 +3659,12 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
                 stage_v ? 1 : 0,
                 raw_lds_q4 ? 1 : 0,
                 v4_k16d16_oracle ? 1 : 0,
-                v4_k16d16_persistent ? 1 : 0,
                 v4_k16d16_144_persistent ? 1 : 0,
                 directv ? 1 : 0,
                 pdmq_pv_wmma_active ? 1 : 0,
                 pdmq_pv_i8_wmma_active ? 1 : 0,
                 pdmq_pv_i4_wmma_active ? 1 : 0,
                 pdmq_pv_i4_cache_active && v_i4_cache_words && v_i4_cache_scales ? 1 : 0,
-                qblock_program.pv_dot4_mode == DP16_FA_QBLOCK_PV_DOT4_PSCALE_I8 ? 1 : 0,
                 qblock_program.pvblock_mode == DP16_FA_QBLOCK_PVBLOCK_EXACT_SCALAR ? 1 : 0,
                 qblock_program.enabled,
                 dp16_fa_qblock_rowmap_mode_name(qblock_program.rowmap_mode),
@@ -4389,7 +3692,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
             "PDMQ2 route=rocm_packed16_dot4_mmq backend=dot4_packed16_fa node=%s layer=%d graph_inst=%d variant=%s "
             "shape=%s(%dx%d) vpath=%s gqa_group=%d gqa_request=%d role=%s "
             "nq=%d nk=%d hq=%d hk=%d gqa_ratio=%d grid_y_old=%d grid_y_new=%d effective_grid_y=%d b=%d sc=%g "
-            "K=%s V=%s mask=%d f16_sidecar=%d packed_rows=%d head_stride=%d causal=%d stage_v=%d raw_lds_q4=%d v4_k16d16_oracle=%d v4_k16d16_persistent=%d v4_k16d16_144_persistent=%d raw_lds_q8=%d raw_lds_f16=%d kshared=%d directv=%d qblock=%d qprog=%d qprog_mode=%s qprog_qprec=%s qprog_rows=%d qprog_rowmask=0x%x qprog_kind0=%d qprog_kind1=%d qprog_qmap0=%d qprog_qmap1=%d qprog_hmap0=%d qprog_vdecode=%d qblock_shape_env=%d qblock_gqa_env=%d qblock_splitk_env=%d split_k=%d split_k_uncoarsened=%d k_shards_per_q_stage=%d q_stage=%s pv_wmma=%d pv_i8_wmma=%d pv_i4_wmma=%d pv_i4_cache=%d pv_dot4=%d pvblock_exact=%d k_scale_group=%d k_block_tokens=%d split_k_requested=%d split_k_effective=%d split_k_compact_empty=%d split_k_roof_cap=%d split_k_roof=%d k_blocks_total=%d\n",
+            "K=%s V=%s mask=%d f16_sidecar=%d packed_rows=%d head_stride=%d causal=%d stage_v=%d raw_lds_q4=%d v4_k16d16_oracle=%d v4_k16d16_144_persistent=%d raw_lds_q8=%d raw_lds_f16=%d kshared=%d directv=%d qblock=%d qprog=%d qprog_mode=%s qprog_qprec=%s qprog_rows=%d qprog_rowmask=0x%x qprog_kind0=%d qprog_kind1=%d qprog_qmap0=%d qprog_qmap1=%d qprog_hmap0=%d qprog_vdecode=%d qblock_shape_env=%d qblock_gqa_env=%d qblock_splitk_env=%d split_k=%d split_k_uncoarsened=%d k_shards_per_q_stage=%d q_stage=%s pv_wmma=%d pv_i8_wmma=%d pv_i4_wmma=%d pv_i4_cache=%d pvblock_exact=%d k_scale_group=%d k_block_tokens=%d split_k_requested=%d split_k_effective=%d split_k_compact_empty=%d split_k_roof_cap=%d split_k_roof=%d k_blocks_total=%d\n",
             pdmq_fattn_node_name(dst), pdmq_layer_index, fa_inst_i32,
             is_gqa1_splitk ? "GQA1_SPLITK" : (is_gqa2_splitk ? "GQA2_SPLITK" : (is_gqa2_xqa_splitk ? "GQA2X_SPLITK" : (is_gqa4_splitk ? "GQA4_SPLITK" : (is_gqa6_splitk ? "GQA6_SPLITK" : (is_gqa4 ? "GQA4" : (is_gqa6 ? "GQA6" : (is_gqa2_xqa ? "GQA2X" : (is_gqa2 ? "GQA2" : "GQA1")))))))),
             pdmq_shape_name(plan.shape), launch_bm, launch_bn,
@@ -4399,7 +3702,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
             ((is_gqa2 || is_gqa2_xqa || is_gqa4 || is_gqa6 || is_gqa1_splitk) ? grid_y_grouped : grid_y_old) * (is_gqax_splitk ? gqax_splitk_active : 1),
             batch, (double) attention_scale,
             ggml_type_name(K->type), ggml_type_name(V->type), mask ? 1 : 0, k_f16_hotcold_sidecar ? 1 : 0, packed_rows, packed_rows / n_heads_k, assume_causal ? 1 : 0,
-            stage_v ? 1 : 0, raw_lds_q4 ? 1 : 0, v4_k16d16_oracle ? 1 : 0, v4_k16d16_persistent ? 1 : 0, v4_k16d16_144_persistent ? 1 : 0, raw_lds_q8 ? 1 : 0, raw_lds_f16 ? 1 : 0, kshared ? 1 : 0, directv ? 1 : 0,
+            stage_v ? 1 : 0, raw_lds_q4 ? 1 : 0, v4_k16d16_oracle ? 1 : 0, v4_k16d16_144_persistent ? 1 : 0, raw_lds_q8 ? 1 : 0, raw_lds_f16 ? 1 : 0, kshared ? 1 : 0, directv ? 1 : 0,
             qblock_inst ? 1 : 0, qblock_program.enabled, dp16_fa_qblock_rowmap_mode_name(qblock_program.rowmap_mode), dp16_fa_qblock_q_precision_mode_name(qblock_program.q_precision_mode), qblock_program.rows_per_cta, qblock_program.row_valid_mask,
             qblock_program.row_kind[0], qblock_program.row_kind[1], qblock_program.row_q_delta[0], qblock_program.row_q_delta[1], qblock_program.head_slot_delta[0],
             qblock_program.v_decode_mode,
@@ -4412,7 +3715,6 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
             pdmq_pv_i8_wmma_active ? 1 : 0,
             pdmq_pv_i4_wmma_active ? 1 : 0,
             pdmq_pv_i4_cache_active && v_i4_cache_words && v_i4_cache_scales ? 1 : 0,
-            qblock_program.pv_dot4_mode == DP16_FA_QBLOCK_PV_DOT4_PSCALE_I8 ? 1 : 0,
             qblock_program.pvblock_mode == DP16_FA_QBLOCK_PVBLOCK_EXACT_SCALAR ? 1 : 0,
             pdmq_k_scale_group,
             is_gqax_splitk ? CEIL_DIV(nk, gqax_splitk_active) : 0,
@@ -4425,15 +3727,14 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         if (!hot_verify_once || pdmq_verbose) {
             hot_verify_once = true;
             fprintf(stderr,
-                "PDMQ2_HOT_VERIFY_ROUTE: variant=%s node=%s layer=%d graph_inst=%d shape=%s bm=%d bn=%d nq=%d nk=%d hq=%d hk=%d gqa_ratio=%d gqa_group=%d gqa_request=%d grid=(%u,%u,%u) split_k=%d split_k_requested=%d split_k_effective=%d k_blocks_total=%d k_shards_per_q_stage=%d q_stage=%s vpath=%s V=%s raw_lds_q4=%d v4_k16d16_oracle=%d v4_k16d16_persistent=%d v4_k16d16_144_persistent=%d qblock=%d pv_dot4=%d pvblock_exact=%d pv_wmma=%d pv_i8_wmma=%d pv_i4_wmma=%d\n",
+                "PDMQ2_HOT_VERIFY_ROUTE: variant=%s node=%s layer=%d graph_inst=%d shape=%s bm=%d bn=%d nq=%d nk=%d hq=%d hk=%d gqa_ratio=%d gqa_group=%d gqa_request=%d grid=(%u,%u,%u) split_k=%d split_k_requested=%d split_k_effective=%d k_blocks_total=%d k_shards_per_q_stage=%d q_stage=%s vpath=%s V=%s raw_lds_q4=%d v4_k16d16_oracle=%d v4_k16d16_144_persistent=%d qblock=%d pvblock_exact=%d pv_wmma=%d pv_i8_wmma=%d pv_i4_wmma=%d\n",
                 pdmq_variant_name, pdmq_fattn_node_name(dst), pdmq_fattn_layer_from_node_name(dst), fa_inst_i32,
                 pdmq_shape_name(plan.shape), launch_bm, launch_bn, nq, nk, n_heads_q, n_heads_k,
                 gqa_ratio, plan.gqa_group, plan.requested_gqa_group, grid.x, grid.y, grid.z,
                 is_gqax_splitk ? gqax_splitk_active : 0, gqax_splitk_requested, gqax_splitk_effective,
                 gqax_k_blocks_total, dp16_k_shards_per_q_stage, dp16_fa_q_stage_name(q_stage),
-                pdmq_v_path_name(plan.v_path), ggml_type_name(V->type), raw_lds_q4 ? 1 : 0, v4_k16d16_oracle ? 1 : 0, v4_k16d16_persistent ? 1 : 0, v4_k16d16_144_persistent ? 1 : 0,
+                pdmq_v_path_name(plan.v_path), ggml_type_name(V->type), raw_lds_q4 ? 1 : 0, v4_k16d16_oracle ? 1 : 0, v4_k16d16_144_persistent ? 1 : 0,
                 qblock_inst ? 1 : 0,
-                qblock_program.pv_dot4_mode == DP16_FA_QBLOCK_PV_DOT4_PSCALE_I8 ? 1 : 0,
                 qblock_program.pvblock_mode == DP16_FA_QBLOCK_PVBLOCK_EXACT_SCALAR ? 1 : 0,
                 pdmq_pv_wmma_active ? 1 : 0, pdmq_pv_i8_wmma_active ? 1 : 0, pdmq_pv_i4_wmma_active ? 1 : 0);
         }
@@ -4443,12 +3744,12 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         if (!decode_once || pdmq_verbose) {
             decode_once = true;
             fprintf(stderr,
-                "PDMQ2_DECODE_ROUTE: variant=%s node=%s layer=%d graph_inst=%d shape=%s bm=%d bn=%d nq=%d nk=%d hq=%d hk=%d gqa_ratio=%d gqa_group=%d gqa_request=%d grid=(%u,%u,%u) split_k=%d q_stage=%s vpath=%s V=%s raw_lds_q4=%d v4_k16d16_oracle=%d v4_k16d16_persistent=%d v4_k16d16_144_persistent=%d qblock=%d pvblock_exact=%d pv_wmma=%d pv_i8_wmma=%d pv_i4_wmma=%d\n",
+                "PDMQ2_DECODE_ROUTE: variant=%s node=%s layer=%d graph_inst=%d shape=%s bm=%d bn=%d nq=%d nk=%d hq=%d hk=%d gqa_ratio=%d gqa_group=%d gqa_request=%d grid=(%u,%u,%u) split_k=%d q_stage=%s vpath=%s V=%s raw_lds_q4=%d v4_k16d16_oracle=%d v4_k16d16_144_persistent=%d qblock=%d pvblock_exact=%d pv_wmma=%d pv_i8_wmma=%d pv_i4_wmma=%d\n",
                 pdmq_variant_name, pdmq_fattn_node_name(dst), pdmq_fattn_layer_from_node_name(dst), fa_inst_i32,
                 pdmq_shape_name(plan.shape), launch_bm, launch_bn, nq, nk, n_heads_q, n_heads_k,
                 gqa_ratio, plan.gqa_group, plan.requested_gqa_group, grid.x, grid.y, grid.z,
                 is_gqax_splitk ? gqax_splitk_active : 0, dp16_fa_q_stage_name(q_stage),
-                pdmq_v_path_name(plan.v_path), ggml_type_name(V->type), raw_lds_q4 ? 1 : 0, v4_k16d16_oracle ? 1 : 0, v4_k16d16_persistent ? 1 : 0, v4_k16d16_144_persistent ? 1 : 0,
+                pdmq_v_path_name(plan.v_path), ggml_type_name(V->type), raw_lds_q4 ? 1 : 0, v4_k16d16_oracle ? 1 : 0, v4_k16d16_144_persistent ? 1 : 0,
                 qblock_inst ? 1 : 0,
                 qblock_program.pvblock_mode == DP16_FA_QBLOCK_PVBLOCK_EXACT_SCALAR ? 1 : 0,
                 pdmq_pv_wmma_active ? 1 : 0, pdmq_pv_i8_wmma_active ? 1 : 0, pdmq_pv_i4_wmma_active ? 1 : 0);
@@ -4595,7 +3896,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
                     nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, batch, 1, nullptr, nullptr, qblock_program, nullptr, nullptr, 0); \
             } \
         } \
-    } else if constexpr (GROUP_VAL == 6 && (VT == PACKED16_DOT4_MMQ_V4_K16D16 || VT == PACKED16_DOT4_MMQ_V4_K16D16_144)) { \
+    } else if constexpr (GROUP_VAL == 6 && (VT == PACKED16_DOT4_MMQ_V4_K16D16_144)) { \
         if constexpr (STAGE_V_VAL || KSHARED_VAL || RAW_LDS_Q4_VAL) { \
             PDMQ_COMPACT_MATRIX_ABORT("non-direct persistent V4 compact GQA6 kernels"); \
         } else if (pdmq_pvblock_exact_active) { \
@@ -4729,9 +4030,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
 } while (0)
 
 #define PDMQ_LAUNCH_GQAX_SPLITK_SHAPE_PVWMMA(GROUP_VAL, VT, BM_VAL, BN_VAL, CAUSAL, RAW_LDS_Q4_VAL, PM, PL, PO) do { \
-    if constexpr (!PDMQ_COMPILE_V4_APPROX_PV && (VT == PACKED16_DOT4_MMQ_V4_K16D16 || (VT == PACKED16_DOT4_MMQ_V4_K16D16_144 && !PDMQ_COMPILE_V4_144_PV_DOT4_I8))) { \
-        PDMQ_COMPACT_MATRIX_ABORT("persistent V4 approximate PV-WMMA kernels"); \
-    } else if constexpr (GROUP_VAL == 1 || ((GROUP_VAL == 4 || GROUP_VAL == 6) && (VT == PACKED16_DOT4_MMQ_V_Q4_0 || VT == PACKED16_DOT4_MMQ_V4_K16D16 || VT == PACKED16_DOT4_MMQ_V4_K16D16_144))) { \
+    if constexpr (GROUP_VAL == 1 || ((GROUP_VAL == 4 || GROUP_VAL == 6) && VT == PACKED16_DOT4_MMQ_V_Q4_0)) { \
         if (pdmq_pv_i4_wmma_active && pdmq_pv_i4_padded_rows) { \
             packed16_dot4_mmq_gqax_kernel<VT, BM_VAL, BN_VAL, PDMQ_D, CAUSAL, false, RAW_LDS_Q4_VAL, false, GROUP_VAL, true, false, false, false, true><<<grid, block, 0, stream>>>( \
                 (const float *) Q->data, (const char *) V->data, (const half *) (v4_tail ? v4_tail->data : nullptr), (float *) dst->data, PM, PL, PO, \
@@ -4784,7 +4083,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
 } while (0)
 
 #define PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA(GROUP_VAL, VT, CAUSAL, PM, PL, PO) do { \
-    constexpr bool pvwmma_raw_lds_q4 = VT != PACKED16_DOT4_MMQ_V4_K16D16 && VT != PACKED16_DOT4_MMQ_V4_K16D16_144; \
+    constexpr bool pvwmma_raw_lds_q4 = true; \
     if (shape == PDMQ_SHAPE_M1N32) { \
         PDMQ_LAUNCH_GQAX_SPLITK_SHAPE_PVWMMA(GROUP_VAL, VT, PDMQ_BM_DECODE32, PDMQ_BN_DECODE32, CAUSAL, pvwmma_raw_lds_q4, PM, PL, PO); \
     } else if (shape == PDMQ_SHAPE_M2N32) { \
@@ -4801,7 +4100,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
 } while (0)
 
 #define PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA_ROWS16(GROUP_VAL, VT, CAUSAL, PM, PL, PO) do { \
-    constexpr bool pvwmma_raw_lds_q4 = VT != PACKED16_DOT4_MMQ_V4_K16D16 && VT != PACKED16_DOT4_MMQ_V4_K16D16_144; \
+    constexpr bool pvwmma_raw_lds_q4 = true; \
     if (shape == PDMQ_SHAPE_M1N32) { \
         PDMQ_LAUNCH_GQAX_SPLITK_SHAPE_PVWMMA(GROUP_VAL, VT, PDMQ_BM_DECODE32, PDMQ_BN_DECODE32, CAUSAL, pvwmma_raw_lds_q4, PM, PL, PO); \
     } else if (shape == PDMQ_SHAPE_M2N32) { \
@@ -4818,7 +4117,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
 #define PDMQ_LAUNCH_GQA4(VT, CAUSAL, kshared_var, raw_lds_q4_var) \
     PDMQ_COMPACT_MATRIX_ABORT("GQA4 kernels")
 #define PDMQ_LAUNCH_GQA6_IMPL(VT, BM_VAL, BN_VAL, CAUSAL, kshared_var, raw_lds_q4_var) do { \
-    if constexpr (VT == PACKED16_DOT4_MMQ_V4_K16D16 || VT == PACKED16_DOT4_MMQ_V4_K16D16_144) { \
+    if constexpr (VT == PACKED16_DOT4_MMQ_V4_K16D16_144) { \
         if (kshared_var || raw_lds_q4_var) { \
             PDMQ_COMPACT_MATRIX_ABORT("non-direct persistent V4 GQA6 kernels"); \
         } else { \
@@ -4873,7 +4172,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         } else { \
             PDMQ_LAUNCH_TYPED_IMPL(VT, CAUSAL, false, false, false); \
         } \
-    } else if constexpr (VT == PACKED16_DOT4_MMQ_V4_K16D16 || VT == PACKED16_DOT4_MMQ_V4_K16D16_144) { \
+    } else if constexpr (VT == PACKED16_DOT4_MMQ_V4_K16D16_144) { \
         if (raw_lds_q4_var || !directv_var) { \
             PDMQ_COMPACT_MATRIX_ABORT("staged/raw persistent V4 K16D16 V paths"); \
         } else { \
@@ -4923,8 +4222,6 @@ if (is_gqa1_splitk) {
         case GGML_TYPE_Q4_0:          PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA(1, PACKED16_DOT4_MMQ_V_Q4_0,        CAUSAL, partial_m.get(), partial_l.get(), partial_out.get()); break; \
         case GGML_TYPE_Q8_0:          PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA(1, PACKED16_DOT4_MMQ_V_Q8_0,        CAUSAL, partial_m.get(), partial_l.get(), partial_out.get()); break; \
         case GGML_TYPE_F16:           PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA(1, PACKED16_DOT4_MMQ_V_F16,         CAUSAL, partial_m.get(), partial_l.get(), partial_out.get()); break; \
-        case GGML_TYPE_V4_K16D16:     PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA(1, PACKED16_DOT4_MMQ_V4_K16D16,     CAUSAL, partial_m.get(), partial_l.get(), partial_out.get()); break; \
-        case GGML_TYPE_V4_K16D16_144: PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA(1, PACKED16_DOT4_MMQ_V4_K16D16_144, CAUSAL, partial_m.get(), partial_l.get(), partial_out.get()); break; \
         default: GGML_ABORT("packed16_dot4_mmq gqa1 split-K PV-WMMA: unsupported V type"); \
     }
     if (assume_causal) {
@@ -4949,7 +4246,7 @@ if (is_gqa1_splitk) {
         nq, nk, n_heads_q, batch, gqax_splitk_active);
 } else if (is_gqa4) {
     if (is_gqa4_splitk) {
-        GGML_ASSERT(((V->type == GGML_TYPE_Q4_0 && raw_lds_q4) || pdmq_v4_pv_wmma_route_supported) && !kshared);
+        GGML_ASSERT(V->type == GGML_TYPE_Q4_0 && raw_lds_q4 && !kshared);
         const size_t partial_rows = size_t(gqax_splitk_active) * size_t(batch) * size_t(nq) * size_t(n_heads_q);
         ggml_cuda_pool & pool = ctx.pool();
         dp16_fa_q_workspace q_workspace(pool);
@@ -4965,8 +4262,6 @@ if (is_gqa1_splitk) {
 #define PDMQ_LAUNCH_GQA4_SPLITK_PVWMMA(CAUSAL) \
         switch (V->type) { \
             case GGML_TYPE_Q4_0:          PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA_ROWS16(4, PACKED16_DOT4_MMQ_V_Q4_0,        CAUSAL, partial_m.get(), partial_l.get(), partial_out.get()); break; \
-            case GGML_TYPE_V4_K16D16:     PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA_ROWS16(4, PACKED16_DOT4_MMQ_V4_K16D16,     CAUSAL, partial_m.get(), partial_l.get(), partial_out.get()); break; \
-            case GGML_TYPE_V4_K16D16_144: PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA_ROWS16(4, PACKED16_DOT4_MMQ_V4_K16D16_144, CAUSAL, partial_m.get(), partial_l.get(), partial_out.get()); break; \
             default: GGML_ABORT("packed16_dot4_mmq gqa4 split-K PV-WMMA: unsupported V type"); \
         }
         if (assume_causal) {
@@ -5002,7 +4297,7 @@ if (is_gqa1_splitk) {
     }
 } else if (is_gqa6) {
     if (is_gqa6_splitk) {
-        GGML_ASSERT(((V->type == GGML_TYPE_Q4_0 && raw_lds_q4) || pdmq_v4_pv_wmma_route_supported) && !kshared);
+        GGML_ASSERT(V->type == GGML_TYPE_Q4_0 && raw_lds_q4 && !kshared);
         const size_t partial_rows = size_t(gqax_splitk_active) * size_t(batch) * size_t(nq) * size_t(n_heads_q);
         ggml_cuda_pool & pool = ctx.pool();
         dp16_fa_q_workspace q_workspace(pool);
@@ -5018,8 +4313,6 @@ if (is_gqa1_splitk) {
 #define PDMQ_LAUNCH_GQA6_SPLITK_PVWMMA(CAUSAL) \
         switch (V->type) { \
             case GGML_TYPE_Q4_0:          PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA_ROWS16(6, PACKED16_DOT4_MMQ_V_Q4_0,        CAUSAL, partial_m.get(), partial_l.get(), partial_out.get()); break; \
-            case GGML_TYPE_V4_K16D16:     PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA_ROWS16(6, PACKED16_DOT4_MMQ_V4_K16D16,     CAUSAL, partial_m.get(), partial_l.get(), partial_out.get()); break; \
-            case GGML_TYPE_V4_K16D16_144: PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA_ROWS16(6, PACKED16_DOT4_MMQ_V4_K16D16_144, CAUSAL, partial_m.get(), partial_l.get(), partial_out.get()); break; \
             default: GGML_ABORT("packed16_dot4_mmq gqa6 split-K PV-WMMA: unsupported V type"); \
         }
         if (assume_causal) {
@@ -5132,7 +4425,6 @@ if (is_gqa1_splitk) {
         case GGML_TYPE_Q4_0:      PDMQ_LAUNCH_TYPED(PACKED16_DOT4_MMQ_V_Q4_0,      CAUSAL, kshared, directv, raw_lds); break; \
         case GGML_TYPE_Q8_0:      PDMQ_LAUNCH_TYPED(PACKED16_DOT4_MMQ_V_Q8_0,      CAUSAL, kshared, directv, raw_lds); break; \
         case GGML_TYPE_F16:            PDMQ_LAUNCH_TYPED(PACKED16_DOT4_MMQ_V_F16,            CAUSAL, kshared, directv, raw_lds); break; \
-        case GGML_TYPE_V4_K16D16:      PDMQ_LAUNCH_TYPED(PACKED16_DOT4_MMQ_V4_K16D16,        CAUSAL, kshared, directv, raw_lds); break; \
         case GGML_TYPE_V4_K16D16_144:  PDMQ_LAUNCH_TYPED(PACKED16_DOT4_MMQ_V4_K16D16_144,    CAUSAL, kshared, directv, raw_lds); break; \
         default: GGML_ABORT("packed16_dot4_mmq: unsupported V type"); \
     }
@@ -5155,11 +4447,9 @@ if (is_gqa1_splitk) {
     //   - GQA6 non-split, V=q4_0, raw_lds_q4, M1N32 (decode fallback/oracle)
     //   - GQA1 non-split, V=q4_0, raw_lds_q4, M1/M2/M8N32 and M16N16 (warmup / normal prefill)
 #if PDMQ_COMPILE_V4_ANY
-    const bool debug_v4_130_cell = PDMQ_COMPILE_V4_130 && V->type == GGML_TYPE_V4_K16D16 && v4_k16d16_persistent && !raw_lds && !kshared;
     const bool debug_v4_144_cell = PDMQ_COMPILE_V4_144 && V->type == GGML_TYPE_V4_K16D16_144 && v4_k16d16_144_persistent && !raw_lds && !kshared;
-    const bool debug_v4_cell = debug_v4_130_cell || debug_v4_144_cell;
+    const bool debug_v4_cell = debug_v4_144_cell;
 #else
-    const bool debug_v4_130_cell = false;
     const bool debug_v4_144_cell = false;
     const bool debug_v4_cell = false;
 #endif
@@ -5167,15 +4457,8 @@ if (is_gqa1_splitk) {
         GGML_ABORT("PDMQ QWEN35_DEBUG_ONLY supports only V=q4_0 raw_lds_q4 kshared=0 or scalar persistent V4 K16D16 GQA1/GQA6; variant=%s V=%s raw_lds_q4=%d kshared=%d vpath=%s",
                    pdmq_variant_name, ggml_type_name(V->type), raw_lds_q4 ? 1 : 0, kshared ? 1 : 0, pdmq_v_path_name(plan.v_path));
     }
-#if PDMQ_COMPILE_V4_ANY
-    const bool debug_v4_pv_i4_cell = debug_v4_cell && pdmq_pv_wmma_active &&
-        !pdmq_pv_i4_cache_active && !pdmq_qblock_pv_dot4_active;
-#else
-    const bool debug_v4_pv_i4_cell = false;
-#endif
-    if ((pdmq_pv_wmma_active || pdmq_pv_i8_wmma_active || pdmq_pv_i4_wmma_active || pdmq_pv_i4_cache_active) &&
-            !debug_v4_pv_i4_cell) {
-        GGML_ABORT("PDMQ QWEN35_DEBUG_ONLY disables PV-WMMA/PV-I8/PV-I4/i4-cache debug cells except persistent V4 PV-WMMA split-K candidates");
+    if (pdmq_pv_wmma_active || pdmq_pv_i8_wmma_active || pdmq_pv_i4_wmma_active || pdmq_pv_i4_cache_active) {
+        GGML_ABORT("PDMQ QWEN35_DEBUG_ONLY disables PV-WMMA/PV-I8/PV-I4/i4-cache debug cells");
     }
 
     const bool debug_gqa1_cell = !is_gqa2 && !is_gqa2_xqa && !is_gqa4 && !is_gqa6 && !is_gqax_splitk;
@@ -5212,9 +4495,7 @@ if (is_gqa1_splitk) {
         }
 #undef PDMQ_LAUNCH_DEBUG_GQA1
     } else if (is_gqa1_splitk) {
-        GGML_ASSERT(((V->type == GGML_TYPE_Q4_0 && raw_lds_q4) ||
-                     (gqa1_splitk_exact_v4_supported && (debug_v4_144_cell || debug_v4_130_cell)) ||
-                     pdmq_v4_pv_wmma_route_supported) && !kshared);
+        GGML_ASSERT(V->type == GGML_TYPE_Q4_0 && raw_lds_q4 && !kshared);
         const size_t partial_rows = size_t(gqax_splitk_active) * size_t(batch) * size_t(nq) * size_t(n_heads_q);
         ggml_cuda_pool & pool = ctx.pool();
         dp16_fa_q_workspace q_workspace(pool);
@@ -5225,33 +4506,6 @@ if (is_gqa1_splitk) {
         ggml_cuda_pool_alloc<float> partial_m(pool, partial_rows);
         ggml_cuda_pool_alloc<float> partial_l(pool, partial_rows);
         ggml_cuda_pool_alloc<float> partial_out(pool, partial_rows * size_t(PDMQ_D));
-#if PDMQ_COMPILE_V4_APPROX_PV
-        if (gqa1_splitk_exact_v4_supported && debug_v4_144_cell) {
-            if (assume_causal) {
-                PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_DIRECTV(1, PACKED16_DOT4_MMQ_V4_K16D16_144, true, partial_m.get(), partial_l.get(), partial_out.get());
-            } else {
-                PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_DIRECTV(1, PACKED16_DOT4_MMQ_V4_K16D16_144, false, partial_m.get(), partial_l.get(), partial_out.get());
-            }
-        } else if (gqa1_splitk_exact_v4_supported && debug_v4_130_cell) {
-            if (assume_causal) {
-                PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_DIRECTV(1, PACKED16_DOT4_MMQ_V4_K16D16, true, partial_m.get(), partial_l.get(), partial_out.get());
-            } else {
-                PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_DIRECTV(1, PACKED16_DOT4_MMQ_V4_K16D16, false, partial_m.get(), partial_l.get(), partial_out.get());
-            }
-        } else if (debug_v4_pv_i4_cell) {
-            if (debug_v4_144_cell) {
-                if (assume_causal) {
-                    PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA(1, PACKED16_DOT4_MMQ_V4_K16D16_144, true, partial_m.get(), partial_l.get(), partial_out.get());
-                } else {
-                    PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA(1, PACKED16_DOT4_MMQ_V4_K16D16_144, false, partial_m.get(), partial_l.get(), partial_out.get());
-                }
-            } else if (assume_causal) {
-                PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA(1, PACKED16_DOT4_MMQ_V4_K16D16, true, partial_m.get(), partial_l.get(), partial_out.get());
-            } else {
-                PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA(1, PACKED16_DOT4_MMQ_V4_K16D16, false, partial_m.get(), partial_l.get(), partial_out.get());
-            }
-        } else
-#endif
         if (assume_causal) {
             PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE(1, PACKED16_DOT4_MMQ_V_Q4_0, true, partial_m.get(), partial_l.get(), partial_out.get());
         } else {
@@ -5276,29 +4530,6 @@ if (is_gqa1_splitk) {
         ggml_cuda_pool_alloc<float> partial_m(pool, partial_rows);
         ggml_cuda_pool_alloc<float> partial_l(pool, partial_rows);
         ggml_cuda_pool_alloc<float> partial_out(pool, partial_rows * size_t(PDMQ_D));
-#if PDMQ_COMPILE_V4_APPROX_PV
-        if (debug_v4_pv_i4_cell && debug_v4_144_cell) {
-#define PDMQ_LAUNCH_DEBUG_GQA4_V4_144_PVWMMA(CAUSAL_VAL) do { \
-            if (shape == PDMQ_SHAPE_M1N32) { \
-                PDMQ_LAUNCH_GQAX_SPLITK_SHAPE_PVWMMA(4, PACKED16_DOT4_MMQ_V4_K16D16_144, PDMQ_BM_DECODE32, PDMQ_BN_DECODE32, CAUSAL_VAL, false, partial_m.get(), partial_l.get(), partial_out.get()); \
-            } else if (shape == PDMQ_SHAPE_M2N32) { \
-                PDMQ_LAUNCH_GQAX_SPLITK_SHAPE_PVWMMA(4, PACKED16_DOT4_MMQ_V4_K16D16_144, PDMQ_BM_VERIFY2_32, PDMQ_BN_VERIFY2_32, CAUSAL_VAL, false, partial_m.get(), partial_l.get(), partial_out.get()); \
-            } else if (shape == PDMQ_SHAPE_M4N32) { \
-                PDMQ_LAUNCH_GQAX_SPLITK_SHAPE_PVWMMA(4, PACKED16_DOT4_MMQ_V4_K16D16_144, PDMQ_BM_VERIFY4_32, PDMQ_BN_VERIFY4_32, CAUSAL_VAL, false, partial_m.get(), partial_l.get(), partial_out.get()); \
-            } else if (shape == PDMQ_SHAPE_M8N32) { \
-                PDMQ_LAUNCH_GQAX_SPLITK_SHAPE_PVWMMA(4, PACKED16_DOT4_MMQ_V4_K16D16_144, PDMQ_BM_SMALL, PDMQ_BN_SMALL, CAUSAL_VAL, false, partial_m.get(), partial_l.get(), partial_out.get()); \
-            } else { \
-                GGML_ABORT("PDMQ QWEN35_DEBUG_ONLY GQA4 PV-WMMA reached unsupported shape=%s", pdmq_shape_name(shape)); \
-            } \
-        } while (0)
-            if (assume_causal) {
-                PDMQ_LAUNCH_DEBUG_GQA4_V4_144_PVWMMA(true);
-            } else {
-                PDMQ_LAUNCH_DEBUG_GQA4_V4_144_PVWMMA(false);
-            }
-#undef PDMQ_LAUNCH_DEBUG_GQA4_V4_144_PVWMMA
-        } else
-#endif
         {
             GGML_ABORT("PDMQ QWEN35_DEBUG_ONLY GQA4 split-K is enabled only for persistent V4_144 PV-WMMA candidates");
         }
@@ -5322,99 +4553,18 @@ if (is_gqa1_splitk) {
         ggml_cuda_pool_alloc<float> partial_l(pool, partial_rows);
         ggml_cuda_pool_alloc<float> partial_out(pool, partial_rows * size_t(PDMQ_D));
         if (shape == PDMQ_SHAPE_M1N32) {
-#if PDMQ_COMPILE_V4_APPROX_PV
-            if (debug_v4_pv_i4_cell) {
-                if (debug_v4_144_cell) {
-                    if (assume_causal) {
-                        PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA_ROWS16(6, PACKED16_DOT4_MMQ_V4_K16D16_144, true, partial_m.get(), partial_l.get(), partial_out.get());
-                    } else {
-                        PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA_ROWS16(6, PACKED16_DOT4_MMQ_V4_K16D16_144, false, partial_m.get(), partial_l.get(), partial_out.get());
-                    }
-                } else if (assume_causal) {
-                    PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA_ROWS16(6, PACKED16_DOT4_MMQ_V4_K16D16, true, partial_m.get(), partial_l.get(), partial_out.get());
-                } else {
-                    PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA_ROWS16(6, PACKED16_DOT4_MMQ_V4_K16D16, false, partial_m.get(), partial_l.get(), partial_out.get());
-                }
-            } else if (debug_v4_144_cell) {
-                if (assume_causal) {
-                    PDMQ_LAUNCH_GQAX_SPLITK_SHAPE(6, PACKED16_DOT4_MMQ_V4_K16D16_144, PDMQ_BM_DECODE32, PDMQ_BN_DECODE32, true, false, partial_m.get(), partial_l.get(), partial_out.get());
-                } else {
-                    PDMQ_LAUNCH_GQAX_SPLITK_SHAPE(6, PACKED16_DOT4_MMQ_V4_K16D16_144, PDMQ_BM_DECODE32, PDMQ_BN_DECODE32, false, false, partial_m.get(), partial_l.get(), partial_out.get());
-                }
-            } else if (debug_v4_130_cell) {
-                if (assume_causal) {
-                    PDMQ_LAUNCH_GQAX_SPLITK_SHAPE(6, PACKED16_DOT4_MMQ_V4_K16D16, PDMQ_BM_DECODE32, PDMQ_BN_DECODE32, true, false, partial_m.get(), partial_l.get(), partial_out.get());
-                } else {
-                    PDMQ_LAUNCH_GQAX_SPLITK_SHAPE(6, PACKED16_DOT4_MMQ_V4_K16D16, PDMQ_BM_DECODE32, PDMQ_BN_DECODE32, false, false, partial_m.get(), partial_l.get(), partial_out.get());
-                }
-            } else
-#endif
             if (assume_causal) {
                 PDMQ_LAUNCH_GQAX_SPLITK_SHAPE(6, PACKED16_DOT4_MMQ_V_Q4_0, PDMQ_BM_DECODE32, PDMQ_BN_DECODE32, true, true, partial_m.get(), partial_l.get(), partial_out.get());
             } else {
                 PDMQ_LAUNCH_GQAX_SPLITK_SHAPE(6, PACKED16_DOT4_MMQ_V_Q4_0, PDMQ_BM_DECODE32, PDMQ_BN_DECODE32, false, true, partial_m.get(), partial_l.get(), partial_out.get());
             }
         } else if (shape == PDMQ_SHAPE_M2N32) {
-#if PDMQ_COMPILE_V4_APPROX_PV
-            if (debug_v4_pv_i4_cell) {
-                if (debug_v4_144_cell) {
-                    if (assume_causal) {
-                        PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA_ROWS16(6, PACKED16_DOT4_MMQ_V4_K16D16_144, true, partial_m.get(), partial_l.get(), partial_out.get());
-                    } else {
-                        PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA_ROWS16(6, PACKED16_DOT4_MMQ_V4_K16D16_144, false, partial_m.get(), partial_l.get(), partial_out.get());
-                    }
-                } else if (assume_causal) {
-                    PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA_ROWS16(6, PACKED16_DOT4_MMQ_V4_K16D16, true, partial_m.get(), partial_l.get(), partial_out.get());
-                } else {
-                    PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA_ROWS16(6, PACKED16_DOT4_MMQ_V4_K16D16, false, partial_m.get(), partial_l.get(), partial_out.get());
-                }
-            } else if (debug_v4_144_cell) {
-                if (assume_causal) {
-                    PDMQ_LAUNCH_GQAX_SPLITK_SHAPE(6, PACKED16_DOT4_MMQ_V4_K16D16_144, PDMQ_BM_VERIFY2_32, PDMQ_BN_VERIFY2_32, true, false, partial_m.get(), partial_l.get(), partial_out.get());
-                } else {
-                    PDMQ_LAUNCH_GQAX_SPLITK_SHAPE(6, PACKED16_DOT4_MMQ_V4_K16D16_144, PDMQ_BM_VERIFY2_32, PDMQ_BN_VERIFY2_32, false, false, partial_m.get(), partial_l.get(), partial_out.get());
-                }
-            } else if (debug_v4_130_cell) {
-                if (assume_causal) {
-                    PDMQ_LAUNCH_GQAX_SPLITK_SHAPE(6, PACKED16_DOT4_MMQ_V4_K16D16, PDMQ_BM_VERIFY2_32, PDMQ_BN_VERIFY2_32, true, false, partial_m.get(), partial_l.get(), partial_out.get());
-                } else {
-                    PDMQ_LAUNCH_GQAX_SPLITK_SHAPE(6, PACKED16_DOT4_MMQ_V4_K16D16, PDMQ_BM_VERIFY2_32, PDMQ_BN_VERIFY2_32, false, false, partial_m.get(), partial_l.get(), partial_out.get());
-                }
-            } else
-#endif
             if (assume_causal) {
                 PDMQ_LAUNCH_GQAX_SPLITK_SHAPE(6, PACKED16_DOT4_MMQ_V_Q4_0, PDMQ_BM_VERIFY2_32, PDMQ_BN_VERIFY2_32, true, true, partial_m.get(), partial_l.get(), partial_out.get());
             } else {
                 PDMQ_LAUNCH_GQAX_SPLITK_SHAPE(6, PACKED16_DOT4_MMQ_V_Q4_0, PDMQ_BM_VERIFY2_32, PDMQ_BN_VERIFY2_32, false, true, partial_m.get(), partial_l.get(), partial_out.get());
             }
         } else {
-#if PDMQ_COMPILE_V4_APPROX_PV
-            if (debug_v4_pv_i4_cell) {
-                if (debug_v4_144_cell) {
-                    if (assume_causal) {
-                        PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA_ROWS16(6, PACKED16_DOT4_MMQ_V4_K16D16_144, true, partial_m.get(), partial_l.get(), partial_out.get());
-                    } else {
-                        PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA_ROWS16(6, PACKED16_DOT4_MMQ_V4_K16D16_144, false, partial_m.get(), partial_l.get(), partial_out.get());
-                    }
-                } else if (assume_causal) {
-                    PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA_ROWS16(6, PACKED16_DOT4_MMQ_V4_K16D16, true, partial_m.get(), partial_l.get(), partial_out.get());
-                } else {
-                    PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_PVWMMA_ROWS16(6, PACKED16_DOT4_MMQ_V4_K16D16, false, partial_m.get(), partial_l.get(), partial_out.get());
-                }
-            } else if (debug_v4_144_cell) {
-                if (assume_causal) {
-                    PDMQ_LAUNCH_GQAX_SPLITK_SHAPE(6, PACKED16_DOT4_MMQ_V4_K16D16_144, PDMQ_BM_VERIFY4_32, PDMQ_BN_VERIFY4_32, true, false, partial_m.get(), partial_l.get(), partial_out.get());
-                } else {
-                    PDMQ_LAUNCH_GQAX_SPLITK_SHAPE(6, PACKED16_DOT4_MMQ_V4_K16D16_144, PDMQ_BM_VERIFY4_32, PDMQ_BN_VERIFY4_32, false, false, partial_m.get(), partial_l.get(), partial_out.get());
-                }
-            } else if (debug_v4_130_cell) {
-                if (assume_causal) {
-                    PDMQ_LAUNCH_GQAX_SPLITK_SHAPE(6, PACKED16_DOT4_MMQ_V4_K16D16, PDMQ_BM_VERIFY4_32, PDMQ_BN_VERIFY4_32, true, false, partial_m.get(), partial_l.get(), partial_out.get());
-                } else {
-                    PDMQ_LAUNCH_GQAX_SPLITK_SHAPE(6, PACKED16_DOT4_MMQ_V4_K16D16, PDMQ_BM_VERIFY4_32, PDMQ_BN_VERIFY4_32, false, false, partial_m.get(), partial_l.get(), partial_out.get());
-                }
-            } else
-#endif
             if (assume_causal) {
                 PDMQ_LAUNCH_GQAX_SPLITK_SHAPE(6, PACKED16_DOT4_MMQ_V_Q4_0, PDMQ_BM_VERIFY4_32, PDMQ_BN_VERIFY4_32, true, true, partial_m.get(), partial_l.get(), partial_out.get());
             } else {

@@ -3475,6 +3475,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             (strcmp(required_route, "rocm_q8k_dot4_qtile4_gqa6_kvshared") == 0 ||
              strcmp(required_route, "rocm_packed16_qtile4_gqa6_kvshared") == 0 ||
              strcmp(required_route, "qtile4_gqa6_kvshared") == 0);
+        const bool require_packed16_dot4_mmq =
+            required_route &&
+            (strcmp(required_route, "rocm_packed16_dot4_mmq") == 0 ||
+             strcmp(required_route, "packed16_dot4_mmq") == 0);
 
         const bool k_shape_ok = K->ne[0] * 4 == Q->ne[0];  // D/4 * 4 == D
         // V layout: FA expects [D,n_kv,heads,batch], native v_trans is [n_kv,heads,D,batch]
@@ -3664,6 +3668,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 BEST_FATTN_KERNEL_PACKED16_DOT4_MMQ : BEST_FATTN_KERNEL_NONE;
         }
 
+        const bool packed16_decode_enabled =
+            require_packed16_decode_alias ||
+            ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE") ||
+            ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_Q8K_DOT4_KQ") ||
+            ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_V4_K16D16_144_PACKED16_DECODE_EXPERIMENT");
+
         if (require_qtile4_gqa6_kvshared) {
             const int gqa_ratio_i32 = K->ne[2] > 0 ? (int) (Q->ne[2] / K->ne[2]) : 0;
             const bool qtile4_supported =
@@ -3714,10 +3724,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_MTP_F16K_Q4V_VEC;
         }
 
-        const bool require_packed16_dot4_mmq =
-            required_route &&
-            (strcmp(required_route, "rocm_packed16_dot4_mmq") == 0 ||
-             strcmp(required_route, "packed16_dot4_mmq") == 0);
         const bool standard_packed16_q4_dot4_mmq_smallq =
             ggml_cuda_fattn_inst_is_mtp_verify_qk(inst) &&
             V->type == GGML_TYPE_Q4_0 && Q->ne[1] <= small_verify_max_nq;
@@ -3764,12 +3770,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 (inst == GGML_FATTN_INST_NONE || inst == GGML_FATTN_INST_DECODE_QK) &&
                 K->type == GGML_TYPE_I32 && V->type == GGML_TYPE_Q4_0 &&
                 Q->ne[0] == 256 && V->ne[0] == 256 && K->ne[0] * 4 == Q->ne[0] &&
-                Q->ne[2] % K->ne[2] == 0 && ggml_cuda_q8k_dot4_kq_enabled();
+                Q->ne[2] % K->ne[2] == 0 && packed16_decode_enabled;
             const bool v4_144_nomtp_packed16_decode =
-                (inst == GGML_FATTN_INST_NONE || inst == GGML_FATTN_INST_DECODE_QK) &&
+                (inst == GGML_FATTN_INST_NONE || inst == GGML_FATTN_INST_DECODE_QK || inst == GGML_FATTN_INST_PREFILL_QK) &&
                 K->type == GGML_TYPE_I32 && V->type == GGML_TYPE_V4_K16D16_144 &&
                 Q->ne[0] == 256 && V->ne[0] == 256 && K->ne[0] * 4 == Q->ne[0] &&
-                Q->ne[2] % K->ne[2] == 0 && ggml_cuda_q8k_dot4_kq_enabled();
+                Q->ne[2] % K->ne[2] == 0 && packed16_decode_enabled;
             if (standard_nomtp_q4_packed16_decode || v4_144_nomtp_packed16_decode) {
                 return BEST_FATTN_KERNEL_PACKED16_DECODE;
             }
@@ -3778,7 +3784,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             const bool standard_mtp_q4_pdmq_decode =
                 inst == GGML_FATTN_INST_MTP_DRAFT_DECODE_QK && V->type == GGML_TYPE_Q4_0;
             const bool typed_v_pdmq_decode = V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_F16;
-            const bool v4_k16d16_pdmq_decode = V->type == GGML_TYPE_V4_K16D16 || V->type == GGML_TYPE_V4_K16D16_144;
+            const char * pdmq_vpath = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_VPATH");
+            const bool explicit_v4_144_pdmq_decode = V->type == GGML_TYPE_V4_K16D16_144 &&
+                (require_packed16_dot4_mmq || ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_V4_K16D16_144_PV4") ||
+                 (pdmq_vpath && (strcmp(pdmq_vpath, "v4_k16d16_144") == 0 || strcmp(pdmq_vpath, "persistent_v4_k16d16_144") == 0)));
+            const bool v4_k16d16_pdmq_decode = V->type == GGML_TYPE_V4_K16D16 || explicit_v4_144_pdmq_decode;
             if ((standard_nomtp_q4_pdmq_decode || standard_mtp_q4_pdmq_decode || typed_v_pdmq_decode || v4_k16d16_pdmq_decode) &&
                     ggml_cuda_packed16_dot4_mmq_supported(cc, dst)) {
                 return BEST_FATTN_KERNEL_PACKED16_DOT4_MMQ;
@@ -3925,7 +3935,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             const char * dbv_auto_env = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_DBV_AUTO");
             const bool dbv_auto_enabled = !dbv_auto_env || atoi(dbv_auto_env) != 0;
             const bool use_pvwmma = dbv_auto_enabled && impl_auto && wmma_available && is_pvwmma_context;
-            const bool use_bm32_regout = !use_pvwmma && impl_auto && wmma_available && (is_big_q || is_27b_like || is_35b_like || is_long_context);
+            const bool use_bm32_regout = !use_pvwmma && impl_auto && wmma_available &&
+                (v4_144_nomtp_prefill || is_big_q || is_27b_like || is_35b_like || is_long_context);
             const bool use_auto_wmma = use_pvwmma || use_bm32_regout;
 
             // IMPL is process-global because the launcher reads it, but auto-set

@@ -436,7 +436,9 @@ extern "C" {
         GGML_TYPE_PLANAR4_0 = 46, // PlanarQuant 4-bit: 2D Givens + 4-bit nibble
         GGML_TYPE_ISO4_0    = 47, // IsoQuant 4-bit: quaternion 4D + 4-bit nibble
         GGML_TYPE_TQ3_0   = 48, // TurboQuant-Lite 3-bit (Lloyd-Max optimal codebook)
-        GGML_TYPE_COUNT   = 49,
+        GGML_TYPE_V4_K16D16     = 49, // internal FA-only V cache: K16 x D16 signed-i4 + fp16 scales
+        GGML_TYPE_V4_K16D16_144 = 50, // internal FA-only V cache: K16 x D32 signed-i4 + fp16 scales
+        GGML_TYPE_COUNT   = 51,
     };
 
     // precision
@@ -603,6 +605,7 @@ extern "C" {
         GGML_OP_GLU,
 
         GGML_OP_PACK_K_PACKED16,
+        GGML_OP_PACK_V4_K16D16,
 
         GGML_OP_COUNT,
     };
@@ -1716,6 +1719,19 @@ extern "C" {
             struct ggml_tensor  * scales,   // destination scales (F16)
             struct ggml_tensor  * k_idxs);  // row indices (I64/I32) — scheduler dependency
 
+    GGML_API struct ggml_tensor * ggml_pack_v4_k16d16(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * v_cur,   // source (F16/F32)
+            struct ggml_tensor  * v_cache, // destination V4_K16D16 payload
+            struct ggml_tensor  * v_tail,  // destination tail/scales sidecar
+            struct ggml_tensor  * v_idxs); // row indices (I64/I32)
+
+    GGML_API struct ggml_tensor * ggml_pack_v4_k16d16_144(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * v_cur,   // source (F16/F32)
+            struct ggml_tensor  * v_cache, // destination V4_K16D16_144 payload
+            struct ggml_tensor  * v_idxs); // row indices (I64/I32)
+
     GGML_API struct ggml_tensor * ggml_diag(
         struct ggml_context     * ctx,
         struct ggml_tensor      * a);
@@ -2560,15 +2576,17 @@ extern "C" {
     // PREFILL_QK:              general prefill             (nq>1, DOT4 recthist-v4).
     // DECODE_QK:               general scalar decode       (nq==1, DOT4 BN64/split-K).
     // SPEC_VERIFY_QK:          speculative verify          (nq>1, DOT4 recthist-v4).
+    // MTP_QBLOCK_VERIFY_QK:    QBlock MTP verify           (nq>1, PDMQ-gated).
     enum ggml_fattn_instruction {
-        GGML_FATTN_INST_NONE                = 0,
-        GGML_FATTN_INST_MTP_DRAFT           = 1,
-        GGML_FATTN_INST_MTP_VERIFY_QK       = 2,
-        GGML_FATTN_INST_MTP_DRAFT_DECODE_QK = 3,
-        GGML_FATTN_INST_PREFILL_QK          = 4,
-        GGML_FATTN_INST_DECODE_QK           = 5,
-        GGML_FATTN_INST_SPEC_VERIFY_QK      = 6,
-        GGML_FATTN_INST_BATCH_VERIFY_QK     = 7,
+        GGML_FATTN_INST_NONE                  = 0,
+        GGML_FATTN_INST_MTP_DRAFT             = 1,
+        GGML_FATTN_INST_MTP_VERIFY_QK         = 2,
+        GGML_FATTN_INST_MTP_DRAFT_DECODE_QK   = 3,
+        GGML_FATTN_INST_PREFILL_QK            = 4,
+        GGML_FATTN_INST_DECODE_QK             = 5,
+        GGML_FATTN_INST_SPEC_VERIFY_QK        = 6,
+        GGML_FATTN_INST_BATCH_VERIFY_QK       = 7,
+        GGML_FATTN_INST_MTP_QBLOCK_VERIFY_QK  = 8,
     };
 
     GGML_API void ggml_flash_attn_ext_set_instruction(

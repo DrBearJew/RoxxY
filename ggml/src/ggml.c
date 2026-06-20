@@ -983,6 +983,18 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_tbq4_0,   // same block layout
         .from_float_ref           = (ggml_from_float_t) quantize_row_tbq4_0_ref,
     },
+    [GGML_TYPE_V4_K16D16] = {
+        .type_name                = "v4_k16d16",
+        .blck_size                = QK_V4_K16D16,
+        .type_size                = sizeof(block_v4_k16d16),
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_V4_K16D16_144] = {
+        .type_name                = "v4_k16d16_144",
+        .blck_size                = QK_V4_K16D16,
+        .type_size                = sizeof(block_v4_k16d16_144),
+        .is_quantized             = true,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
@@ -1145,9 +1157,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "GLU",
     "PACK_K_PACKED16",
+    "PACK_V4_K16D16",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1265,9 +1278,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "pack_v4_k16d16(x)",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -4048,6 +4062,45 @@ struct ggml_tensor * ggml_pack_k_packed16(
     result->src[1] = scales;  // secondary output (scales tensor)
     result->src[2] = k_idxs;  // row indices (scheduler dependency, keeps buffer allocated)
 
+    return result;
+}
+
+// ggml_pack_v4_k16d16
+
+struct ggml_tensor * ggml_pack_v4_k16d16(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * v_cur,
+        struct ggml_tensor  * v_cache,
+        struct ggml_tensor  * v_tail,
+        struct ggml_tensor  * v_idxs) {
+    GGML_ASSERT(ggml_is_contiguous(v_cur));
+    GGML_ASSERT(v_cache->type == GGML_TYPE_V4_K16D16);
+    GGML_ASSERT(v_tail);
+    GGML_ASSERT(v_tail->type == GGML_TYPE_F16);
+    GGML_ASSERT(v_idxs && (v_idxs->type == GGML_TYPE_I64 || v_idxs->type == GGML_TYPE_I32));
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, v_cache);
+    result->op     = GGML_OP_PACK_V4_K16D16;
+    result->src[0] = v_cur;
+    result->src[1] = v_tail;
+    result->src[2] = v_idxs;
+    return result;
+}
+
+struct ggml_tensor * ggml_pack_v4_k16d16_144(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * v_cur,
+        struct ggml_tensor  * v_cache,
+        struct ggml_tensor  * v_idxs) {
+    GGML_ASSERT(ggml_is_contiguous(v_cur));
+    GGML_ASSERT(v_cache->type == GGML_TYPE_V4_K16D16_144);
+    GGML_ASSERT(v_idxs && (v_idxs->type == GGML_TYPE_I64 || v_idxs->type == GGML_TYPE_I32));
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, v_cache);
+    result->op     = GGML_OP_PACK_V4_K16D16;
+    result->src[0] = v_cur;
+    result->src[1] = NULL;
+    result->src[2] = v_idxs;
     return result;
 }
 

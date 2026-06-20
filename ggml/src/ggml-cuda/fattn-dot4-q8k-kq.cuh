@@ -4,6 +4,8 @@
 
 struct ggml_backend_cuda_context;
 void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst);
+void ggml_cuda_op_pack_v4_k16d16(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst);
+void ggml_cuda_op_pack_v4_k16d16_144(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst);
 
 extern "C" {
 void llama_kv_cache_get_packed16_tensors(const void * k_view_data, struct ggml_tensor ** payload, struct ggml_tensor ** scales);

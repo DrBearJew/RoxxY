@@ -252,6 +252,11 @@ enum dp16_fa_vpath {
     DP16_FA_VPATH_DIRECT_PV,
 };
 
+enum dp16_fa_q_stage {
+    DP16_FA_Q_STAGE_INLINE = 0,
+    DP16_FA_Q_STAGE_QPACK_I8_BLOCK32,
+};
+
 enum dp16_fa_shape {
     DP16_FA_SHAPE_NONE = 0,
     DP16_FA_SHAPE_1X32,
@@ -284,6 +289,14 @@ static inline const char * dp16_fa_vpath_name(const dp16_fa_vpath vpath) {
         case DP16_FA_VPATH_STAGE_F32:  return "stage_f32";
         case DP16_FA_VPATH_DIRECT_PV:  return "direct_pv";
         default:                       return "unknown";
+    }
+}
+
+static inline const char * dp16_fa_q_stage_name(const dp16_fa_q_stage stage) {
+    switch (stage) {
+        case DP16_FA_Q_STAGE_INLINE:           return "inline";
+        case DP16_FA_Q_STAGE_QPACK_I8_BLOCK32: return "qpack_i8_block32";
+        default:                               return "unknown";
     }
 }
 
@@ -321,6 +334,25 @@ static inline bool dp16_mtp_enable_dot4_fa2() {
 
 static inline bool dp16_mtp_enable_f16_adapt_dot4() {
     return dp16_env_enabled("LLAMA_MTP_ENABLE_F16K_ADAPT_DOT4_FA2");
+}
+
+static inline bool dp16_fa_qpack_i8_enabled() {
+    return dp16_env_enabled("GGML_CUDA_DP16_FA_QPACK_I8") ||
+           dp16_env_enabled("GGML_CUDA_DP16_FA_QPACK");
+}
+
+static inline int dp16_fa_qpack_i8_min_nk() {
+    const char * v = getenv("GGML_CUDA_DP16_FA_QPACK_MIN_NK");
+    return v && *v ? atoi(v) : 12288;
+}
+
+static inline int dp16_fa_k_shards_per_q_stage() {
+    const char * v = getenv("GGML_CUDA_DP16_FA_K_SHARDS_PER_Q_STAGE");
+    const int n = v && *v ? atoi(v) : 1;
+    if (n == 1 || n == 2 || n == 4 || n == 8) {
+        return n;
+    }
+    GGML_ABORT("invalid GGML_CUDA_DP16_FA_K_SHARDS_PER_Q_STAGE=%s; expected 1, 2, 4, or 8", v ? v : "");
 }
 
 static inline bool dp16_trace_enabled() {

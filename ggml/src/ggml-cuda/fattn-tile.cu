@@ -5,6 +5,13 @@
 void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
+#ifdef GGML_HIP_QWEN35_ATTENTION_INSTANCES_ONLY
+    if (K->ne[0] == 256 && V->ne[0] == 256) {
+        ggml_cuda_flash_attn_ext_tile_case<256, 256>(ctx, dst);
+        return;
+    }
+    GGML_ABORT("Qwen35 dev build only compiles D=256 FlashAttention tile instances");
+#else
     switch (K->ne[0]) {
         case  40: {
             GGML_ASSERT(V->ne[0] == K->ne[0]);
@@ -54,4 +61,5 @@ void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor 
             GGML_ABORT("Unsupported head size");
         } break;
     }
+#endif
 }
