@@ -3254,8 +3254,10 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     }
     const bool pdmq_pv_wmma_policy_requested = pdmq_pv_wmma_requested();
     const bool qblock_tetris_shape_policy_requested = qblock_inst && pdmq_qblock_tetris_shape_policy_requested();
+    const bool qwen27b_gqa6_topology =
+        n_heads_q == 24 && n_heads_k == 4 && (n_heads_q / n_heads_k) == 6;
     const bool qwen27b_gqa6_q4_smallq =
-        V->type == GGML_TYPE_Q4_0 && nq <= 4 && n_heads_q == 24 && n_heads_k == 4 && (n_heads_q / n_heads_k) == 6;
+        V->type == GGML_TYPE_Q4_0 && nq <= 4 && qwen27b_gqa6_topology;
     const int qwen27b_gqa6_splitk_min_nk = []() {
         const char * s = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQAX_SPLITK_MIN_NK");
         return s && *s ? atoi(s) : 12288;
@@ -3285,6 +3287,20 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         // later passed exactness but failed speed gates, so GQA6 remains an
         // opt-in diagnostic path rather than the QBlock/DOT4 promotion route.
         shape = pdmq_select_qwen35_gqa6_qblock_shape(nq, qblock_tetris_shape_policy_requested);
+    }
+
+    const bool v4_144_pv4_requested = V->type == GGML_TYPE_V4_K16D16_144 && pdmq_v4_144_pv4_requested();
+    const bool qwen27b_gqa6_row_serial_pdmq =
+        qwen27b_gqa6_topology &&
+        (V->type == GGML_TYPE_Q4_0 || v4_144_pv4_requested) &&
+        !shape_env_set && !pv_rows_env_set && !qwen27b_gqa6_policy_requested &&
+        (ggml_cuda_packed16_dot4_mmq_route_required() || v4_144_pv4_requested);
+    if (qwen27b_gqa6_row_serial_pdmq) {
+        // Normal q4 uses PWMMA/DBV for these rows. When q4 is explicitly forced
+        // through PDMQ, or V4_144 PV4 must use PDMQ, keep the row-serial shape
+        // that preserves the q4 sampling trajectory. Auto M8/M16 is faster for
+        // isolated kernels but changes long-context MTP output by n46/n128.
+        shape = PDMQ_SHAPE_M1N32;
     }
 
     // m8n32 is a useful shallow/promptfill GQA2 shape, but deep pp2048
