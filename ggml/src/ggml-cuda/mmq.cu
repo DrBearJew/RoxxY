@@ -3,7 +3,182 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 
+#include <algorithm>
 #include <cstdlib>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+struct ggml_cuda_mtp_mmq_census_entry {
+    std::string route;
+    std::string tensor;
+    std::string dst;
+    std::string type;
+    int64_t ncols_x = 0;
+    int64_t nrows_x = 0;
+    int64_t ncols_dst = 0;
+    int64_t ncols_max = 0;
+    int mmq_x = 0;
+    int mmq_y = 0;
+    bool has_ids = false;
+    bool stream_k = false;
+    bool need_check = false;
+    bool experimental = false;
+    size_t shared_bytes = 0;
+    uint64_t calls = 0;
+    uint64_t approx_outputs = 0;
+    uint64_t timing_calls = 0;
+    double total_ms = 0.0;
+    float max_ms = 0.0f;
+};
+
+static bool ggml_cuda_mtp_mmq_env_enabled(const char * name) {
+    const char * env = getenv(name);
+    return env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0 && strcmp(env, "off") != 0 && strcmp(env, "false") != 0;
+}
+
+bool ggml_cuda_mtp_mmq_timing_enabled() {
+    static const bool enabled = ggml_cuda_mtp_mmq_env_enabled("LLAMA_MTP_MMQ_TIMING");
+    return enabled;
+}
+
+bool ggml_cuda_mtp_mmq_route_census_enabled() {
+    static const bool enabled = ggml_cuda_mtp_mmq_env_enabled("LLAMA_MTP_MMQ_ROUTE_CENSUS") || ggml_cuda_mtp_mmq_timing_enabled();
+    return enabled;
+}
+
+bool ggml_cuda_mtp_mmq_stream_is_capturing(cudaStream_t stream) {
+#if defined(GGML_USE_HIP)
+    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+    CUDA_CHECK(hipStreamIsCapturing(stream, &capture_status));
+    return capture_status != hipStreamCaptureStatusNone;
+#else
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+    return capture_status != cudaStreamCaptureStatusNone;
+#endif
+}
+
+static std::mutex & ggml_cuda_mtp_mmq_census_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+static std::unordered_map<std::string, ggml_cuda_mtp_mmq_census_entry> & ggml_cuda_mtp_mmq_census_map() {
+    static auto * map = new std::unordered_map<std::string, ggml_cuda_mtp_mmq_census_entry>();
+    return *map;
+}
+
+static std::string ggml_cuda_mtp_mmq_census_key(const mmq_args & args, ggml_type type, const int mmq_x) {
+    const char * route = args.route_name && args.route_name[0] ? args.route_name : (args.ids_dst ? "id_mmq" : "direct_mmq");
+    const char * tensor = args.tensor_name && args.tensor_name[0] ? args.tensor_name : "-";
+    return std::string(route) + "|" + tensor + "|" + ggml_type_name(type) + "|" +
+        std::to_string((long long) args.ncols_dst) + "|" + std::to_string((long long) args.ncols_x) + "|" +
+        std::to_string((long long) args.nrows_x) + "|" + std::to_string((long long) args.ncols_max) + "|" +
+        std::to_string(mmq_x) + "|" + (args.ids_dst ? "ids" : "noids") + "|" + (args.use_stream_k ? "streamk" : "nostreamk");
+}
+
+static ggml_cuda_mtp_mmq_census_entry & ggml_cuda_mtp_mmq_census_entry_for(const mmq_args & args, ggml_type type, const int mmq_x) {
+    auto & entry = ggml_cuda_mtp_mmq_census_map()[ggml_cuda_mtp_mmq_census_key(args, type, mmq_x)];
+    if (entry.calls == 0 && entry.timing_calls == 0) {
+        entry.route = args.route_name && args.route_name[0] ? args.route_name : (args.ids_dst ? "id_mmq" : "direct_mmq");
+        entry.tensor = args.tensor_name && args.tensor_name[0] ? args.tensor_name : "-";
+        entry.dst = args.dst_name && args.dst_name[0] ? args.dst_name : "-";
+        entry.type = ggml_type_name(type);
+        entry.ncols_x = args.ncols_x;
+        entry.nrows_x = args.nrows_x;
+        entry.ncols_dst = args.ncols_dst;
+        entry.ncols_max = args.ncols_max;
+        entry.mmq_x = mmq_x;
+        entry.has_ids = args.ids_dst != nullptr;
+        entry.stream_k = args.use_stream_k;
+    }
+    return entry;
+}
+
+static void ggml_cuda_mtp_mmq_census_dump() {
+    if (!ggml_cuda_mtp_mmq_route_census_enabled()) {
+        return;
+    }
+
+    std::vector<ggml_cuda_mtp_mmq_census_entry> rows;
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_mtp_mmq_census_mutex());
+        rows.reserve(ggml_cuda_mtp_mmq_census_map().size());
+        for (const auto & kv : ggml_cuda_mtp_mmq_census_map()) {
+            rows.push_back(kv.second);
+        }
+    }
+
+    std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) {
+        if (a.total_ms != b.total_ms) {
+            return a.total_ms > b.total_ms;
+        }
+        if (a.approx_outputs != b.approx_outputs) {
+            return a.approx_outputs > b.approx_outputs;
+        }
+        return a.calls > b.calls;
+    });
+
+    GGML_LOG_INFO("mtp_mmq_census summary count=%zu timing=%d\n", rows.size(), ggml_cuda_mtp_mmq_timing_enabled() ? 1 : 0);
+    size_t dump_limit = 512;
+    if (const char * env_limit = getenv("LLAMA_MTP_MMQ_CENSUS_LIMIT")) {
+        const long parsed = std::strtol(env_limit, nullptr, 10);
+        if (parsed > 0) {
+            dump_limit = (size_t) parsed;
+        }
+    }
+    const size_t limit = std::min<size_t>(rows.size(), dump_limit);
+    for (size_t i = 0; i < limit; ++i) {
+        const auto & r = rows[i];
+        const double avg_ms = r.timing_calls > 0 ? r.total_ms / (double) r.timing_calls : 0.0;
+        GGML_LOG_INFO("mtp_mmq_census rank=%zu route=%s tensor=%s dst=%s type=%s mmq_x=%d mmq_y=%d ncols_dst=%lld ncols_max=%lld ncols_x=%lld nrows_x=%lld ids=%d stream_k=%d need_check=%d experimental=%d shared=%zu calls=%llu approx_outputs=%llu timing_calls=%llu total_ms=%.6f avg_ms=%.6f max_ms=%.6f\n",
+                i + 1, r.route.c_str(), r.tensor.c_str(), r.dst.c_str(), r.type.c_str(), r.mmq_x, r.mmq_y,
+                (long long) r.ncols_dst, (long long) r.ncols_max, (long long) r.ncols_x, (long long) r.nrows_x,
+                r.has_ids ? 1 : 0, r.stream_k ? 1 : 0, r.need_check ? 1 : 0, r.experimental ? 1 : 0, r.shared_bytes,
+                (unsigned long long) r.calls, (unsigned long long) r.approx_outputs,
+                (unsigned long long) r.timing_calls, r.total_ms, avg_ms, (double) r.max_ms);
+    }
+}
+
+static void ggml_cuda_mtp_mmq_register_atexit_once() {
+    static const bool registered = []() {
+        std::atexit(ggml_cuda_mtp_mmq_census_dump);
+        return true;
+    }();
+    GGML_UNUSED(registered);
+}
+
+void ggml_cuda_mtp_mmq_census_record(const mmq_args & args, ggml_type type, const int mmq_x, const int mmq_y,
+        const bool need_check, const size_t nbytes_shared, const bool use_experimental) {
+    if (!ggml_cuda_mtp_mmq_route_census_enabled()) {
+        return;
+    }
+    ggml_cuda_mtp_mmq_register_atexit_once();
+    std::lock_guard<std::mutex> lock(ggml_cuda_mtp_mmq_census_mutex());
+    auto & entry = ggml_cuda_mtp_mmq_census_entry_for(args, type, mmq_x);
+    entry.mmq_y = mmq_y;
+    entry.need_check = need_check;
+    entry.experimental = use_experimental;
+    entry.shared_bytes = nbytes_shared;
+    entry.calls++;
+    entry.approx_outputs += (uint64_t) std::max<int64_t>(args.nrows_x, 0) * (uint64_t) std::max<int64_t>(args.ncols_dst, 0);
+}
+
+void ggml_cuda_mtp_mmq_timing_record(const mmq_args & args, ggml_type type, const int mmq_x, const float elapsed_ms) {
+    if (!ggml_cuda_mtp_mmq_timing_enabled()) {
+        return;
+    }
+    ggml_cuda_mtp_mmq_register_atexit_once();
+    std::lock_guard<std::mutex> lock(ggml_cuda_mtp_mmq_census_mutex());
+    auto & entry = ggml_cuda_mtp_mmq_census_entry_for(args, type, mmq_x);
+    entry.timing_calls++;
+    entry.total_ms += (double) elapsed_ms;
+    if (elapsed_ms > entry.max_ms) {
+        entry.max_ms = elapsed_ms;
+    }
+}
 
 static bool ggml_cuda_mtp_prefill_force_mmq_runtime() {
     static const bool force = []() {
@@ -28,12 +203,15 @@ static bool ggml_cuda_mtp_prefill_force_mmq_runtime() {
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
+#if !defined(GGML_HIP_MMQ_QWEN35_INSTANCES_ONLY)
         case GGML_TYPE_Q1_0:
             mul_mat_q_case<GGML_TYPE_Q1_0>(ctx, args, stream);
             break;
+#endif
         case GGML_TYPE_Q4_0:
             mul_mat_q_case<GGML_TYPE_Q4_0>(ctx, args, stream);
             break;
+#if !defined(GGML_HIP_MMQ_QWEN35_INSTANCES_ONLY)
         case GGML_TYPE_Q4_1:
             mul_mat_q_case<GGML_TYPE_Q4_1>(ctx, args, stream);
             break;
@@ -43,9 +221,11 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_Q5_1:
             mul_mat_q_case<GGML_TYPE_Q5_1>(ctx, args, stream);
             break;
+#endif
         case GGML_TYPE_Q8_0:
             mul_mat_q_case<GGML_TYPE_Q8_0>(ctx, args, stream);
             break;
+#if !defined(GGML_HIP_MMQ_QWEN35_INSTANCES_ONLY)
         case GGML_TYPE_MXFP4:
             mul_mat_q_case<GGML_TYPE_MXFP4>(ctx, args, stream);
             break;
@@ -58,6 +238,7 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_Q3_K:
             mul_mat_q_case<GGML_TYPE_Q3_K>(ctx, args, stream);
             break;
+#endif
         case GGML_TYPE_Q4_K:
             mul_mat_q_case<GGML_TYPE_Q4_K>(ctx, args, stream);
             break;
@@ -67,6 +248,7 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_Q6_K:
             mul_mat_q_case<GGML_TYPE_Q6_K>(ctx, args, stream);
             break;
+#if !defined(GGML_HIP_MMQ_QWEN35_INSTANCES_ONLY)
         case GGML_TYPE_IQ2_XXS:
             mul_mat_q_case<GGML_TYPE_IQ2_XXS>(ctx, args, stream);
             break;
@@ -91,8 +273,13 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_IQ4_NL:
             mul_mat_q_case<GGML_TYPE_IQ4_NL>(ctx, args, stream);
             break;
+#endif
         default:
+#if defined(GGML_HIP_MMQ_QWEN35_INSTANCES_ONLY)
+            GGML_ABORT("MMQ Qwen35 instance whitelist does not include V type %s", ggml_type_name(args.type_x));
+#else
             GGML_ABORT("fatal error");
+#endif
             break;
     }
 }
@@ -179,7 +366,8 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            use_stream_k, ne1};
+            use_stream_k, ne1,
+            src0->name, dst->name, "direct_mmq"};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }
@@ -240,7 +428,8 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        use_stream_k, ne12};
+        use_stream_k, ne12,
+        src0->name, dst->name, "id_mmq"};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
@@ -280,7 +469,8 @@ void ggml_cuda_op_mul_mat_q(
         ne00, row_diff, src1_ncols, stride01, ne11, nrows_dst,
         1, 1, 0, 0, 0,
         1, 1, 0, 0, 0,
-        use_stream_k, src1_ncols};
+        use_stream_k, src1_ncols,
+        src0->name, dst->name, "op_mmq"};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 

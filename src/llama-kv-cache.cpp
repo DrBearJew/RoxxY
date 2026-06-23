@@ -18,6 +18,42 @@ static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
 
+enum llama_pdmq_k_format {
+    LLAMA_PDMQ_K_FORMAT_NONE             = 0,
+    LLAMA_PDMQ_K_FORMAT_PACKED16_Q8_272  = 1,
+    LLAMA_PDMQ_K_FORMAT_PACKED8_Q4_144   = 2,
+    LLAMA_PDMQ_K_FORMAT_PACKED4_Q2_80_V1 = 3,
+};
+
+static int llama_pdmq_k_format_from_env(int default_format) {
+    const char * env = getenv("GGML_CUDA_ROCM_PDMQ_K_FORMAT");
+    if (!env || env[0] == '\0' || strcmp(env, "default") == 0) {
+        return default_format;
+    }
+    if (strcmp(env, "none") == 0 || strcmp(env, "off") == 0) {
+        return LLAMA_PDMQ_K_FORMAT_NONE;
+    }
+    if (strcmp(env, "packed16_q8") == 0 || strcmp(env, "packed16") == 0) {
+        return LLAMA_PDMQ_K_FORMAT_PACKED16_Q8_272;
+    }
+    if (strcmp(env, "packed8_q4") == 0 || strcmp(env, "packed8") == 0) {
+        return LLAMA_PDMQ_K_FORMAT_PACKED8_Q4_144;
+    }
+    if (strcmp(env, "packed4_q2") == 0 || strcmp(env, "packed4") == 0) {
+        return LLAMA_PDMQ_K_FORMAT_PACKED4_Q2_80_V1;
+    }
+    throw std::runtime_error(std::string("unknown GGML_CUDA_ROCM_PDMQ_K_FORMAT=") + env);
+}
+
+static int64_t llama_pdmq_k_payload_words_per_token(int format, int64_t d) {
+    switch (format) {
+        case LLAMA_PDMQ_K_FORMAT_PACKED16_Q8_272:  return d / 4;
+        case LLAMA_PDMQ_K_FORMAT_PACKED8_Q4_144:   return d / 8;
+        case LLAMA_PDMQ_K_FORMAT_PACKED4_Q2_80_V1: return d / 16;
+        default: return 0;
+    }
+}
+
 // orthonormal Walsh-Hadamard rotation matrix
 // note: res^2 == I
 static void ggml_gen_hadamard(ggml_tensor * tensor) {
@@ -259,13 +295,16 @@ llama_kv_cache::llama_kv_cache(
             }
         }
 
-        // Packed16/I32 K is the standard ROCm packed16 path.  Keep explicit
-        // disable envs for emergency fallback, but do not require users to set
-        // the old opt-in knobs just to get the measured route.
+        // PDMQ/I32 K is the standard ROCm compressed-K path. Packed16_q8 remains
+        // the canonical default. Explicit/effective q8_0 K requests are redirected
+        // to packed8_q4 PDMQ so the legacy raw GGML_TYPE_Q8_0 VEC FA path is not
+        // used as the standard q8 experience.
         //
-        // MTP draft default: packed16-only K payload+scales.  The old hot/cold
-        // mode (LLAMA_MTP_PACKED16_HOTCOLD_K=1) still exists as an explicit
-        // f16-shadow experiment, but it is not the q4 standard path.
+        // MTP draft standard: packed16 K payload+scales with the default PV4/V4_144
+        // V cache profile. Hot/cold F16-K shadow is deprecated/default-off:
+        // LLAMA_MTP_PACKED16_HOTCOLD_K=1 only takes effect with
+        // LLAMA_MTP_PACKED16_HOTCOLD_K_EXPERIMENT=1. Legacy q4_0 V hot/cold additionally
+        // requires LLAMA_MTP_PACKED16_HOTCOLD_K_LEGACY_Q4V=1.
 #ifdef GGML_USE_HIP
         const bool packed16_default_enabled = true;
 #else
@@ -276,32 +315,56 @@ llama_kv_cache::llama_kv_cache(
         const char * mtp_disable_p16_env = getenv("LLAMA_MTP_DISABLE_PACKED16_FA");
         const bool mtp_packed16_disabled = mtp_disable_p16_env && atoi(mtp_disable_p16_env) != 0;
         const bool mtp_packed16_requested = mtp_fa_enabled && packed16_default_enabled && !mtp_packed16_disabled;
-        const bool mtp_packed16_hotcold_k = mtp_packed16_requested &&
+        const bool mtp_packed16_hotcold_experiment = getenv("LLAMA_MTP_PACKED16_HOTCOLD_K_EXPERIMENT") &&
+            atoi(getenv("LLAMA_MTP_PACKED16_HOTCOLD_K_EXPERIMENT")) != 0;
+        const bool mtp_packed16_hotcold_k = mtp_packed16_requested && mtp_packed16_hotcold_experiment &&
             getenv("LLAMA_MTP_PACKED16_HOTCOLD_K") && atoi(getenv("LLAMA_MTP_PACKED16_HOTCOLD_K")) != 0;
         const bool mtp_packed16_only = mtp_packed16_requested && !mtp_packed16_hotcold_k;
 
-        const char * packed16_k_cache_env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE");
-        const bool packed16_k_cache_enabled = packed16_k_cache_env ?
-            atoi(packed16_k_cache_env) != 0 : packed16_default_enabled;
+        const char * pdmq_k_cache_env = getenv("GGML_CUDA_ROCM_PDMQ_K_CACHE");
+        if (!pdmq_k_cache_env) {
+            pdmq_k_cache_env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE"); // legacy alias
+        }
+        const bool pdmq_k_cache_enabled = pdmq_k_cache_env ?
+            atoi(pdmq_k_cache_env) != 0 : packed16_default_enabled;
         const bool packed16_disabled = getenv("GGML_CUDA_ROCM_PACKED16_DISABLE") &&
             atoi(getenv("GGML_CUDA_ROCM_PACKED16_DISABLE")) != 0;
-        const bool packed16_active = has_k && !packed16_disabled &&
-            (mtp_packed16_only || mtp_packed16_hotcold_k || (!is_mtp_draft && packed16_k_cache_enabled));
+        int pdmq_k_format = LLAMA_PDMQ_K_FORMAT_NONE;
+        if (has_k && !packed16_disabled && (mtp_packed16_only || mtp_packed16_hotcold_k || (!is_mtp_draft && pdmq_k_cache_enabled))) {
+            const bool q8_k_requested = type_k == GGML_TYPE_Q8_0;
+            const int default_pdmq_k_format = (mtp_packed16_hotcold_k || !q8_k_requested) ?
+                LLAMA_PDMQ_K_FORMAT_PACKED16_Q8_272 : LLAMA_PDMQ_K_FORMAT_PACKED8_Q4_144;
+            pdmq_k_format = llama_pdmq_k_format_from_env(default_pdmq_k_format);
+        }
+        if (mtp_packed16_hotcold_k && pdmq_k_format != LLAMA_PDMQ_K_FORMAT_PACKED16_Q8_272) {
+            throw std::runtime_error("LLAMA_MTP_PACKED16_HOTCOLD_K requires GGML_CUDA_ROCM_PDMQ_K_FORMAT=packed16_q8");
+        }
+        if (pdmq_k_format == LLAMA_PDMQ_K_FORMAT_PACKED4_Q2_80_V1) {
+            throw std::runtime_error("GGML_CUDA_ROCM_PDMQ_K_FORMAT=packed4_q2 is reserved until PDMQ_K4_Q2_0_32_V1 is implemented");
+        }
+        const bool pdmq_k_active = has_k && pdmq_k_format != LLAMA_PDMQ_K_FORMAT_NONE;
+        const bool packed16_active = pdmq_k_active;
 
         const char * v4_k16d16_env = getenv("GGML_CUDA_ROCM_V4_K16D16_V_CACHE");
         const char * v4_k16d16_144_env = getenv("GGML_CUDA_ROCM_V4_K16D16_144_V_CACHE");
         const char * v4_k16d16_144_mtp_env = getenv("GGML_CUDA_ROCM_V4_K16D16_144_MTP_DRAFT_V_CACHE");
+        const char * v4_k16d16_144_pv4_env = getenv("GGML_CUDA_ROCM_V4_K16D16_144_PV4");
+        const char * v4_k16d16_144_pv4_disable_env = getenv("GGML_CUDA_ROCM_V4_K16D16_144_PV4_DISABLE");
 #ifdef GGML_USE_HIP
-        const bool v4_k16d16_144_mtp_draft_enabled =
-            !is_mtp_draft || (v4_k16d16_144_mtp_env && atoi(v4_k16d16_144_mtp_env) != 0);
+        const bool v4_k16d16_144_pv4_disabled = v4_k16d16_144_pv4_disable_env && atoi(v4_k16d16_144_pv4_disable_env) != 0;
+        const bool v4_k16d16_144_pv4_enabled = !v4_k16d16_144_pv4_disabled &&
+            (v4_k16d16_144_pv4_env ? atoi(v4_k16d16_144_pv4_env) != 0 : true);
+        const bool v4_k16d16_144_cache_enabled = v4_k16d16_144_env ?
+            atoi(v4_k16d16_144_env) != 0 : v4_k16d16_144_pv4_enabled;
+        const bool v4_k16d16_144_mtp_draft_enabled = !is_mtp_draft ||
+            (v4_k16d16_144_mtp_env ? atoi(v4_k16d16_144_mtp_env) != 0 : v4_k16d16_144_pv4_enabled);
         const bool v4_k16d16_active = has_v && !v_trans && n_stream == 1 && type_v_layer == GGML_TYPE_Q4_0 &&
             v4_k16d16_env && atoi(v4_k16d16_env) != 0 && hparams.n_embd_head_v(il) == 256;
-        // The MTP draft cache is acceptance-sensitive: using V4_144 for the draft
-        // layer preserves final hashes but collapses speculative depth and roughly
-        // halves throughput. Keep the draft layer on q4_0 by default; the opt-in
-        // env keeps the V4_144 MTP route available for diagnostics.
+        // V144/PV4 exact scalar consumption is standard in HIP when compiled;
+        // GGML_CUDA_ROCM_V4_K16D16_144_PROFILE is the separate explicit DP16-DOT
+        // profile and must not control standard V144 cache allocation.
         const bool v4_k16d16_144_active = has_v && !v4_k16d16_active && !v_trans && n_stream == 1 && type_v_layer == GGML_TYPE_Q4_0 &&
-            v4_k16d16_144_mtp_draft_enabled && v4_k16d16_144_env && atoi(v4_k16d16_144_env) != 0 &&
+            v4_k16d16_144_mtp_draft_enabled && v4_k16d16_144_cache_enabled &&
             hparams.n_embd_head_v(il) == 256 && (kv_size % 16) == 0;
 #else
         const bool v4_k16d16_active = false;
@@ -321,14 +384,15 @@ llama_kv_cache::llama_kv_cache(
         ggml_tensor * k_payload = nullptr;
         ggml_tensor * k_scales  = nullptr;
         {
-            if (has_k && packed16_active) {
+            if (has_k && pdmq_k_active) {
                 GGML_ASSERT(n_embd_k_gqa % 32 == 0);
                 const int64_t n_head_kv = (int64_t) hparams.n_head_kv(il);
                 const int64_t n_embd_head_k = hparams.n_embd_head_k(il);
-                const int64_t k_payload_d4  = n_embd_head_k / 4;
+                const int64_t k_payload_words = llama_pdmq_k_payload_words_per_token(pdmq_k_format, n_embd_head_k);
                 const int64_t k_scales_d32  = n_embd_head_k / 32;
                 GGML_ASSERT(n_embd_head_k % 32 == 0);
-                k_payload = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, k_payload_d4, kv_size * n_head_kv, n_stream);
+                GGML_ASSERT(k_payload_words > 0);
+                k_payload = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, k_payload_words, kv_size * n_head_kv, n_stream);
                 k_scales  = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, k_scales_d32, kv_size * n_head_kv, n_stream);
                 ggml_format_name(k_payload, "cache_k_payload_l%d", il);
                 ggml_format_name(k_scales,  "cache_k_scales_l%d", il);
@@ -412,12 +476,28 @@ llama_kv_cache::llama_kv_cache(
 
     // Register packed16 K tensors for DOT4 FA dispatch lookup. Hot/cold mode
     // keeps exact FP16 K as the graph-facing cache, and the normal K->data
-    // registry entry below maps that F16 cache to its packed16 sidecar.
+    // registry entry below maps that F16 cache to its packed16 sidecar. Record
+    // allocation-time capacity/stride metadata so route selection can fail closed
+    // before the first pack op refreshes the generation for written bytes.
     for (auto & layer : layers) {
         if (layer.k_payload && layer.k_scales) {
-            llama_kv_cache_register_packed16(layer.k_payload->data, layer.k_payload, layer.k_scales);
+            const uint32_t d = (uint32_t) hparams.n_embd_head_k(layer.il);
+            const uint32_t n_head_kv = (uint32_t) hparams.n_head_kv(layer.il);
+            const uint32_t kv_capacity = n_head_kv ? (uint32_t) (layer.k_payload->ne[1] / n_head_kv) : 0;
+            const int layer_format = (layer.k_payload->ne[0] == (int64_t) d / 8) ? LLAMA_PDMQ_K_FORMAT_PACKED8_Q4_144 : LLAMA_PDMQ_K_FORMAT_PACKED16_Q8_272;
+            llama_kv_cache_register_pdmq_k_with_layout_info(layer.k_payload->data, layer.k_payload, layer.k_scales, layer_format, -1, kv_capacity, d);
+            for (auto * k_payload_view : layer.k_payload_stream) {
+                if (k_payload_view) {
+                    llama_kv_cache_register_pdmq_k_with_layout_info(k_payload_view->data, layer.k_payload, layer.k_scales, layer_format, -1, kv_capacity, d);
+                }
+            }
             if (layer.k) {
-                llama_kv_cache_register_packed16(layer.k->data, layer.k_payload, layer.k_scales);
+                llama_kv_cache_register_pdmq_k_with_layout_info(layer.k->data, layer.k_payload, layer.k_scales, layer_format, -1, kv_capacity, d);
+                for (auto * k_view : layer.k_stream) {
+                    if (k_view) {
+                        llama_kv_cache_register_pdmq_k_with_layout_info(k_view->data, layer.k_payload, layer.k_scales, layer_format, -1, kv_capacity, d);
+                    }
+                }
             }
         }
         if (layer.v && layer.v->type == GGML_TYPE_V4_K16D16 && layer.v4_tail) {
@@ -1455,25 +1535,25 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     auto * k = layers[ikv].k;
     auto * kp = layers[ikv].k_payload;
 
-    // Packed16-only mode: return I32 payload as a 4D view. MTP hot/cold mode
-    // intentionally keeps FP16 K graph-facing and exposes the packed16 sidecar
+    // PDMQ packed-K mode: return I32 payload as a 4D view. MTP hot/cold mode
+    // intentionally keeps FP16 K graph-facing and exposes the packed sidecar
     // only through the DOT4 registry.
     if (!k && kp) {
         const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
         const int64_t n_head_kv = hparams.n_head_kv(il);
         const int64_t n_embd_head_k = hparams.n_embd_head_k(il);
-        const int64_t d4_per_head = n_embd_head_k / 4;
+        const int64_t packed_words_per_head = kp->ne[0];
         const uint32_t kv_size_total = get_size();
 
         GGML_ASSERT(kp->type == GGML_TYPE_I32);
-        GGML_ASSERT(kp->ne[0] == d4_per_head);
+        GGML_ASSERT(packed_words_per_head == n_embd_head_k / 4 || packed_words_per_head == n_embd_head_k / 8);
         GGML_ASSERT(kp->ne[1] == (int64_t) kv_size_total * n_head_kv);
 
         const size_t row_bytes = kp->nb[1];
 
-        // [D/4 per head, n_kv, n_head_kv, ns] — fixed kv_size head stride
+        // [packed words per head, n_kv, n_head_kv, ns] — fixed kv_size head stride
         return ggml_view_4d(ctx, kp,
-                d4_per_head, n_kv, n_head_kv, ns,
+                packed_words_per_head, n_kv, n_head_kv, ns,
                 row_bytes,
                 row_bytes * (size_t) kv_size_total,
                 row_bytes * (size_t) kv_size_total * (size_t) n_head_kv,

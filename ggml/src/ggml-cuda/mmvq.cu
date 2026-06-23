@@ -433,85 +433,11 @@ static int ggml_cuda_mtp_mmvq_interleaved_act_nwarps(const char * env_name) {
     }
 
     const int n_multiwarps =
-        (ggml_cuda_mtp_mmvq_interleaved_act_nwarps_raw("LLAMA_MTP_MMVQ_LEGACY_INTERLEAVED_ACT_NWARPS") > 1 ? 1 : 0) +
         (ggml_cuda_mtp_mmvq_interleaved_act_nwarps_raw("LLAMA_MTP_MMVQ_LOWK_INTERLEAVED_ACT_NWARPS") > 1 ? 1 : 0) +
         (ggml_cuda_mtp_mmvq_interleaved_act_nwarps_raw("LLAMA_MTP_MMVQ_Q4K_INTERLEAVED_ACT_NWARPS") > 1 ? 1 : 0) +
         (ggml_cuda_mtp_mmvq_interleaved_act_nwarps_raw("LLAMA_MTP_MMVQ_Q5K_INTERLEAVED_ACT_NWARPS") > 1 ? 1 : 0) +
         (ggml_cuda_mtp_mmvq_interleaved_act_nwarps_raw("LLAMA_MTP_MMVQ_Q6K_INTERLEAVED_ACT_NWARPS") > 1 ? 1 : 0);
     return n_multiwarps > 1 ? 1 : requested;
-}
-
-static bool ggml_cuda_mtp_mmvq_legacy_interleaved_act_enabled() {
-    const char * env = getenv("LLAMA_MTP_MMVQ_LEGACY_INTERLEAVED_ACT");
-    return env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0 && strcmp(env, "off") != 0 && strcmp(env, "false") != 0;
-}
-
-static bool ggml_cuda_mtp_mmvq_legacy_interleaved_act_log_enabled() {
-    const char * env = getenv("LLAMA_MTP_MMVQ_LEGACY_INTERLEAVED_ACT_LOG");
-    return env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0 && strcmp(env, "off") != 0 && strcmp(env, "false") != 0;
-}
-
-static bool ggml_cuda_mtp_mmvq_legacy_interleaved_act_name_allowed(const char * name) {
-    const char * filter = getenv("LLAMA_MTP_MMVQ_LEGACY_INTERLEAVED_ACT_FILTER");
-    if (filter == nullptr || filter[0] == '\0') {
-        return true;
-    }
-    return ggml_cuda_mtp_mmvq_serial_columns_match_name(filter, name);
-}
-
-static bool ggml_cuda_mtp_mmvq_legacy_interleaved_act_type_allowed(const ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_1:
-        case GGML_TYPE_Q5_0:
-        case GGML_TYPE_Q5_1:
-        case GGML_TYPE_Q8_0:
-            break;
-        default:
-            return false;
-    }
-
-    const char * filter = getenv("LLAMA_MTP_MMVQ_LEGACY_INTERLEAVED_ACT_TYPES");
-    if (filter == nullptr || filter[0] == '\0') {
-        return true;
-    }
-    return ggml_cuda_mtp_mmvq_serial_columns_match_name(filter, ggml_type_name(type));
-}
-
-static bool ggml_cuda_mtp_mmvq_legacy_interleaved_act_ncols_allowed(const int ncols_dst) {
-    const char * env = getenv("LLAMA_MTP_MMVQ_LEGACY_INTERLEAVED_ACT_NCOLS");
-    if (env == nullptr || env[0] == '\0') {
-        return ncols_dst > 1 && ncols_dst <= 5;
-    }
-    const char * p = env;
-    while (*p != '\0') {
-        while (*p == ' ' || *p == '\t' || *p == ',') {
-            ++p;
-        }
-        const char * begin = p;
-        while (*p != '\0' && *p != ',') {
-            ++p;
-        }
-        const char * end = p;
-        while (end > begin && (end[-1] == ' ' || end[-1] == '\t')) {
-            --end;
-        }
-        if (end - begin == 3 && strncmp(begin, "all", 3) == 0) {
-            return true;
-        }
-        char buf[16] = {};
-        const size_t len = std::min<size_t>((size_t) (end - begin), sizeof(buf) - 1);
-        memcpy(buf, begin, len);
-        char * parse_end = nullptr;
-        const long v = strtol(buf, &parse_end, 10);
-        if (parse_end != buf && v == ncols_dst) {
-            return true;
-        }
-        if (*p == ',') {
-            ++p;
-        }
-    }
-    return false;
 }
 
 static bool ggml_cuda_mtp_mmvq_lowk_interleaved_act_enabled() {
@@ -3940,104 +3866,10 @@ static __global__ void mul_mat_vec_q_q5_K_reuse_weight(
     GGML_UNUSED_VARS(nchannels_dst, nsamples_dst);
 }
 
-// Generic legacy-quant interleaved-activation route for non-K GGUF block types
-// where one weight block maps to one Q8_1 activation block. This is default-off
-// framework coverage for models with hot Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 tensors.
-template <ggml_type type, int ncols_dst, int nwarps, int rows_per_block, bool interleaved_act = false>
-__launch_bounds__(nwarps*ggml_cuda_get_physical_warp_size(), 1)
-static __global__ void mul_mat_vec_q_legacy_interleaved_act(
-        const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
-        const uint32_t ncols_x, const uint3 channel_ratio, const uint3 sample_ratio,
-        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
-        const uint32_t nchannels_dst, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
-        const uint32_t stride_channel_dst, const uint32_t nsamples_dst,
-        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst) {
-
-    constexpr int qk = ggml_cuda_type_traits<type>::qk;
-    constexpr int qi = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = get_vdr_mmvq(type);
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
-
-    static_assert(qk == QK8_1, "legacy interleaved route expects one Q8_1 block per weight block");
-
-    const int tid = warp_size*threadIdx.y + threadIdx.x;
-
-    const uint32_t row0        = rows_per_block*blockIdx.x;
-    const uint32_t channel_dst = blockIdx.y;
-    const uint32_t sample_dst  = blockIdx.z;
-
-    const uint32_t channel_x = fastdiv(channel_dst, channel_ratio);
-    const uint32_t channel_y = channel_dst;
-    const uint32_t sample_x  = fastdiv(sample_dst, sample_ratio);
-    const uint32_t sample_y  = sample_dst;
-
-    const block_q8_1 * y = ((const block_q8_1 *) vy) +
-        sample_y*stride_sample_y + channel_y*stride_channel_y;
-    const int kbx_offset_base = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
-    const int blocks_per_row_x = ncols_x / qk;
-    constexpr int blocks_per_iter = vdr * nwarps * warp_size / qi;
-
-    float tmp[ncols_dst][rows_per_block] = {{ 0.0f }};
-
-    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-        const int kqs = vdr * (tid % (qi/vdr));
-        const int kby = kbx;
-
-#pragma unroll
-        for (int j = 0; j < ncols_dst; ++j) {
-            const block_q8_1 * bq8 = interleaved_act ?
-                (y + kby*stride_col_y + j) :
-                (y + j*stride_col_y + kby);
-#pragma unroll
-            for (int r = 0; r < rows_per_block; ++r) {
-                if (rows_per_block == 1 || uint32_t(row0 + r) < stride_col_dst) {
-                    tmp[j][r] += vec_dot_q_cuda(vx, bq8, kbx_offset_base + r*stride_row_x + kbx, kqs);
-                }
-            }
-        }
-    }
-
-    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_block][warp_size];
-    if constexpr (nwarps > 1) {
-        if (threadIdx.y > 0) {
-#pragma unroll
-            for (int j = 0; j < ncols_dst; ++j) {
-#pragma unroll
-                for (int r = 0; r < rows_per_block; ++r) {
-                    tmp_shared[threadIdx.y-1][j][r][threadIdx.x] = tmp[j][r];
-                }
-            }
-        }
-        __syncthreads();
-        if (threadIdx.y > 0) {
-            return;
-        }
-    } else {
-        (void) tmp_shared;
-    }
-
-    float * dst_row = dst + sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
-#pragma unroll
-    for (int j = 0; j < ncols_dst; ++j) {
-#pragma unroll
-        for (int r = 0; r < rows_per_block; ++r) {
-            if constexpr (nwarps > 1) {
-#pragma unroll
-                for (int l = 0; l < nwarps-1; ++l) {
-                    tmp[j][r] += tmp_shared[l][j][r][threadIdx.x];
-                }
-            }
-            tmp[j][r] = warp_reduce_sum<warp_size>(tmp[j][r]);
-        }
-        if (threadIdx.x < rows_per_block && (rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
-            dst_row[j*stride_col_dst + threadIdx.x] = tmp[j][threadIdx.x];
-        }
-    }
-
-    GGML_UNUSED_VARS(nchannels_dst, nsamples_dst);
-}
-
+// Generic legacy-quant interleaved-activation route archived out-of-tree by
+// 2026-06-23 build-trim. Modern K-quant interleaved routes remain below.
+// Restore archived-code/20260623-mmvq-legacy-interleaved-trim only as an
+// opt-in validation TU if LLAMA_MTP_MMVQ_LEGACY_INTERLEAVED_ACT is needed.
 // Generic low-bit K-quant interleaved-activation route for Q2_K/Q3_K. These
 // block types span multiple Q8_1 activation blocks, so they need explicit
 // interleaved gathers rather than the legacy one-block vecdot wrapper.
@@ -5713,117 +5545,6 @@ static bool mul_mat_vec_q_q5_K_interleaved_act_try_launch(
 }
 
 template <ggml_type type, int c_ncols_dst, int c_nwarps, int c_rows_per_block, bool c_interleaved_act = false>
-static void mul_mat_vec_q_legacy_interleaved_act_launch_typed(
-        const void * vx, const void * vy, float * dst,
-        const uint32_t ncols_x, const uint32_t nrows_x,
-        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
-        const uint3 channel_ratio, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
-        const uint32_t stride_channel_dst, const uint3 sample_ratio,
-        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
-        const int warp_size, const int nchannels_dst, const int nsamples_dst, cudaStream_t stream) {
-
-    const dim3 block_nums((nrows_x + c_rows_per_block - 1) / c_rows_per_block, nchannels_dst, nsamples_dst);
-    const dim3 block_dims(warp_size, c_nwarps, 1);
-    mul_mat_vec_q_legacy_interleaved_act<type, c_ncols_dst, c_nwarps, c_rows_per_block, c_interleaved_act><<<block_nums, block_dims, 0, stream>>>(
-            vx, vy, dst, ncols_x, channel_ratio, sample_ratio,
-            stride_row_x, stride_col_y, stride_col_dst,
-            nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-            nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst);
-}
-
-static bool mul_mat_vec_q_legacy_interleaved_act_try_launch(
-        const ggml_tensor * src0, const void * vx, const void * vy_interleaved, float * dst,
-        const int ncols_x, const int nrows_x, const int ncols_dst,
-        const int stride_row_x, const int stride_col_y_interleaved, const int stride_col_dst,
-        const int nchannels_x, const int nchannels_dst,
-        const int stride_channel_x, const int stride_channel_y_interleaved, const int stride_channel_dst,
-        const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y_interleaved,
-        const int stride_sample_dst, const int cc, const int warp_size, cudaStream_t stream) {
-
-    if (!ggml_cuda_mtp_mmvq_legacy_interleaved_act_enabled()) {
-        return false;
-    }
-    if (src0 == nullptr || !ggml_cuda_mtp_mmvq_legacy_interleaved_act_type_allowed(src0->type) ||
-            !ggml_cuda_mtp_mmvq_legacy_interleaved_act_name_allowed(src0->name)) {
-        return false;
-    }
-    if (!ggml_cuda_mtp_mmvq_legacy_interleaved_act_ncols_allowed(ncols_dst) || ncols_dst < 2 || ncols_dst > 5) {
-        return false;
-    }
-    if (!GGML_CUDA_CC_IS_RDNA(cc) || warp_size != 32 || ncols_x % QK8_1 != 0 || nrows_x <= 0 || nchannels_dst % nchannels_x != 0 || nsamples_dst % nsamples_x != 0) {
-        return false;
-    }
-
-    const uint3 channel_ratio_fd = init_fastdiv_values(nchannels_dst / nchannels_x);
-    const uint3 sample_ratio_fd  = init_fastdiv_values(nsamples_dst / nsamples_x);
-    const int rows_requested   = ggml_cuda_mtp_mmvq_interleaved_act_rows("LLAMA_MTP_MMVQ_LEGACY_INTERLEAVED_ACT_ROWS");
-    const int nwarps_requested = ggml_cuda_mtp_mmvq_interleaved_act_nwarps("LLAMA_MTP_MMVQ_LEGACY_INTERLEAVED_ACT_NWARPS");
-
-    if (ggml_cuda_mtp_mmvq_legacy_interleaved_act_log_enabled()) {
-        GGML_LOG_INFO("%s: mtp_weight_route route=mmvq_legacy_interleaved_act tensor=%s type=%s status=selected ncols_x=%d nrows_x=%d ncols_dst=%d nwarps=%d rows=%d\n",
-                __func__, src0->name, ggml_type_name(src0->type), ncols_x, nrows_x, ncols_dst, nwarps_requested, rows_requested);
-    }
-
-#define GGML_CUDA_MMVQ_LEGACY_INTERLEAVED_ACT_LAUNCH_TYPED(TYPE, NCOLS, NWARPS, ROWS) \
-    mul_mat_vec_q_legacy_interleaved_act_launch_typed<TYPE, NCOLS, NWARPS, ROWS, true>( \
-            vx, vy_interleaved, dst, ncols_x, nrows_x, stride_row_x, stride_col_y_interleaved, stride_col_dst, \
-            channel_ratio_fd, stride_channel_x, stride_channel_y_interleaved, stride_channel_dst, \
-            sample_ratio_fd, stride_sample_x, stride_sample_y_interleaved, stride_sample_dst, \
-            warp_size, nchannels_dst, nsamples_dst, stream)
-
-#define GGML_CUDA_MMVQ_LEGACY_INTERLEAVED_ACT_LAUNCH_ROWS(TYPE, NCOLS, ROWS) \
-    do { \
-        if (nwarps_requested == 4) { \
-            GGML_CUDA_MMVQ_LEGACY_INTERLEAVED_ACT_LAUNCH_TYPED(TYPE, NCOLS, 4, ROWS); \
-        } else if (nwarps_requested == 2) { \
-            GGML_CUDA_MMVQ_LEGACY_INTERLEAVED_ACT_LAUNCH_TYPED(TYPE, NCOLS, 2, ROWS); \
-        } else { \
-            GGML_CUDA_MMVQ_LEGACY_INTERLEAVED_ACT_LAUNCH_TYPED(TYPE, NCOLS, 1, ROWS); \
-        } \
-    } while (0)
-
-#define GGML_CUDA_MMVQ_LEGACY_INTERLEAVED_ACT_LAUNCH_NCOLS(TYPE, NCOLS) \
-    do { \
-        if (rows_requested == 2) { \
-            GGML_CUDA_MMVQ_LEGACY_INTERLEAVED_ACT_LAUNCH_ROWS(TYPE, NCOLS, 2); \
-        } else { \
-            GGML_CUDA_MMVQ_LEGACY_INTERLEAVED_ACT_LAUNCH_ROWS(TYPE, NCOLS, 1); \
-        } \
-    } while (0)
-
-#define GGML_CUDA_MMVQ_LEGACY_INTERLEAVED_ACT_SWITCH_NCOLS(TYPE) \
-    do { \
-        switch (ncols_dst) { \
-            case 2: GGML_CUDA_MMVQ_LEGACY_INTERLEAVED_ACT_LAUNCH_NCOLS(TYPE, 2); return true; \
-            case 3: GGML_CUDA_MMVQ_LEGACY_INTERLEAVED_ACT_LAUNCH_NCOLS(TYPE, 3); return true; \
-            case 4: GGML_CUDA_MMVQ_LEGACY_INTERLEAVED_ACT_LAUNCH_NCOLS(TYPE, 4); return true; \
-            case 5: GGML_CUDA_MMVQ_LEGACY_INTERLEAVED_ACT_LAUNCH_NCOLS(TYPE, 5); return true; \
-            default: return false; \
-        } \
-    } while (0)
-
-    switch (src0->type) {
-        case GGML_TYPE_Q4_0:
-            GGML_CUDA_MMVQ_LEGACY_INTERLEAVED_ACT_SWITCH_NCOLS(GGML_TYPE_Q4_0);
-        case GGML_TYPE_Q4_1:
-            GGML_CUDA_MMVQ_LEGACY_INTERLEAVED_ACT_SWITCH_NCOLS(GGML_TYPE_Q4_1);
-        case GGML_TYPE_Q5_0:
-            GGML_CUDA_MMVQ_LEGACY_INTERLEAVED_ACT_SWITCH_NCOLS(GGML_TYPE_Q5_0);
-        case GGML_TYPE_Q5_1:
-            GGML_CUDA_MMVQ_LEGACY_INTERLEAVED_ACT_SWITCH_NCOLS(GGML_TYPE_Q5_1);
-        case GGML_TYPE_Q8_0:
-            GGML_CUDA_MMVQ_LEGACY_INTERLEAVED_ACT_SWITCH_NCOLS(GGML_TYPE_Q8_0);
-        default:
-            return false;
-    }
-
-#undef GGML_CUDA_MMVQ_LEGACY_INTERLEAVED_ACT_SWITCH_NCOLS
-#undef GGML_CUDA_MMVQ_LEGACY_INTERLEAVED_ACT_LAUNCH_NCOLS
-#undef GGML_CUDA_MMVQ_LEGACY_INTERLEAVED_ACT_LAUNCH_ROWS
-#undef GGML_CUDA_MMVQ_LEGACY_INTERLEAVED_ACT_LAUNCH_TYPED
-}
-
-template <ggml_type type, int c_ncols_dst, int c_nwarps, int c_rows_per_block, bool c_interleaved_act = false>
 static void mul_mat_vec_q_lowk_interleaved_act_launch_typed(
         const void * vx, const void * vy, float * dst,
         const uint32_t ncols_x, const uint32_t nrows_x,
@@ -7144,19 +6865,18 @@ void ggml_cuda_mul_mat_vec_q(
                 ggml_cuda_mtp_mmvq_q5k_interleaved_act_name_allowed(src0->name) &&
                 ggml_cuda_mtp_mmvq_q5k_interleaved_act_ncols_allowed((int) ncols_dst_i) &&
                 ncols_dst_i >= 2 && ncols_dst_i <= 5;
-        const bool legacy_interleaved_wanted = !ids_d && !early_has_fusion &&
-                ggml_cuda_mtp_mmvq_legacy_interleaved_act_enabled() &&
-                ggml_cuda_mtp_mmvq_legacy_interleaved_act_type_allowed(src0->type) &&
-                ggml_cuda_mtp_mmvq_legacy_interleaved_act_name_allowed(src0->name) &&
-                ggml_cuda_mtp_mmvq_legacy_interleaved_act_ncols_allowed((int) ncols_dst_i) &&
-                ncols_dst_i >= 2 && ncols_dst_i <= 5;
+        if (const char * legacy_env = getenv("LLAMA_MTP_MMVQ_LEGACY_INTERLEAVED_ACT")) {
+            if (legacy_env[0] != '\0' && strcmp(legacy_env, "0") != 0 && strcmp(legacy_env, "off") != 0 && strcmp(legacy_env, "false") != 0) {
+                GGML_ABORT("LLAMA_MTP_MMVQ_LEGACY_INTERLEAVED_ACT was archived out-of-tree by 2026-06-23 build-trim");
+            }
+        }
         const bool lowk_interleaved_wanted = !ids_d && !early_has_fusion &&
                 ggml_cuda_mtp_mmvq_lowk_interleaved_act_enabled() &&
                 ggml_cuda_mtp_mmvq_lowk_interleaved_act_type_allowed(src0->type) &&
                 ggml_cuda_mtp_mmvq_lowk_interleaved_act_name_allowed(src0->name) &&
                 ggml_cuda_mtp_mmvq_lowk_interleaved_act_ncols_allowed((int) ncols_dst_i) &&
                 ncols_dst_i >= 2 && ncols_dst_i <= 5;
-        if (q6k_interleaved_wanted || q4k_interleaved_wanted || q5k_interleaved_wanted || legacy_interleaved_wanted || lowk_interleaved_wanted) {
+        if (q6k_interleaved_wanted || q4k_interleaved_wanted || q5k_interleaved_wanted || lowk_interleaved_wanted) {
             const int64_t nchannels_dst_i      = ne2;
             const int64_t blocks_per_col_i     = ne10_padded / QK8_1;
             const int64_t stride_col_y_i       = ne11;
@@ -7207,15 +6927,6 @@ void ggml_cuda_mul_mat_vec_q(
                         ne03, ne3, stride_sample_x_i, stride_sample_y_i, stride_sample_dst_i,
                         cc, warp_size, stream)) {
                 ggml_cuda_mtp_mmvq_route_census_record("mmvq_q5k_interleaved_act", src0, ne00, ne01, ncols_dst_i, false, false);
-                return;
-            }
-            if (legacy_interleaved_wanted && mul_mat_vec_q_legacy_interleaved_act_try_launch(
-                        src0, src0->data, src1_q8_1_interleaved_d, dst_d, ne00, ne01, ncols_dst_i,
-                        stride_row_x_i, stride_col_y_i, stride_col_dst_i,
-                        ne02, nchannels_dst_i, stride_channel_x_i, stride_channel_y_i, stride_channel_dst_i,
-                        ne03, ne3, stride_sample_x_i, stride_sample_y_i, stride_sample_dst_i,
-                        cc, warp_size, stream)) {
-                ggml_cuda_mtp_mmvq_route_census_record("mmvq_legacy_interleaved_act", src0, ne00, ne01, ncols_dst_i, false, false);
                 return;
             }
             if (lowk_interleaved_wanted && mul_mat_vec_q_lowk_interleaved_act_try_launch(

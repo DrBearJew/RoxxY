@@ -329,10 +329,10 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,       GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,       GGML_TYPE_Q4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0,      GGML_TYPE_Q4_0)
+#if !defined(GGML_USE_HIP) || defined(GGML_HIP_COMPILE_STANDARD_Q8_FATTN)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,      GGML_TYPE_Q8_0)
-    // Stable no-TBQ public path: q8_0 K + q4_0 V should run without
-    // GGML_CUDA_FA_ALL_QUANTS or lab/unsafe ROCm route knobs.
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,      GGML_TYPE_Q4_0)
+#endif
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16,      GGML_TYPE_BF16)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
@@ -403,7 +403,7 @@ enum ggml_cuda_fattn_k_physical_repr {
     GGML_CUDA_FATTN_K_PHYS_UNKNOWN = 0,
     GGML_CUDA_FATTN_K_PHYS_F16_EXACT,
     GGML_CUDA_FATTN_K_PHYS_Q8_0_BLOCK32,
-    GGML_CUDA_FATTN_K_PHYS_PACKED16_Q8_SIDECAR,
+    GGML_CUDA_FATTN_K_PHYS_PDMQ_I32_SIDECAR,
 };
 
 static ggml_cuda_fattn_k_physical_repr ggml_cuda_fattn_k_physical_repr_from_tensor(const ggml_tensor * K) {
@@ -417,7 +417,7 @@ static ggml_cuda_fattn_k_physical_repr ggml_cuda_fattn_k_physical_repr_from_tens
         return GGML_CUDA_FATTN_K_PHYS_Q8_0_BLOCK32;
     }
     if (K->type == GGML_TYPE_I32) {
-        return GGML_CUDA_FATTN_K_PHYS_PACKED16_Q8_SIDECAR;
+        return GGML_CUDA_FATTN_K_PHYS_PDMQ_I32_SIDECAR;
     }
     return GGML_CUDA_FATTN_K_PHYS_UNKNOWN;
 }
@@ -426,18 +426,68 @@ static const char * ggml_cuda_fattn_k_physical_repr_name(const ggml_tensor * K) 
     switch (ggml_cuda_fattn_k_physical_repr_from_tensor(K)) {
         case GGML_CUDA_FATTN_K_PHYS_F16_EXACT:              return "f16_exact";
         case GGML_CUDA_FATTN_K_PHYS_Q8_0_BLOCK32:           return "q8_0_block32";
-        case GGML_CUDA_FATTN_K_PHYS_PACKED16_Q8_SIDECAR:   return "packed16_q8_sidechannel_i32_f16scales";
+        case GGML_CUDA_FATTN_K_PHYS_PDMQ_I32_SIDECAR:      return "pdmq_i32_payload_f16scales";
         case GGML_CUDA_FATTN_K_PHYS_UNKNOWN:
         default:                                            return "unknown";
     }
 }
 
+static bool ggml_cuda_v4_144_pv4_standard_enabled() {
+#ifdef GGML_USE_HIP
+    const char * disable_v = getenv("GGML_CUDA_ROCM_V4_K16D16_144_PV4_DISABLE");
+    if (disable_v && atoi(disable_v) != 0) {
+        return false;
+    }
+    const char * legacy_pv4 = getenv("GGML_CUDA_ROCM_V4_K16D16_144_PV4");
+    if (legacy_pv4 && *legacy_pv4) {
+        return atoi(legacy_pv4) != 0;
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
+static bool ggml_cuda_v4_144_dp16_dot_profile_enabled() {
+#ifdef GGML_USE_HIP
+    const char * disable_v = getenv("GGML_CUDA_ROCM_V4_K16D16_144_PV4_DISABLE");
+    if (disable_v && atoi(disable_v) != 0) {
+        return false;
+    }
+    const char * profile = getenv("GGML_CUDA_ROCM_V4_K16D16_144_PROFILE");
+    return profile && *profile && atoi(profile) != 0;
+#else
+    return false;
+#endif
+}
+
 static bool ggml_cuda_env_enabled_name(const char * name) {
 #ifdef GGML_USE_HIP
     const char * env = getenv(name);
-    return env && atoi(env) != 0;
+    if (env && *env) {
+        return atoi(env) != 0;
+    }
+    if (strcmp(name, "GGML_CUDA_ROCM_V4_K16D16_144_PROFILE") == 0) {
+        return ggml_cuda_v4_144_dp16_dot_profile_enabled();
+    }
+    if (strcmp(name, "GGML_CUDA_ROCM_V4_K16D16_144_PV4") == 0 ||
+            strcmp(name, "GGML_CUDA_ROCM_V4_K16D16_144_PACKED16_DECODE_EXPERIMENT") == 0 ||
+            strcmp(name, "GGML_CUDA_ROCM_V4_K16D16_144_DECODE_SPLITK") == 0 ||
+            strcmp(name, "GGML_CUDA_ROCM_V4_K16D16_144_GQA6_WAVEGROUP") == 0 ||
+            strcmp(name, "GGML_CUDA_ROCM_V4_K16D16_144_PWMMA_PREFILL") == 0) {
+        return ggml_cuda_v4_144_pv4_standard_enabled();
+    }
+    return false;
 #else
     GGML_UNUSED(name);
+    return false;
+#endif
+}
+
+static constexpr bool ggml_cuda_standard_q8_fattn_vec_compiled() {
+#if !defined(GGML_USE_HIP) || defined(GGML_CUDA_FA_ALL_QUANTS) || defined(GGML_HIP_COMPILE_STANDARD_Q8_FATTN)
+    return true;
+#else
     return false;
 #endif
 }
@@ -811,6 +861,26 @@ static bool ggml_cuda_fattn_route_contract_is_i8(const char * required) {
         strcmp(required, "rocm_packed16_bm_dot4_pages_intflash_vfrag_wmma") == 0);
 }
 
+static bool ggml_cuda_mtp_hotcold_experiment_enabled() {
+    const char * env = getenv("LLAMA_MTP_PACKED16_HOTCOLD_K_EXPERIMENT");
+    return env && env[0] != '\0' && atoi(env) != 0;
+}
+
+static bool ggml_cuda_mtp_hotcold_legacy_q4v_enabled() {
+    const char * env = getenv("LLAMA_MTP_PACKED16_HOTCOLD_K_LEGACY_Q4V");
+    return env && env[0] != '\0' && atoi(env) != 0;
+}
+
+static bool ggml_cuda_mtp_hotcold_v_type_supported(const ggml_tensor * V) {
+    if (!V) {
+        return false;
+    }
+    if (V->type == GGML_TYPE_V4_K16D16_144) {
+        return true;
+    }
+    return V->type == GGML_TYPE_Q4_0 && ggml_cuda_mtp_hotcold_legacy_q4v_enabled();
+}
+
 static bool ggml_cuda_mtp_hotcold_packed16_decode_contract_applicable(
         const ggml_tensor * dst,
         const bool require_cold_allowed) {
@@ -821,6 +891,9 @@ static bool ggml_cuda_mtp_hotcold_packed16_decode_contract_applicable(
     const char * hotcold_env = getenv("LLAMA_MTP_PACKED16_HOTCOLD_K");
     if (!hotcold_env || atoi(hotcold_env) == 0) {
         return false;
+    }
+    if (!ggml_cuda_mtp_hotcold_experiment_enabled()) {
+        GGML_ABORT("LLAMA_MTP_PACKED16_HOTCOLD_K is deprecated/default-off; set LLAMA_MTP_PACKED16_HOTCOLD_K_EXPERIMENT=1 for the old hot/cold experiment");
     }
 
     const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
@@ -840,9 +913,12 @@ static bool ggml_cuda_mtp_hotcold_packed16_decode_contract_applicable(
     if (hot_window <= 0) {
         return false;
     }
-    const char * cold_unsafe_env = getenv("LLAMA_MTP_PACKED16_HOTCOLD_K_COLD_UNSAFE");
-    const bool cold_unsafe = cold_unsafe_env && atoi(cold_unsafe_env) != 0;
-    const bool cold_allowed = hot_window >= K->ne[1] || cold_unsafe;
+    if (const char * cold_unsafe_env = getenv("LLAMA_MTP_PACKED16_HOTCOLD_K_COLD_UNSAFE")) {
+        if (cold_unsafe_env[0] != '\0' && atoi(cold_unsafe_env) != 0) {
+            GGML_ABORT("LLAMA_MTP_PACKED16_HOTCOLD_K_COLD_UNSAFE was deprecated; increase LLAMA_MTP_PACKED16_HOTCOLD_K_WINDOW or disable hot/cold K");
+        }
+    }
+    const bool cold_allowed = hot_window >= K->ne[1];
     if (require_cold_allowed && !cold_allowed) {
         return false;
     }
@@ -851,7 +927,7 @@ static bool ggml_cuda_mtp_hotcold_packed16_decode_contract_applicable(
     ggml_tensor * scales  = nullptr;
     llama_kv_cache_get_packed16_tensors(K->data, &payload, &scales);
     return Q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-        K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_Q4_0 &&
+        K->type == GGML_TYPE_F16 && ggml_cuda_mtp_hotcold_v_type_supported(V) &&
         Q->ne[0] == 256 && Q->ne[1] == 1 && K->ne[0] == Q->ne[0] && V->ne[0] == Q->ne[0] &&
         K->ne[1] > 0 && Q->ne[2] % K->ne[2] == 0 && V->ne[2] == K->ne[2] &&
         Q->ne[3] == K->ne[3] && V->ne[3] == K->ne[3] &&
@@ -874,6 +950,9 @@ static bool ggml_cuda_mtp_hotcold_packed16_small_verify_contract_applicable(
     if (!hotcold_env || atoi(hotcold_env) == 0) {
         return false;
     }
+    if (!ggml_cuda_mtp_hotcold_experiment_enabled()) {
+        GGML_ABORT("LLAMA_MTP_PACKED16_HOTCOLD_K is deprecated/default-off; set LLAMA_MTP_PACKED16_HOTCOLD_K_EXPERIMENT=1 for the old hot/cold experiment");
+    }
 
     const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
     const bool smallq_verify_inst =
@@ -895,9 +974,12 @@ static bool ggml_cuda_mtp_hotcold_packed16_small_verify_contract_applicable(
     if (hot_window <= 0) {
         return false;
     }
-    const char * cold_unsafe_env = getenv("LLAMA_MTP_PACKED16_HOTCOLD_K_COLD_UNSAFE");
-    const bool cold_unsafe = cold_unsafe_env && atoi(cold_unsafe_env) != 0;
-    const bool cold_allowed = hot_window >= K->ne[1] || cold_unsafe;
+    if (const char * cold_unsafe_env = getenv("LLAMA_MTP_PACKED16_HOTCOLD_K_COLD_UNSAFE")) {
+        if (cold_unsafe_env[0] != '\0' && atoi(cold_unsafe_env) != 0) {
+            GGML_ABORT("LLAMA_MTP_PACKED16_HOTCOLD_K_COLD_UNSAFE was deprecated; increase LLAMA_MTP_PACKED16_HOTCOLD_K_WINDOW or disable hot/cold K");
+        }
+    }
+    const bool cold_allowed = hot_window >= K->ne[1];
     if (require_cold_allowed && !cold_allowed) {
         return false;
     }
@@ -909,7 +991,7 @@ static bool ggml_cuda_mtp_hotcold_packed16_small_verify_contract_applicable(
     ggml_tensor * scales  = nullptr;
     llama_kv_cache_get_packed16_tensors(K->data, &payload, &scales);
     return Q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-        K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_Q4_0 &&
+        K->type == GGML_TYPE_F16 && ggml_cuda_mtp_hotcold_v_type_supported(V) &&
         Q->ne[0] == 256 && K->ne[0] == Q->ne[0] && V->ne[0] == Q->ne[0] &&
         Q->ne[1] >= 2 && Q->ne[1] <= max_nq && K->ne[1] > 0 &&
         Q->ne[2] % K->ne[2] == 0 && V->ne[2] == K->ne[2] &&
@@ -967,12 +1049,12 @@ static bool ggml_cuda_fattn_route_contract_applicable(
             ggml_cuda_fattn_inst_is_mtp_verify_qk(fa_inst_i32) ||
             fa_inst_i32 == GGML_FATTN_INST_NONE;
         const bool persistent_packed16 =
-            K->type == GGML_TYPE_I32 && K->ne[0] * 4 == Q->ne[0];
+            K->type == GGML_TYPE_I32 && (K->ne[0] * 4 == Q->ne[0] || K->ne[0] * 8 == Q->ne[0]);
         const bool hotcold_f16_sidecar =
             ggml_cuda_mtp_hotcold_packed16_small_verify_contract_applicable(dst, false);
         return smallq_verify_inst &&
             Q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-            V->type == GGML_TYPE_Q4_0 && Q->ne[0] == 256 && V->ne[0] == 256 &&
+            ggml_cuda_mtp_hotcold_v_type_supported(V) && Q->ne[0] == 256 && V->ne[0] == 256 &&
             Q->ne[1] >= 2 && Q->ne[1] <= max_nq && K->ne[1] > 0 && K->ne[2] > 0 &&
             Q->ne[2] % K->ne[2] == 0 && Q->ne[3] == K->ne[3] &&
             V->ne[2] == K->ne[2] && V->ne[3] == K->ne[3] &&
@@ -1018,7 +1100,8 @@ static bool ggml_cuda_fattn_route_contract_applicable(
         const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
         const bool persistent_packed16 =
             K->type == GGML_TYPE_I32 && K->ne[0] * 4 == Q->ne[0] &&
-            (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0);
+            (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0 ||
+             V->type == GGML_TYPE_V4_K16D16_144);
         const bool hotcold_f16_sidecar =
             ggml_cuda_mtp_hotcold_packed16_decode_contract_applicable(dst, false);
         return fa_inst_i32 == GGML_FATTN_INST_MTP_DRAFT_DECODE_QK &&
@@ -1042,11 +1125,11 @@ static bool ggml_cuda_fattn_route_contract_applicable(
             fa_inst_i32 == GGML_FATTN_INST_NONE;
         if (smallq_verify_inst && Q->ne[1] >= 2) {
             const bool persistent_packed16 =
-                K->type == GGML_TYPE_I32 && K->ne[0] * 4 == Q->ne[0];
+                K->type == GGML_TYPE_I32 && (K->ne[0] * 4 == Q->ne[0] || K->ne[0] * 8 == Q->ne[0]);
             const bool hotcold_f16_sidecar =
                 ggml_cuda_mtp_hotcold_packed16_small_verify_contract_applicable(dst, false);
             return Q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-                V->type == GGML_TYPE_Q4_0 && Q->ne[0] == 256 && V->ne[0] == 256 &&
+                ggml_cuda_mtp_hotcold_v_type_supported(V) && Q->ne[0] == 256 && V->ne[0] == 256 &&
                 K->ne[1] > 0 && K->ne[2] > 0 &&
                 Q->ne[2] % K->ne[2] == 0 && Q->ne[3] == K->ne[3] &&
                 V->ne[2] == K->ne[2] && V->ne[3] == K->ne[3] &&
@@ -2272,6 +2355,9 @@ static bool ggml_cuda_dp16_fa_route_required() {
 static bool ggml_cuda_mtp_packed16_hotcold_k_enabled() {
 #ifdef GGML_USE_HIP
     const char * env = getenv("LLAMA_MTP_PACKED16_HOTCOLD_K");
+    if (env && atoi(env) != 0 && !ggml_cuda_mtp_hotcold_experiment_enabled()) {
+        GGML_ABORT("LLAMA_MTP_PACKED16_HOTCOLD_K is deprecated/default-off; set LLAMA_MTP_PACKED16_HOTCOLD_K_EXPERIMENT=1 for the old hot/cold experiment");
+    }
     return env && atoi(env) != 0;
 #else
     return false;
@@ -2290,10 +2376,11 @@ static int64_t ggml_cuda_mtp_packed16_hotcold_k_window() {
 static bool ggml_cuda_mtp_packed16_hotcold_cold_unsafe_enabled() {
 #ifdef GGML_USE_HIP
     const char * env = getenv("LLAMA_MTP_PACKED16_HOTCOLD_K_COLD_UNSAFE");
-    return env && atoi(env) != 0;
-#else
-    return false;
+    if (env && env[0] != '\0' && atoi(env) != 0) {
+        GGML_ABORT("LLAMA_MTP_PACKED16_HOTCOLD_K_COLD_UNSAFE was deprecated; increase LLAMA_MTP_PACKED16_HOTCOLD_K_WINDOW or disable hot/cold K");
+    }
 #endif
+    return false;
 }
 
 static bool ggml_cuda_fattn_has_packed16_sidecar(
@@ -2350,7 +2437,7 @@ static bool ggml_cuda_mtp_hotcold_packed16_decode_supported(
     return Q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
            Q->ne[0] == 256 && Q->ne[1] == 1 &&
            K->type == GGML_TYPE_F16 && K->ne[0] == Q->ne[0] &&
-           V->type == GGML_TYPE_Q4_0 && V->ne[0] == Q->ne[0] &&
+           ggml_cuda_mtp_hotcold_v_type_supported(V) && V->ne[0] == Q->ne[0] &&
            K->ne[1] > 0 && hot_window > 0 &&
            Q->ne[2] % K->ne[2] == 0 &&
            V->ne[2] == K->ne[2] && Q->ne[3] == K->ne[3] &&
@@ -3242,7 +3329,7 @@ static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
         (getenv("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ") ?
         std::max(2, atoi(getenv("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ"))) : 4);
     const bool smallq_packed16_persistent =
-        K->type == GGML_TYPE_I32 && K->ne[0] * 4 == Q->ne[0];
+        K->type == GGML_TYPE_I32 && (K->ne[0] * 4 == Q->ne[0] || K->ne[0] * 8 == Q->ne[0]);
     const bool smallq_hotcold_sidecar_relaxed =
         ggml_cuda_mtp_hotcold_packed16_small_verify_contract_applicable(dst, false);
     const bool smallq_hotcold_sidecar =
@@ -3250,7 +3337,7 @@ static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
     const bool smallq_fa2_shape =
         ggml_cuda_fattn_inst_is_mtp_verify_qk(inst) &&
         Q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-        V->type == GGML_TYPE_Q4_0 && Q->ne[0] == 256 && V->ne[0] == Q->ne[0] &&
+        ggml_cuda_mtp_hotcold_v_type_supported(V) && Q->ne[0] == 256 && V->ne[0] == Q->ne[0] &&
         Q->ne[1] >= 2 && Q->ne[1] <= small_verify_max_nq && K->ne[1] > 0 &&
         K->ne[2] > 0 && Q->ne[2] % K->ne[2] == 0 && V->ne[2] == K->ne[2] &&
         Q->ne[3] == K->ne[3] && V->ne[3] == K->ne[3] &&
@@ -3258,7 +3345,7 @@ static best_fattn_kernel ggml_cuda_select_mtp_verify_fattn(
     const bool smallq_pdmq_shape =
         ggml_cuda_fattn_inst_is_mtp_verify_qk(inst) &&
         Q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-        V->type == GGML_TYPE_Q4_0 && Q->ne[0] == 256 && V->ne[0] == Q->ne[0] &&
+        ggml_cuda_mtp_hotcold_v_type_supported(V) && Q->ne[0] == 256 && V->ne[0] == Q->ne[0] &&
         Q->ne[1] >= 2 && Q->ne[1] <= small_verify_max_nq && K->ne[1] > 0 &&
         K->ne[2] > 0 && Q->ne[2] % K->ne[2] == 0 && V->ne[2] == K->ne[2] &&
         Q->ne[3] == K->ne[3] && V->ne[3] == K->ne[3] &&
@@ -3481,7 +3568,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             (strcmp(required_route, "rocm_packed16_dot4_mmq") == 0 ||
              strcmp(required_route, "packed16_dot4_mmq") == 0);
 
-        const bool k_shape_ok = K->ne[0] * 4 == Q->ne[0];  // D/4 * 4 == D
+        const bool k_shape_ok = K->ne[0] * 4 == Q->ne[0] || K->ne[0] * 8 == Q->ne[0];  // packed D/4 or D/8 I32 K
         // V layout: FA expects [D,n_kv,heads,batch], native v_trans is [n_kv,heads,D,batch]
         const bool v_shape_fa    = V->ne[0] == Q->ne[0];
         const bool v_shape_trans = V->type == GGML_TYPE_F16 && V->ne[0] == K->ne[1] && V->ne[1] == K->ne[2] && V->ne[2] == Q->ne[0];
@@ -3554,6 +3641,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         // ── Route dispatch ───────────────────────────────────
         const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
         const ggml_fattn_instruction inst = (ggml_fattn_instruction)fa_inst_i32;
+        ggml_cuda_packed16_sidecar_meta packed16_meta = {};
+        llama_kv_cache_get_packed16_sidecar_meta(K->data, &packed16_meta);
+        const bool packed16_layout_row = packed16_meta.layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_ROW;
+        const bool packed8_q4_144_k_format =
+            K->type == GGML_TYPE_I32 &&
+            K->ne[0] * 8 == Q->ne[0] &&
+            packed16_meta.k_format == GGML_CUDA_PDMQ_K_FORMAT_PACKED8_Q4_144 &&
+            packed16_meta.code_bits == 4 && packed16_meta.zero_point == 8;
 
         const char * packed16_fa2_vec_min_nk_env = getenv("GGML_CUDA_ROCM_PACKED16_LDS_A8_MIN_NK");
         const int packed16_fa2_vec_min_nk = packed16_fa2_vec_min_nk_env ? atoi(packed16_fa2_vec_min_nk_env) : 12288;
@@ -3571,26 +3666,34 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 K->type == GGML_TYPE_I32 &&
                 V->type == GGML_TYPE_Q4_0 &&
                 Q->ne[0] == 256 && V->ne[0] == 256) {
-            if (g_fattn_select_ctx == GGML_CUDA_FATTN_SELECT_DISPATCH &&
-                    (getenv("LLAMA_MTP_FA_ROUTE") || getenv("GGML_CUDA_ROCM_PACKED16_DECODE_LOG") ||
-                     getenv("GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE") || getenv("COMPRESSED_KV_FATTN_LOG"))) {
-                static int packed16_fa2_vec_log_count = 0;
-                const bool packed16_fa2_vec_verbose_all =
-                    (getenv("GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE") && atoi(getenv("GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE")) != 0) ||
-                    (getenv("COMPRESSED_KV_FATTN_LOG") && atoi(getenv("COMPRESSED_KV_FATTN_LOG")) != 0);
-                if (packed16_fa2_vec_verbose_all || packed16_fa2_vec_log_count++ < 16) {
-                    fprintf(stderr,
-                        "packed16_fa2_vec selected=rocm_packed16_fa2_vec route=packed16k_q4v_fa2_vec "
-                        "inst=%d nq=%lld nk=%lld hq=%lld hk=%lld batch=%lld force=%d qblock=%d long_context=%d min_nk=%d\n",
-                        fa_inst_i32,
-                        (long long) Q->ne[1], (long long) K->ne[1],
-                        (long long) Q->ne[2], (long long) K->ne[2], (long long) Q->ne[3],
-                        packed16_fa2_vec_force ? 1 : 0, packed16_fa2_vec_qblock ? 1 : 0,
-                        packed16_fa2_vec_long_context ? 1 : 0,
-                        packed16_fa2_vec_min_nk);
+            if (!packed16_layout_row) {
+                if (g_fattn_select_ctx == GGML_CUDA_FATTN_SELECT_DISPATCH && packed16_fa2_vec_force) {
+                    GGML_ABORT("required rocm_packed16_fa2_vec route is row-layout only but packed16 descriptor layout=%s; use rocm_packed16_dot4_mmq/PDMQ for D16-planar",
+                            ggml_cuda_packed16_k_layout_kind_name(packed16_meta.layout_kind));
                 }
+            } else {
+                if (g_fattn_select_ctx == GGML_CUDA_FATTN_SELECT_DISPATCH &&
+                        (getenv("LLAMA_MTP_FA_ROUTE") || getenv("GGML_CUDA_ROCM_PACKED16_DECODE_LOG") ||
+                         getenv("GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE") || getenv("COMPRESSED_KV_FATTN_LOG"))) {
+                    static int packed16_fa2_vec_log_count = 0;
+                    const bool packed16_fa2_vec_verbose_all =
+                        (getenv("GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE") && atoi(getenv("GGML_CUDA_ROCM_PACKED16_AUTO_VERBOSE")) != 0) ||
+                        (getenv("COMPRESSED_KV_FATTN_LOG") && atoi(getenv("COMPRESSED_KV_FATTN_LOG")) != 0);
+                    if (packed16_fa2_vec_verbose_all || packed16_fa2_vec_log_count++ < 16) {
+                        fprintf(stderr,
+                            "packed16_fa2_vec selected=rocm_packed16_fa2_vec route=packed16k_q4v_fa2_vec "
+                            "inst=%d nq=%lld nk=%lld hq=%lld hk=%lld batch=%lld force=%d qblock=%d long_context=%d min_nk=%d layout=%s\n",
+                            fa_inst_i32,
+                            (long long) Q->ne[1], (long long) K->ne[1],
+                            (long long) Q->ne[2], (long long) K->ne[2], (long long) Q->ne[3],
+                            packed16_fa2_vec_force ? 1 : 0, packed16_fa2_vec_qblock ? 1 : 0,
+                            packed16_fa2_vec_long_context ? 1 : 0,
+                            packed16_fa2_vec_min_nk,
+                            ggml_cuda_packed16_k_layout_kind_name(packed16_meta.layout_kind));
+                    }
+                }
+                return BEST_FATTN_KERNEL_PACKED16_FA2_VEC;
             }
-            return BEST_FATTN_KERNEL_PACKED16_FA2_VEC;
         }
 
         const bool require_packed16_dot4_decode =
@@ -3677,6 +3780,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
         const bool packed16_decode_enabled =
             require_packed16_decode_alias ||
+            ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_PDMQ_K_CACHE") ||
             ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE") ||
             ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_Q8K_DOT4_KQ") ||
             ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_V4_K16D16_144_PACKED16_DECODE_EXPERIMENT");
@@ -3794,7 +3898,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             const bool typed_v_pdmq_decode = V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_F16;
             const char * pdmq_vpath = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_VPATH");
             const bool explicit_v4_144_pdmq_decode = V->type == GGML_TYPE_V4_K16D16_144 &&
-                (require_packed16_dot4_mmq || ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_V4_K16D16_144_PV4") ||
+                (require_packed16_dot4_mmq || ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_V4_K16D16_144_PROFILE") ||
+                 ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_V4_K16D16_144_PV4") ||
                  (pdmq_vpath && (strcmp(pdmq_vpath, "v4_k16d16_144") == 0 || strcmp(pdmq_vpath, "persistent_v4_k16d16_144") == 0)));
             const bool v4_k16d16_pdmq_decode = V->type == GGML_TYPE_V4_K16D16 || explicit_v4_144_pdmq_decode;
             if ((standard_nomtp_q4_pdmq_decode || standard_mtp_q4_pdmq_decode || typed_v_pdmq_decode || v4_k16d16_pdmq_decode) &&
@@ -3901,11 +4006,40 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
              inst == GGML_FATTN_INST_MTP_DRAFT);
         const bool v4_144_mtp_pwmma =
             v4_144_mtp_batched && ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_V4_K16D16_144_PWMMA_MTP");
+        const bool v4_144_pv4_pwmma_disable =
+            ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_V4_K16D16_144_PV4_PWMMA_DISABLE");
+        const char * v4_144_pv4_pwmma_candidate_env = getenv("GGML_CUDA_ROCM_V4_K16D16_144_PV4_PWMMA_PREFILL_CANDIDATE");
+        const bool v4_144_pv4_pwmma_candidate_enabled =
+            !v4_144_pv4_pwmma_candidate_env || atoi(v4_144_pv4_pwmma_candidate_env) != 0;
+        const bool v4_144_pv4_pwmma_prefill_candidate =
+            V->type == GGML_TYPE_V4_K16D16_144 &&
+            !v4_144_pv4_pwmma_disable &&
+            v4_144_pv4_pwmma_candidate_enabled &&
+            !v4_144_mtp_batched;
         const bool v4_144_pwmma_prefill =
             V->type == GGML_TYPE_V4_K16D16_144 &&
+            !v4_144_pv4_pwmma_disable &&
             (v4_144_nomtp_prefill || v4_144_mtp_pwmma ||
+             v4_144_pv4_pwmma_prefill_candidate ||
              (!v4_144_mtp_batched && ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_V4_K16D16_144_PWMMA_PREFILL")));
-        const bool wmma_sup = (!v4_k16d16_v || v4_144_pwmma_prefill) && ggml_cuda_packed16_wmma_tile_enabled();
+        const char * v4_144_pwmma_min_nq_env = getenv("GGML_CUDA_ROCM_V4_K16D16_144_PWMMA_PREFILL_MIN_NQ");
+        const int v4_144_pwmma_min_nq = v4_144_pwmma_min_nq_env ? std::max(1, atoi(v4_144_pwmma_min_nq_env)) : 16;
+        const bool v4_144_pwmma_nq_ok = !v4_144_pwmma_prefill || Q->ne[1] >= v4_144_pwmma_min_nq;
+        const bool pure_prefill_inst = inst == GGML_FATTN_INST_NONE || inst == GGML_FATTN_INST_PREFILL_QK;
+        const bool packed8_pwmma_candidate_requested =
+            ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_PACKED8_Q4_144_PWMMA_PREFILL_CANDIDATE") ||
+            ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_PACKED8_Q4_PWMMA_PREFILL");
+        const int packed8_pwmma_min_nq = getenv("GGML_CUDA_ROCM_PACKED8_Q4_PWMMA_PREFILL_MIN_NQ") ?
+            std::max(1, atoi(getenv("GGML_CUDA_ROCM_PACKED8_Q4_PWMMA_PREFILL_MIN_NQ"))) : 16;
+        const int packed8_pwmma_min_nk = getenv("GGML_CUDA_ROCM_PACKED8_Q4_PWMMA_PREFILL_MIN_NK") ?
+            std::max(1, atoi(getenv("GGML_CUDA_ROCM_PACKED8_Q4_PWMMA_PREFILL_MIN_NK"))) : 512;
+        const bool packed8_pwmma_prefill =
+            packed8_pwmma_candidate_requested && packed8_q4_144_k_format && pure_prefill_inst &&
+            Q->ne[1] >= packed8_pwmma_min_nq && K->ne[1] >= packed8_pwmma_min_nk;
+        const bool k_wmma_shape_ok = K->type != GGML_TYPE_I32 || K->ne[0] * 4 == Q->ne[0] || packed8_pwmma_prefill;
+        const bool wmma_sup = (!v4_k16d16_v || (v4_144_pwmma_prefill && v4_144_pwmma_nq_ok)) &&
+            k_wmma_shape_ok &&
+            ggml_cuda_packed16_wmma_tile_enabled();
         best_fattn_kernel packed16_kernel = BEST_FATTN_KERNEL_NONE;
         const char * packed16_route_name = "none";
 
@@ -3933,7 +4067,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                     strcmp(explicit_impl, "bm64_i8qk_k32acc_kshared_512t_wavegate_stagev") == 0 ||
                     strcmp(explicit_impl, "bm64_i8qk_pvwmma_512t_wavegate_stagev") == 0 ||
                     strcmp(explicit_impl, "bm64_i8qk_pvwmma_bn32_512t_wavegate_stagev") == 0 ||
-                    strcmp(explicit_impl, "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev") == 0);
+                    strcmp(explicit_impl, "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev") == 0 ||
+                    strcmp(explicit_impl, "bm64_i8qk_packed8_expand_pvwmma_dbv_512t_wavegate_stagev") == 0);
             const bool impl_auto = impl_autoset || !explicit_impl || !*explicit_impl || strcmp(explicit_impl, "smem") == 0;
             // Qwen 27B-like shape: gqa_ratio=6, heads_q=24, heads_k=4.
             // Qwen 35B-like shape: gqa_ratio=8, heads_q=16, heads_k=2.
@@ -3949,8 +4084,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             const bool wmma_available = wmma_sup;
             const char * dbv_auto_env = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_DBV_AUTO");
             const bool dbv_auto_enabled = !dbv_auto_env || atoi(dbv_auto_env) != 0;
-            const bool use_pvwmma = dbv_auto_enabled && impl_auto && wmma_available && is_pvwmma_context;
-            const bool use_bm32_regout = !use_pvwmma && impl_auto && wmma_available &&
+            const bool use_pvwmma = dbv_auto_enabled && impl_auto && wmma_available && (is_pvwmma_context || packed8_pwmma_prefill);
+            const bool use_bm32_regout = !packed8_pwmma_prefill && !use_pvwmma && impl_auto && wmma_available &&
                 (v4_144_nomtp_prefill || v4_144_mtp_pwmma || is_big_q || is_27b_like || is_35b_like || is_long_context);
             const bool use_auto_wmma = use_pvwmma || use_bm32_regout;
 
@@ -3960,7 +4095,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             // and stays fixed.
             if (use_auto_wmma || (impl_is_wmma && wmma_available)) {
                 if (use_pvwmma) {
-                    setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL", "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev", 1);
+                    setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL",
+                        packed8_pwmma_prefill ? "bm64_i8qk_packed8_expand_pvwmma_dbv_512t_wavegate_stagev" : "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev", 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL_AUTOSET", "1", 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM", "64", 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_CAUSAL_SKIP", "1", 1);
@@ -3972,12 +4108,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 }
                 packed16_kernel = BEST_FATTN_KERNEL_PACKED16_WMMA_TILE;
                 if (use_pvwmma) {
-                    packed16_route_name = "pwmma_bm64_i8qk_pvwmma_dbv";
+                    packed16_route_name = packed8_pwmma_prefill ? "pwmma_bm64_i8qk_packed8_expand_pvwmma_dbv" : "pwmma_bm64_i8qk_pvwmma_dbv";
                 } else if (use_bm32_regout) {
                     packed16_route_name = "pwmma_bm32_regout_directv";
                 } else {
                     explicit_impl = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL");
-                    if (explicit_impl && strcmp(explicit_impl, "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev") == 0) {
+                    if (explicit_impl && strcmp(explicit_impl, "bm64_i8qk_packed8_expand_pvwmma_dbv_512t_wavegate_stagev") == 0) {
+                        packed16_route_name = "pwmma_bm64_i8qk_packed8_expand_pvwmma_dbv";
+                    } else if (explicit_impl && strcmp(explicit_impl, "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev") == 0) {
                         packed16_route_name = "pwmma_bm64_i8qk_pvwmma_dbv";
                     } else if (explicit_impl && strcmp(explicit_impl, "bm64_i8qk_pvwmma_512t_wavegate_stagev") == 0) {
                         packed16_route_name = "pwmma_bm64_i8qk_pvwmma";
@@ -4002,12 +4140,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             if (impl_auto) {
                 const char * dbv_auto_env = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_DBV_AUTO");
                 const bool dbv_auto_enabled = !dbv_auto_env || atoi(dbv_auto_env) != 0;
-                if (dbv_auto_enabled && K->ne[1] >= 1024) {
-                    setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL", "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev", 1);
+                if (packed8_pwmma_prefill || (dbv_auto_enabled && K->ne[1] >= 1024)) {
+                    setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL",
+                        packed8_pwmma_prefill ? "bm64_i8qk_packed8_expand_pvwmma_dbv_512t_wavegate_stagev" : "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev", 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL_AUTOSET", "1", 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM", "64", 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_CAUSAL_SKIP", "1", 1);
-                    packed16_route_name = "pwmma_bm64_i8qk_pvwmma_dbv";
+                    packed16_route_name = packed8_pwmma_prefill ? "pwmma_bm64_i8qk_packed8_expand_pvwmma_dbv" : "pwmma_bm64_i8qk_pvwmma_dbv";
                 } else {
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL", "bm32_regout_directv", 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL_AUTOSET", "1", 1);
@@ -4017,7 +4156,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 }
             } else {
                 explicit_impl = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL");
-                if (explicit_impl && strcmp(explicit_impl, "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev") == 0) {
+                if (explicit_impl && strcmp(explicit_impl, "bm64_i8qk_packed8_expand_pvwmma_dbv_512t_wavegate_stagev") == 0) {
+                    packed16_route_name = "pwmma_bm64_i8qk_packed8_expand_pvwmma_dbv";
+                } else if (explicit_impl && strcmp(explicit_impl, "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev") == 0) {
                     packed16_route_name = "pwmma_bm64_i8qk_pvwmma_dbv";
                 } else if (explicit_impl && strcmp(explicit_impl, "bm64_i8qk_pvwmma_512t_wavegate_stagev") == 0) {
                     packed16_route_name = "pwmma_bm64_i8qk_pvwmma";
@@ -4026,7 +4167,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                     packed16_route_name = (bm == 16) ? "pwmma_bm16" : (bm == 32 ? "pwmma_bm32" : "pwmma_bm64");
                 }
             }
-        } else if (ggml_cuda_q8k_dot4_kq_enabled() || getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE")) {
+        } else if (ggml_cuda_q8k_dot4_kq_enabled() || getenv("GGML_CUDA_ROCM_PDMQ_K_CACHE") || getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE")) {
             packed16_kernel = BEST_FATTN_KERNEL_NONE;
             packed16_route_name = "dot4_kq_removed";
         } else {
@@ -4036,12 +4177,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
         if (auto_verbose && g_fattn_select_ctx == GGML_CUDA_FATTN_SELECT_DISPATCH) {
             fprintf(stderr, "%s: PACKED16 FA ROUTE nq=%lld nk=%lld D=%lld hq=%lld hk=%lld gqa=%d"
-                " K=I32 V=%s auto=1 selected=%s"
+                " K=I32 k_format=%s V=%s auto=1 selected=%s"
                 " dot4_mmq_sup=%d wmma_sup=%d forced_route=%s\n",
                 __func__,
                 (long long)Q->ne[1], (long long)K->ne[1], (long long)Q->ne[0],
                 (long long)Q->ne[2], (long long)K->ne[2], gqa_ratio,
-                ggml_type_name(V->type),
+                packed8_q4_144_k_format ? "packed8_q4_144" : "packed16_q8_272", ggml_type_name(V->type),
                 packed16_route_name,
                 dot4_sup ? 1 : 0, wmma_sup ? 1 : 0,
                 required_route ? required_route : "none");
@@ -4079,7 +4220,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // reserve/proof graph stamped MTP_VERIFY_QK.  If the user explicitly asks
     // for the packed16 small-Q route and the graph-facing F16 K has a registered
     // hot/cold packed16 sidecar, select the packed16 decode family before the
-    // generic mixed-KV rejection sends F16-K/q4V to fallback.
+    // generic mixed-KV rejection sends F16-K with standard PV4/V144 to fallback.
+    // Legacy q4_0 V hot/cold remains opt-in via LLAMA_MTP_PACKED16_HOTCOLD_K_LEGACY_Q4V.
     {
         const int32_t fa_inst_i32 = ((const int32_t *)dst->op_params)[4];
         const char * required_route = getenv("GGML_CUDA_FA_ROUTE_REQUIRE");
@@ -4287,10 +4429,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         const auto return_quantized_route = [&](best_fattn_kernel selected) {
             return ggml_cuda_fattn_apply_route_contract(dst, selected, &f16_policy);
         };
+        const bool raw_q8_standard_vec = K->type == GGML_TYPE_Q8_0 &&
+            (V->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_Q8_0);
 
         if (!require_f16_route && ggml_cuda_fattn_mtp_hidden_producer_use_conservative_route(dst)) {
-            best_fattn_kernel producer_kernel = BEST_FATTN_KERNEL_VEC;
-            const char * producer_reason = "producer_dot4_disabled_vec";
+            best_fattn_kernel producer_kernel = (raw_q8_standard_vec && !ggml_cuda_standard_q8_fattn_vec_compiled()) ?
+                BEST_FATTN_KERNEL_NONE : BEST_FATTN_KERNEL_VEC;
+            const char * producer_reason = producer_kernel == BEST_FATTN_KERNEL_NONE ?
+                "producer_dot4_disabled_q8_standard_vec_not_compiled" : "producer_dot4_disabled_vec";
             if (allow_quant_prefill_f16 && f16_prefill_applicable) {
                 const best_fattn_kernel f16_backend = ggml_cuda_fattn_select_rocm_quant_prefill_f16_backend(cc, dst);
                 if (f16_backend != BEST_FATTN_KERNEL_NONE) {
@@ -4313,7 +4459,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return return_quantized_route(producer_kernel);
         }
 
-        if (!require_f16_route && ggml_cuda_q8k_dot4_packed16_vec_supported(cc, dst)) {
+        if (!require_f16_route && ggml_cuda_standard_q8_fattn_vec_compiled() && ggml_cuda_q8k_dot4_packed16_vec_supported(cc, dst)) {
             return return_quantized_route(BEST_FATTN_KERNEL_Q8K_DOT4_PACKED16_VEC);
         }
 
@@ -4340,6 +4486,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
 
         if (!allow_quant_prefill_f16) {
+            if (raw_q8_standard_vec && !ggml_cuda_standard_q8_fattn_vec_compiled()) {
+                return return_quantized_route(BEST_FATTN_KERNEL_NONE);
+            }
             return return_quantized_route(BEST_FATTN_KERNEL_VEC);
         }
 

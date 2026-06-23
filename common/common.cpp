@@ -1629,6 +1629,18 @@ void common_batch_add(
         batch.seq_id[batch.n_tokens][i] = seq_ids[i];
     }
     batch.logits  [batch.n_tokens] = logits;
+    if (batch.qblock_row_parent != nullptr) {
+        batch.qblock_row_parent[batch.n_tokens] = LLAMA_QBLOCK_ROW_META_UNSET;
+    }
+    if (batch.qblock_row_branch_id != nullptr) {
+        batch.qblock_row_branch_id[batch.n_tokens] = LLAMA_QBLOCK_ROW_META_UNSET;
+    }
+    if (batch.qblock_row_candidate_rank != nullptr) {
+        batch.qblock_row_candidate_rank[batch.n_tokens] = LLAMA_QBLOCK_ROW_META_UNSET;
+    }
+    if (batch.qblock_row_output_policy != nullptr) {
+        batch.qblock_row_output_policy[batch.n_tokens] = LLAMA_QBLOCK_ROW_META_UNSET;
+    }
 
     batch.n_tokens++;
 }

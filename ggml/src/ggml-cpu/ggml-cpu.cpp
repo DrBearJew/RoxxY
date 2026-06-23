@@ -468,6 +468,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         case GGML_OP_OUT_PROD:
             return (src0->type == GGML_TYPE_F32 || (ggml_is_quantized(src0->type) && src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3])) &&
                 src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+        case GGML_OP_PACK_V4_K16D16:
+            return false;
         case GGML_OP_FLASH_ATTN_EXT: {
             const ggml_tensor * q = op->src[0];
             const ggml_tensor * k = op->src[1];

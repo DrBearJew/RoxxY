@@ -1,8 +1,0 @@
-{
-  "prompt_tokens_approx": 4096,
-  "n_predict": 1,
-  "temperature": 0.0,
-  "top_k": 1,
-  "cache_prompt": true,
-  "seed": 1
-}

@@ -1,7 +1,0 @@
-The capital of France is
-Write a Python function that reverses a string.
-Explain why the sky is blue in one paragraph.
-Complete this sentence: The best way to learn programming is
-Solve step by step: if x + 7 = 12, x =
-Translate to French: good morning
-List three common uses of GPUs:

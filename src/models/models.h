@@ -1812,6 +1812,23 @@ struct llama_model_qwen35 : public llama_model_base {
                 int                       il,
                 int64_t                   row);
 
+        ggml_tensor * build_layer_attn_prefix_all(
+                llm_graph_input_attn_kv * inp_attn,
+                ggml_tensor *             cur,
+                ggml_tensor *             inp_pos,
+                int *                     sections,
+                int                       il);
+
+        ggml_tensor * build_layer_attn_prefix_all_q_only_scratch(
+                llm_graph_input_attn_kv * inp_attn,
+                ggml_tensor *             cur,
+                ggml_tensor *             inp_pos,
+                int *                     sections,
+                int                       il_src,
+                int                       il_label,
+                ggml_tensor *             qcur_override,
+                ggml_tensor *             gate_override);
+
         ggml_tensor * build_attn_prefix_row(
                 llm_graph_input_attn_kv * inp_attn,
                 ggml_tensor *             q_cur,

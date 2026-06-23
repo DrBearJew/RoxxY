@@ -2331,14 +2331,21 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         // speculative verify (nq>1 with spec context). DOT4 recthist/decode
         // paths fire when legal; fallback to existing policy otherwise.
         if (gtype != LLM_GRAPH_TYPE_DECODER_MTP) {
-            // QBlock verification is scoped by the server around the target
-            // verifier decode even when the graph type is the ordinary decoder.
-            // Stamp it before generic prefill classification so CUDA can apply
-            // QBlock-specific packed16/PDMQ policy and invariants.
-            const bool qblock_active = []() {
-                const char * env = getenv("LLAMA_MTP_QBLOCK_ACTIVE");
+            // QBlock verification is scoped either by the prefix-verify graph
+            // type or by the server around ordinary target-verifier decode
+            // chunks that contain only verifier rows.  Do not honor the legacy
+            // LLAMA_MTP_QBLOCK_ACTIVE process env here: exporting it globally
+            // can misclassify unrelated prefill/decoder graphs.
+            const bool qblock_target_verify_active = []() {
+                const char * env = getenv("LLAMA_MTP_QBLOCK_TARGET_VERIFY_ACTIVE");
                 return env && atoi(env) != 0;
             }();
+            const bool qblock_disabled = []() {
+                const char * env = getenv("LLAMA_MTP_QBLOCK_DISABLE");
+                return env && atoi(env) != 0;
+            }();
+            const bool qblock_active = !qblock_disabled &&
+                (gtype == LLM_GRAPH_TYPE_DECODER_PREFIX_VERIFY || qblock_target_verify_active);
             const int64_t n_query = q->ne[1];
             if (qblock_active && n_query > 1) {
                 ggml_flash_attn_ext_set_instruction(cur, GGML_FATTN_INST_MTP_QBLOCK_VERIFY_QK);
@@ -2396,12 +2403,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 inst_reason = "auto_packed16_mtp_draft_decode";
             } else if (packed16_mtp_q4_batched && (n_outputs > 0 || qblock_active)) {
                 // Persistent packed16 q4 MTP verify is a validated PDMQ lane.
-                // QBlock recurrent-prefix full-attention batching has no sampler
-                // output rows at the FA node (`n_outputs == 0`), but the server
-                // scopes LLAMA_MTP_QBLOCK_ACTIVE around the exact QBlock rows.
-                // Honor that semantic scope so long-context prefix FA can take
-                // the QBlock packed16 route instead of looking like generic
-                // upstream-like MTP attention.
+                // Legacy MTP/probe graph QBlock routing still uses
+                // LLAMA_MTP_QBLOCK_ACTIVE for no-output row-program experiments.
+                // Ordinary target verification is scoped in the non-MTP decoder
+                // block above through LLAMA_MTP_QBLOCK_TARGET_VERIFY_ACTIVE.
                 inst = qblock_active ? GGML_FATTN_INST_MTP_QBLOCK_VERIFY_QK : GGML_FATTN_INST_MTP_VERIFY_QK;
                 inst_reason = qblock_active
                     ? (n_outputs > 0 ? "auto_packed16_mtp_qblock_verify" : "auto_packed16_mtp_qblock_prefix_verify")
@@ -2456,7 +2461,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                     inst = GGML_FATTN_INST_NONE;
                     inst_reason = "forced_none";
                 } else {
-                    // invalid force value — leave inst as NONE
+                    static bool warned_invalid_force = false;
+                    if (!warned_invalid_force) {
+                        LLAMA_LOG_WARN("%s: ignoring invalid LLAMA_MTP_FA_INST=%s; expected draft_decode, draft, verify, qblock, or none\n",
+                                __func__, force);
+                        warned_invalid_force = true;
+                    }
                 }
             }
 

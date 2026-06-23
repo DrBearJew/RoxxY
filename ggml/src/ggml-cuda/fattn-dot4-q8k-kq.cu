@@ -10,9 +10,13 @@
 #include <unordered_set>
 
 // Packed16 K cache tensor registry (shared with llama-kv-cache).
+// The metadata is intentionally compact: it binds sidecar bytes to the physical
+// layout selected by the producer without adding any hot-kernel arguments beyond
+// the existing layout-specialized bool.
 struct packed16_registry_entry {
     ggml_tensor * payload  = nullptr;
     ggml_tensor * scales   = nullptr;
+    ggml_cuda_packed16_sidecar_meta meta = {};
 };
 
 struct v4_k16d16_registry_entry {
@@ -22,15 +26,145 @@ struct v4_k16d16_registry_entry {
 
 static std::mutex s_packed16_mutex;
 static std::unordered_map<const void *, packed16_registry_entry> s_packed16_registry;
+static unsigned long long s_packed16_generation = 0;
 static std::mutex s_v4_k16d16_mutex;
 static std::unordered_map<const void *, v4_k16d16_registry_entry> s_v4_k16d16_registry;
 
+static dp16_packed_i8_desc_v1 ggml_cuda_make_packed16_i8_desc(
+        const ggml_tensor * payload,
+        const ggml_cuda_packed16_sidecar_meta & meta) {
+    dp16_packed_i8_desc_v1 desc = {};
+    desc.version = DP16_PACKED_I8_DESC_VERSION;
+    desc.lanes_per_vector = DP16_PACKED_I8X16_LANES;
+    desc.words_per_vector = DP16_PACKED_I8X16_WORDS;
+    desc.bytes_per_vector = DP16_PACKED_I8X16_BYTES;
+    desc.bytes_per_word = DP16_PACKED_I8_WORD_BYTES;
+    desc.layout_kind = meta.layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_D16_PLANAR ?
+        DP16_PACKED_I8_LAYOUT_D16_PLANAR :
+        (meta.layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_ROW ? DP16_PACKED_I8_LAYOUT_ROW : DP16_PACKED_I8_LAYOUT_UNKNOWN);
+    desc.axis_x = DP16_PACKED_I8_AXIS_D16;
+    desc.axis_y = DP16_PACKED_I8_AXIS_TOKEN;
+    desc.axis_z = DP16_PACKED_I8_AXIS_HEAD;
+    desc.logical_x = meta.d ? uint32_t(meta.d / GGML_CUDA_PACKED16_K_D16) : 0;
+    desc.logical_y = meta.kv_capacity;
+    desc.logical_z = payload && meta.kv_capacity ? uint32_t(payload->ne[1] / meta.kv_capacity) : 0;
+    desc.physical_x = desc.logical_x;
+    desc.physical_y = desc.logical_y;
+    desc.physical_z = desc.logical_z;
+    desc.scale_layout = meta.scale_layout == GGML_CUDA_PACKED16_K_SCALE_LAYOUT_QBLOCK_PLANAR ?
+        DP16_PACKED_I8_SCALE_LAYOUT_QBLOCK_PLANAR :
+        (meta.scale_layout == GGML_CUDA_PACKED16_K_SCALE_LAYOUT_ROW ? DP16_PACKED_I8_SCALE_LAYOUT_ROW : DP16_PACKED_I8_SCALE_LAYOUT_UNKNOWN);
+    desc.scale_axis_x = DP16_PACKED_I8_AXIS_QBLOCK;
+    desc.scale_axis_y = DP16_PACKED_I8_AXIS_TOKEN;
+    desc.scale_axis_z = DP16_PACKED_I8_AXIS_HEAD;
+
+    constexpr uint64_t word_bytes = DP16_PACKED_I8_WORD_BYTES;
+    constexpr uint64_t scale_bytes = sizeof(uint16_t);
+    desc.z_stride_bytes = uint64_t(meta.payload_head_stride) * word_bytes;
+    desc.scale_z_stride_bytes = uint64_t(meta.scale_head_stride) * scale_bytes;
+    if (meta.layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_D16_PLANAR) {
+        desc.x_stride_bytes = uint64_t(meta.payload_d16_plane_stride) * word_bytes;
+        desc.y_stride_bytes = uint64_t(meta.payload_token_stride) * word_bytes;
+        desc.plane_stride_bytes = desc.x_stride_bytes;
+        desc.scale_x_stride_bytes = uint64_t(meta.scale_qblock_plane_stride) * scale_bytes;
+        desc.scale_y_stride_bytes = uint64_t(meta.scale_token_stride) * scale_bytes;
+        desc.scale_plane_stride_bytes = desc.scale_x_stride_bytes;
+    } else {
+        desc.x_stride_bytes = DP16_PACKED_I8X16_BYTES;
+        desc.y_stride_bytes = uint64_t(meta.payload_token_stride) * word_bytes;
+        desc.plane_stride_bytes = 0;
+        desc.scale_x_stride_bytes = scale_bytes;
+        desc.scale_y_stride_bytes = uint64_t(meta.scale_token_stride) * scale_bytes;
+        desc.scale_plane_stride_bytes = uint64_t(meta.scale_qblock_plane_stride) * scale_bytes;
+    }
+    return desc;
+}
+
+static ggml_cuda_packed16_sidecar_meta ggml_cuda_make_pdmq_k_sidecar_meta(
+        const ggml_tensor * payload,
+        const ggml_tensor * scales,
+        const int k_format,
+        const int layout_kind,
+        const uint32_t kv_capacity,
+        const uint32_t d,
+        const unsigned long long generation) {
+    ggml_cuda_packed16_sidecar_meta meta = {};
+    meta.format_version = GGML_CUDA_PDMQ_K_FORMAT_VERSION;
+    meta.generation = generation;
+    meta.kv_capacity = kv_capacity;
+    meta.d = (uint16_t) d;
+    meta.block_size = QK8_0;
+    meta.layout_kind = layout_kind;
+    meta.scale_layout = layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_D16_PLANAR ?
+        GGML_CUDA_PACKED16_K_SCALE_LAYOUT_QBLOCK_PLANAR : GGML_CUDA_PACKED16_K_SCALE_LAYOUT_ROW;
+    meta.k_format = (uint8_t) k_format;
+    meta.code_bits = (uint8_t) ggml_cuda_pdmq_k_code_bits(k_format);
+    meta.zero_point = (uint8_t) ggml_cuda_pdmq_k_zero_point(k_format);
+    meta.code_order = 0;
+
+    const size_t words = d ? size_t(ggml_cuda_pdmq_k_payload_words_per_token(k_format, d)) : (payload ? size_t(payload->ne[0]) : 0);
+    const size_t qblocks = d ? size_t(d / QK8_0) : (scales ? size_t(scales->ne[0]) : 0);
+    meta.payload_words_per_token = (uint32_t) words;
+    meta.payload_head_stride = size_t(kv_capacity) * words;
+    meta.scale_head_stride = size_t(kv_capacity) * qblocks;
+    if (k_format == GGML_CUDA_PDMQ_K_FORMAT_PACKED16_Q8_272 && layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_D16_PLANAR) {
+        meta.payload_token_stride = size_t(GGML_CUDA_PACKED16_K_WORDS_PER_D16);
+        meta.scale_token_stride = 1;
+        meta.payload_d16_plane_stride = size_t(kv_capacity) * size_t(GGML_CUDA_PACKED16_K_WORDS_PER_D16);
+        meta.scale_qblock_plane_stride = size_t(kv_capacity);
+    } else {
+        meta.payload_token_stride = words;
+        meta.scale_token_stride = qblocks;
+        meta.payload_d16_plane_stride = 0;
+        meta.scale_qblock_plane_stride = 1;
+    }
+    if (k_format == GGML_CUDA_PDMQ_K_FORMAT_PACKED16_Q8_272) {
+        meta.packed_i8_desc = ggml_cuda_make_packed16_i8_desc(payload, meta);
+    } else {
+        meta.packed_i8_desc = {};
+        meta.packed_i8_desc.layout_kind = DP16_PACKED_I8_LAYOUT_UNKNOWN;
+        meta.packed_i8_desc.scale_layout = DP16_PACKED_I8_SCALE_LAYOUT_UNKNOWN;
+    }
+    return meta;
+}
+
+static ggml_cuda_packed16_sidecar_meta ggml_cuda_make_packed16_sidecar_meta(
+        const ggml_tensor * payload,
+        const ggml_tensor * scales,
+        const int layout_kind,
+        const uint32_t kv_capacity,
+        const uint32_t d,
+        const unsigned long long generation) {
+    return ggml_cuda_make_pdmq_k_sidecar_meta(payload, scales,
+        GGML_CUDA_PDMQ_K_FORMAT_PACKED16_Q8_272, layout_kind, kv_capacity, d, generation);
+}
+
 extern "C" {
-void llama_kv_cache_register_packed16(const void * k_view_data, ggml_tensor * payload, ggml_tensor * scales) {
+void llama_kv_cache_register_pdmq_k_with_layout_info(const void * k_view_data, ggml_tensor * payload, ggml_tensor * scales, int k_format, int layout_kind, uint32_t kv_capacity, uint32_t d) {
     std::lock_guard<std::mutex> lock(s_packed16_mutex);
     packed16_registry_entry & entry = s_packed16_registry[k_view_data];
     entry.payload = payload;
     entry.scales  = scales;
+    if (k_format != GGML_CUDA_PDMQ_K_FORMAT_PACKED16_Q8_272) {
+        layout_kind = GGML_CUDA_PACKED16_K_LAYOUT_ROW;
+    } else if (layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_UNKNOWN) {
+        layout_kind = ggml_cuda_packed16_k_layout_kind_from_env();
+    }
+    entry.meta = ggml_cuda_make_pdmq_k_sidecar_meta(payload, scales, k_format, layout_kind, kv_capacity, d, ++s_packed16_generation);
+}
+
+void llama_kv_cache_register_packed16_with_layout_info(const void * k_view_data, ggml_tensor * payload, ggml_tensor * scales, int layout_kind, uint32_t kv_capacity, uint32_t d) {
+    llama_kv_cache_register_pdmq_k_with_layout_info(k_view_data, payload, scales,
+        GGML_CUDA_PDMQ_K_FORMAT_PACKED16_Q8_272, layout_kind, kv_capacity, d);
+}
+
+void llama_kv_cache_register_packed16_with_layout(const void * k_view_data, ggml_tensor * payload, ggml_tensor * scales, int layout_kind) {
+    const uint32_t d = payload && payload->ne[0] > 0 ? uint32_t(payload->ne[0] * 4) : uint32_t(GGML_CUDA_PACKED16_K_TILE_D);
+    llama_kv_cache_register_packed16_with_layout_info(k_view_data, payload, scales, layout_kind, 0, d);
+}
+
+void llama_kv_cache_register_packed16(const void * k_view_data, ggml_tensor * payload, ggml_tensor * scales) {
+    llama_kv_cache_register_packed16_with_layout_info(k_view_data, payload, scales, ggml_cuda_packed16_k_layout_kind_from_env(), 0, 0);
 }
 
 void llama_kv_cache_get_packed16_tensors(const void * k_view_data, ggml_tensor ** payload, ggml_tensor ** scales) {
@@ -43,6 +177,56 @@ void llama_kv_cache_get_packed16_tensors(const void * k_view_data, ggml_tensor *
         *payload = nullptr;
         *scales  = nullptr;
     }
+}
+
+void llama_kv_cache_get_packed16_metadata(const void * k_view_data, int * layout_kind, unsigned long long * generation) {
+    std::lock_guard<std::mutex> lock(s_packed16_mutex);
+    auto it = s_packed16_registry.find(k_view_data);
+    if (it != s_packed16_registry.end()) {
+        if (layout_kind) {
+            *layout_kind = it->second.meta.layout_kind;
+        }
+        if (generation) {
+            *generation = it->second.meta.generation;
+        }
+    } else {
+        if (layout_kind) {
+            *layout_kind = GGML_CUDA_PACKED16_K_LAYOUT_UNKNOWN;
+        }
+        if (generation) {
+            *generation = 0;
+        }
+    }
+}
+
+void llama_kv_cache_get_packed16_sidecar_meta(const void * k_view_data, ggml_cuda_packed16_sidecar_meta * meta) {
+    if (!meta) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(s_packed16_mutex);
+    auto it = s_packed16_registry.find(k_view_data);
+    if (it != s_packed16_registry.end()) {
+        *meta = it->second.meta;
+    } else {
+        *meta = {};
+        meta->layout_kind = GGML_CUDA_PACKED16_K_LAYOUT_UNKNOWN;
+        meta->scale_layout = GGML_CUDA_PACKED16_K_SCALE_LAYOUT_UNKNOWN;
+        meta->packed_i8_desc.layout_kind = DP16_PACKED_I8_LAYOUT_UNKNOWN;
+        meta->packed_i8_desc.scale_layout = DP16_PACKED_I8_SCALE_LAYOUT_UNKNOWN;
+    }
+}
+
+void llama_kv_cache_get_pdmq_k_sidecar_meta(const void * k_view_data, ggml_cuda_packed16_sidecar_meta * meta) {
+    llama_kv_cache_get_packed16_sidecar_meta(k_view_data, meta);
+}
+
+void llama_kv_cache_get_packed16_packed_i8_desc(const void * k_view_data, dp16_packed_i8_desc_v1 * desc) {
+    if (!desc) {
+        return;
+    }
+    ggml_cuda_packed16_sidecar_meta meta = {};
+    llama_kv_cache_get_packed16_sidecar_meta(k_view_data, &meta);
+    *desc = meta.packed_i8_desc;
 }
 
 void llama_kv_cache_register_v4_k16d16(const void * v_view_data, ggml_tensor * v_cache, ggml_tensor * v_tail) {
@@ -75,9 +259,41 @@ static constexpr int GGML_CUDA_Q8K_DOT4_KQ_PAR_TILE_K = 8;
 static constexpr int GGML_CUDA_Q8K_DOT4_KQ_MAX_GQA = 8;
 static constexpr int GGML_CUDA_Q8K_DOT4_KQ_GQA6 = 6;
 
+static inline bool ggml_cuda_q8k_dot4_v4_144_pv4_standard_enabled() {
+    const char * disable_v = getenv("GGML_CUDA_ROCM_V4_K16D16_144_PV4_DISABLE");
+    if (disable_v && atoi(disable_v) != 0) {
+        return false;
+    }
+    const char * legacy_pv4 = getenv("GGML_CUDA_ROCM_V4_K16D16_144_PV4");
+    if (legacy_pv4 && *legacy_pv4) {
+        return atoi(legacy_pv4) != 0;
+    }
+    return true;
+}
+
+static inline bool ggml_cuda_q8k_dot4_v4_144_dp16_dot_profile_enabled() {
+    const char * disable_v = getenv("GGML_CUDA_ROCM_V4_K16D16_144_PV4_DISABLE");
+    if (disable_v && atoi(disable_v) != 0) {
+        return false;
+    }
+    const char * profile = getenv("GGML_CUDA_ROCM_V4_K16D16_144_PROFILE");
+    return profile && *profile && atoi(profile) != 0;
+}
+
 static inline bool ggml_cuda_q8k_dot4_kq_env_enabled(const char * name) {
     const char * env = getenv(name);
-    return env && atoi(env) != 0;
+    if (env && *env) {
+        return atoi(env) != 0;
+    }
+    if (strcmp(name, "GGML_CUDA_ROCM_V4_K16D16_144_PROFILE") == 0) {
+        return ggml_cuda_q8k_dot4_v4_144_dp16_dot_profile_enabled();
+    }
+    if (strcmp(name, "GGML_CUDA_ROCM_V4_K16D16_144_PV4") == 0 ||
+            strcmp(name, "GGML_CUDA_ROCM_V4_K16D16_144_PACKED16_DECODE_EXPERIMENT") == 0 ||
+            strcmp(name, "GGML_CUDA_ROCM_V4_K16D16_144_DECODE_SPLITK") == 0) {
+        return ggml_cuda_q8k_dot4_v4_144_pv4_standard_enabled();
+    }
+    return false;
 }
 
 static inline int ggml_cuda_q8k_dot4_kq_env_int(const char * name, int fallback) {
@@ -308,6 +524,97 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_q8k_dot4_quant_k_pack
     ((int8_t *)(k_payload + row * (GGML_CUDA_Q8K_DOT4_KQ_D / 4)))[d] = (int8_t) qi;
     if (lane == 0) {
         k_scales[row * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS + q_block] = __float2half(scale);
+    }
+
+}
+
+template <typename idx_t>
+static __global__ __launch_bounds__(256, 1) void ggml_cuda_quant_k_packed8_q4_indexed_kernel(
+        const char  * __restrict__ K,
+        int         * __restrict__ k_payload,
+        half        * __restrict__ k_scales,
+        const idx_t * __restrict__ k_idxs,
+        int64_t nb01,
+        int64_t nb02,
+        int64_t nb03,
+        int64_t src_head_stride_bytes,
+        int nk_cur,
+        int n_heads_k,
+        int batch,
+        int kv_size,
+        bool src_f16,
+        int scale_mode,
+        float scale_mul) {
+    const int tid = threadIdx.x;
+    const int k_local = blockIdx.x;
+    const int hk = blockIdx.y;
+    const int b = blockIdx.z;
+    const int q_block = tid;
+    if (k_local >= nk_cur || hk >= n_heads_k || b >= batch || q_block >= GGML_CUDA_Q8K_DOT4_KQ_BLOCKS) return;
+    const int64_t cell = (int64_t) k_idxs[k_local];
+    if (cell < 0 || cell >= kv_size) return;
+    const char * row = K + int64_t(b) * nb03 + int64_t(k_local) * nb01 + int64_t(hk) * src_head_stride_bytes;
+    float vals[QK8_0];
+    float amax = 0.0f, maxv = 0.0f;
+#pragma unroll
+    for (int i = 0; i < QK8_0; ++i) {
+        const int d = q_block * QK8_0 + i;
+        const float x = src_f16 ? __half2float(((const half *) row)[d]) : ((const float *) row)[d];
+        vals[i] = x;
+        const float ax = fabsf(x);
+        if (ax > amax) { amax = ax; maxv = x; }
+    }
+    float d_f = maxv / -8.0f;
+    if (scale_mode == 1 || scale_mode == 4) {
+        // Symmetric positive scale, preserving the code zero point: value=(code-8)*d.
+        d_f = amax > 0.0f ? amax / 7.0f : 1.0f;
+    } else if (scale_mode == 2) {
+        // Symmetric positive scale with extra negative headroom.
+        d_f = amax > 0.0f ? amax / 8.0f : 1.0f;
+    }
+    d_f *= scale_mul;
+    if (d_f == 0.0f || !isfinite(d_f)) {
+        d_f = 1.0f;
+    }
+    float id = 1.0f / d_f;
+    uint8_t codes[QK8_0];
+#pragma unroll
+    for (int i = 0; i < QK8_0; ++i) codes[i] = (uint8_t) min(15, max(0, int(vals[i] * id + 8.5f)));
+    if (scale_mode == 3 || scale_mode == 4) {
+        float num = 0.0f;
+        float den = 0.0f;
+#pragma unroll
+        for (int i = 0; i < QK8_0; ++i) {
+            const float q = float(int(codes[i]) - 8);
+            num += vals[i] * q;
+            den += q * q;
+        }
+        if (den > 0.0f) {
+            const float d_mse = num / den;
+            if (d_mse != 0.0f && isfinite(d_mse)) {
+                d_f = d_mse * scale_mul;
+                id = 1.0f / d_f;
+#pragma unroll
+                for (int i = 0; i < QK8_0; ++i) codes[i] = (uint8_t) min(15, max(0, int(vals[i] * id + 8.5f)));
+            }
+        }
+    }
+    const half d_h = __float2half(d_f);
+    const size_t head_base = (size_t(b) * size_t(n_heads_k) + size_t(hk)) * size_t(kv_size);
+    const size_t payload_row = (head_base + size_t(cell)) * size_t(GGML_CUDA_Q8K_DOT4_KQ_D / 8);
+    const size_t scale_row   = (head_base + size_t(cell)) * size_t(GGML_CUDA_Q8K_DOT4_KQ_BLOCKS);
+    k_scales[scale_row + size_t(q_block)] = d_h;
+#pragma unroll
+    for (int d16 = 0; d16 < 2; ++d16) {
+        const int d16_global = q_block * 2 + d16;
+        uint32_t w0 = 0, w1 = 0;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            w0 |= uint32_t(codes[d16 * 16 + i] & 0x0f) << (4 * i);
+            w1 |= uint32_t(codes[d16 * 16 + 8 + i] & 0x0f) << (4 * i);
+        }
+        k_payload[payload_row + size_t(d16_global * 2 + 0)] = (int) w0;
+        k_payload[payload_row + size_t(d16_global * 2 + 1)] = (int) w1;
     }
 }
 
@@ -978,6 +1285,44 @@ static inline float ggml_cuda_pack_k_packed16_scale_mul() {
     return (v > 0.0f && v < 100.0f) ? v : 1.0f;
 }
 
+static inline int ggml_cuda_pack_k_packed8_q4_scale_mode() {
+    const char * env = getenv("GGML_CUDA_ROCM_PACKED8_Q4_K_SCALE_MODE");
+    if (!env) {
+        env = getenv("GGML_CUDA_ROCM_PACKED8_Q4_SCALE_MODE");
+    }
+    if (!env) {
+        env = getenv("LLAMA_MTP_PACKED8_Q4_K_SCALE_MODE");
+    }
+    if (!env) {
+        env = getenv("GGML_CUDA_ROCM_PDMQ_PACKED8_Q4_SCALE_MODE");
+    }
+    if (!env || env[0] == '\0') {
+        return 0;
+    }
+    const std::string mode(env);
+    if (mode == "q4_0" || mode == "legacy" || mode == "current" || mode == "0") return 0;
+    if (mode == "sym7" || mode == "symmetric" || mode == "amax7" || mode == "1") return 1;
+    if (mode == "sym8" || mode == "amax8" || mode == "2") return 2;
+    if (mode == "mse" || mode == "mse_q4_0" || mode == "3") return 3;
+    if (mode == "mse_sym" || mode == "mse_sym7" || mode == "4") return 4;
+    return 0;
+}
+
+static inline float ggml_cuda_pack_k_packed8_q4_scale_mul() {
+    const char * env = getenv("GGML_CUDA_ROCM_PACKED8_Q4_K_SCALE_MUL");
+    if (!env) {
+        env = getenv("GGML_CUDA_ROCM_PACKED8_Q4_SCALE_MUL");
+    }
+    if (!env) {
+        env = getenv("LLAMA_MTP_PACKED8_Q4_K_SCALE_MUL");
+    }
+    if (!env || env[0] == '\0') {
+        return 1.0f;
+    }
+    const float v = strtof(env, nullptr);
+    return (v > 0.0f && v < 100.0f) ? v : 1.0f;
+}
+
 static inline int ggml_cuda_pack_k_packed16_scale_group_qblocks() {
     const char * env = getenv("GGML_CUDA_ROCM_PACKED16_K_SCALE_GROUP_QBLOCKS");
     if (!env) {
@@ -1020,7 +1365,8 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_pack_k_packed16_from_
         int kv_size,
         int n_heads_k,
         int batch,
-        int nk_cur) {
+        int nk_cur,
+        bool tile16_layout) {
     const int tid = threadIdx.x;
     const int k_local = blockIdx.x;
     const int hk = blockIdx.y;
@@ -1038,11 +1384,12 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_pack_k_packed16_from_
     const size_t q8_row = (size_t(b) * size_t(n_heads_k) + size_t(hk)) * size_t(kv_size) + size_t(cell);
     const char * src = K + q8_row * nb11 + qblk * sizeof(block_q8_0);
 
-    const size_t packed_row = (size_t(b) * size_t(n_heads_k) + size_t(hk)) * size_t(kv_size) + size_t(cell);
-    k_scales[packed_row * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS + qblk] = ggml_cuda_pack_k_packed16_load_half_unaligned(src);
+    const size_t head_base = (size_t(b) * size_t(n_heads_k) + size_t(hk)) * size_t(kv_size);
+    k_scales[ggml_cuda_packed16_k_scale_index(head_base, kv_size, int(cell), qblk, tile16_layout)] = ggml_cuda_pack_k_packed16_load_half_unaligned(src);
 #pragma unroll
     for (int i = 0; i < QK8_0 / 4; ++i) {
-        k_payload[packed_row * (GGML_CUDA_Q8K_DOT4_KQ_D / 4) + qblk * (QK8_0 / 4) + i] =
+        const int d_word = qblk * (QK8_0 / 4) + i;
+        k_payload[ggml_cuda_packed16_k_payload_index(head_base, kv_size, int(cell), d_word, tile16_layout)] =
             ggml_cuda_pack_k_packed16_load_i32_unaligned(src + sizeof(half) + 4 * i);
     }
 }
@@ -1065,7 +1412,8 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_quant_k_packed16_inde
         int kv_size,
         int scale_mode,
         float scale_mul,
-        int scale_group_qblocks) {
+        int scale_group_qblocks,
+        bool tile16_layout) {
     const int tid = threadIdx.x;
     const int k_local = blockIdx.x;
     const int hk = blockIdx.y;
@@ -1121,10 +1469,11 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_quant_k_packed16_inde
         }
         const int qi = max(-128, min(127, int(lrintf(x / scale))));
 
-        const size_t row = (size_t(b) * size_t(n_heads_k) + size_t(hk)) * size_t(kv_size) + size_t(cell);
-        ((int8_t *)(k_payload + row * (GGML_CUDA_Q8K_DOT4_KQ_D / 4)))[d] = (int8_t) qi;
+        const size_t head_base = (size_t(b) * size_t(n_heads_k) + size_t(hk)) * size_t(kv_size);
+        int * dst_word = k_payload + ggml_cuda_packed16_k_payload_index(head_base, kv_size, int(cell), d / 4, tile16_layout);
+        ((int8_t *) dst_word)[d & 3] = (int8_t) qi;
         if (lane == 0) {
-            k_scales[row * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS + q_block] = __float2half(scale);
+            k_scales[ggml_cuda_packed16_k_scale_index(head_base, kv_size, int(cell), q_block, tile16_layout)] = __float2half(scale);
         }
         return;
     }
@@ -1184,10 +1533,11 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_quant_k_packed16_inde
     }
     const int qi = max(-128, min(127, int(lrintf(x / scale))));
 
-    const size_t row = (size_t(b) * size_t(n_heads_k) + size_t(hk)) * size_t(kv_size) + size_t(cell);
-    ((int8_t *)(k_payload + row * (GGML_CUDA_Q8K_DOT4_KQ_D / 4)))[d] = (int8_t) qi;
+    const size_t head_base = (size_t(b) * size_t(n_heads_k) + size_t(hk)) * size_t(kv_size);
+    int * dst_word = k_payload + ggml_cuda_packed16_k_payload_index(head_base, kv_size, int(cell), d / 4, tile16_layout);
+    ((int8_t *) dst_word)[d & 3] = (int8_t) qi;
     if (lane == 0) {
-        k_scales[row * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS + q_block] = __float2half(scale);
+        k_scales[ggml_cuda_packed16_k_scale_index(head_base, kv_size, int(cell), q_block, tile16_layout)] = __float2half(scale);
     }
 }
 
@@ -1218,9 +1568,11 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
     const bool v4_144_nomtp_decode =
         V->type == GGML_TYPE_V4_K16D16_144 &&
         (fa_inst_i32 == GGML_FATTN_INST_NONE || fa_inst_i32 == GGML_FATTN_INST_DECODE_QK);
+    const bool v4_144_pv4_standard = ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_V4_K16D16_144_PROFILE") ||
+        ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_V4_K16D16_144_PV4");
     const bool v4_144_decode_diag_env =
         V->type == GGML_TYPE_V4_K16D16_144 &&
-        (v4_144_nomtp_decode ||
+        (v4_144_nomtp_decode || v4_144_pv4_standard ||
          ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_V4_K16D16_144_PACKED16_DECODE_EXPERIMENT"));
 
     // I32 packed16 K contract: DOT4-dispatch path only.
@@ -1635,7 +1987,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                     V->type == GGML_TYPE_V4_K16D16_144 && is_standard_decode;
                 const bool v4_144_decode_diag =
                     V->type == GGML_TYPE_V4_K16D16_144 &&
-                    (v4_144_nomtp_decode ||
+                    (v4_144_nomtp_decode || v4_144_pv4_standard ||
                      ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_V4_K16D16_144_PACKED16_DECODE_EXPERIMENT"));
                 const bool use_default_packed16_decode =
                     nq == 1 && K->type == GGML_TYPE_I32 && (V->type == GGML_TYPE_Q4_0 || v4_144_decode_diag) &&
@@ -1733,7 +2085,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                         (ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_Q4PAIR") || impl_q4pair);
                     const int splitk_threshold = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_SPLITK_THRESHOLD", 2048);
                     const bool v4_144_splitk = v4_144_decode_diag &&
-                        (v4_144_nomtp_decode || impl_splitk || ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_V4_K16D16_144_DECODE_SPLITK"));
+                        (v4_144_nomtp_decode || v4_144_pv4_standard || impl_splitk || ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_V4_K16D16_144_DECODE_SPLITK"));
                     const bool splitk = !impl_logits_debug && !impl_dsplit &&
                         (ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_SPLITK") || impl_splitk || impl_small_verify_splitk || nk >= splitk_threshold) &&
                         (V->type == GGML_TYPE_Q4_0 || v4_144_splitk);
@@ -2044,7 +2396,9 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
     GGML_ASSERT(k_idxs != nullptr);
     GGML_ASSERT(payload->type == GGML_TYPE_I32);
     GGML_ASSERT(scales->type == GGML_TYPE_F16);
-    GGML_ASSERT(payload->ne[0] == GGML_CUDA_Q8K_DOT4_KQ_D / 4);
+    const bool payload_is_packed16 = payload->ne[0] == GGML_CUDA_Q8K_DOT4_KQ_D / 4;
+    const bool payload_is_packed8  = payload->ne[0] == GGML_CUDA_Q8K_DOT4_KQ_D / 8;
+    GGML_ASSERT(payload_is_packed16 || payload_is_packed8);
     GGML_ASSERT(scales->ne[0]  == GGML_CUDA_Q8K_DOT4_KQ_BLOCKS);
 
     const int D = GGML_CUDA_Q8K_DOT4_KQ_D;
@@ -2087,6 +2441,9 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
     const int k_scale_mode = ggml_cuda_pack_k_packed16_scale_mode(1);
     const float k_scale_mul = ggml_cuda_pack_k_packed16_scale_mul();
     const int k_scale_group_qblocks = ggml_cuda_pack_k_packed16_scale_group_qblocks();
+    const int packed8_q4_scale_mode = ggml_cuda_pack_k_packed8_q4_scale_mode();
+    const float packed8_q4_scale_mul = ggml_cuda_pack_k_packed8_q4_scale_mul();
+    const bool tile16_layout = ggml_cuda_packed16_k_layout_tile16();
 
     static bool pack_debug_printed = false;
     if (!pack_debug_printed && ggml_cuda_pack_k_packed16_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_KQ_DEBUG_I32")) {
@@ -2094,26 +2451,42 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
         fprintf(stderr,
             "pack_k_i32: k_cur type=%d ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] "
             "payload ne=[%lld,%lld,%lld,%lld] scales ne=[%lld,%lld,%lld,%lld] "
-            "n_heads=%d nk_cur=%d kv_size=%d src_head_stride=%lld scale_mode=%d scale_mul=%g scale_group_qblocks=%d\n",
+            "n_heads=%d nk_cur=%d kv_size=%d src_head_stride=%lld scale_mode=%d scale_mul=%g scale_group_qblocks=%d packed8_scale_mode=%d packed8_scale_mul=%g layout=%s\n",
             k_cur->type, (long long) k_cur->ne[0], (long long) k_cur->ne[1], (long long) k_cur->ne[2], (long long) k_cur->ne[3],
             k_cur->nb[0], k_cur->nb[1], k_cur->nb[2], k_cur->nb[3],
             (long long) payload->ne[0], (long long) payload->ne[1], (long long) payload->ne[2], (long long) payload->ne[3],
             (long long) scales->ne[0], (long long) scales->ne[1], (long long) scales->ne[2], (long long) scales->ne[3],
-            n_heads, nk_cur, kv_size, (long long) src_head_stride_bytes, k_scale_mode, (double) k_scale_mul, k_scale_group_qblocks);
+            n_heads, nk_cur, kv_size, (long long) src_head_stride_bytes, k_scale_mode, (double) k_scale_mul, k_scale_group_qblocks,
+            packed8_q4_scale_mode, (double) packed8_q4_scale_mul, ggml_cuda_packed16_k_layout_name());
     }
 
     dim3 grid(nk_cur, n_heads, batch);
     dim3 block(256);
     cudaStream_t stream = ctx.stream();
 
-    if (is_q8_k) {
+    if (payload_is_packed8 && is_q8_k) {
+        GGML_ABORT("packed8 q4 K writer does not yet accept q8_0 source rows");
+    } else if (is_q8_k) {
         // Indexed pack from q8_0 cache blocks preserves calibrated quantization.
         ggml_cuda_pack_k_packed16_from_q8_indexed_kernel<<<grid, block, 0, stream>>>(
             (const char *) k_cur->data,
             (int *) payload->data,
             (half *) scales->data,
             (const int64_t *) k_idxs->data,
-            k_cur->nb[1], kv_size, n_heads, batch, nk_cur);
+            k_cur->nb[1], kv_size, n_heads, batch, nk_cur, tile16_layout);
+    } else if (payload_is_packed8 && k_idxs->type == GGML_TYPE_I64) {
+        ggml_cuda_quant_k_packed8_q4_indexed_kernel<int64_t><<<grid, block, 0, stream>>>(
+            (const char *) k_cur->data, (int *) payload->data, (half *) scales->data, (const int64_t *) k_idxs->data,
+            src_token_stride_bytes, k_cur->nb[2], k_cur->nb[3], src_head_stride_bytes,
+            nk_cur, n_heads, batch, kv_size, k_cur->type == GGML_TYPE_F16,
+            packed8_q4_scale_mode, packed8_q4_scale_mul);
+    } else if (payload_is_packed8) {
+        GGML_ASSERT(k_idxs->type == GGML_TYPE_I32);
+        ggml_cuda_quant_k_packed8_q4_indexed_kernel<int32_t><<<grid, block, 0, stream>>>(
+            (const char *) k_cur->data, (int *) payload->data, (half *) scales->data, (const int32_t *) k_idxs->data,
+            src_token_stride_bytes, k_cur->nb[2], k_cur->nb[3], src_head_stride_bytes,
+            nk_cur, n_heads, batch, kv_size, k_cur->type == GGML_TYPE_F16,
+            packed8_q4_scale_mode, packed8_q4_scale_mul);
     } else if (k_idxs->type == GGML_TYPE_I64) {
         ggml_cuda_quant_k_packed16_indexed_kernel<int64_t><<<grid, block, 0, stream>>>(
             (const half *) k_cur->data,
@@ -2122,7 +2495,7 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
             (const int64_t *) k_idxs->data,
             src_token_stride_bytes, k_cur->nb[2], k_cur->nb[3],
             src_head_stride_bytes,
-            nk_cur, n_heads, batch, kv_size, k_scale_mode, k_scale_mul, k_scale_group_qblocks);
+            nk_cur, n_heads, batch, kv_size, k_scale_mode, k_scale_mul, k_scale_group_qblocks, tile16_layout);
     } else {
         GGML_ASSERT(k_idxs->type == GGML_TYPE_I32);
         ggml_cuda_quant_k_packed16_indexed_kernel<int32_t><<<grid, block, 0, stream>>>(
@@ -2132,9 +2505,19 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
             (const int32_t *) k_idxs->data,
             src_token_stride_bytes, k_cur->nb[2], k_cur->nb[3],
             src_head_stride_bytes,
-            nk_cur, n_heads, batch, kv_size, k_scale_mode, k_scale_mul, k_scale_group_qblocks);
+            nk_cur, n_heads, batch, kv_size, k_scale_mode, k_scale_mul, k_scale_group_qblocks, tile16_layout);
     }
     CUDA_CHECK(cudaGetLastError());
+
+    // Bind the just-produced sidecar bytes to their physical layout. Consumers
+    // must use this metadata instead of re-reading the environment later.
+    const int layout_kind = tile16_layout ? GGML_CUDA_PACKED16_K_LAYOUT_D16_PLANAR : GGML_CUDA_PACKED16_K_LAYOUT_ROW;
+    const int k_format = payload_is_packed8 ? GGML_CUDA_PDMQ_K_FORMAT_PACKED8_Q4_144 : GGML_CUDA_PDMQ_K_FORMAT_PACKED16_Q8_272;
+    const int effective_layout = payload_is_packed8 ? GGML_CUDA_PACKED16_K_LAYOUT_ROW : layout_kind;
+    llama_kv_cache_register_pdmq_k_with_layout_info(dst->data, payload, scales, k_format, effective_layout, (uint32_t) kv_size, (uint32_t) D);
+    if (k_cur && k_cur->data) {
+        llama_kv_cache_register_pdmq_k_with_layout_info(k_cur->data, payload, scales, k_format, effective_layout, (uint32_t) kv_size, (uint32_t) D);
+    }
 }
 
 static constexpr int GGML_CUDA_V4_K16D16_D = 256;

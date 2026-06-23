@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <cstdint>
 #include <unordered_map>
 #include <vector>
 
@@ -246,10 +247,12 @@ private:
         ggml_tensor * k;
         ggml_tensor * v;
 
-        // Packed16 DOT4 K cache (optional — allocated when GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE=1)
-        // Stores quantized K in INT8-packed I32 payload + F16 scales, ready for DOT4 FA kernel.
-        ggml_tensor * k_payload = nullptr;  // GGML_TYPE_I32, [D/4, n_tokens]
-        ggml_tensor * k_scales  = nullptr;  // GGML_TYPE_F16, [D/32, n_tokens]
+        // PDMQ compressed K cache (standard: packed16_q8; q8_0 K request: packed8_q4).
+        // Stores quantized K in I32 payload + F16 scales, ready for DOT4/PDMQ FA kernels.
+        // packed8_q4 uses D/8 payload words per token/KV-head; packed16_q8 uses D/4.
+        // packed16 physical layout is selected by GGML_CUDA_ROCM_PACKED16_K_LAYOUT: row or tile16/native.
+        ggml_tensor * k_payload = nullptr;  // GGML_TYPE_I32, D/8 or D/4 words per token/KV-head
+        ggml_tensor * k_scales  = nullptr;  // GGML_TYPE_F16, D/32 scales per token/KV-head
 
         // Experimental sealed V4_K16D16 V cache (default-off, FA-only).
         ggml_tensor * v4_tail = nullptr;    // GGML_TYPE_F16, [D, 16 * n_heads]
@@ -257,7 +260,7 @@ private:
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
 
-        // Packed16 stream views (same view offset as k_stream/v_stream)
+        // PDMQ K stream views (same view offset as k_stream/v_stream)
         std::vector<ggml_tensor *> k_payload_stream;
         std::vector<ggml_tensor *> k_scales_stream;
     };
@@ -485,14 +488,18 @@ private:
 };
 
 // Packed16 K cache registry (shared between KV-cache ctor and DOT4 FA dispatch).
-// Defined in ggml/src/ggml-cuda/fattn-dot4-q8k-kq.cu.
+// Defined in ggml/src/ggml-cuda/fattn-dot4-q8k-kq.cu.  The metadata call binds
+// sidecar bytes to their producer-selected physical layout/generation.
 #ifdef __cplusplus
 extern "C" {
 #endif
 struct ggml_tensor;
 void llama_kv_cache_register_packed16(const void * k_view_data, struct ggml_tensor * payload, struct ggml_tensor * scales);
+void llama_kv_cache_register_packed16_with_layout_info(const void * k_view_data, struct ggml_tensor * payload, struct ggml_tensor * scales, int layout_kind, uint32_t kv_capacity, uint32_t d);
+void llama_kv_cache_register_pdmq_k_with_layout_info(const void * k_view_data, struct ggml_tensor * payload, struct ggml_tensor * scales, int k_format, int layout_kind, uint32_t kv_capacity, uint32_t d);
 void llama_kv_cache_register_packed16_shadow(const void * k_view_data, struct ggml_tensor * payload, struct ggml_tensor * scales, struct ggml_tensor * shadow_k);
 void llama_kv_cache_get_packed16_tensors(const void * k_view_data, struct ggml_tensor ** payload, struct ggml_tensor ** scales);
+void llama_kv_cache_get_packed16_metadata(const void * k_view_data, int * layout_kind, unsigned long long * generation);
 void llama_kv_cache_get_packed16_shadow_k(const void * k_view_data, struct ggml_tensor ** shadow_k);
 void llama_kv_cache_register_v4_k16d16(const void * v_view_data, struct ggml_tensor * v_cache, struct ggml_tensor * v_tail);
 void llama_kv_cache_get_v4_k16d16_tensors(const void * v_view_data, struct ggml_tensor ** v_cache, struct ggml_tensor ** v_tail);

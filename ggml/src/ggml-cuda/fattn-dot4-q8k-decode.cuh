@@ -1773,7 +1773,7 @@ static __device__ __forceinline__ int ggml_cuda_q8k_dot4_pack_i8x4(
 // signed-int8 weighted-P routes, and an experimental INT-FlashAttention-style
 // transient-V-fragment DOT4/WMMA routes.  Its row/page organization matches the
 // calculator-backed 16x16 WMMA layout in
-// scripts/hip/rdna3-wmma-bm-pages-calculator.py.
+// archived-code/20260623-nonruntime-experimental-scripts-docs-trim/files/scripts/hip/rdna3-wmma-bm-pages-calculator.py.
 template <int BN, int BN_VSUB, int GH_MAX, int ROW_BLOCK, int NQ_MAX, int PV_IMPL = BM_DOT4_PAGES_PV_IMPL_SCALAR>
 static __global__ __launch_bounds__(128, 1)
 void ggml_cuda_q8k_dot4_bm_dot4_pages_stage1_kernel(

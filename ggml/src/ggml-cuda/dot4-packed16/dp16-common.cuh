@@ -336,14 +336,27 @@ static inline bool dp16_mtp_enable_f16_adapt_dot4() {
     return dp16_env_enabled("LLAMA_MTP_ENABLE_F16K_ADAPT_DOT4_FA2");
 }
 
+static inline bool dp16_v4_144_profile_enabled() {
+    const char * disable_v = getenv("GGML_CUDA_ROCM_V4_K16D16_144_PV4_DISABLE");
+    if (disable_v && atoi(disable_v) != 0) {
+        return false;
+    }
+    const char * profile = getenv("GGML_CUDA_ROCM_V4_K16D16_144_PROFILE");
+    return profile && *profile && atoi(profile) != 0;
+}
+
 static inline bool dp16_fa_qpack_i8_enabled() {
     return dp16_env_enabled("GGML_CUDA_DP16_FA_QPACK_I8") ||
-           dp16_env_enabled("GGML_CUDA_DP16_FA_QPACK");
+           dp16_env_enabled("GGML_CUDA_DP16_FA_QPACK") ||
+           dp16_v4_144_profile_enabled();
 }
 
 static inline int dp16_fa_qpack_i8_min_nk() {
     const char * v = getenv("GGML_CUDA_DP16_FA_QPACK_MIN_NK");
-    return v && *v ? atoi(v) : 12288;
+    if (v && *v) {
+        return atoi(v);
+    }
+    return dp16_v4_144_profile_enabled() ? 0 : 12288;
 }
 
 static inline int dp16_fa_k_shards_per_q_stage() {

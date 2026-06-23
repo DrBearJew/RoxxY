@@ -1,2 +1,0 @@
-/home/mrtrent/.local/bin/ar qc libcpp-httplib.a "CMakeFiles/cpp-httplib.dir/httplib.cpp.o"
-/home/mrtrent/.local/bin/ranlib libcpp-httplib.a

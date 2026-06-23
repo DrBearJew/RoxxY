@@ -4043,14 +4043,16 @@ struct ggml_tensor * ggml_pack_k_packed16(
     GGML_ASSERT(scales->type  == GGML_TYPE_F16);
     GGML_ASSERT(k_idxs);
     GGML_ASSERT(k_idxs->type == GGML_TYPE_I64 || k_idxs->type == GGML_TYPE_I32);
-    // k_cur has GQA combined dimension; payload has per-head D/4.
+    // k_cur has GQA combined dimension. Scales carry the logical block32 width.
     const int64_t k_cur_dim = k_cur->ne[0];
-    const int64_t k_pld_dim = payload->ne[0] * 4;
+    const int64_t k_pld_dim = scales->ne[0] * 32;
     GGML_ASSERT(k_pld_dim > 0);
-    GGML_ASSERT(k_cur_dim % k_pld_dim == 0 && "k_cur width must be multiple of per-head packed16 width");
+    const bool payload_is_packed16 = payload->ne[0] * 4 == k_pld_dim;
+    const bool payload_is_packed8  = payload->ne[0] * 8 == k_pld_dim;
+    GGML_ASSERT((payload_is_packed16 || payload_is_packed8) && "unsupported PDMQ K payload geometry");
+    GGML_ASSERT(k_cur_dim % k_pld_dim == 0 && "k_cur width must be multiple of per-head packed K width");
     const int64_t inferred_heads = k_cur_dim / k_pld_dim;
     GGML_ASSERT(inferred_heads > 0);
-    GGML_ASSERT(scales->ne[0] * 32 == k_pld_dim);
     GGML_ASSERT(k_cur->ne[0] == scales->ne[0] * 32 * inferred_heads);
     GGML_ASSERT(payload->ne[1] % inferred_heads == 0);
     GGML_ASSERT(scales->ne[1] == payload->ne[1]);
@@ -5774,11 +5776,11 @@ static inline bool ggml_can_flash_attn_ext_kq(
     static_assert(GGML_MAX_DIMS == 4, "GGML_MAX_DIMS is not 4 - update this function");
 
     const bool normal_kq = k->ne[0] == q->ne[0];
-    const bool packed16_kq =
+    const bool packed_kq =
         k->type == GGML_TYPE_I32 &&
-        k->ne[0] * 4 == q->ne[0];
+        (k->ne[0] * 4 == q->ne[0] || k->ne[0] * 8 == q->ne[0]);
 
-    return (normal_kq || packed16_kq) &&
+    return (normal_kq || packed_kq) &&
            (q->ne[2] % k->ne[2] == 0) &&
            (q->ne[3] % k->ne[3] == 0);
 }

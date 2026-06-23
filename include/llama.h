@@ -239,6 +239,10 @@ extern "C" {
     //               - if not:        only the last token is output
     //            )
     //
+    // Optional per-row QBlock verifier metadata uses this unset sentinel.
+    // When unset or absent, QBlock backends use their default linear verifier row program.
+#define LLAMA_QBLOCK_ROW_META_UNSET (-128)
+
     typedef struct llama_batch {
         int32_t n_tokens;
 
@@ -248,6 +252,16 @@ extern "C" {
         int32_t      *  n_seq_id;
         llama_seq_id ** seq_id;
         int8_t       *  logits;   // TODO: rename this to "output"
+
+        // Optional row-local QBlock verifier metadata, parallel to token/embd.
+        // Only rows with all four fields set participate; otherwise the backend
+        // keeps its default row metadata. Values are small signed integers:
+        // parent/rank may be -1, branch is non-negative, output_policy follows
+        // the backend dp16_fa_qblock_row_output_policy enum.
+        int32_t      *  qblock_row_parent;
+        int32_t      *  qblock_row_branch_id;
+        int32_t      *  qblock_row_candidate_rank;
+        int32_t      *  qblock_row_output_policy;
     } llama_batch;
 
     enum llama_model_kv_override_type {
@@ -887,6 +901,9 @@ extern "C" {
 
 // keeps the tensor data on device buffers (i.e. not accessible in host memory, but faster save/load)
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
+
+// allow loading a saved sequence state into a different destination sequence id
+#define LLAMA_STATE_SEQ_FLAGS_ALLOW_SEQ_REMAP 4
 
     typedef uint32_t llama_state_seq_flags;
 

@@ -484,6 +484,67 @@ static bool llama_prefix_snapshot_trace_cb(ggml_tensor * t, bool ask, void * use
     const uint64_t hash = llama_mtp_fnv1a64(tmp.data(), tmp.size());
     const size_t nfloat = t->type == GGML_TYPE_F32 ? nbytes / sizeof(float) : 0;
 
+    if (is_hidden && t->type == GGML_TYPE_F32 && getenv("LLAMA_MTP_PREFIX_HIDDEN_TRACE_COMPARE")) {
+        auto layer64_stage = [](const std::string & name, const char * prefix, std::string & stage) -> bool {
+            const size_t begin = name.find(prefix);
+            if (begin == std::string::npos) {
+                return false;
+            }
+            const size_t stage_begin = begin + strlen(prefix);
+            const size_t stage_end = name.find("_row", stage_begin);
+            if (stage_end == std::string::npos || stage_end == stage_begin) {
+                return false;
+            }
+            stage = name.substr(stage_begin, stage_end - stage_begin);
+            return true;
+        };
+        std::string ref_stage;
+        std::string pdmq_stage;
+        const bool is_layer64_ref  = layer64_stage(node_name, "layer64_ref_",  ref_stage);
+        const bool is_layer64_pdmq = layer64_stage(node_name, "layer64_pdmq_", pdmq_stage);
+        if ((is_layer64_ref || is_layer64_pdmq) && nfloat > 0) {
+            static std::map<std::string, std::vector<float>> refs;
+            const std::string & stage = is_layer64_ref ? ref_stage : pdmq_stage;
+            const std::string key = std::string("layer64_") + stage + ":row=" + std::to_string(row) +
+                ":token=" + std::to_string((long long) tok) +
+                ":pos=" + std::to_string((long long) pos);
+            const float * vals = reinterpret_cast<const float *>(tmp.data());
+            std::vector<float> cur(vals, vals + nfloat);
+            if (is_layer64_ref) {
+                refs[key] = std::move(cur);
+            } else {
+                auto it = refs.find(key);
+                if (it != refs.end()) {
+                    if (it->second.size() != cur.size()) {
+                        fprintf(stderr,
+                                "MTP_PREFIX_HIDDEN_COMPARE: key=%s ref_n=%zu cur_n=%zu size_mismatch=1\n",
+                                key.c_str(), it->second.size(), cur.size());
+                    } else {
+                        double sum_abs = 0.0;
+                        double sumsq = 0.0;
+                        float max_abs = 0.0f;
+                        size_t max_i = 0;
+                        for (size_t i = 0; i < cur.size(); ++i) {
+                            const float d = cur[i] - it->second[i];
+                            const float ad = std::fabs(d);
+                            sum_abs += (double) ad;
+                            sumsq += (double) d * (double) d;
+                            if (ad > max_abs) {
+                                max_abs = ad;
+                                max_i = i;
+                            }
+                        }
+                        const double mean_abs = sum_abs / (double) cur.size();
+                        const double rms = std::sqrt(sumsq / (double) cur.size());
+                        fprintf(stderr,
+                                "MTP_PREFIX_HIDDEN_COMPARE: key=%s n_float=%zu max_abs=%.9g mean_abs=%.9g rms=%.9g max_i=%zu ref=%.9g cur=%.9g\n",
+                                key.c_str(), cur.size(), max_abs, mean_abs, rms, max_i, it->second[max_i], cur[max_i]);
+                    }
+                }
+            }
+        }
+    }
+
     fprintf(stderr,
             "%s: layer=%d kind=%c row=%lld slot=%lld token=%d pos=%d node=%s op=%s type=%s ne=[%lld,%lld,%lld,%lld] n_bytes=%zu n_float=%zu hash=%016" PRIx64 " first=[",
             trace_name, layer, kind, row, slot, (int) tok, (int) pos, node_name.c_str(), ggml_op_name(t->op), ggml_type_name(t->type),
@@ -1610,15 +1671,18 @@ llama_context::llama_context(
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
-                // Packed16 K cache with DOT4 FA supports quantized V without cparams.flash_attn.
+                // PDMQ compressed K cache with DOT4 FA supports quantized V without cparams.flash_attn.
 #ifdef GGML_USE_HIP
-                const bool packed16_default_enabled = true;
+                const bool pdmq_default_enabled = true;
 #else
-                const bool packed16_default_enabled = false;
+                const bool pdmq_default_enabled = false;
 #endif
-                const char * packed16_env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE");
-                const bool packed16_active = packed16_env ? atoi(packed16_env) != 0 : packed16_default_enabled;
-                if (!packed16_active) {
+                const char * pdmq_env = getenv("GGML_CUDA_ROCM_PDMQ_K_CACHE");
+                if (!pdmq_env) {
+                    pdmq_env = getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE"); // legacy alias
+                }
+                const bool pdmq_active = pdmq_env ? atoi(pdmq_env) != 0 : pdmq_default_enabled;
+                if (!pdmq_active) {
                     throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
                 }
             }
@@ -4464,7 +4528,8 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
             throw std::runtime_error("wrong sequence state magic");
         }
 
-        const bool need_seq_match = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        const bool need_seq_match = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) &&
+            !(flags & LLAMA_STATE_SEQ_FLAGS_ALLOW_SEQ_REMAP);
 
         llama_seq_id seq_id_read;
         io->read(&seq_id_read, sizeof(seq_id_read));
@@ -5316,6 +5381,7 @@ void llama_context::handle_mtp_for_ubatch(
                 return;
             }
         }
+
         for (int k = 0; k + 1 < n_rows; ++k) {
             ggml_backend_tensor_get(t,
                 mtp.hook_batch.embd + (size_t) out_idx * n_embd,

@@ -49,6 +49,13 @@ DEEPSEEK_HANDOFF.md
 /tags
 /.build/
 /build*
+/DartConfiguration.tcl
+/compile_commands.json
+/llama-config.cmake
+/llama-version.cmake
+/llama.pc
+/*.tar.gz
+/*.log
 /release
 /debug
 /libllama.so

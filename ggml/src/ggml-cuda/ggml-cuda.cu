@@ -93,6 +93,217 @@ void ggml_cuda_mtp_q8_dot4_mmvq_act_cache_reset();
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
+static bool ggml_cuda_kernel_attrib_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_CUDA_KERNEL_ATTRIB");
+        return env && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static uint64_t ggml_cuda_kernel_attrib_next_seq() {
+    static std::atomic<uint64_t> seq{0};
+    return seq.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+static const char * ggml_cuda_kernel_attrib_name(const ggml_tensor * t) {
+    return t && t->name[0] ? t->name : "-";
+}
+
+static void ggml_cuda_kernel_attrib_log_mul_mat(
+        const char * site,
+        const char * route,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * dst) {
+    if (!ggml_cuda_kernel_attrib_enabled()) {
+        return;
+    }
+    const uint64_t seq = ggml_cuda_kernel_attrib_next_seq();
+    fprintf(stderr,
+        "KATTR: seq=%" PRIu64 " site=%s route=%s src0=%s dst=%s "
+        "src0_type=%s src1_type=%s dst_type=%s "
+        "src0_ne=%lld,%lld,%lld,%lld src1_ne=%lld,%lld,%lld,%lld dst_ne=%lld,%lld,%lld,%lld\n",
+        seq, site ? site : "-", route ? route : "-",
+        ggml_cuda_kernel_attrib_name(src0), ggml_cuda_kernel_attrib_name(dst),
+        src0 ? ggml_type_name(src0->type) : "-",
+        src1 ? ggml_type_name(src1->type) : "-",
+        dst  ? ggml_type_name(dst->type)  : "-",
+        src0 ? (long long) src0->ne[0] : 0, src0 ? (long long) src0->ne[1] : 0,
+        src0 ? (long long) src0->ne[2] : 0, src0 ? (long long) src0->ne[3] : 0,
+        src1 ? (long long) src1->ne[0] : 0, src1 ? (long long) src1->ne[1] : 0,
+        src1 ? (long long) src1->ne[2] : 0, src1 ? (long long) src1->ne[3] : 0,
+        dst  ? (long long) dst->ne[0]  : 0, dst  ? (long long) dst->ne[1]  : 0,
+        dst  ? (long long) dst->ne[2]  : 0, dst  ? (long long) dst->ne[3]  : 0);
+}
+
+struct ggml_cuda_mtp_cublas_census_entry {
+    std::string route;
+    std::string tensor;
+    std::string dst;
+    std::string type;
+    std::string src1_type;
+    std::string exec;
+    int64_t ne00 = 0;
+    int64_t nrows = 0;
+    int64_t ncols = 0;
+    int64_t src1_batch = 0;
+    int64_t dst_ne0 = 0;
+    int64_t dst_ne1 = 0;
+    uint64_t calls = 0;
+    uint64_t approx_outputs = 0;
+    uint64_t timing_calls = 0;
+    double total_ms = 0.0;
+    float max_ms = 0.0f;
+};
+
+static bool ggml_cuda_mtp_env_enabled(const char * name) {
+    const char * env = getenv(name);
+    return env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0 && strcmp(env, "off") != 0 && strcmp(env, "false") != 0;
+}
+
+static bool ggml_cuda_mtp_cublas_timing_enabled() {
+    static const bool enabled = ggml_cuda_mtp_env_enabled("LLAMA_MTP_CUBLAS_TIMING");
+    return enabled;
+}
+
+static bool ggml_cuda_mtp_cublas_route_census_enabled() {
+    static const bool enabled = ggml_cuda_mtp_env_enabled("LLAMA_MTP_CUBLAS_ROUTE_CENSUS") || ggml_cuda_mtp_cublas_timing_enabled();
+    return enabled;
+}
+
+static std::mutex & ggml_cuda_mtp_cublas_census_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+static std::map<std::string, ggml_cuda_mtp_cublas_census_entry> & ggml_cuda_mtp_cublas_census_map() {
+    static auto * map = new std::map<std::string, ggml_cuda_mtp_cublas_census_entry>();
+    return *map;
+}
+
+static std::string ggml_cuda_mtp_cublas_census_key(
+        const char * route,
+        const char * exec,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const int64_t nrows,
+        const int64_t ncols) {
+    const char * tensor = ggml_cuda_kernel_attrib_name(src0);
+    return std::string(route ? route : "-") + "|" + (exec ? exec : "-") + "|" + tensor + "|" +
+        (src0 ? ggml_type_name(src0->type) : "-") + "|" +
+        (src1 ? ggml_type_name(src1->type) : "-") + "|" +
+        std::to_string((long long) (src0 ? src0->ne[0] : 0)) + "|" +
+        std::to_string((long long) nrows) + "|" + std::to_string((long long) ncols) + "|" +
+        std::to_string((long long) (src1 ? src1->ne[1] : 0));
+}
+
+static ggml_cuda_mtp_cublas_census_entry & ggml_cuda_mtp_cublas_census_entry_for(
+        const char * route,
+        const char * exec,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * dst,
+        const int64_t nrows,
+        const int64_t ncols) {
+    auto & entry = ggml_cuda_mtp_cublas_census_map()[ggml_cuda_mtp_cublas_census_key(route, exec, src0, src1, nrows, ncols)];
+    if (entry.calls == 0 && entry.timing_calls == 0) {
+        entry.route = route && route[0] ? route : "-";
+        entry.tensor = ggml_cuda_kernel_attrib_name(src0);
+        entry.dst = ggml_cuda_kernel_attrib_name(dst);
+        entry.type = src0 ? ggml_type_name(src0->type) : "-";
+        entry.src1_type = src1 ? ggml_type_name(src1->type) : "-";
+        entry.exec = exec && exec[0] ? exec : "-";
+        entry.ne00 = src0 ? src0->ne[0] : 0;
+        entry.nrows = nrows;
+        entry.ncols = ncols;
+        entry.src1_batch = src1 ? src1->ne[1] : 0;
+        entry.dst_ne0 = dst ? dst->ne[0] : 0;
+        entry.dst_ne1 = dst ? dst->ne[1] : 0;
+    }
+    return entry;
+}
+
+static void ggml_cuda_mtp_cublas_census_dump() {
+    if (!ggml_cuda_mtp_cublas_route_census_enabled()) {
+        return;
+    }
+
+    std::vector<ggml_cuda_mtp_cublas_census_entry> rows;
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_mtp_cublas_census_mutex());
+        rows.reserve(ggml_cuda_mtp_cublas_census_map().size());
+        for (const auto & kv : ggml_cuda_mtp_cublas_census_map()) {
+            rows.push_back(kv.second);
+        }
+    }
+
+    std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) {
+        if (a.total_ms != b.total_ms) {
+            return a.total_ms > b.total_ms;
+        }
+        if (a.approx_outputs != b.approx_outputs) {
+            return a.approx_outputs > b.approx_outputs;
+        }
+        return a.calls > b.calls;
+    });
+
+    GGML_LOG_INFO("mtp_cublas_census summary count=%zu timing=%d\n", rows.size(), ggml_cuda_mtp_cublas_timing_enabled() ? 1 : 0);
+    size_t dump_limit = 512;
+    if (const char * env_limit = getenv("LLAMA_MTP_CUBLAS_CENSUS_LIMIT")) {
+        const long parsed = std::strtol(env_limit, nullptr, 10);
+        if (parsed > 0) {
+            dump_limit = (size_t) parsed;
+        }
+    }
+    const size_t limit = std::min<size_t>(rows.size(), dump_limit);
+    for (size_t i = 0; i < limit; ++i) {
+        const auto & r = rows[i];
+        const double avg_ms = r.timing_calls > 0 ? r.total_ms / (double) r.timing_calls : 0.0;
+        GGML_LOG_INFO("mtp_cublas_census rank=%zu route=%s tensor=%s dst=%s type=%s src1_type=%s exec=%s ne00=%lld nrows=%lld ncols=%lld src1_batch=%lld dst_ne=%lld,%lld calls=%llu approx_outputs=%llu timing_calls=%llu total_ms=%.6f avg_ms=%.6f max_ms=%.6f\n",
+                i + 1, r.route.c_str(), r.tensor.c_str(), r.dst.c_str(), r.type.c_str(), r.src1_type.c_str(), r.exec.c_str(),
+                (long long) r.ne00, (long long) r.nrows, (long long) r.ncols, (long long) r.src1_batch,
+                (long long) r.dst_ne0, (long long) r.dst_ne1,
+                (unsigned long long) r.calls, (unsigned long long) r.approx_outputs,
+                (unsigned long long) r.timing_calls, r.total_ms, avg_ms, (double) r.max_ms);
+    }
+}
+
+static void ggml_cuda_mtp_cublas_register_atexit_once() {
+    static const bool registered = []() {
+        std::atexit(ggml_cuda_mtp_cublas_census_dump);
+        return true;
+    }();
+    GGML_UNUSED(registered);
+}
+
+static void ggml_cuda_mtp_cublas_census_record(
+        const char * route,
+        const char * exec,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * dst,
+        const int64_t nrows,
+        const int64_t ncols,
+        const bool has_timing,
+        const float elapsed_ms) {
+    if (!ggml_cuda_mtp_cublas_route_census_enabled()) {
+        return;
+    }
+    ggml_cuda_mtp_cublas_register_atexit_once();
+    std::lock_guard<std::mutex> lock(ggml_cuda_mtp_cublas_census_mutex());
+    auto & entry = ggml_cuda_mtp_cublas_census_entry_for(route, exec, src0, src1, dst, nrows, ncols);
+    entry.calls++;
+    entry.approx_outputs += (uint64_t) std::max<int64_t>(nrows, 0) * (uint64_t) std::max<int64_t>(ncols, 0);
+    if (has_timing) {
+        entry.timing_calls++;
+        entry.total_ms += (double) elapsed_ms;
+        if (elapsed_ms > entry.max_ms) {
+            entry.max_ms = elapsed_ms;
+        }
+    }
+}
+
 struct ggml_cuda_copy_sync_trace_row {
     std::string kind;
     std::string direction;
@@ -1772,7 +1983,24 @@ static void ggml_cuda_op_mul_mat_cublas(
         row_diff == src0->ne[1] &&
         dst->op_params[0] == GGML_PREC_DEFAULT;
 
+    const bool cublas_census_enabled = ggml_cuda_mtp_cublas_route_census_enabled();
+    const bool cublas_timing_enabled = ggml_cuda_mtp_cublas_timing_enabled() && !ggml_cuda_mtp_mmq_stream_is_capturing(stream);
+    cudaEvent_t cublas_timing_start = nullptr;
+    cudaEvent_t cublas_timing_stop  = nullptr;
+    if (cublas_timing_enabled) {
+#if defined(GGML_USE_HIP)
+        CUDA_CHECK(hipEventCreate(&cublas_timing_start));
+        CUDA_CHECK(hipEventCreate(&cublas_timing_stop));
+#else
+        CUDA_CHECK(cudaEventCreate(&cublas_timing_start));
+        CUDA_CHECK(cudaEventCreate(&cublas_timing_stop));
+#endif
+        CUDA_CHECK(cudaEventRecord(cublas_timing_start, stream));
+    }
+    const char * cublas_exec = "unknown";
+
     if (supports_bf16 && src0->type == GGML_TYPE_BF16 && ggml_is_contiguous(src0) && row_diff == src0->ne[1]) {
+        cublas_exec = src1->type == GGML_TYPE_BF16 ? "bf16_gemm_f32acc" : "bf16_convert_gemm_f32acc";
         ggml_cuda_pool_alloc<nv_bfloat16> src1_as_bf16(ctx.pool(id));
         if (src1->type != GGML_TYPE_BF16) {
             const to_bf16_cuda_t to_bf16_cuda = ggml_get_to_bf16_cuda(src1->type);
@@ -1831,6 +2059,8 @@ static void ggml_cuda_op_mul_mat_cublas(
                                         || cc == GGML_CUDA_CC_VOLTA
                                         || force_compute_type.fp32))
         {
+            cublas_exec = (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16) ?
+                "fp16_gemm_f32acc" : "fp16_dequant_gemm_f32acc";
             const float alpha = 1.0f;
             const float beta = 0.0f;
             CUBLAS_CHECK(
@@ -1842,6 +2072,8 @@ static void ggml_cuda_op_mul_mat_cublas(
                         CUBLAS_COMPUTE_32F,
                         CUBLAS_GEMM_DEFAULT_TENSOR_OP));
         } else {
+            cublas_exec = (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16) ?
+                "fp16_gemm_f16acc_to_f32" : "fp16_dequant_gemm_f16acc_to_f32";
             ggml_cuda_pool_alloc<half> dst_f16(ctx.pool(id), row_diff*src1_ncols);
 
             const half alpha_f16 = 1.0f;
@@ -1860,6 +2092,8 @@ static void ggml_cuda_op_mul_mat_cublas(
             to_fp32_cuda(dst_f16.get(), dst_dd_i, row_diff*src1_ncols, stream);
         }
     } else {
+        cublas_exec = (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) ?
+            "f32_sgemm" : "fp32_dequant_sgemm";
         ggml_cuda_pool_alloc<float> src0_ddq_as_f32(ctx.pool(id));
         ggml_cuda_pool_alloc<float> src1_ddq_as_f32(ctx.pool(id));
 
@@ -1889,6 +2123,25 @@ static void ggml_cuda_op_mul_mat_cublas(
                     &alpha, src0_ddf_i,  ne00,
                             src1_ddf1_i, ne10,
                     &beta,  dst_dd_i,    ldc));
+    }
+
+    bool cublas_has_timing = false;
+    float cublas_elapsed_ms = 0.0f;
+    if (cublas_timing_enabled) {
+        CUDA_CHECK(cudaEventRecord(cublas_timing_stop, stream));
+        CUDA_CHECK(cudaEventSynchronize(cublas_timing_stop));
+#if defined(GGML_USE_HIP)
+        CUDA_CHECK(hipEventElapsedTime(&cublas_elapsed_ms, cublas_timing_start, cublas_timing_stop));
+#else
+        CUDA_CHECK(cudaEventElapsedTime(&cublas_elapsed_ms, cublas_timing_start, cublas_timing_stop));
+#endif
+        CUDA_CHECK(cudaEventDestroy(cublas_timing_start));
+        CUDA_CHECK(cudaEventDestroy(cublas_timing_stop));
+        cublas_has_timing = true;
+    }
+    if (cublas_census_enabled) {
+        ggml_cuda_mtp_cublas_census_record("op_cublas", cublas_exec, src0, src1, dst, row_diff, src1_ncols,
+                cublas_has_timing, cublas_elapsed_ms);
     }
 
     GGML_UNUSED_VARS(dst, src1_ddq_i, src1_padded_row_size);
@@ -3150,24 +3403,33 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (!split && use_mul_mat_vec_f) {
         // the custom F16 vector kernel can be used over batched cuBLAS GEMM
         // but this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
+        ggml_cuda_kernel_attrib_log_mul_mat(__func__, "direct_mmvf", src0, src1, dst);
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_f) {
+        ggml_cuda_kernel_attrib_log_mul_mat(__func__, "direct_mmf", src0, src1, dst);
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_vec_q) {
+        ggml_cuda_kernel_attrib_log_mul_mat(__func__, "direct_mmvq", src0, src1, dst);
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_q) {
+        ggml_cuda_kernel_attrib_log_mul_mat(__func__, "direct_mmq", src0, src1, dst);
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
     } else if (!split && (use_batched_cublas_f16 || use_batched_cublas_bf16 || use_batched_cublas_f32)
         && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->ne[2]*src1->ne[3] > 1) {
         // general KQ + KQV multi-batch without FlashAttention
+        ggml_cuda_kernel_attrib_log_mul_mat(__func__, "batched_cublas", src0, src1, dst);
         ggml_cuda_mul_mat_batched_cublas(ctx, src0, src1, dst);
     } else if (use_mul_mat_vec_f) {
+        ggml_cuda_kernel_attrib_log_mul_mat(__func__, "op_mmvf", src0, src1, dst);
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_vec_f, nullptr);
     } else if (use_mul_mat_vec_q) {
+        ggml_cuda_kernel_attrib_log_mul_mat(__func__, "op_mmvq", src0, src1, dst);
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_vec_q, quantize_row_q8_1_cuda);
     } else if (use_mul_mat_q) {
+        ggml_cuda_kernel_attrib_log_mul_mat(__func__, "op_mmq", src0, src1, dst);
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_q, quantize_mmq_q8_1_cuda);
     } else {
+        ggml_cuda_kernel_attrib_log_mul_mat(__func__, "op_cublas", src0, src1, dst);
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
     }
 }
@@ -3200,6 +3462,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     ggml_cuda_mtp_moe_route_policy_log(__func__, src0, ne2, n_expert_used_for_policy, mmvq_mmid_max,
                             small_route_gemv_preferred, force_small_mmq_requested,
                             small_route_gemv_preferred ? "mmvq_moe_small_route_gemv" : "mmvq_moe_type_cap");
+                    ggml_cuda_kernel_attrib_log_mul_mat(__func__, "id_mmvq", src0, src1, dst);
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
                 }
@@ -3216,6 +3479,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 if (GGML_CUDA_CC_IS_AMD(cc)) {
                     ggml_cuda_mtp_moe_route_policy_log(__func__, src0, ne2, n_expert_used_for_policy, MMVF_MAX_BATCH_SIZE,
                             small_route_gemv_preferred, false, "mmvf_moe_small_route_gemv");
+                    ggml_cuda_kernel_attrib_log_mul_mat(__func__, "id_mmvf", src0, src1, dst);
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                     return;
                 }
@@ -3225,11 +3489,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             ggml_cuda_mtp_moe_route_policy_log(__func__, src0, ne2, n_expert_used_for_policy, get_mmvq_mmid_max_batch(src0->type, cc),
                     small_route_gemv_preferred, false, "mmq_grouped_moe");
+            ggml_cuda_kernel_attrib_log_mul_mat(__func__, "id_mmq", src0, src1, dst);
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
 
         if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+            ggml_cuda_kernel_attrib_log_mul_mat(__func__, "id_mmf", src0, src1, dst);
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return;
         }

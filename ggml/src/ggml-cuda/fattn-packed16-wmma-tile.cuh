@@ -47,12 +47,14 @@ static int ggml_cuda_rocm_packed16_wmma_gqa_group() {
     GGML_ABORT("invalid GGML_CUDA_ROCM_PACKED16_WMMA_GQA_GROUP=%s; expected 1 or 2", s);
 }
 
-static inline bool ggml_cuda_pwmma_self_probes_enabled() {
+static inline void ggml_cuda_pwmma_self_probes_fail_closed_if_requested() {
     const char * v = getenv("GGML_CUDA_PWMMA_SELF_PROBES");
     if (!v) {
         v = getenv("GGML_CUDA_PWMMA_DEBUG_SELF_PROBES");
     }
-    return v && atoi(v) != 0;
+    if (v && atoi(v) != 0) {
+        GGML_ABORT("GGML_CUDA_PWMMA_SELF_PROBES was archived out-of-tree by 2026-06-23 build-trim");
+    }
 }
 
 static inline bool ggml_cuda_pwmma_log_enabled() {
@@ -80,6 +82,7 @@ static int ggml_cuda_rocm_packed16_wmma_impl() {
     if (strcmp(s, "bm64_i8qk_pvwmma_512t_wavegate_stagev") == 0) return 14;
     if (strcmp(s, "bm64_i8qk_pvwmma_bn32_512t_wavegate_stagev") == 0) return 15;
     if (strcmp(s, "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev") == 0) return 16;
+    if (strcmp(s, "bm64_i8qk_packed8_expand_pvwmma_dbv_512t_wavegate_stagev") == 0) return 17;
     GGML_ABORT("invalid GGML_CUDA_ROCM_PACKED16_WMMA_IMPL=%s", s);
 }
 
@@ -2423,7 +2426,7 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_512t_wavegate_stagev_kernel(
 }
 
 // ── BM64_I8QK PV-WMMA DBV: dedicated scaffold for V double-buffer route ──
-template<packed16_wmma_v_type V_TYPE>
+template<packed16_wmma_v_type V_TYPE, bool PACKED8_K = false>
 static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev_kernel(
         const float * __restrict__ Q, const char * __restrict__ V, float * __restrict__ dst,
         int64_t q_nb01, int64_t q_nb02, int64_t q_nb03,
@@ -2449,7 +2452,7 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
     const int q0 = q_tile * PWMMA_BM64;
     constexpr bool PROBS_F16 = true;
     constexpr bool K32_ACC = false;
-    constexpr bool K_SHARED = false;
+    constexpr bool K_SHARED = PACKED8_K;
     constexpr bool PV_WMMA = true;
     constexpr bool BN32 = false;
     constexpr int Q_SCALE_BLOCK = 32;
@@ -2543,7 +2546,24 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
                 const int g = idx - c * (PWMMA_D/4);
                 if (c < valid_k) {
                     const size_t row = k_head_base + size_t(k0) + size_t(c);
-                    k_i32_smem[idx] = k_payload[row * k_payload_row_stride_i32 + g];
+                    if constexpr (PACKED8_K) {
+                        // packed8_q4_144 stores 8 signed-i4 codes per i32 word. Expand
+                        // once per K tile into the existing i8 WMMA shared-K layout:
+                        // four signed int8 lanes per i32 word, scale unchanged.
+                        const int d_base = g * 4;
+                        uint32_t packed_i8 = 0;
+                        #pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            const int dd = d_base + i;
+                            const uint32_t src = static_cast<uint32_t>(k_payload[row * k_payload_row_stride_i32 + (dd >> 3)]);
+                            const int code = int((src >> (4 * (dd & 7))) & 0x0fu);
+                            const int8_t q = static_cast<int8_t>(code - 8);
+                            packed_i8 |= uint32_t(uint8_t(q)) << (8 * i);
+                        }
+                        k_i32_smem[idx] = static_cast<int>(packed_i8);
+                    } else {
+                        k_i32_smem[idx] = k_payload[row * k_payload_row_stride_i32 + g];
+                    }
                 } else {
                     k_i32_smem[idx] = 0;
                 }
@@ -3823,7 +3843,9 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
                 (long long)K->ne[0]*4, (unsigned long long)Q->ne[0]);
     }
     GGML_ASSERT(Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(Q->ne[0] == 256 && K->ne[0]*4 == Q->ne[0]);
+    const bool k_view_packed16 = K->ne[0] * 4 == Q->ne[0];
+    const bool k_view_packed8  = K->ne[0] * 8 == Q->ne[0];
+    GGML_ASSERT(Q->ne[0] == 256 && (k_view_packed16 || k_view_packed8));
     if (getenv("GGML_CUDA_PWMMA_ABORT_AFTER_LAYOUT")) {
         GGML_ABORT("PWMMA layout debug abort");
     }
@@ -3838,10 +3860,13 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
     ggml_tensor * packed16_payload = nullptr, * packed16_scales = nullptr;
     llama_kv_cache_get_packed16_tensors(K->data, &packed16_payload, &packed16_scales);
     GGML_ASSERT(packed16_payload && packed16_scales);
-    GGML_ASSERT(packed16_payload->ne[0] == PWMMA_D/4 && packed16_scales->ne[0] == PWMMA_D/QK8_0);
+    const bool k_payload_packed16 = k_view_packed16 && packed16_payload->ne[0] == PWMMA_D/4;
+    const bool k_payload_packed8  = k_view_packed8  && packed16_payload->ne[0] == PWMMA_D/8;
+    const int k_payload_i32_per_row = k_payload_packed8 ? PWMMA_D/8 : PWMMA_D/4;
+    GGML_ASSERT((k_payload_packed16 || k_payload_packed8) && packed16_scales->ne[0] == PWMMA_D/QK8_0);
     GGML_ASSERT(packed16_payload->ne[1] >= K->ne[1] * K->ne[2] && packed16_scales->ne[1] >= K->ne[1] * K->ne[2]);
     GGML_ASSERT(packed16_payload->nb[0] == (int64_t)sizeof(int) && packed16_scales->nb[0] == (int64_t)sizeof(half));
-    GGML_ASSERT(packed16_payload->nb[1] >= (PWMMA_D/4)*(int64_t)sizeof(int));
+    GGML_ASSERT(packed16_payload->nb[1] >= k_payload_i32_per_row*(int64_t)sizeof(int));
     GGML_ASSERT(packed16_scales->nb[1] >= (PWMMA_D/QK8_0)*(int64_t)sizeof(half));
     GGML_ASSERT((packed16_payload->nb[1] % (int64_t)sizeof(int)) == 0);
     GGML_ASSERT((packed16_scales->nb[1] % (int64_t)sizeof(half)) == 0);
@@ -3881,7 +3906,7 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
 
     // impl validation: bm32_regout only valid with BM32; bm64_regout only valid with BM64
     const bool impl_bm32_regout = (impl == 1 || impl == 2);
-    const bool impl_bm64_regout = (impl == 3 || impl == 4 || impl == 5 || impl == 6 || impl == 7 || impl == 8 || impl == 9 || impl == 10 || impl == 11 || impl == 12 || impl == 13 || impl == 14 || impl == 15 || impl == 16);
+    const bool impl_bm64_regout = (impl == 3 || impl == 4 || impl == 5 || impl == 6 || impl == 7 || impl == 8 || impl == 9 || impl == 10 || impl == 11 || impl == 12 || impl == 13 || impl == 14 || impl == 15 || impl == 16 || impl == 17);
     if (impl_bm32_regout && !is_bm32) GGML_ABORT("PWMMA BM32 regout impl requires BM=32, got BM=%d impl=%d", bm, impl);
     if (impl_bm64_regout && !is_bm64) GGML_ABORT("PWMMA BM64 regout impl requires BM=64, got BM=%d impl=%d", bm, impl);
 
@@ -3902,6 +3927,7 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
         (impl == 14) ? "bm64_i8qk_pvwmma_512t_wavegate_stagev" :
         (impl == 15) ? "bm64_i8qk_pvwmma_bn32_512t_wavegate_stagev" :
         (impl == 16) ? "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev" :
+        (impl == 17) ? "bm64_i8qk_packed8_expand_pvwmma_dbv_512t_wavegate_stagev" :
         "unknown";
 
     // GQA2 validation: only BM16, GQA ratio >= 2, nq > 1
@@ -3942,8 +3968,14 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
         CUDA_CHECK(hipMemset(d_skip_counter, 0, sizeof(unsigned long long)));
     }
 
-    const bool impl_i8qk = (impl == 9 || impl == 10 || impl == 11 || impl == 12 || impl == 13 || impl == 14 || impl == 15 || impl == 16);
-    const bool impl_pvwmma = (impl == 14 || impl == 15 || impl == 16);
+    if (k_payload_packed8 && impl != 17) {
+        GGML_ABORT("packed8_q4 PWMMA requires GGML_CUDA_ROCM_PACKED16_WMMA_IMPL=bm64_i8qk_packed8_expand_pvwmma_dbv_512t_wavegate_stagev, got %s", impl_name);
+    }
+    if (!k_payload_packed8 && impl == 17) {
+        GGML_ABORT("packed8_q4 PWMMA impl requires packed8_q4_144 K payload");
+    }
+    const bool impl_i8qk = (impl == 9 || impl == 10 || impl == 11 || impl == 12 || impl == 13 || impl == 14 || impl == 15 || impl == 16 || impl == 17);
+    const bool impl_pvwmma = (impl == 14 || impl == 15 || impl == 16 || impl == 17);
     const bool live_dot4_shadow_requested = impl_i8qk && getenv("GGML_CUDA_PWMMA_I8_LIVE_DOT4_SHADOW");
     const bool live_pv_shadow_requested = impl_pvwmma && getenv("GGML_CUDA_PWMMA_PV_WMMA_SHADOW");
     bool live_dot4_shadow = live_dot4_shadow_requested || live_pv_shadow_requested;
@@ -3993,12 +4025,13 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
     { static bool once = false; if (!once) { once = true;
         if (pwmma_log) {
             fprintf(stderr, "PWMMA v0.6 variant=%s BM=%d GQA_GROUP=%d IMPL=%s Q4fix=%d nq=%d nk=%d hq=%d hk=%d b=%d sc=%g "
-                    "gqa_ratio=%d grid_y_old=%d grid_y_new=%d payload_ne1=%lld payload_ne2=%lld packed_kv_size=%d head_stride=%d payload_stride_i32=%d scales_stride_half=%d\n",
+                    "gqa_ratio=%d grid_y_old=%d grid_y_new=%d k_format=%s payload_ne0=%lld payload_ne1=%lld payload_ne2=%lld packed_kv_size=%d head_stride=%d payload_stride_i32=%d scales_stride_half=%d\n",
                     is_gqa2 ? "BM16_GQA2" : (is_bm64 ? "BM64_X4" : (is_bm32 ? "BM32_2W" : "BM16_1W")), bm, gqa_group,
                     impl_name,
                     PWMMA_Q4_LAYOUT_FIXED, nq, nk, n_heads_q, n_heads_k, batch, (double)attention_scale,
                     gqa_ratio, grid_y_old, is_gqa2 ? grid_y_gqa2 : grid_y_old,
-                    (long long)packed16_payload->ne[1], (long long)packed16_payload->ne[2],
+                    k_payload_packed8 ? "packed8_q4_144" : "packed16_q8_272",
+                    (long long)packed16_payload->ne[0], (long long)packed16_payload->ne[1], (long long)packed16_payload->ne[2],
                     packed_kv_size, packed_kv_size / n_heads_k,
                     k_payload_row_stride_i32, k_scales_row_stride_half);
         }
@@ -4014,22 +4047,7 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
                 CUDA_CHECK(hipStreamSynchronize(stream));
             }
         }
-        const bool self_probes = ggml_cuda_pwmma_self_probes_enabled();
-        if (self_probes && !pbwmma_qk_probe_pass(stream)) GGML_ABORT("PBWMMA QK probe failed");
-        if (self_probes && impl_i8qk && !pbwmma_i8_qk_probe_pass(stream)) GGML_ABORT("PBWMMA I8 QK probe failed");
-        if (self_probes && impl_pvwmma && !pbwmma_pv_probe_pass(stream)) GGML_ABORT("PBWMMA PV WMMA probe failed");
-        if (self_probes && impl_pvwmma && getenv("GGML_CUDA_PWMMA_PV_MULTI_PROBE") &&
-                !pbwmma_pv_probe_bm64_d256_pass(stream)) GGML_ABORT("PBWMMA BM64_D256 PV WMMA probe failed");
-        if (self_probes && impl_i8qk && getenv("GGML_CUDA_PWMMA_I8_DOT4_SHADOW_PROBE") &&
-                !pbwmma_i8_dot4_shadow_probe_pass(stream)) GGML_ABORT("PBWMMA I8 DOT4 shadow probe failed");
-        if (self_probes && is_bm32 && !pbwmma_qk_probe_bm32_pass(stream)) GGML_ABORT("PBWMMA BM32_2W QK probe failed");
-        if (self_probes && is_gqa2 && !pbwmma_qk_probe_gqa2_pass(stream)) GGML_ABORT("PBWMMA GQA2 QK probe failed");
-        // BM64 probe disabled by default — enable with GGML_CUDA_PWMMA_SELF_PROBES=1 GGML_CUDA_PWMMA_BM64_PROBE=1
-        if (self_probes && getenv("GGML_CUDA_PWMMA_BM64_PROBE")) {
-            static bool bm64_probed = false; if (!bm64_probed) { bm64_probed = true;
-                pbwmma_qk_probe_bm64_x4_pass(stream);
-            }
-        }
+        ggml_cuda_pwmma_self_probes_fail_closed_if_requested();
         if (getenv("GGML_CUDA_PACKED16_KV_CHECK")) {
             const int head_stride_chk = packed_kv_size / n_heads_k;
             packed16_kv_check_kernel<<<1, 1, 0, stream>>>(
@@ -4188,10 +4206,11 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
                 default: GGML_ABORT("pwmma bm64 i8qk pvwmma bn32: unsupported V type");
             }
 #undef LAUNCH_BM64_I8QK_PV_BN32
-        } else if (impl == 16) {
+        } else if (impl == 16 || impl == 17) {
             dim3 block512(512);
-#define LAUNCH_BM64_I8QK_DBV(VT) \
-    packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev_kernel<VT><<<grid, block512, 0, stream>>>( \
+            const size_t kshared_smem = impl == 17 ? PWMMA_I8_KSHARED_SMEM_BYTES : 0;
+#define LAUNCH_BM64_I8QK_DBV(VT, PACKED8V) \
+    packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev_kernel<VT, PACKED8V><<<grid, block512, kshared_smem, stream>>>( \
         (const float*)Q->data, (const char*)V->data, (float*)dst->data, \
         Q->nb[1], Q->nb[2], Q->nb[3], V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
         v_layout, \
@@ -4199,13 +4218,18 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
         k_payload, k_scales, k_payload_row_stride_i32, k_scales_row_stride_half, \
         nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_kv_size, attention_scale, \
         d_skip_counter, causal_skip_active, d_live_shadow_err, profile_dev)
+#define LAUNCH_BM64_I8QK_DBV_SELECT(VT) do { \
+    if (impl == 17) { LAUNCH_BM64_I8QK_DBV(VT, true); } \
+    else { LAUNCH_BM64_I8QK_DBV(VT, false); } \
+} while (0)
             switch (V->type) {
-                case GGML_TYPE_Q4_0: LAUNCH_BM64_I8QK_DBV(PACKED16_WMMA_V_Q4_0); break;
-                case GGML_TYPE_Q8_0: LAUNCH_BM64_I8QK_DBV(PACKED16_WMMA_V_Q8_0); break;
-                case GGML_TYPE_F16:  LAUNCH_BM64_I8QK_DBV(PACKED16_WMMA_V_F16);  break;
-                case GGML_TYPE_V4_K16D16_144: LAUNCH_BM64_I8QK_DBV(PACKED16_WMMA_V4_K16D16_144); break;
+                case GGML_TYPE_Q4_0: LAUNCH_BM64_I8QK_DBV_SELECT(PACKED16_WMMA_V_Q4_0); break;
+                case GGML_TYPE_Q8_0: LAUNCH_BM64_I8QK_DBV_SELECT(PACKED16_WMMA_V_Q8_0); break;
+                case GGML_TYPE_F16:  LAUNCH_BM64_I8QK_DBV_SELECT(PACKED16_WMMA_V_F16);  break;
+                case GGML_TYPE_V4_K16D16_144: LAUNCH_BM64_I8QK_DBV_SELECT(PACKED16_WMMA_V4_K16D16_144); break;
                 default: GGML_ABORT("pwmma bm64 i8qk pvwmma dbv: unsupported V type");
             }
+#undef LAUNCH_BM64_I8QK_DBV_SELECT
 #undef LAUNCH_BM64_I8QK_DBV
         } else if (impl_i8qk) {
             dim3 block512(512);

@@ -18,11 +18,12 @@ values, while f16 scales remain separate.
 
 ## Start here: recommended MTP server launch
 
-Set your model path once, then run `llama-server` directly:
+Set your model path once, then run `llama-server` directly. For the measured Qwen3.6 27B Q4_K_M MTP speed profile, use the single PV4 opt-in and pure MTP, without `--spec-default`:
 
 ```bash
 MODEL=/path/to/Qwen3.6-27B-Q4_K_M-mtp.gguf
 
+GGML_CUDA_ROCM_V4_K16D16_144_PV4=1 \
 ./build-rocm/bin/llama-server \
   --device ROCm0 \
   --model "$MODEL" \
@@ -31,13 +32,12 @@ MODEL=/path/to/Qwen3.6-27B-Q4_K_M-mtp.gguf
   --cache-type-v-draft q4_0 \
   --ctx-size 40960 --batch-size 2048 --ubatch-size 512 \
   --parallel 1 --no-warmup \
-  --spec-type draft-mtp --spec-default \
+  --spec-type draft-mtp \
   --spec-draft-n-max 4 --spec-draft-p-min 0 \
   --spec-draft-prio 2 --spec-draft-prio-batch 2
 ```
 
-That is the normal MTP path. You do not need to set internal MTP, PDMQ,
-packed16, MMVQ, backend-top-k, or route assertion environment variables.
+That is the pure-MTP active-RS path. The PV4 switch implies the internal V144/PV4, QBlock/PDMQ, QPack, packed16, and target-batch verifier backend stack. You do not need to set the historical long ROCm/MTP env stack.
 
 `q4_0` is the recommended V-cache choice for the fast MTP path. `q8_0` and
 `f16` are supported higher-precision V-cache choices; they use more VRAM and
@@ -46,13 +46,14 @@ remain slower than `q4_0` on the measured 27B MTP path.
 Do not add `--cache-type-k` for the packed16/I32 path; K is selected by the
 RoxxY packed16 runtime layout.
 
-Expected q4 evidence on the measured 27B path is approximately:
+Expected q4 evidence on the measured pure-MTP PV4 profile is approximately:
 
 ```text
-~60 tok/s or better, draft acceptance around 410/459, SHA f460e459... for the
-standard n512 smoke. Draft KV should be about 65 MiB at ctx 40960: packed16 K
-payload+scales around 42.5 MiB plus q4_0 V around 22.5 MiB.
+n128: ~53 tok/s, SHA accabc9a, draft acceptance around 96/121
+n512: ~42-43 tok/s, SHA 8d10ba2d, draft acceptance around 357/612
 ```
+
+Draft KV should be about 65 MiB at ctx 40960 before V144/PV4 physical route effects: packed16 K payload+scales around 42.5 MiB plus q4_0 logical V around 22.5 MiB.
 
 Expected higher-precision typed-V evidence on the same direct/clean command,
 with only the V cache type changed, is approximately:

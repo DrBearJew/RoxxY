@@ -1,2 +1,0 @@
-/home/mrtrent/.local/bin/ar qc libserver-context.a "CMakeFiles/server-context.dir/server-chat.cpp.o" "CMakeFiles/server-context.dir/server-task.cpp.o" "CMakeFiles/server-context.dir/server-queue.cpp.o" "CMakeFiles/server-context.dir/server-common.cpp.o" "CMakeFiles/server-context.dir/server-context.cpp.o" "CMakeFiles/server-context.dir/server-tools.cpp.o"
-/home/mrtrent/.local/bin/ranlib libserver-context.a

@@ -1,2 +1,0 @@
-/home/mrtrent/.local/bin/ar qc libllama-diffusion.a "CMakeFiles/llama-diffusion.dir/diffusion.cpp.o"
-/home/mrtrent/.local/bin/ranlib libllama-diffusion.a

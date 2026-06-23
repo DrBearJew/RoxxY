@@ -24,6 +24,13 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
 void common_speculative_free(common_speculative * spec);
 
+struct common_speculative_branch_candidate {
+    llama_token id = LLAMA_TOKEN_NULL;
+    float logit = -1.0e30f;
+    float p = 0.0f;
+    int32_t rank = -1;
+};
+
 struct common_speculative_draft_params {
     // this flag is used to chain the drafts through all the available implementations
     // after the first successful draft from an implementation, we set it
@@ -43,6 +50,12 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // Optional per-depth branch candidates for tree/block verifiers. This does
+    // not affect token selection: result remains the accepted linear draft path.
+    // When populated, branch_candidates[depth][rank] describes the draft model's
+    // alternate candidates for result[depth].
+    std::vector<std::vector<common_speculative_branch_candidate>> * branch_candidates = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -56,6 +69,18 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
 // process the batch using externally captured target pre-norm embedding rows.
 // h_pre_norm must contain batch.n_tokens contiguous rows of llama_model_n_embd(ctx_tgt) floats.
 bool common_speculative_process_with_pre_norm(common_speculative * spec, const llama_batch & batch, const float * h_pre_norm);
+
+// diagnostic-only descendant probe for branch/sibling experiments.
+// Returns false unless a concrete speculative implementation supports the probe.
+bool common_speculative_probe_descendants(
+        common_speculative * spec,
+        llama_seq_id seq_id,
+        uint16_t reject_depth,
+        llama_pos sibling_pos,
+        llama_token sampled,
+        int n_max,
+        llama_tokens & result,
+        std::vector<std::vector<common_speculative_branch_candidate>> * branch_candidates);
 
 // true if any implementation requires target post-norm embeddings to be extracted
 bool common_speculative_need_embd(common_speculative * spec);

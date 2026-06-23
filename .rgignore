@@ -1,0 +1,35 @@
+# Generated/build pollution
+build*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+__pycache__/
+*.pyc
+DartConfiguration.tcl
+compile_commands.json
+llama-config.cmake
+llama-version.cmake
+llama.pc
+*.log
+*.tar.gz
+
+# Bulky local artifacts/reference dumps
+benches/
+reference/
+packed16-pdmq-dll-i8-gpt55pro/
+.harness/research/
+.harness/tmp/
+.harness/artifacts/
+
+# Frontend/generated deps
+node_modules/
+.svelte-kit/
+dist/
+
+# In-repo graveyards should not exist; ignore if accidentally created and remove them.
+archive/
+archives/
+dead_code/
+graveyard/

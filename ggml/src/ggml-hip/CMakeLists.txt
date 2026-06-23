@@ -59,10 +59,12 @@ message(STATUS "HIP and hipBLAS found")
 
 option(GGML_HIP_PDMQ_QWEN35_DEBUG_ONLY "Compile only the narrow Qwen35 PDMQ debug route cells (GQA6 q4 raw_lds_q4 M1/M2N32)" ON)
 option(GGML_HIP_PDMQ_COMPILE_PVBLOCK_EXACT "Compile PDMQ PV-block exact scalar specializations" OFF)
-option(GGML_HIP_PDMQ_COMPILE_V4_144_PV4 "Compile exact V4_144 PV4 path: float P x q4_0-exact packed V" OFF)
+option(GGML_HIP_PDMQ_COMPILE_LEGACY_Q4V "Compile legacy GGML_TYPE_Q4_0 V PDMQ debug/fallback cells" OFF)
+option(GGML_HIP_PDMQ_COMPILE_V4_144_PV4 "Compile exact scalar V4_144 PV4 PDMQ path" ON)
 option(GGML_HIP_PDMQ_FAST_COMPILE "Use a lower optimization level for fattn-packed16-dot4-mmq.cu in dev builds; keeps code present but reduces HIP compile latency" OFF)
 set(GGML_HIP_PDMQ_FAST_COMPILE_OPT "-O1" CACHE STRING "Optimization flag for fattn-packed16-dot4-mmq.cu when GGML_HIP_PDMQ_FAST_COMPILE=ON")
 option(GGML_HIP_QWEN35_ATTENTION_INSTANCES_ONLY "Compile only Qwen35 D=256 FlashAttention tile/MMA template instances in this HIP dev build" ON)
+option(GGML_HIP_COMPILE_STANDARD_Q8_FATTN "Compile legacy standard GGML_TYPE_Q8_0 FlashAttention VEC instances; packed8/PDMQ replaces this in the dev standard build" OFF)
 
 file(GLOB   GGML_HEADERS_ROCM "../ggml-cuda/*.cuh")
 list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
@@ -91,9 +93,12 @@ else()
         ../ggml-cuda/template-instances/fattn-vec-instance-f16-f16.cu
         ../ggml-cuda/template-instances/fattn-vec-instance-f16-q4_0.cu
         ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q4_0.cu
         ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu)
+    if (GGML_HIP_COMPILE_STANDARD_Q8_FATTN)
+        list(APPEND GGML_SOURCES_ROCM
+            ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu
+            ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q4_0.cu)
+    endif()
 endif()
 
 ggml_add_backend_library(ggml-hip
@@ -112,12 +117,19 @@ endif()
 if (GGML_HIP_PDMQ_COMPILE_PVBLOCK_EXACT)
     list(APPEND GGML_HIP_PDMQ_SOURCE_DEFS GGML_HIP_PDMQ_COMPILE_PVBLOCK_EXACT=1)
 endif()
+if (GGML_HIP_PDMQ_COMPILE_LEGACY_Q4V)
+    list(APPEND GGML_HIP_PDMQ_SOURCE_DEFS GGML_HIP_PDMQ_COMPILE_LEGACY_Q4V=1)
+endif()
 if (GGML_HIP_PDMQ_COMPILE_V4_144_PV4)
+    list(APPEND GGML_HIP_PDMQ_SOURCE_DEFS GGML_HIP_PDMQ_COMPILE_V4_144=1)
     list(APPEND GGML_HIP_PDMQ_SOURCE_DEFS GGML_HIP_PDMQ_COMPILE_V4_144_PV4=1)
 endif()
 if (GGML_HIP_QWEN35_ATTENTION_INSTANCES_ONLY)
     list(APPEND GGML_HIP_FATTN_SOURCE_DEFS GGML_HIP_QWEN35_ATTENTION_INSTANCES_ONLY=1)
     list(APPEND GGML_HIP_FATTN_TILE_SOURCE_DEFS GGML_HIP_QWEN35_ATTENTION_INSTANCES_ONLY=1)
+endif()
+if (GGML_HIP_COMPILE_STANDARD_Q8_FATTN)
+    list(APPEND GGML_HIP_FATTN_SOURCE_DEFS GGML_HIP_COMPILE_STANDARD_Q8_FATTN=1)
 endif()
 set_source_files_properties(../ggml-cuda/fattn-packed16-dot4-mmq.cu PROPERTIES COMPILE_DEFINITIONS "${GGML_HIP_PDMQ_SOURCE_DEFS}")
 set_source_files_properties(../ggml-cuda/fattn.cu PROPERTIES COMPILE_DEFINITIONS "${GGML_HIP_FATTN_SOURCE_DEFS}")

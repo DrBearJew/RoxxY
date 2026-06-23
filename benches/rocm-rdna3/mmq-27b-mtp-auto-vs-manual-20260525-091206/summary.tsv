@@ -1,4 +1,0 @@
-case	health	fill_pps	test_pps	loaded_gib	peak_gib	caps	reasons	routes
-baseline	True	789.239976931687	717.6743426516525	20786679808	None	128	disabled,native,ok	{"tile:tile": 119, "vec:q8k_tbq4v_vec": 15, "vec:vec": 2}
-auto	True	815.9531591889554	730.5529515338044	20784848896	None	128	auto_nonmoe_native,disabled,ok	{"tile:tile": 119, "vec:q8k_tbq4v_vec": 15, "vec:vec": 2}
-manual48	True	742.8769688007997	676.0066491591507	20785115136	None	48	disabled,manual,ok	{"tile:tile": 119, "vec:q8k_tbq4v_vec": 15, "vec:vec": 2}

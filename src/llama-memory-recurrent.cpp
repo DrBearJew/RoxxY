@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cinttypes>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -25,6 +26,29 @@ bool llama_rs_cell_trace_enabled() {
 bool llama_rs_commit_layer_trace_enabled() {
     const char * env = getenv("LLAMA_MTP_RS_COMMIT_LAYER_TRACE");
     return env != nullptr && atoi(env) != 0;
+}
+
+bool llama_rs_state_write_layer_trace_enabled() {
+    const char * env = getenv("LLAMA_MTP_RS_STATE_WRITE_LAYER_TRACE");
+    return env != nullptr && atoi(env) != 0;
+}
+
+int llama_rs_state_write_trace_layer_filter() {
+    const char * env = getenv("LLAMA_MTP_RS_STATE_WRITE_TRACE_LAYER");
+    if (env == nullptr || env[0] == '\0') {
+        return -1;
+    }
+    char * end = nullptr;
+    const long v = strtol(env, &end, 10);
+    return end != env ? (int) v : -1;
+}
+
+char llama_rs_state_write_trace_kind_filter() {
+    const char * env = getenv("LLAMA_MTP_RS_STATE_WRITE_TRACE_KIND");
+    if (env == nullptr || env[0] == '\0') {
+        return 0;
+    }
+    return (char) tolower((unsigned char) env[0]);
 }
 
 int llama_rs_commit_trace_layer_filter() {
@@ -1106,6 +1130,10 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
 void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const {
     const uint32_t s_trans = 0;
     const uint32_t n_layer = hparams.n_layer;
+    const bool write_layer_trace = llama_rs_state_write_layer_trace_enabled();
+    const int write_layer_filter = write_layer_trace ? llama_rs_state_write_trace_layer_filter() : -1;
+    const char write_kind_filter = write_layer_trace ? llama_rs_state_write_trace_kind_filter() : 0;
+    std::vector<uint8_t> write_hash_tmp;
 
     io.write(&s_trans, sizeof(s_trans));
     io.write(&n_layer, sizeof(n_layer));
@@ -1128,6 +1156,15 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
         for (const auto & range : cell_ranges) {
             const size_t range_size = range.second - range.first;
             const size_t buf_size = range_size * r_size_row;
+            if (write_layer_trace && (write_kind_filter == 0 || write_kind_filter == 'r') && (write_layer_filter < 0 || write_layer_filter == (int) il)) {
+                write_hash_tmp.resize(buf_size);
+                ggml_backend_tensor_get(r_l[il], write_hash_tmp.data(), range.first * r_size_row, buf_size);
+                fprintf(stderr,
+                        "LLAMA_RS_STATE_WRITE_LAYER_TRACE: kind=r layer=%u range=%u-%u row_size=%llu buf_size=%zu hash=%016" PRIx64 " first_row_hash=%016" PRIx64 "\n",
+                        il, range.first, range.second, (unsigned long long) r_size_row, buf_size,
+                        llama_rs_fnv1a64(write_hash_tmp.data(), write_hash_tmp.size()),
+                        range_size > 0 ? llama_rs_fnv1a64(write_hash_tmp.data(), (size_t) r_size_row) : 0);
+            }
             io.write_tensor(r_l[il], range.first * r_size_row, buf_size);
         }
     }
@@ -1149,6 +1186,15 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             for (const auto & range : cell_ranges) {
                 const size_t range_size = range.second - range.first;
                 const size_t buf_size = range_size * s_size_row;
+                if (write_layer_trace && (write_kind_filter == 0 || write_kind_filter == 's') && (write_layer_filter < 0 || write_layer_filter == (int) il)) {
+                    write_hash_tmp.resize(buf_size);
+                    ggml_backend_tensor_get(s_l[il], write_hash_tmp.data(), range.first * s_size_row, buf_size);
+                    fprintf(stderr,
+                            "LLAMA_RS_STATE_WRITE_LAYER_TRACE: kind=s layer=%u range=%u-%u row_size=%llu buf_size=%zu hash=%016" PRIx64 " first_row_hash=%016" PRIx64 "\n",
+                            il, range.first, range.second, (unsigned long long) s_size_row, buf_size,
+                            llama_rs_fnv1a64(write_hash_tmp.data(), write_hash_tmp.size()),
+                            range_size > 0 ? llama_rs_fnv1a64(write_hash_tmp.data(), (size_t) s_size_row) : 0);
+                }
                 io.write_tensor(s_l[il], range.first * s_size_row, buf_size);
             }
         }

@@ -51,6 +51,26 @@ struct common_speculative_config {
             const common_params_speculative & p = common_params_speculative{}) : type(t), params(p) {}
 };
 
+static uint64_t common_speculative_fnv1a64(const void * data, size_t size) {
+    const uint8_t * p = static_cast<const uint8_t *>(data);
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < size; ++i) {
+        h ^= p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static bool common_speculative_hidden_shift_trace_enabled() {
+    const char * env = getenv("LLAMA_MTP_HIDDEN_SHIFT_TRACE");
+    return env && atoi(env) != 0;
+}
+
+static bool common_speculative_env_enabled(const char * name) {
+    const char * env = getenv(name);
+    return env && atoi(env) != 0;
+}
+
 static bool common_speculative_are_compatible(
     const llama_model * model_tgt,
     const llama_model * model_dft) {
@@ -463,6 +483,38 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const char * source = "unknown";
     };
 
+    static void copy_branch_candidates(
+            std::vector<common_speculative_branch_candidate> & out,
+            const std::vector<backend_topk_entry> & top,
+            float p_top1) {
+        out.clear();
+        out.reserve(top.size());
+        for (size_t i = 0; i < top.size(); ++i) {
+            common_speculative_branch_candidate cand;
+            cand.id = top[i].id;
+            cand.logit = top[i].logit;
+            cand.p = i == 0 ? p_top1 : 0.0f;
+            cand.rank = (int32_t) i;
+            out.push_back(cand);
+        }
+    }
+
+    static void copy_selected_branch_candidate(
+            std::vector<common_speculative_branch_candidate> & out,
+            llama_token id,
+            float p_top1) {
+        out.clear();
+        if (id == LLAMA_TOKEN_NULL) {
+            return;
+        }
+        common_speculative_branch_candidate cand;
+        cand.id = id;
+        cand.logit = 0.0f;
+        cand.p = p_top1;
+        cand.rank = 0;
+        out.push_back(cand);
+    }
+
     int32_t n_embd = 0;
 
     bool kv_shared_with_target = false;
@@ -543,6 +595,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             backend_topk_enabled = false;
             backend_topk_require = false;
         }
+        const bool branch_candidates_requested = common_speculative_env_enabled("LLAMA_MTP_DRAFT_CANDIDATES_TRACE") ||
+            common_speculative_env_enabled("LLAMA_MTP_DRAFT_BRANCH_CANDIDATES");
         if (const char * env = getenv("LLAMA_MTP_DRAFT_MARGIN_MIN")) {
             char * end = nullptr;
             const float v = std::strtof(env, &end);
@@ -559,7 +613,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             backend_topk_k = std::max(1, std::min(16, atoi(env)));
             backend_topk_k_user = true;
         }
-        if (!backend_topk_k_user && quality_trace_enabled) {
+        if (!backend_topk_k_user && (quality_trace_enabled || branch_candidates_requested)) {
             backend_topk_k = 16;
         } else if (!backend_topk_k_user && this->params.p_min <= 0.0f) {
             backend_topk_k = 1;
@@ -590,6 +644,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (quality_trace_enabled) {
             LOG_INF("%s: MTP packed16 quality trace enabled sidecar_k=%d backend_topk_k=%d direct_sidecar=%d\n",
                     __func__, sidecar_k, backend_topk_k, sidecar_enabled ? 1 : 0);
+        }
+        if (branch_candidates_requested) {
+            LOG_INF("%s: MTP draft branch-candidate capture enabled backend_topk_k=%d\n",
+                    __func__, backend_topk_k);
         }
         if (margin_gate_enabled) {
             LOG_INF("%s: MTP draft margin gate enabled min=%.6g depth_min=%d backend_topk_k=%d\n",
@@ -1136,8 +1194,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     const char * quality_lane_name() const {
         const char * disable_p16 = getenv("LLAMA_MTP_DISABLE_PACKED16_FA");
-        if (disable_p16 && atoi(disable_p16) == 0) {
-            return "packed16_dot4_optin";
+        if (!disable_p16 || atoi(disable_p16) == 0) {
+            return "packed16_dot4_default";
         }
         return "f16_exact_control";
     }
@@ -1270,6 +1328,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        const bool hidden_shift_trace = common_speculative_hidden_shift_trace_enabled();
+        const bool hidden_shift_abort = common_speculative_env_enabled("LLAMA_MTP_HIDDEN_SHIFT_REQUIRE");
+        std::vector<uint64_t> hidden_pending_before_hash(hidden_shift_trace || hidden_shift_abort ? n_seq : 0, 0);
+        std::vector<uint64_t> hidden_catchup_row0_hash(hidden_shift_trace || hidden_shift_abort ? n_seq : 0, 0);
+        std::vector<uint64_t> hidden_catchup_row1_hash(hidden_shift_trace || hidden_shift_abort ? n_seq : 0, 0);
+        if (hidden_shift_trace || hidden_shift_abort) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                hidden_pending_before_hash[seq_id] = common_speculative_fnv1a64(pending_h[seq_id].data(), row_bytes);
+            }
+        }
 
         // If the target context is wired to stream MTP hidden states directly
         // into ctx_dft during llama_decode(), do not replay the same target
@@ -1314,6 +1382,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+            }
+
+            if (hidden_shift_trace || hidden_shift_abort) {
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_beg[seq_id] < 0) {
+                        continue;
+                    }
+                    hidden_catchup_row0_hash[seq_id] = common_speculative_fnv1a64(
+                            batch.embd + (size_t) i_batch_beg[seq_id] * n_embd, row_bytes);
+                    if (i_batch_beg[seq_id] + 1 <= i_batch_end[seq_id]) {
+                        hidden_catchup_row1_hash[seq_id] = common_speculative_fnv1a64(
+                                batch.embd + (size_t) (i_batch_beg[seq_id] + 1) * n_embd, row_bytes);
+                    }
+                }
             }
 
             validate_real_mtp_batch("process_catchup", batch);
@@ -1378,6 +1460,39 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
 
+            if (hidden_shift_trace || hidden_shift_abort) {
+                const uint64_t verify_first_hash = common_speculative_fnv1a64(verify_h[seq_id].data(), row_bytes);
+                const uint64_t verify_last_hash = common_speculative_fnv1a64(
+                        verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+                const uint64_t pending_after_hash = common_speculative_fnv1a64(pending_h[seq_id].data(), row_bytes);
+                const bool catchup_ran = !kv_shared_with_target && !mtp_hook_wired;
+                const bool row0_match = !catchup_ran || hidden_pending_before_hash[seq_id] == hidden_catchup_row0_hash[seq_id];
+                const bool row1_match = !catchup_ran || n_rows <= 1 || hidden_catchup_row1_hash[seq_id] == verify_first_hash;
+                const bool pending_after_match = pending_after_hash == verify_last_hash;
+                if (hidden_shift_trace) {
+                    fprintf(stderr,
+                            "MTP_HIDDEN_SHIFT_TRACE: seq_id=%d n_rows=%d i_batch_beg=%d i_batch_end=%d catchup=%d pending_before_hash=%016" PRIx64 " catchup_row0_hash=%016" PRIx64 " row0_match=%d catchup_row1_hash=%016" PRIx64 " verify_first_hash=%016" PRIx64 " row1_shift_match=%d verify_last_hash=%016" PRIx64 " pending_after_hash=%016" PRIx64 " pending_after_match=%d\n",
+                            (int) seq_id,
+                            (int) n_rows,
+                            (int) i_batch_beg[seq_id],
+                            (int) i_batch_end[seq_id],
+                            catchup_ran ? 1 : 0,
+                            hidden_pending_before_hash[seq_id],
+                            hidden_catchup_row0_hash[seq_id],
+                            row0_match ? 1 : 0,
+                            hidden_catchup_row1_hash[seq_id],
+                            verify_first_hash,
+                            row1_match ? 1 : 0,
+                            verify_last_hash,
+                            pending_after_hash,
+                            pending_after_match ? 1 : 0);
+                }
+                if (hidden_shift_abort && (!row0_match || !row1_match || !pending_after_match)) {
+                    GGML_ABORT("MTP hidden-shift trace invariant failed: seq_id=%d row0_match=%d row1_match=%d pending_after_match=%d",
+                            (int) seq_id, row0_match ? 1 : 0, row1_match ? 1 : 0, pending_after_match ? 1 : 0);
+                }
+            }
+
             if (h_pre_norm == nullptr) {
                 capture_target_sidecar(ctx_tgt, i_batch_end[seq_id], seq_id);
             }
@@ -1406,6 +1521,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (!dp.drafting) {
                 continue;
+            }
+
+            if (dp.branch_candidates != nullptr) {
+                dp.branch_candidates->clear();
             }
 
             n_drafting++;
@@ -1451,6 +1570,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 common_sampler_accept(smpls[seq_id].get(), id, true);
                 dp.result->push_back(id);
+                if (dp.branch_candidates != nullptr) {
+                    dp.branch_candidates->emplace_back();
+                    copy_selected_branch_candidate(dp.branch_candidates->back(), id, p_draft);
+                }
                 last_n_drafted[seq_id] = 1;
             }
 
@@ -1543,7 +1666,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     // The sampler itself remains greedy (top_k=1); p_min is gated by a
                     // separate top-k logit confidence so it is not permanently 1.0.
                     id = cur_p->data[0].id;
-                    const bool need_confidence = params.p_min > 0.0f || quality_trace_enabled || margin_gate_enabled || getenv("LLAMA_MTP_CONF_TRACE") || getenv("LLAMA_MTP_TOPK_TRACE");
+                    const bool need_branch_candidates = dparams[seq_id].branch_candidates != nullptr;
+                    const bool need_confidence = need_branch_candidates || params.p_min > 0.0f || quality_trace_enabled || margin_gate_enabled || getenv("LLAMA_MTP_CONF_TRACE") || getenv("LLAMA_MTP_TOPK_TRACE");
                     p_draft = need_confidence ? draft_confidence_topk(ctx_dft, sample_idx, id, &top_cpu) : 1.0f;
                 } else {
                     for (int k = 0; k < std::min(3, (int) top_backend.size()); ++k) {
@@ -1589,6 +1713,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto & result = *dp.result;
 
                 result.push_back(id);
+                if (dp.branch_candidates != nullptr) {
+                    dp.branch_candidates->emplace_back();
+                    copy_branch_candidates(dp.branch_candidates->back(), top_for_gate, p_draft);
+                }
 
                 if ((params.n_max <= (int) result.size()) ||
                     (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
@@ -2390,6 +2518,28 @@ bool common_speculative_process_with_pre_norm(common_speculative * spec, const l
     return result;
 }
 
+bool common_speculative_probe_descendants(
+        common_speculative * spec,
+        llama_seq_id seq_id,
+        uint16_t reject_depth,
+        llama_pos sibling_pos,
+        llama_token sampled,
+        int n_max,
+        llama_tokens & result,
+        std::vector<std::vector<common_speculative_branch_candidate>> * branch_candidates) {
+    (void) spec;
+    (void) seq_id;
+    (void) reject_depth;
+    (void) sibling_pos;
+    (void) sampled;
+    (void) n_max;
+    result.clear();
+    if (branch_candidates != nullptr) {
+        branch_candidates->clear();
+    }
+    return false;
+}
+
 bool common_speculative_need_embd(common_speculative * spec) {
     if (spec == nullptr) {
         return false;
@@ -2432,6 +2582,9 @@ void common_speculative_draft(common_speculative * spec) {
             GGML_ASSERT(!dp.drafting || dp.result->empty());
 
             if (dp.drafting) {
+                if (dp.branch_candidates != nullptr) {
+                    dp.branch_candidates->clear();
+                }
                 n_drafting++;
             }
         }
@@ -2464,6 +2617,9 @@ void common_speculative_draft(common_speculative * spec) {
                         LOG_DBG("%s: truncating draft to %d tokens\n", __func__, dp.n_max);
                         result.resize(dp.n_max);
                     }
+                }
+                if (dp.branch_candidates != nullptr && dp.branch_candidates->size() != result.size()) {
+                    dp.branch_candidates->resize(result.size());
                 }
 
                 if (!result.empty()) {

@@ -32,6 +32,17 @@ struct dp16_fa_qblock_program {
     // these fields and row_valid_mask.
     int row_q_delta[DP16_FA_QBLOCK_MAX_ROWS];
     int row_kind[DP16_FA_QBLOCK_MAX_ROWS];
+
+    // Branch/tree metadata for QBlock as a verifier block IR. Current production
+    // programs are a single linear branch: row 0 is the target/sample row and
+    // row i>0 has parent i-1. Keeping this in the backend-visible program lets
+    // later DFlash-style schedulers add sibling rows, tree masks, and per-row
+    // output policies without inventing a parallel metadata channel.
+    int row_parent[DP16_FA_QBLOCK_MAX_ROWS];
+    int row_branch_id[DP16_FA_QBLOCK_MAX_ROWS];
+    int row_candidate_rank[DP16_FA_QBLOCK_MAX_ROWS];
+    int row_output_policy[DP16_FA_QBLOCK_MAX_ROWS];
+
     int head_slot_delta[DP16_FA_QBLOCK_MAX_HEAD_SLOTS];
     int rowmap_mode;
     int q_precision_mode;
@@ -61,6 +72,14 @@ enum dp16_fa_qblock_row_kind {
     DP16_FA_QBLOCK_ROW_INVALID = 0,
     DP16_FA_QBLOCK_ROW_TARGET,
     DP16_FA_QBLOCK_ROW_DRAFT,
+};
+
+enum dp16_fa_qblock_row_output_policy {
+    DP16_FA_QBLOCK_ROW_OUTPUT_NONE = 0,
+    DP16_FA_QBLOCK_ROW_OUTPUT_FULL_LOGITS,
+    DP16_FA_QBLOCK_ROW_OUTPUT_VERIFY_TOP1,
+    DP16_FA_QBLOCK_ROW_OUTPUT_VERIFY_TOPK,
+    DP16_FA_QBLOCK_ROW_OUTPUT_ATTENTION_ONLY,
 };
 
 enum dp16_fa_qblock_rowmap_mode {
@@ -167,12 +186,25 @@ static inline const char * dp16_fa_qblock_q_precision_mode_name(const int mode) 
     }
 }
 
+static inline const char * dp16_fa_qblock_row_output_policy_name(const int mode) {
+    switch (mode) {
+        case DP16_FA_QBLOCK_ROW_OUTPUT_NONE:           return "none";
+        case DP16_FA_QBLOCK_ROW_OUTPUT_FULL_LOGITS:    return "full_logits";
+        case DP16_FA_QBLOCK_ROW_OUTPUT_VERIFY_TOP1:    return "verify_top1";
+        case DP16_FA_QBLOCK_ROW_OUTPUT_VERIFY_TOPK:    return "verify_topk";
+        case DP16_FA_QBLOCK_ROW_OUTPUT_ATTENTION_ONLY: return "attention_only";
+        default:                                      return "unknown";
+    }
+}
+
 static inline void dp16_fa_qblock_program_invalidate_row(dp16_fa_qblock_program & p, const int qr) {
     if (qr < 0 || qr >= DP16_FA_QBLOCK_MAX_ROWS) {
         return;
     }
     p.row_valid_mask &= ~(1 << qr);
     p.row_kind[qr] = DP16_FA_QBLOCK_ROW_INVALID;
+    p.row_parent[qr] = -1;
+    p.row_output_policy[qr] = DP16_FA_QBLOCK_ROW_OUTPUT_NONE;
 }
 
 static inline void dp16_fa_qblock_program_apply_debug_rowmap(dp16_fa_qblock_program & p) {
@@ -283,8 +315,13 @@ static __host__ __device__ __forceinline__ dp16_fa_qblock_program dp16_fa_qblock
     p.rowmap_mode    = DP16_FA_QBLOCK_ROWMAP_IDENTITY;
     p.q_precision_mode = DP16_FA_QBLOCK_Q_PRECISION_QPACK;
     for (int i = 0; i < DP16_FA_QBLOCK_MAX_ROWS; ++i) {
+        const bool live = i < rows_per_cta;
         p.row_q_delta[i] = i;
-        p.row_kind[i] = i < rows_per_cta ? (i == 0 ? DP16_FA_QBLOCK_ROW_TARGET : DP16_FA_QBLOCK_ROW_DRAFT) : DP16_FA_QBLOCK_ROW_INVALID;
+        p.row_kind[i] = live ? (i == 0 ? DP16_FA_QBLOCK_ROW_TARGET : DP16_FA_QBLOCK_ROW_DRAFT) : DP16_FA_QBLOCK_ROW_INVALID;
+        p.row_parent[i] = live ? (i == 0 ? -1 : i - 1) : -1;
+        p.row_branch_id[i] = 0;
+        p.row_candidate_rank[i] = live ? (i == 0 ? -1 : 0) : -1;
+        p.row_output_policy[i] = live ? DP16_FA_QBLOCK_ROW_OUTPUT_FULL_LOGITS : DP16_FA_QBLOCK_ROW_OUTPUT_NONE;
     }
     for (int i = 0; i < DP16_FA_QBLOCK_MAX_HEAD_SLOTS; ++i) {
         p.head_slot_delta[i] = i;
@@ -351,6 +388,79 @@ static __host__ __device__ __forceinline__ bool dp16_fa_qblock_program_row_live(
     return q >= 0 && q < nq && dp16_fa_qblock_program_row_enabled(program, qr);
 }
 
+static __host__ __device__ __forceinline__ int dp16_fa_qblock_program_row_parent(
+        const dp16_fa_qblock_program & program,
+        const int qr) {
+    if (program.enabled && qr >= 0 && qr < DP16_FA_QBLOCK_MAX_ROWS) {
+        return program.row_parent[qr];
+    }
+    return qr == 0 ? -1 : qr - 1;
+}
+
+static __host__ __device__ __forceinline__ int dp16_fa_qblock_program_row_branch_id(
+        const dp16_fa_qblock_program & program,
+        const int qr) {
+    if (program.enabled && qr >= 0 && qr < DP16_FA_QBLOCK_MAX_ROWS) {
+        return program.row_branch_id[qr];
+    }
+    return 0;
+}
+
+static __host__ __device__ __forceinline__ int dp16_fa_qblock_program_row_candidate_rank(
+        const dp16_fa_qblock_program & program,
+        const int qr) {
+    if (program.enabled && qr >= 0 && qr < DP16_FA_QBLOCK_MAX_ROWS) {
+        return program.row_candidate_rank[qr];
+    }
+    return qr == 0 ? -1 : 0;
+}
+
+static __host__ __device__ __forceinline__ int dp16_fa_qblock_program_row_output_policy(
+        const dp16_fa_qblock_program & program,
+        const int qr) {
+    if (program.enabled && qr >= 0 && qr < DP16_FA_QBLOCK_MAX_ROWS) {
+        return program.row_output_policy[qr];
+    }
+    return DP16_FA_QBLOCK_ROW_OUTPUT_FULL_LOGITS;
+}
+
+static __host__ __device__ __forceinline__ bool dp16_fa_qblock_program_row_writes_attention(
+        const dp16_fa_qblock_program & program,
+        const int qr) {
+    return dp16_fa_qblock_program_row_output_policy(program, qr) != DP16_FA_QBLOCK_ROW_OUTPUT_NONE;
+}
+
+static __host__ __device__ __forceinline__ bool dp16_fa_qblock_program_tree_allows_local_k(
+        const dp16_fa_qblock_program & program,
+        const int qr,
+        const int local_k) {
+    if (!program.enabled || local_k < 0) {
+        return true;
+    }
+    if (qr < 0 || qr >= DP16_FA_QBLOCK_MAX_ROWS) {
+        return false;
+    }
+
+    int cur = qr;
+    for (int depth = 0; depth < DP16_FA_QBLOCK_MAX_ROWS; ++depth) {
+        if (cur < 0) {
+            return false;
+        }
+        if (cur >= DP16_FA_QBLOCK_MAX_ROWS || !dp16_fa_qblock_program_row_enabled(program, cur)) {
+            return false;
+        }
+        if (program.row_q_delta[cur] == local_k) {
+            return true;
+        }
+        const int parent = dp16_fa_qblock_program_row_parent(program, cur);
+        if (parent == cur) {
+            return false;
+        }
+        cur = parent;
+    }
+    return false;
+}
+
 static __host__ __device__ __forceinline__ int dp16_fa_qblock_program_q_last_live(
         const dp16_fa_qblock_program & program,
         const int q0,
@@ -369,6 +479,68 @@ static __host__ __device__ __forceinline__ int dp16_fa_qblock_program_q_last_liv
         }
     }
     return q_last >= 0 ? q_last : (q0 < nq ? q0 : nq - 1);
+}
+
+static constexpr uint32_t DP16_FA_QBLOCK_META_MAGIC   = 0x51424d01u;
+static constexpr int      DP16_FA_QBLOCK_META_WORD0   = 5;
+static constexpr int      DP16_FA_QBLOCK_META_N_WORDS = 9;
+static constexpr int      DP16_FA_QBLOCK_META_HEADER  = 14;
+
+static inline uint32_t dp16_fa_qblock_meta_get_bits(const uint32_t words[DP16_FA_QBLOCK_META_N_WORDS], uint32_t bit, uint32_t width) {
+    uint32_t value = 0;
+    for (uint32_t i = 0; i < width; ++i) {
+        const uint32_t src_bit = bit + i;
+        const uint32_t word = src_bit / 32u;
+        const uint32_t off  = src_bit % 32u;
+        if (word < DP16_FA_QBLOCK_META_N_WORDS && ((words[word] >> off) & 1u) != 0) {
+            value |= 1u << i;
+        }
+    }
+    return value;
+}
+
+static inline int dp16_fa_qblock_meta_decode_signed5(const uint32_t v) {
+    return (int) (v & 0x1fu) - 1;
+}
+
+static inline int dp16_fa_qblock_op_metadata_n_rows(const int32_t * op_params) {
+    if (op_params == nullptr) {
+        return 0;
+    }
+    const uint32_t header = (uint32_t) op_params[DP16_FA_QBLOCK_META_HEADER];
+    for (int n = 1; n <= DP16_FA_QBLOCK_MAX_ROWS; ++n) {
+        if (header == (DP16_FA_QBLOCK_META_MAGIC ^ (uint32_t) n)) {
+            return n;
+        }
+    }
+    return 0;
+}
+
+static inline void dp16_fa_qblock_program_apply_op_metadata(
+        dp16_fa_qblock_program & program,
+        const int32_t * op_params) {
+    if (!program.enabled || op_params == nullptr) {
+        return;
+    }
+
+    const int n_meta_rows = dp16_fa_qblock_op_metadata_n_rows(op_params);
+    if (n_meta_rows <= 0) {
+        return;
+    }
+
+    uint32_t words[DP16_FA_QBLOCK_META_N_WORDS];
+    for (int i = 0; i < DP16_FA_QBLOCK_META_N_WORDS; ++i) {
+        words[i] = (uint32_t) op_params[DP16_FA_QBLOCK_META_WORD0 + i];
+    }
+
+    const int rows = n_meta_rows < program.rows_per_cta ? n_meta_rows : program.rows_per_cta;
+    for (int r = 0; r < rows && r < DP16_FA_QBLOCK_MAX_ROWS; ++r) {
+        const uint32_t base = (uint32_t) r * 17u;
+        program.row_parent[r]         = dp16_fa_qblock_meta_decode_signed5(dp16_fa_qblock_meta_get_bits(words, base +  0u, 5u));
+        program.row_branch_id[r]      = (int) dp16_fa_qblock_meta_get_bits(words, base +  5u, 4u);
+        program.row_candidate_rank[r] = dp16_fa_qblock_meta_decode_signed5(dp16_fa_qblock_meta_get_bits(words, base +  9u, 5u));
+        program.row_output_policy[r]  = (int) dp16_fa_qblock_meta_get_bits(words, base + 14u, 3u);
+    }
 }
 
 static __host__ __device__ __forceinline__ bool dp16_fa_qblock_program_head_live(

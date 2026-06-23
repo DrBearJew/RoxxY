@@ -141,6 +141,56 @@ static bool ggml_cuda_mmq_route_log_env() {
     return log;
 }
 
+static int ggml_cuda_mmq_q4k_x_max_env() {
+    static const int env_cap = []() {
+        const char * env = getenv("LLAMA_MTP_MMQ_Q4K_X_MAX");
+        if (env == nullptr || env[0] == '\0') {
+            return 80;
+        }
+        char * end = nullptr;
+        const long val = std::strtol(env, &end, 10);
+        if (end == env || val <= 0) {
+            GGML_LOG_WARN("LLAMA_MTP_MMQ_Q4K_X_MAX ignored: expected positive integer, got '%s'\n", env);
+            return 0;
+        }
+        return (int) val;
+    }();
+    return env_cap;
+}
+
+static bool ggml_cuda_mmq_name_filter_match(const char * filter, const char * name) {
+    if (filter == nullptr || filter[0] == '\0' || strcmp(filter, "*") == 0 || strcmp(filter, "all") == 0) {
+        return true;
+    }
+    if (name == nullptr || name[0] == '\0') {
+        return false;
+    }
+
+    const char * cur = filter;
+    while (*cur != '\0') {
+        const char * comma = strchr(cur, ',');
+        const size_t len = comma != nullptr ? (size_t) (comma - cur) : strlen(cur);
+        if (len == 3 && strncmp(cur, "all", len) == 0) {
+            return true;
+        }
+        if (len > 0) {
+            char tmp[128];
+            if (len < sizeof(tmp)) {
+                memcpy(tmp, cur, len);
+                tmp[len] = '\0';
+                if (strstr(name, tmp) != nullptr) {
+                    return true;
+                }
+            }
+        }
+        if (comma == nullptr) {
+            break;
+        }
+        cur = comma + 1;
+    }
+    return false;
+}
+
 static int get_mmq_x_native_max_host(const int cc) {
     return (turing_mma_available(cc) || amd_wmma_available(cc)) ? 128 :
         GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA ?
@@ -4055,7 +4105,15 @@ struct mmq_args {
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     bool use_stream_k; int64_t ncols_max;
+    const char * tensor_name; const char * dst_name; const char * route_name;
 };
+
+bool ggml_cuda_mtp_mmq_route_census_enabled();
+bool ggml_cuda_mtp_mmq_timing_enabled();
+bool ggml_cuda_mtp_mmq_stream_is_capturing(cudaStream_t stream);
+void ggml_cuda_mtp_mmq_census_record(const mmq_args & args, ggml_type type, int mmq_x, int mmq_y,
+        bool need_check, size_t nbytes_shared, bool use_experimental);
+void ggml_cuda_mtp_mmq_timing_record(const mmq_args & args, ggml_type type, int mmq_x, float elapsed_ms);
 
 static int get_mmq_x_max_host(const int cc, const ggml_type type, const mmq_args & args) {
     const int native_max = get_mmq_x_native_max_host(cc);
@@ -4063,9 +4121,14 @@ static int get_mmq_x_max_host(const int cc, const ggml_type type, const mmq_args
     const char * reason = "native";
 
     const int env_cap = ggml_cuda_mmq_x_max_env();
+    const int q4k_cap = ggml_cuda_mmq_q4k_x_max_env();
     if (env_cap != 0) {
         cap = env_cap;
         reason = "manual";
+    } else if (q4k_cap != 0 && type == GGML_TYPE_Q4_K && args.ids_dst == nullptr &&
+            ggml_cuda_mmq_name_filter_match(getenv("LLAMA_MTP_MMQ_Q4K_X_FILTER"), args.tensor_name)) {
+        cap = q4k_cap;
+        reason = "q4k_tensor_cap";
     } else if (ggml_cuda_mmq_x_max_auto_env() && GGML_CUDA_CC_IS_RDNA3_0(cc)) {
         const bool is_moe = args.ids_dst != nullptr;
         if (is_moe) {
@@ -4185,8 +4248,44 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
+    const bool runtime_need_check = args.nrows_x % mmq_y != 0;
+    if (ggml_cuda_mtp_mmq_route_census_enabled()) {
+        ggml_cuda_mtp_mmq_census_record(args, type, mmq_x, mmq_y, runtime_need_check, nbytes_shared, use_experimental);
+    }
+
+    const bool mmq_timing = ggml_cuda_mtp_mmq_timing_enabled() && !ggml_cuda_mtp_mmq_stream_is_capturing(stream);
+    cudaEvent_t mmq_timing_start = nullptr;
+    cudaEvent_t mmq_timing_stop  = nullptr;
+    if (mmq_timing) {
+#if defined(GGML_USE_HIP)
+        CUDA_CHECK(hipEventCreate(&mmq_timing_start));
+        CUDA_CHECK(hipEventCreate(&mmq_timing_stop));
+#else
+        CUDA_CHECK(cudaEventCreate(&mmq_timing_start));
+        CUDA_CHECK(cudaEventCreate(&mmq_timing_stop));
+#endif
+        CUDA_CHECK(cudaEventRecord(mmq_timing_start, stream));
+    }
+
+    auto mmq_timing_finish = [&]() {
+        if (!mmq_timing) {
+            return;
+        }
+        CUDA_CHECK(cudaEventRecord(mmq_timing_stop, stream));
+        CUDA_CHECK(cudaEventSynchronize(mmq_timing_stop));
+        float elapsed_ms = 0.0f;
+#if defined(GGML_USE_HIP)
+        CUDA_CHECK(hipEventElapsedTime(&elapsed_ms, mmq_timing_start, mmq_timing_stop));
+#else
+        CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, mmq_timing_start, mmq_timing_stop));
+#endif
+        CUDA_CHECK(cudaEventDestroy(mmq_timing_start));
+        CUDA_CHECK(cudaEventDestroy(mmq_timing_stop));
+        ggml_cuda_mtp_mmq_timing_record(args, type, mmq_x, elapsed_ms);
+    };
+
     if (!args.use_stream_k) {
-        if (args.nrows_x % mmq_y == 0) {
+        if (!runtime_need_check) {
             constexpr bool need_check = false;
             mul_mat_q<type, mmq_x, need_check><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
                 (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
@@ -4203,6 +4302,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                  sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
                  ntx_fd, use_experimental);
         }
+        mmq_timing_finish();
         return;
     }
 
@@ -4236,6 +4336,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              ntx_fd, use_experimental);
 
         if (!fixup_needed) {
+            mmq_timing_finish();
             return;
         }
 
@@ -4244,6 +4345,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
             (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
              args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
              ntx_fd);
+        mmq_timing_finish();
     } else {
         constexpr bool need_check = true;
         mul_mat_q<type, mmq_x, need_check><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
@@ -4254,6 +4356,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              ntx_fd, use_experimental);
 
         if (!fixup_needed) {
+            mmq_timing_finish();
             return;
         }
 
@@ -4262,6 +4365,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
             (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
              args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
              ntx_fd);
+        mmq_timing_finish();
     }
 }
 

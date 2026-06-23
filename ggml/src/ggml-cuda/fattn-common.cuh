@@ -1087,9 +1087,6 @@ static const char * ggml_cuda_fattn_rocm_quant_prefill_f16_env() {
     if (!env) {
         env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_MMA");
     }
-    if (!env) {
-        env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_WMMA");
-    }
     return env;
 #else
     return nullptr;
