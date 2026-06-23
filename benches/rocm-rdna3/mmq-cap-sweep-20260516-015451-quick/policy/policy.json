@@ -1,0 +1,549 @@
+{
+  "backend": "ROCm/HIP",
+  "generated_at": "2026-05-15T23:57:43.268983+00:00",
+  "gpu_label": "gfx1100/RX 7900 XTX",
+  "hardware_budget": {
+    "accum_soft_budget_bytes_per_thread": 96,
+    "nwarps": 8,
+    "sizeof_int": 4,
+    "smpbo": 65536,
+    "warp_size": 32
+  },
+  "model_label": "Qwen3.6-35B-A3B-IQ4_XS",
+  "repo_commit": "dc740a884a37",
+  "schema_version": 1,
+  "selected_env": {
+    "GGML_CUDA_MMQ_MAX_X": "48",
+    "RDNA2_MATMUL_OPT_V1": "1"
+  },
+  "selected_variant": "maxx48",
+  "selection_basis": "fastest eligible weighted llama-bench throughput",
+  "shape_candidates": [
+    {
+      "accum_bytes_per_thread": 32.0,
+      "accum_floats_per_thread": 8.0,
+      "coherent_fits": true,
+      "coherent_shared": 42048,
+      "explicit_double_buffer_fits": false,
+      "explicit_double_buffer_shared": 80964,
+      "mmq_x": 16,
+      "mmq_y": 128,
+      "nbs_ids": 64,
+      "nbs_x": 38912,
+      "nbs_y_padded": 3072,
+      "nbs_y_raw": 2304,
+      "ncols_max": 512,
+      "reason": "fits coherent LDS and soft accumulator budget",
+      "safe_by_accum_budget": true,
+      "score": 32.160400390625,
+      "tiles_x": 32,
+      "valid_granularity": true,
+      "viable": true
+    },
+    {
+      "accum_bytes_per_thread": 64.0,
+      "accum_floats_per_thread": 16.0,
+      "coherent_fits": true,
+      "coherent_shared": 44160,
+      "explicit_double_buffer_fits": false,
+      "explicit_double_buffer_shared": 83076,
+      "mmq_x": 32,
+      "mmq_y": 128,
+      "nbs_ids": 128,
+      "nbs_x": 38912,
+      "nbs_y_padded": 5120,
+      "nbs_y_raw": 4608,
+      "ncols_max": 512,
+      "reason": "fits coherent LDS and soft accumulator budget",
+      "safe_by_accum_budget": true,
+      "score": 16.16845703125,
+      "tiles_x": 16,
+      "valid_granularity": true,
+      "viable": true
+    },
+    {
+      "accum_bytes_per_thread": 96.0,
+      "accum_floats_per_thread": 24.0,
+      "coherent_fits": true,
+      "coherent_shared": 46272,
+      "explicit_double_buffer_fits": false,
+      "explicit_double_buffer_shared": 85188,
+      "mmq_x": 48,
+      "mmq_y": 128,
+      "nbs_ids": 192,
+      "nbs_x": 38912,
+      "nbs_y_padded": 7168,
+      "nbs_y_raw": 6912,
+      "ncols_max": 512,
+      "reason": "fits coherent LDS and soft accumulator budget",
+      "safe_by_accum_budget": true,
+      "score": 11.176513671875,
+      "tiles_x": 11,
+      "valid_granularity": true,
+      "viable": true
+    },
+    {
+      "accum_bytes_per_thread": 128.0,
+      "accum_floats_per_thread": 32.0,
+      "coherent_fits": true,
+      "coherent_shared": 48384,
+      "explicit_double_buffer_fits": false,
+      "explicit_double_buffer_shared": 87300,
+      "mmq_x": 64,
+      "mmq_y": 128,
+      "nbs_ids": 256,
+      "nbs_x": 38912,
+      "nbs_y_padded": 9216,
+      "nbs_y_raw": 9216,
+      "ncols_max": 512,
+      "reason": "over soft accumulator/register budget",
+      "safe_by_accum_budget": false,
+      "score": 12.1845703125,
+      "tiles_x": 8,
+      "valid_granularity": true,
+      "viable": false
+    },
+    {
+      "accum_bytes_per_thread": 160.0,
+      "accum_floats_per_thread": 40.0,
+      "coherent_fits": true,
+      "coherent_shared": 51520,
+      "explicit_double_buffer_fits": false,
+      "explicit_double_buffer_shared": 90436,
+      "mmq_x": 80,
+      "mmq_y": 128,
+      "nbs_ids": 320,
+      "nbs_x": 38912,
+      "nbs_y_padded": 12288,
+      "nbs_y_raw": 11520,
+      "ncols_max": 512,
+      "reason": "over soft accumulator/register budget",
+      "safe_by_accum_budget": false,
+      "score": 15.196533203125,
+      "tiles_x": 7,
+      "valid_granularity": true,
+      "viable": false
+    },
+    {
+      "accum_bytes_per_thread": 192.0,
+      "accum_floats_per_thread": 48.0,
+      "coherent_fits": true,
+      "coherent_shared": 53632,
+      "explicit_double_buffer_fits": false,
+      "explicit_double_buffer_shared": 92548,
+      "mmq_x": 96,
+      "mmq_y": 128,
+      "nbs_ids": 384,
+      "nbs_x": 38912,
+      "nbs_y_padded": 14336,
+      "nbs_y_raw": 13824,
+      "ncols_max": 512,
+      "reason": "over soft accumulator/register budget",
+      "safe_by_accum_budget": false,
+      "score": 18.20458984375,
+      "tiles_x": 6,
+      "valid_granularity": true,
+      "viable": false
+    },
+    {
+      "accum_bytes_per_thread": 224.0,
+      "accum_floats_per_thread": 56.0,
+      "coherent_fits": true,
+      "coherent_shared": 55744,
+      "explicit_double_buffer_fits": false,
+      "explicit_double_buffer_shared": 94660,
+      "mmq_x": 112,
+      "mmq_y": 128,
+      "nbs_ids": 448,
+      "nbs_x": 38912,
+      "nbs_y_padded": 16384,
+      "nbs_y_raw": 16128,
+      "ncols_max": 512,
+      "reason": "over soft accumulator/register budget",
+      "safe_by_accum_budget": false,
+      "score": 21.212646484375,
+      "tiles_x": 5,
+      "valid_granularity": true,
+      "viable": false
+    },
+    {
+      "accum_bytes_per_thread": 256.0,
+      "accum_floats_per_thread": 64.0,
+      "coherent_fits": true,
+      "coherent_shared": 57856,
+      "explicit_double_buffer_fits": false,
+      "explicit_double_buffer_shared": 96772,
+      "mmq_x": 128,
+      "mmq_y": 128,
+      "nbs_ids": 512,
+      "nbs_x": 38912,
+      "nbs_y_padded": 18432,
+      "nbs_y_raw": 18432,
+      "ncols_max": 512,
+      "reason": "over soft accumulator/register budget",
+      "safe_by_accum_budget": false,
+      "score": 24.220703125,
+      "tiles_x": 4,
+      "valid_granularity": true,
+      "viable": false
+    }
+  ],
+  "summary": "/home/mrtrent/llama.cpp-mtp-tbq4-rdna3/benches/rocm-rdna3/mmq-cap-sweep-20260516-015451-quick/summary.caps.json",
+  "variants": [
+    {
+      "eligible": true,
+      "env": {},
+      "name": "baseline",
+      "perf": {
+        "missing_prompts": [],
+        "prompts": {
+          "128": {
+            "avg_ts": 1268.488379,
+            "stddev_ts": 39.258314
+          },
+          "256": {
+            "avg_ts": 1936.791638,
+            "stddev_ts": 22.084465
+          },
+          "512": {
+            "avg_ts": 2572.104248,
+            "stddev_ts": 178.782688
+          }
+        },
+        "speedup_vs_baseline": 1.0,
+        "throughput_tok_s": 2073.384530061097,
+        "total_weighted_tokens": 896.0,
+        "weighted_seconds": 0.43214366993159603
+      },
+      "reject_reasons": [],
+      "static": null
+    },
+    {
+      "eligible": true,
+      "env": {
+        "RDNA2_MATMUL_OPT_V1": "1"
+      },
+      "name": "rdna2_opt",
+      "perf": {
+        "missing_prompts": [],
+        "prompts": {
+          "128": {
+            "avg_ts": 1267.182823,
+            "stddev_ts": 42.507205
+          },
+          "256": {
+            "avg_ts": 1944.014588,
+            "stddev_ts": 91.115612
+          },
+          "512": {
+            "avg_ts": 2677.773163,
+            "stddev_ts": 23.413236
+          }
+        },
+        "speedup_vs_baseline": 1.0194439003659976,
+        "throughput_tok_s": 2113.6992122840056,
+        "total_weighted_tokens": 896.0,
+        "weighted_seconds": 0.42390137385338134
+      },
+      "reject_reasons": [],
+      "static": null
+    },
+    {
+      "eligible": true,
+      "env": {
+        "GGML_CUDA_MMQ_MAX_X": "32",
+        "RDNA2_MATMUL_OPT_V1": "1"
+      },
+      "name": "maxx32",
+      "perf": {
+        "missing_prompts": [],
+        "prompts": {
+          "128": {
+            "avg_ts": 1657.597072,
+            "stddev_ts": 54.226302
+          },
+          "256": {
+            "avg_ts": 2236.527263,
+            "stddev_ts": 104.120957
+          },
+          "512": {
+            "avg_ts": 2711.319042,
+            "stddev_ts": 27.91632
+          }
+        },
+        "speedup_vs_baseline": 1.1356620574359,
+        "throughput_tok_s": 2354.664141264952,
+        "total_weighted_tokens": 896.0,
+        "weighted_seconds": 0.3805213594150454
+      },
+      "reject_reasons": [],
+      "static": {
+        "accum_bytes_per_thread": 64.0,
+        "accum_floats_per_thread": 16.0,
+        "coherent_fits": true,
+        "coherent_shared": 44160,
+        "explicit_double_buffer_fits": false,
+        "explicit_double_buffer_shared": 83076,
+        "mmq_x": 32,
+        "mmq_y": 128,
+        "nbs_ids": 128,
+        "nbs_x": 38912,
+        "nbs_y_padded": 5120,
+        "nbs_y_raw": 4608,
+        "ncols_max": 512,
+        "reason": "fits coherent LDS and soft accumulator budget",
+        "safe_by_accum_budget": true,
+        "score": 16.16845703125,
+        "tiles_x": 16,
+        "valid_granularity": true,
+        "viable": true
+      }
+    },
+    {
+      "eligible": true,
+      "env": {
+        "GGML_CUDA_MMQ_MAX_X": "48",
+        "RDNA2_MATMUL_OPT_V1": "1"
+      },
+      "name": "maxx48",
+      "perf": {
+        "missing_prompts": [],
+        "prompts": {
+          "128": {
+            "avg_ts": 1799.752702,
+            "stddev_ts": 82.093541
+          },
+          "256": {
+            "avg_ts": 2515.937607,
+            "stddev_ts": 96.143753
+          },
+          "512": {
+            "avg_ts": 3184.250802,
+            "stddev_ts": 31.540798
+          }
+        },
+        "speedup_vs_baseline": 1.295147902318213,
+        "throughput_tok_s": 2685.3396248076638,
+        "total_weighted_tokens": 896.0,
+        "weighted_seconds": 0.3336635678119022
+      },
+      "reject_reasons": [],
+      "static": {
+        "accum_bytes_per_thread": 96.0,
+        "accum_floats_per_thread": 24.0,
+        "coherent_fits": true,
+        "coherent_shared": 46272,
+        "explicit_double_buffer_fits": false,
+        "explicit_double_buffer_shared": 85188,
+        "mmq_x": 48,
+        "mmq_y": 128,
+        "nbs_ids": 192,
+        "nbs_x": 38912,
+        "nbs_y_padded": 7168,
+        "nbs_y_raw": 6912,
+        "ncols_max": 512,
+        "reason": "fits coherent LDS and soft accumulator budget",
+        "safe_by_accum_budget": true,
+        "score": 11.176513671875,
+        "tiles_x": 11,
+        "valid_granularity": true,
+        "viable": true
+      }
+    },
+    {
+      "eligible": true,
+      "env": {
+        "GGML_CUDA_MMQ_MAX_X": "64",
+        "RDNA2_MATMUL_OPT_V1": "1"
+      },
+      "name": "maxx64",
+      "perf": {
+        "missing_prompts": [],
+        "prompts": {
+          "128": {
+            "avg_ts": 1689.973418,
+            "stddev_ts": 85.079638
+          },
+          "256": {
+            "avg_ts": 2457.534189,
+            "stddev_ts": 81.492343
+          },
+          "512": {
+            "avg_ts": 3155.807447,
+            "stddev_ts": 26.986461
+          }
+        },
+        "speedup_vs_baseline": 1.2630208394415885,
+        "throughput_tok_s": 2618.7278696429703,
+        "total_weighted_tokens": 896.0,
+        "weighted_seconds": 0.3421508627859672
+      },
+      "reject_reasons": [],
+      "static": {
+        "accum_bytes_per_thread": 128.0,
+        "accum_floats_per_thread": 32.0,
+        "coherent_fits": true,
+        "coherent_shared": 48384,
+        "explicit_double_buffer_fits": false,
+        "explicit_double_buffer_shared": 87300,
+        "mmq_x": 64,
+        "mmq_y": 128,
+        "nbs_ids": 256,
+        "nbs_x": 38912,
+        "nbs_y_padded": 9216,
+        "nbs_y_raw": 9216,
+        "ncols_max": 512,
+        "reason": "over soft accumulator/register budget",
+        "safe_by_accum_budget": false,
+        "score": 12.1845703125,
+        "tiles_x": 8,
+        "valid_granularity": true,
+        "viable": false
+      }
+    },
+    {
+      "eligible": false,
+      "env": {
+        "GGML_CUDA_MMQ_MAX_X": "96",
+        "RDNA2_MATMUL_OPT_V1": "1"
+      },
+      "name": "maxx96",
+      "perf": {
+        "missing_prompts": [
+          128,
+          256,
+          512
+        ],
+        "prompts": {},
+        "speedup_vs_baseline": 0.0,
+        "throughput_tok_s": 0.0,
+        "total_weighted_tokens": 0.0,
+        "weighted_seconds": 0.0
+      },
+      "reject_reasons": [
+        "missing prompt rows: [128, 256, 512]"
+      ],
+      "static": {
+        "accum_bytes_per_thread": 192.0,
+        "accum_floats_per_thread": 48.0,
+        "coherent_fits": true,
+        "coherent_shared": 53632,
+        "explicit_double_buffer_fits": false,
+        "explicit_double_buffer_shared": 92548,
+        "mmq_x": 96,
+        "mmq_y": 128,
+        "nbs_ids": 384,
+        "nbs_x": 38912,
+        "nbs_y_padded": 14336,
+        "nbs_y_raw": 13824,
+        "ncols_max": 512,
+        "reason": "over soft accumulator/register budget",
+        "safe_by_accum_budget": false,
+        "score": 18.20458984375,
+        "tiles_x": 6,
+        "valid_granularity": true,
+        "viable": false
+      }
+    },
+    {
+      "eligible": true,
+      "env": {
+        "GGML_CUDA_MMQ_MAX_X": "128",
+        "RDNA2_MATMUL_OPT_V1": "1"
+      },
+      "name": "maxx128",
+      "perf": {
+        "missing_prompts": [],
+        "prompts": {
+          "128": {
+            "avg_ts": 1281.963949,
+            "stddev_ts": 73.325522
+          },
+          "256": {
+            "avg_ts": 1924.887868,
+            "stddev_ts": 42.372819
+          },
+          "512": {
+            "avg_ts": 2676.876474,
+            "stddev_ts": 20.623866
+          }
+        },
+        "speedup_vs_baseline": 1.0189442003699,
+        "throughput_tok_s": 2112.6631420424255,
+        "total_weighted_tokens": 896.0,
+        "weighted_seconds": 0.42410925914757447
+      },
+      "reject_reasons": [],
+      "static": {
+        "accum_bytes_per_thread": 256.0,
+        "accum_floats_per_thread": 64.0,
+        "coherent_fits": true,
+        "coherent_shared": 57856,
+        "explicit_double_buffer_fits": false,
+        "explicit_double_buffer_shared": 96772,
+        "mmq_x": 128,
+        "mmq_y": 128,
+        "nbs_ids": 512,
+        "nbs_x": 38912,
+        "nbs_y_padded": 18432,
+        "nbs_y_raw": 18432,
+        "ncols_max": 512,
+        "reason": "over soft accumulator/register budget",
+        "safe_by_accum_budget": false,
+        "score": 24.220703125,
+        "tiles_x": 4,
+        "valid_granularity": true,
+        "viable": false
+      }
+    },
+    {
+      "eligible": false,
+      "env": {
+        "GGML_CUDA_IQ4_XS_MMQ_SCRATCH16K": "1",
+        "RDNA2_MATMUL_OPT_V1": "1"
+      },
+      "name": "scratch16k",
+      "perf": {
+        "missing_prompts": [
+          128,
+          256,
+          512
+        ],
+        "prompts": {},
+        "speedup_vs_baseline": 0.0,
+        "throughput_tok_s": 0.0,
+        "total_weighted_tokens": 0.0,
+        "weighted_seconds": 0.0
+      },
+      "reject_reasons": [
+        "missing prompt rows: [128, 256, 512]"
+      ],
+      "static": {
+        "accum_bytes_per_thread": 128.0,
+        "accum_floats_per_thread": 32.0,
+        "coherent_fits": true,
+        "coherent_shared": 48384,
+        "explicit_double_buffer_fits": false,
+        "explicit_double_buffer_shared": 87300,
+        "mmq_x": 64,
+        "mmq_y": 128,
+        "nbs_ids": 256,
+        "nbs_x": 38912,
+        "nbs_y_padded": 9216,
+        "nbs_y_raw": 9216,
+        "ncols_max": 512,
+        "reason": "over soft accumulator/register budget",
+        "safe_by_accum_budget": false,
+        "score": 12.1845703125,
+        "tiles_x": 8,
+        "valid_granularity": true,
+        "viable": false
+      }
+    }
+  ],
+  "weights": {
+    "128": 1.0,
+    "256": 1.0,
+    "512": 1.0
+  }
+}

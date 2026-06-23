@@ -1,0 +1,6 @@
+case	type_k	type_v	n_prompt	n_gen	pp_tps	tg_tps
+default_q8_tbq4_p128_n16	q8_0	tbq4_0	128	16	313.623	26.680
+f16_bucket_q8_tbq4_p128_n16	q8_0	tbq4_0	128	16	333.841	25.226
+auto_asym_tbq4_tbq4_p32_n1	tbq4_0	tbq4_0	32	1	108.986	15.922
+default_q8_tbq4_p1024_n64	q8_0	tbq4_0	1024	64	719.237	27.101
+f16_bucket_q8_tbq4_p1024_n64	q8_0	tbq4_0	1024	64	767.590	26.786

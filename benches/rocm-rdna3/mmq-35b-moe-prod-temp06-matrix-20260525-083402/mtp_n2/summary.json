@@ -1,0 +1,16 @@
+{
+  "case": "mtp_n2",
+  "prompt_tokenize_count": 16093,
+  "tokens_evaluated": 16093,
+  "tokens_predicted": 4096,
+  "prompt_tps": 2777.680449551693,
+  "gen_tps": 75.68341560732829,
+  "prompt_ms": 5793.683,
+  "gen_ms": 54120.179,
+  "wall_s": 59.93522787094116,
+  "draft_n": 3061,
+  "draft_n_accepted": 2595,
+  "temperature": 0.6,
+  "top_p": 0.95,
+  "seed": 3407
+}

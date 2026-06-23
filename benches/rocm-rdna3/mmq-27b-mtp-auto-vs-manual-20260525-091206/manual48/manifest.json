@@ -1,0 +1,31 @@
+{
+  "started": "2026-05-25T09:12:33",
+  "repo": "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github",
+  "server_bin": "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/build-rocm-rdna2-fa/bin/llama-server",
+  "model": "/mnt/CC6AA71F6AA70574/models/MTP/Qwen3.6-27B-Q4_K_M-mtp.gguf",
+  "ctx_size": 12288,
+  "fill_tokens": 4096,
+  "pp_tokens": 1024,
+  "cases": [
+    {
+      "name": "chunk1024_f161_mmq0",
+      "chunk": 1024,
+      "ubatch": 1024,
+      "f16": true,
+      "mmq": false
+    }
+  ],
+  "dry_run": false,
+  "spec_draft_n_max": 3,
+  "spec_draft_p_min": 0.0,
+  "spec_draft_prio": 2,
+  "spec_draft_prio_batch": 2,
+  "stable_f16_alloc": true,
+  "stable_nkv": 12288,
+  "contract": {
+    "mtp_required": "--spec-type draft-mtp --spec-default --spec-draft-n-max <N> --spec-draft-p-min 0 --spec-draft-prio 2 --spec-draft-prio-batch 2 --parallel 1",
+    "chunk_equals_ubatch_required": true,
+    "vram_sampling_required": true,
+    "route_log_required": true
+  }
+}

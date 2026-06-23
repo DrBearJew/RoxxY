@@ -1,0 +1,201 @@
+
+# Consider dependencies only in project.
+set(CMAKE_DEPENDS_IN_PROJECT_ONLY OFF)
+
+# The set of languages for which implicit dependencies are needed:
+set(CMAKE_DEPENDS_LANGUAGES
+  "HIP"
+  )
+# The set of files for implicit dependencies of each language:
+set(CMAKE_DEPENDS_CHECK_HIP
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/acc.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/acc.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/add-id.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/add-id.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/arange.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/arange.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/argmax.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/argmax.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/argsort.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/argsort.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/binbcast.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/binbcast.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/clamp.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/clamp.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/concat.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/concat.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/conv-transpose-1d.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/conv-transpose-1d.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/conv2d-dw.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/conv2d-dw.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/conv2d-transpose.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/conv2d-transpose.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/conv2d.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/conv2d.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/convert.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/convert.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/count-equal.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/count-equal.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/cpy-planar-iso.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/cpy-planar-iso.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/cpy.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/cpy.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/cross-entropy-loss.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/cross-entropy-loss.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/cumsum.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/cumsum.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/diag.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/diag.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/diagmask.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/diagmask.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/fattn-dot4-q8k-kq.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/fattn-dot4-q8k-kq.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/fattn-packed16-dot4-mmq.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/fattn-packed16-dot4-mmq.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/fattn-tile.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/fattn-tile.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/fattn-wmma-f16.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/fattn-wmma-f16.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/fattn-wmma-tbq4.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/fattn-wmma-tbq4.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/fattn.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/fattn.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/fill.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/fill.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/gated_delta_net.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/gated_delta_net.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/getrows.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/getrows.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/ggml-cuda.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/ggml-cuda.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/gla.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/gla.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/im2col.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/im2col.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/mean.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/mean.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/mmf.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/mmf.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/mmid.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/mmid.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/mmq.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/mmq.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/mmvf.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/mmvf.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/mmvq.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/mmvq.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/norm.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/norm.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/opt-step-adamw.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/opt-step-adamw.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/opt-step-sgd.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/opt-step-sgd.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/out-prod.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/out-prod.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/pad.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/pad.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/pad_reflect_1d.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/pad_reflect_1d.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/pool2d.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/pool2d.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/quantize.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/quantize.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/roll.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/roll.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/rope.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/rope.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/scale.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/scale.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/set-rows.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/set-rows.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/set.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/set.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/softcap.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/softcap.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/softmax.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/softmax.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/solve_tri.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/solve_tri.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/ssm-conv.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/ssm-conv.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/ssm-scan.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/ssm-scan.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/sum.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/sum.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/sumrows.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/sumrows.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_16.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_16.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_32.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_32.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_16.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_16.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_32.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_32.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_16.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_16.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-mma-tbq4-instance-ncols2_1.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-mma-tbq4-instance-ncols2_1.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-mma-tbq4-instance-ncols2_2.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-mma-tbq4-instance-ncols2_2.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-mma-tbq4-instance-ncols2_4.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-mma-tbq4-instance-ncols2_4.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-mma-tbq4-instance-ncols2_8.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-mma-tbq4-instance-ncols2_8.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-f16.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-vec-instance-f16-f16.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-q4_0.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-vec-instance-q8_0-q4_0.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmf-instance-ncols_1.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmf-instance-ncols_1.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmf-instance-ncols_10.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmf-instance-ncols_10.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmf-instance-ncols_11.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmf-instance-ncols_11.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmf-instance-ncols_12.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmf-instance-ncols_12.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmf-instance-ncols_13.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmf-instance-ncols_13.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmf-instance-ncols_14.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmf-instance-ncols_14.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmf-instance-ncols_15.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmf-instance-ncols_15.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmf-instance-ncols_16.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmf-instance-ncols_16.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmf-instance-ncols_2.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmf-instance-ncols_2.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmf-instance-ncols_3.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmf-instance-ncols_3.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmf-instance-ncols_4.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmf-instance-ncols_4.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmf-instance-ncols_5.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmf-instance-ncols_5.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmf-instance-ncols_6.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmf-instance-ncols_6.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmf-instance-ncols_7.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmf-instance-ncols_7.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmf-instance-ncols_8.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmf-instance-ncols_8.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmf-instance-ncols_9.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmf-instance-ncols_9.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmq-instance-iq1_s.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmq-instance-iq1_s.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmq-instance-iq2_s.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmq-instance-iq2_s.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmq-instance-iq2_xs.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmq-instance-iq2_xs.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmq-instance-iq2_xxs.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmq-instance-iq2_xxs.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmq-instance-iq3_s.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmq-instance-iq3_s.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmq-instance-iq3_xxs.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmq-instance-iq3_xxs.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmq-instance-iq4_nl.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmq-instance-iq4_nl.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmq-instance-iq4_xs.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmq-instance-iq4_xs.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmq-instance-mxfp4.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmq-instance-mxfp4.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmq-instance-nvfp4.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmq-instance-nvfp4.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmq-instance-q1_0.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmq-instance-q1_0.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmq-instance-q2_k.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmq-instance-q2_k.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmq-instance-q3_k.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmq-instance-q3_k.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmq-instance-q4_0.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmq-instance-q4_0.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmq-instance-q4_1.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmq-instance-q4_1.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmq-instance-q4_k.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmq-instance-q4_k.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmq-instance-q5_0.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmq-instance-q5_0.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmq-instance-q5_1.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmq-instance-q5_1.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmq-instance-q5_k.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmq-instance-q5_k.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmq-instance-q6_k.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmq-instance-q6_k.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/template-instances/mmq-instance-q8_0.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/template-instances/mmq-instance-q8_0.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/top-k.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/top-k.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/topk-moe.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/topk-moe.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/tri.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/tri.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/tsembd.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/tsembd.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/unary.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/unary.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/upscale.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/upscale.cu.o"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-cuda/wkv.cu" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/wkv.cu.o"
+  )
+set(CMAKE_HIP_COMPILER_ID "Clang")
+
+# Preprocessor definitions for this target.
+set(CMAKE_TARGET_DEFINITIONS_HIP
+  "GGML_BACKEND_BUILD"
+  "GGML_BACKEND_SHARED"
+  "GGML_HIP_GRAPHS"
+  "GGML_HIP_NO_VMM"
+  "GGML_HIP_ROCWMMA_FATTN"
+  "GGML_SCHED_MAX_COPIES=4"
+  "GGML_SHARED"
+  "GGML_USE_HIP"
+  "USE_PROF_API=1"
+  "_GNU_SOURCE"
+  "_XOPEN_SOURCE=600"
+  "__HIP_PLATFORM_AMD__=1"
+  "__HIP_ROCclr__=1"
+  "ggml_hip_EXPORTS"
+  )
+
+# The include file search paths:
+set(CMAKE_HIP_TARGET_INCLUDE_PATH
+  "ggml/src/ggml-hip/.."
+  "ggml/src/../include"
+  )
+
+# The set of dependency files which are needed:
+set(CMAKE_DEPENDS_DEPENDENCY_FILES
+  )
+
+# Pairs of files generated by the same build rule.
+set(CMAKE_MULTIPLE_OUTPUT_PAIRS
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/bin/libggml-hip.so" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/bin/libggml-hip.so.0.11.0"
+  "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/bin/libggml-hip.so.0" "/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/bin/libggml-hip.so.0.11.0"
+  )
+
+
+# Targets to which this target links which contain Fortran sources.
+set(CMAKE_Fortran_TARGET_LINKED_INFO_FILES
+  )
+
+# Targets to which this target links which contain Fortran sources.
+set(CMAKE_Fortran_TARGET_FORWARD_LINKED_INFO_FILES
+  )
+
+# Fortran module output directory.
+set(CMAKE_Fortran_TARGET_MODULE_DIR "")

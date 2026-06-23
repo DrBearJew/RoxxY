@@ -1,0 +1,4 @@
+/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/benches/rocm-rdna3/mmq-27b-mtp-auto-vs-manual-20260525-091206/manual48
+case	chunk	ubatch	f16	mmq	contract_valid	health_ok	fill_pps	test_cache_n	test_prompt_n	test_pps	loaded_gib	peak_gib	peak_delta_gib	after_shutdown_gib	route_counts	server_rc	dir
+chunk1024_f161_mmq0	1024	1024	1	0	True	True	742.8769688007997	4096	1024	676.0066491591507	19.358	22.736	3.379	1.352	"{""tile:tile"": 119, ""vec:q8k_tbq4v_vec"": 15, ""vec:vec"": 2}"	0	/home/mrtrent/llama.cpp-tree-tbq4-rdna3-github/benches/rocm-rdna3/mmq-27b-mtp-auto-vs-manual-20260525-091206/manual48/chunk1024_f161_mmq0
+

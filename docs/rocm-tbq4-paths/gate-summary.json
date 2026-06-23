@@ -1,0 +1,247 @@
+{
+  "gate": "TBQ4 ROCm Coherence & Precision",
+  "model": "/mnt/CC6AA71F6AA70574/models/MTP/Qwen3.6-27B-Q4_K_M-mtp.gguf",
+  "binary": "/home/mrtrent/llama.cpp-mtp-tbq4-rdna3/build-rocm/bin/llama-server",
+  "q8_ctx": 4096,
+  "tbq4_ctx": 4096,
+  "timestamp": "2026-05-14T09:56:14Z",
+  "overall": "PASS",
+  "passes": [
+    "smoke: all deterministic tests passed",
+    "precision: all probe classes passed thresholds",
+    "canaries: all structured tests passed",
+    "mtp: acceptance measured, above sanity floor",
+    "cache: output matches with/without cache_prompt"
+  ],
+  "warnings": [],
+  "critical_failures": [],
+  "sections": {
+    "smoke": {
+      "tests": [
+        {
+          "name": "france_paris_attempt_1",
+          "passed": true,
+          "output": "Paris.\n\n<think>"
+        },
+        {
+          "name": "france_paris_attempt_2",
+          "passed": true,
+          "output": "Paris.\n\n<think>"
+        },
+        {
+          "name": "france_paris_attempt_3",
+          "passed": true,
+          "output": "Paris.\n\n<think>"
+        },
+        {
+          "name": "math_2plus2_attempt_1",
+          "passed": true,
+          "output": "4"
+        },
+        {
+          "name": "math_2plus2_attempt_2",
+          "passed": true,
+          "output": "4"
+        },
+        {
+          "name": "math_2plus2_attempt_3",
+          "passed": true,
+          "output": "4"
+        },
+        {
+          "name": "deterministic_repeat_3x",
+          "passed": true,
+          "outputs": [
+            " Paris.\n\n<think>\nHere's a thinking process:\n\n1.  **",
+            " Paris.\n\n<think>\nHere's a thinking process:\n\n1.  **",
+            " Paris.\n\n<think>\nHere's a thinking process:\n\n1.  **"
+          ]
+        }
+      ],
+      "critical_failures": [],
+      "vram_used": 0
+    },
+    "precision_probes": {
+      "probes": [
+        {
+          "name": "factual_capitals",
+          "class": "short factual/math/code",
+          "q8_token": " Paris",
+          "tbq4_token": " Paris",
+          "top1_match": true,
+          "q8_top1_rank_in_tbq4": 1,
+          "top10_jaccard": 1.0,
+          "shared_logprob_mae": 0.07201188177831712,
+          "approx_jsd": 0.0010553215304621693
+        },
+        {
+          "name": "math_2plus2",
+          "class": "short factual/math/code",
+          "q8_token": "4",
+          "tbq4_token": "4",
+          "top1_match": true,
+          "q8_top1_rank_in_tbq4": 1,
+          "top10_jaccard": 0.8181818181818182,
+          "shared_logprob_mae": 0.08492880150423211,
+          "approx_jsd": 0.0008630924325685517
+        },
+        {
+          "name": "math_7x8",
+          "class": "short factual/math/code",
+          "q8_token": " ",
+          "tbq4_token": " ",
+          "top1_match": true,
+          "q8_top1_rank_in_tbq4": 1,
+          "top10_jaccard": 0.8181818181818182,
+          "shared_logprob_mae": 0.16896254899071866,
+          "approx_jsd": 0.0026164220952315477
+        },
+        {
+          "name": "code_python_func",
+          "class": "short factual/math/code",
+          "q8_token": " if",
+          "tbq4_token": " if",
+          "top1_match": true,
+          "q8_top1_rank_in_tbq4": 1,
+          "top10_jaccard": 1.0,
+          "shared_logprob_mae": 0.07476705880392165,
+          "approx_jsd": 0.0004957954623205523
+        },
+        {
+          "name": "factual_water",
+          "class": "short factual/math/code",
+          "q8_token": " ",
+          "tbq4_token": " ",
+          "top1_match": true,
+          "q8_top1_rank_in_tbq4": 1,
+          "top10_jaccard": 0.8181818181818182,
+          "shared_logprob_mae": 0.08500113803893328,
+          "approx_jsd": 0.00029661735806240475
+        },
+        {
+          "name": "factual_earth",
+          "class": "short factual/math/code",
+          "q8_token": " Sun",
+          "tbq4_token": " Sun",
+          "top1_match": true,
+          "q8_top1_rank_in_tbq4": 1,
+          "top10_jaccard": 1.0,
+          "shared_logprob_mae": 0.1320180046179938,
+          "approx_jsd": 0.00019181113863198264
+        },
+        {
+          "name": "code_html",
+          "class": "short factual/math/code",
+          "q8_token": " ",
+          "tbq4_token": " ",
+          "top1_match": true,
+          "q8_top1_rank_in_tbq4": 1,
+          "top10_jaccard": 1.0,
+          "shared_logprob_mae": 0.05933054939645235,
+          "approx_jsd": 0.009377996004148478
+        },
+        {
+          "name": "code_sql",
+          "class": "short factual/math/code",
+          "q8_token": " username",
+          "tbq4_token": " username",
+          "top1_match": true,
+          "q8_top1_rank_in_tbq4": 1,
+          "top10_jaccard": 1.0,
+          "shared_logprob_mae": 0.06090133719974094,
+          "approx_jsd": 0.0011141528961526328
+        },
+        {
+          "name": "factual_largest_ocean",
+          "class": "short factual/math/code",
+          "q8_token": " Pacific",
+          "tbq4_token": " Pacific",
+          "top1_match": true,
+          "q8_top1_rank_in_tbq4": 1,
+          "top10_jaccard": 1.0,
+          "shared_logprob_mae": 0.1439480393651932,
+          "approx_jsd": 0.0006111295350035735
+        },
+        {
+          "name": "factual_light_speed",
+          "class": "short factual/math/code",
+          "q8_token": " $",
+          "tbq4_token": " $",
+          "top1_match": true,
+          "q8_top1_rank_in_tbq4": 1,
+          "top10_jaccard": 1.0,
+          "shared_logprob_mae": 0.06573028303682804,
+          "approx_jsd": 0.00010132617628743921
+        }
+      ],
+      "class_summary": {
+        "short factual/math/code": {
+          "top1_match_pct": 100.0,
+          "top10_jaccard_avg": 0.945,
+          "shared_logprob_mae_avg": 0.0948,
+          "approx_jsd_avg": 0.0017
+        }
+      },
+      "critical_failures": []
+    },
+    "canaries": {
+      "tests": [
+        {
+          "name": "json_canary",
+          "passed": true,
+          "output": "{\"answer\":4,\"check\":\"ok\"}"
+        },
+        {
+          "name": "chatml_leak_guard",
+          "passed": true,
+          "output": "SAFE_OUTPUT"
+        },
+        {
+          "name": "tool_call_schema",
+          "passed": true,
+          "output": "{\"tool\":\"read_file\",\"args\":{\"path\":\"/tmp/example.txt\"}}"
+        },
+        {
+          "name": "code_syntax_add",
+          "passed": true,
+          "output": "```python\ndef add(a, b):\n    return a + b\n```"
+        }
+      ],
+      "critical_failures": []
+    },
+    "mtp_acceptance": {
+      "tests": [
+        {
+          "name": "mtp_short_q8_0",
+          "cache": "q8_0",
+          "draft_n": 57,
+          "draft_n_accepted": 44,
+          "accept_pct": 77.19298245614036,
+          "gen_tok_s": 50.64032314856209
+        },
+        {
+          "name": "mtp_short_tbq4",
+          "cache": "tbq4_0",
+          "draft_n": 57,
+          "draft_n_accepted": 44,
+          "accept_pct": 77.19298245614036,
+          "gen_tok_s": 53.27477547595601,
+          "text": "\n\n<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Topic:** AMD GPUs and open-source inference\n   ",
+          "accept_delta_vs_q8": 0.0
+        }
+      ],
+      "critical_failures": []
+    },
+    "cache_coherence": {
+      "tests": [
+        {
+          "name": "cache_vs_nocache_match",
+          "passed": true,
+          "no_cache": " Paris.\n\n<think>\nHere's a thinking process:\n\n1.  **",
+          "cached": " Paris.\n\n<think>\nHere's a thinking process:\n\n1.  **"
+        }
+      ],
+      "critical_failures": []
+    }
+  }
+}

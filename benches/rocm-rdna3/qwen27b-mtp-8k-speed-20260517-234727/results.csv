@@ -1,0 +1,8 @@
+artifact=/tmp/daily-27b-mtp-8k-speed-20260517-234727
+config,prompt_toks,prompt_tps,pred_toks,pred_tps,pred_ms,draft_n,draft_acc,accept_rate,log
+n0,7281,657.31,128,26.08,4907.9,0,0,0.0%,/tmp/daily-27b-mtp-8k-speed-20260517-234727/n0.log
+n3,7281,506.34,128,51.23,2498.7,102,92,90.2%,/tmp/daily-27b-mtp-8k-speed-20260517-234727/n3.log
+n4,7281,513.29,128,47.01,2722.9,122,95,77.9%,/tmp/daily-27b-mtp-8k-speed-20260517-234727/n4.log
+n5,7281,503.02,128,44.37,2885.1,142,97,68.3%,/tmp/daily-27b-mtp-8k-speed-20260517-234727/n5.log
+n6,7281,508.38,128,47.93,2670.4,137,103,75.2%,/tmp/daily-27b-mtp-8k-speed-20260517-234727/n6.log
+n7,7281,483.65,128,39.93,3205.4,172,100,58.1%,/tmp/daily-27b-mtp-8k-speed-20260517-234727/n7.log

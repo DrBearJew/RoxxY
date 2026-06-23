@@ -1,0 +1,142 @@
+[
+  {
+    "variant": "baseline-off",
+    "test": "pp8192",
+    "tok_s": 2143.696986,
+    "baseline_tok_s": 2143.696986,
+    "delta_percent": 0.0
+  },
+  {
+    "variant": "baseline-off",
+    "test": "pp16384",
+    "tok_s": 1585.517592,
+    "baseline_tok_s": 1585.517592,
+    "delta_percent": 0.0
+  },
+  {
+    "variant": "baseline-off",
+    "test": "pp32768",
+    "tok_s": 1024.505356,
+    "baseline_tok_s": 1024.505356,
+    "delta_percent": 0.0
+  },
+  {
+    "variant": "baseline-off",
+    "test": "tg64",
+    "tok_s": 81.138849,
+    "baseline_tok_s": 81.138849,
+    "delta_percent": 0.0
+  },
+  {
+    "variant": "tau0",
+    "test": "pp8192",
+    "tok_s": 2119.625545,
+    "baseline_tok_s": 2143.696986,
+    "delta_percent": -1.1228938211512718
+  },
+  {
+    "variant": "tau0",
+    "test": "pp16384",
+    "tok_s": 1583.932556,
+    "baseline_tok_s": 1585.517592,
+    "delta_percent": -0.09996962556565459
+  },
+  {
+    "variant": "tau0",
+    "test": "pp32768",
+    "tok_s": 1030.365287,
+    "baseline_tok_s": 1024.505356,
+    "delta_percent": 0.5719766095590995
+  },
+  {
+    "variant": "tau0",
+    "test": "tg64",
+    "tok_s": 81.010562,
+    "baseline_tok_s": 81.138849,
+    "delta_percent": -0.15810798597845066
+  },
+  {
+    "variant": "tau1",
+    "test": "pp8192",
+    "tok_s": 2108.737472,
+    "baseline_tok_s": 2143.696986,
+    "delta_percent": -1.630804830548016
+  },
+  {
+    "variant": "tau1",
+    "test": "pp16384",
+    "tok_s": 1560.83123,
+    "baseline_tok_s": 1585.517592,
+    "delta_percent": -1.5569907344175293
+  },
+  {
+    "variant": "tau1",
+    "test": "pp32768",
+    "tok_s": 1043.916155,
+    "baseline_tok_s": 1024.505356,
+    "delta_percent": 1.8946508074673352
+  },
+  {
+    "variant": "tau1",
+    "test": "tg64",
+    "tok_s": 80.94368,
+    "baseline_tok_s": 81.138849,
+    "delta_percent": -0.24053705765532118
+  },
+  {
+    "variant": "tau2",
+    "test": "pp8192",
+    "tok_s": 2154.491909,
+    "baseline_tok_s": 2143.696986,
+    "delta_percent": 0.5035657124350612
+  },
+  {
+    "variant": "tau2",
+    "test": "pp16384",
+    "tok_s": 1598.85108,
+    "baseline_tok_s": 1585.517592,
+    "delta_percent": 0.840954907550473
+  },
+  {
+    "variant": "tau2",
+    "test": "pp32768",
+    "tok_s": 1029.866357,
+    "baseline_tok_s": 1024.505356,
+    "delta_percent": 0.5232770105694007
+  },
+  {
+    "variant": "tau2",
+    "test": "tg64",
+    "tok_s": 80.554255,
+    "baseline_tok_s": 81.138849,
+    "delta_percent": -0.7204859413275533
+  },
+  {
+    "variant": "tau3",
+    "test": "pp8192",
+    "tok_s": 2102.138485,
+    "baseline_tok_s": 2143.696986,
+    "delta_percent": -1.9386369095729994
+  },
+  {
+    "variant": "tau3",
+    "test": "pp16384",
+    "tok_s": 1560.446163,
+    "baseline_tok_s": 1585.517592,
+    "delta_percent": -1.5812772514478546
+  },
+  {
+    "variant": "tau3",
+    "test": "pp32768",
+    "tok_s": 1031.253699,
+    "baseline_tok_s": 1024.505356,
+    "delta_percent": 0.658692798478655
+  },
+  {
+    "variant": "tau3",
+    "test": "tg64",
+    "tok_s": 82.831128,
+    "baseline_tok_s": 81.138849,
+    "delta_percent": 2.085658129067136
+  }
+]

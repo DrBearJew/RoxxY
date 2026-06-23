@@ -1,0 +1,140 @@
+{
+  "cmd": [
+    "/home/mrtrent/llama.cpp-mtp-tbq4-rdna3/build-rocm/bin/llama-server",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "18682",
+    "--model",
+    "/mnt/CC6AA71F6AA70574/models/MTP/Qwen3.6-27B-Q4_K_M-mtp.gguf",
+    "--ctx-size",
+    "131072",
+    "--flash-attn",
+    "on",
+    "--no-context-shift",
+    "--no-webui",
+    "--no-warmup",
+    "--jinja",
+    "--chat-template-file",
+    "/home/mrtrent/.pi/agent/qwen36-merged-template.jinja",
+    "--reasoning",
+    "off",
+    "--batch-size",
+    "1024",
+    "--ubatch-size",
+    "512",
+    "--cache-ram",
+    "128",
+    "--cache-type-k",
+    "planar3_0",
+    "--cache-type-v",
+    "planar3_0",
+    "--parallel",
+    "1",
+    "--spec-type",
+    "draft-mtp",
+    "--spec-draft-n-max",
+    "3"
+  ],
+  "ctx": 131072,
+  "env_subset": {
+    "COMPRESSED_KV_FATTN_LOG": "1",
+    "GGML_CUDA_MMQ_MAX_X": "48",
+    "LLAMA_MTP_PREFILL_CHUNK": "512",
+    "LLAMA_MTP_PREFILL_FORCE_MMQ": "1",
+    "RDNA2_MATMUL_OPT_V1": "1"
+  },
+  "finished": "2026-05-16T00:43:33",
+  "health": {
+    "body": "{\"status\":\"ok\"}",
+    "ok": true,
+    "status": 200
+  },
+  "log_counts": {
+    "cublas_stack": 0,
+    "double_free": 0,
+    "kernel_vec": 121,
+    "kernel_wmma": 0,
+    "rocm_oom": 0
+  },
+  "name": "planar3_0-ctx128k",
+  "post_vram": {
+    "ok": true,
+    "vram_b": 1759019008
+  },
+  "pre_vram": {
+    "ok": true,
+    "vram_b": 1759019008
+  },
+  "quant": "planar3_0",
+  "request": {
+    "content": "SAFE_OUTPUT",
+    "http_status": 200,
+    "ok": true,
+    "raw_preview": "{\"choices\":[{\"finish_reason\":\"stop\",\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"SAFE_OUTPUT\"}}],\"created\":1778885011,\"model\":\"Qwen3.6-27B-Q4_K_M-mtp.gguf\",\"system_fingerprint\":\"b9122-a6ef2115a\",\"object\":\"chat.completion\",\"usage\":{\"completion_tokens\":3,\"prompt_tokens\":1987,\"total_tokens\":1990,\"prompt_tokens_details\":{\"cached_tokens\":0}},\"id\":\"chatcmpl-YFE6bkKo4ZJughntkR1fwFzEqLzx5zny\",\"timings\":{\"cache_n\":0,\"prompt_n\":1987,\"prompt_ms\":10104.073,\"prompt_per_token_ms\":5.085089582284851,\"prompt_per_second\":196.65336938876035,\"predicted_n\":3,\"predicted_ms\":91.231,\"predicted_per_token_ms\":30.41033333333333,\"predicted_per_second\":32.88355931646042,\"draft_n\":3,\"draft_n_accepted\":3}}",
+    "timings": {
+      "cache_n": 0,
+      "draft_n": 3,
+      "draft_n_accepted": 3,
+      "predicted_ms": 91.231,
+      "predicted_n": 3,
+      "predicted_per_second": 32.88355931646042,
+      "predicted_per_token_ms": 30.41033333333333,
+      "prompt_ms": 10104.073,
+      "prompt_n": 1987,
+      "prompt_per_second": 196.65336938876035,
+      "prompt_per_token_ms": 5.085089582284851
+    },
+    "usage": {
+      "completion_tokens": 3,
+      "prompt_tokens": 1987,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      },
+      "total_tokens": 1990
+    },
+    "vram": {
+      "after_b": 22657998848,
+      "peak_b": 22657998848,
+      "samples_b": [
+        22153555968,
+        22153555968,
+        22153555968,
+        22153555968,
+        22153555968,
+        22212861952,
+        22267387904,
+        22427455488,
+        22578454528,
+        22657998848,
+        22657998848
+      ]
+    },
+    "wall_sec": 10.212
+  },
+  "selected_kernels": [
+    "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=planar3_0 V=planar3_0 nq=4 nkv=2048 d_q=256 d_v=256",
+    "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=planar3_0 V=planar3_0 nq=1 nkv=2048 d_q=256 d_v=256",
+    "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=planar3_0 V=planar3_0 nq=1 nkv=2048 d_q=256 d_v=256",
+    "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=planar3_0 V=planar3_0 nq=4 nkv=2048 d_q=256 d_v=256",
+    "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=planar3_0 V=planar3_0 nq=4 nkv=2048 d_q=256 d_v=256",
+    "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=planar3_0 V=planar3_0 nq=4 nkv=2048 d_q=256 d_v=256",
+    "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=planar3_0 V=planar3_0 nq=4 nkv=2048 d_q=256 d_v=256",
+    "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=planar3_0 V=planar3_0 nq=4 nkv=2048 d_q=256 d_v=256",
+    "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=planar3_0 V=planar3_0 nq=4 nkv=2048 d_q=256 d_v=256",
+    "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=planar3_0 V=planar3_0 nq=4 nkv=2048 d_q=256 d_v=256",
+    "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=planar3_0 V=planar3_0 nq=4 nkv=2048 d_q=256 d_v=256",
+    "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=planar3_0 V=planar3_0 nq=4 nkv=2048 d_q=256 d_v=256",
+    "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=planar3_0 V=planar3_0 nq=4 nkv=2048 d_q=256 d_v=256",
+    "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=planar3_0 V=planar3_0 nq=4 nkv=2048 d_q=256 d_v=256",
+    "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=planar3_0 V=planar3_0 nq=4 nkv=2048 d_q=256 d_v=256",
+    "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=planar3_0 V=planar3_0 nq=4 nkv=2048 d_q=256 d_v=256",
+    "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=planar3_0 V=planar3_0 nq=4 nkv=2048 d_q=256 d_v=256",
+    "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=planar3_0 V=planar3_0 nq=4 nkv=2048 d_q=256 d_v=256",
+    "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=planar3_0 V=planar3_0 nq=4 nkv=2048 d_q=256 d_v=256",
+    "ggml_cuda_fattn_log_selection: kernel=vec Q=f32 K=planar3_0 V=planar3_0 nq=4 nkv=2048 d_q=256 d_v=256"
+  ],
+  "server_rc": 0,
+  "started": "2026-05-16T00:43:13",
+  "startup_sec": 8.146
+}

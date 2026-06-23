@@ -1,0 +1,73 @@
+{
+  "niah": [
+    {
+      "name": "q8k_tbq4v_sparse_off",
+      "passed": 3,
+      "tests": [
+        {
+          "content": "SPARSEV-05818DDA",
+          "ctx": 8192,
+          "depth": 10,
+          "passed": true,
+          "secret": "SPARSEV-05818DDA"
+        },
+        {
+          "content": "SPARSEV-D4FEE197",
+          "ctx": 8192,
+          "depth": 50,
+          "passed": true,
+          "secret": "SPARSEV-D4FEE197"
+        },
+        {
+          "content": "SPARSEV-600584C0",
+          "ctx": 8192,
+          "depth": 90,
+          "passed": true,
+          "secret": "SPARSEV-600584C0"
+        }
+      ],
+      "total": 3
+    },
+    {
+      "name": "q8k_tbq4v_sparse_on",
+      "passed": 3,
+      "tests": [
+        {
+          "content": "SPARSEV-05818DDA",
+          "ctx": 8192,
+          "depth": 10,
+          "passed": true,
+          "secret": "SPARSEV-05818DDA"
+        },
+        {
+          "content": "SPARSEV-D4FEE197",
+          "ctx": 8192,
+          "depth": 50,
+          "passed": true,
+          "secret": "SPARSEV-D4FEE197"
+        },
+        {
+          "content": "SPARSEV-600584C0",
+          "ctx": 8192,
+          "depth": 90,
+          "passed": true,
+          "secret": "SPARSEV-600584C0"
+        }
+      ],
+      "total": 3
+    }
+  ],
+  "ppl": {
+    "off": {
+      "ci": 0.34412,
+      "ppl": 6.3087,
+      "rc": 0
+    },
+    "on": {
+      "ci": 0.34574,
+      "ppl": 6.3316,
+      "rc": 0
+    }
+  },
+  "ppl_delta_percent": 0.36299079049566346
+}

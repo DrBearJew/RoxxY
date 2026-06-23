@@ -1,0 +1,8 @@
+artifact=/tmp/daily-moe-mtp-8k-speed-20260517-233955
+config,prompt_toks,prompt_tps,pred_toks,pred_tps,pred_ms,draft_n,draft_acc,accept_rate,log
+n0,7281,2259.71,128,76.43,1674.7,0,0,0.0%,/tmp/daily-moe-mtp-8k-speed-20260517-233955/n0.log
+n3,7281,1376.82,128,102.90,1244.0,133,81,60.9%,/tmp/daily-moe-mtp-8k-speed-20260517-233955/n3.log
+n4,7281,1358.95,128,93.99,1361.8,160,86,53.8%,/tmp/daily-moe-mtp-8k-speed-20260517-233955/n4.log
+n5,7281,1356.56,128,87.62,1460.8,190,88,46.3%,/tmp/daily-moe-mtp-8k-speed-20260517-233955/n5.log
+n6,7281,1353.36,128,73.49,1741.8,246,84,34.1%,/tmp/daily-moe-mtp-8k-speed-20260517-233955/n6.log
+n7,7281,1350.56,128,76.10,1682.1,253,89,35.2%,/tmp/daily-moe-mtp-8k-speed-20260517-233955/n7.log
