@@ -20,6 +20,7 @@
 #include "fattn-packed16-wmma-builtin.cuh"
 #include "dot4-packed16/dp16-fa-qpack.cuh"
 #include "dot4-packed16/dp16-trace.cuh"
+#include "dot4-packed16/mtp-qblock-txn-lineage.cuh"
 
 #include <atomic>
 #include <cfloat>
@@ -4768,6 +4769,88 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         if (disable_qprog && atoi(disable_qprog) != 0) {
             qblock_program = dp16_fa_qblock_program_disabled();
         }
+    }
+
+    const bool qblock_txn_tail_page_proof = []() {
+        const char * v = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_PROOF");
+        return v && atoi(v) != 0;
+    }();
+    const bool qblock_txn_tail_page_enable = []() {
+        const char * v = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE");
+        return v && atoi(v) != 0;
+    }();
+    if ((qblock_txn_tail_page_proof || qblock_txn_tail_page_enable) && qblock_inst) {
+        const char * txn_tail_reason = "ok";
+        mtp_v4_144_tail_page_status txn_tail_status = MTP_V4_144_TAIL_PAGE_OK;
+        bool txn_tail_desc_static_ok = false;
+
+        if (K->type != GGML_TYPE_I32 || !k_persistent_i32) {
+            txn_tail_reason = "not_packed16_i32_k";
+        } else if (V->type != GGML_TYPE_V4_K16D16_144 || !v4_k16d16_144_persistent || !directv || stage_v) {
+            txn_tail_reason = "not_v4_144_direct_v";
+        } else if (PDMQ_D != (int) MTP_V4_144_D || Q->ne[0] != (int64_t) MTP_V4_144_D || V->ne[0] != (int64_t) MTP_V4_144_D) {
+            txn_tail_reason = "bad_d";
+        } else if (batch != 1) {
+            txn_tail_reason = "batch_not_one";
+        } else if ((nk & ((int) MTP_V4_144_PAGE_TOKENS - 1)) != 0) {
+            txn_tail_reason = "kv_size_not_k16_aligned";
+        } else if (!qblock_program.enabled) {
+            txn_tail_reason = "qblock_program_disabled";
+        } else {
+            static const int32_t txn_identity_block_table_stub[1] = { 0 };
+            mtp_v4_144_tail_page_desc_v1 tail_desc = {};
+            tail_desc.version = MTP_V4_144_TAIL_PAGE_ABI_VERSION;
+            tail_desc.abi_bytes = sizeof(mtp_v4_144_tail_page_desc_v1);
+            tail_desc.flags = MTP_V4_144_TAIL_FLAG_TAIL_ONLY | MTP_V4_144_TAIL_FLAG_ALIGNED_ONLY;
+            tail_desc.page_tokens = MTP_V4_144_PAGE_TOKENS;
+            tail_desc.d = MTP_V4_144_D;
+            tail_desc.logical_base_token = 0;
+            tail_desc.logical_tokens = (uint32_t) nk;
+            tail_desc.block_table = txn_identity_block_table_stub;
+            tail_desc.block_table_pages = mtp_v4_144_tail_page_count_for_tokens((uint32_t) nk);
+            tail_desc.physical_pages = tail_desc.block_table_pages;
+            tail_desc.valid_tail_tokens = (uint32_t) nk;
+            tail_desc.prefix_tokens = (uint32_t) nk;
+            tail_desc.boundary_slot = 0;
+            tail_desc.k_payload_base = packed16_payload ? packed16_payload->data : nullptr;
+            tail_desc.k_scale_base = packed16_scales ? packed16_scales->data : nullptr;
+            tail_desc.k_head_stride_bytes = packed16_desc.z_stride_bytes;
+            tail_desc.k_page_stride_bytes = uint64_t(MTP_V4_144_PAGE_TOKENS) * packed16_desc.y_stride_bytes;
+            tail_desc.v4_base = V->data;
+            tail_desc.v4_head_stride_bytes = (uint64_t) V->nb[2];
+            tail_desc.v4_page_stride_bytes = (uint64_t) V->nb[1];
+            tail_desc.v4_batch_stride_bytes = (uint64_t) V->nb[3];
+            tail_desc.kv_heads = (uint32_t) n_heads_k;
+            tail_desc.batch = (uint32_t) batch;
+            tail_desc.gqa_ratio = (uint32_t) gqa_ratio;
+            tail_desc.k_desc = packed16_desc;
+            txn_tail_status = mtp_v4_144_tail_page_validate_static(tail_desc);
+            txn_tail_desc_static_ok = txn_tail_status == MTP_V4_144_TAIL_PAGE_OK;
+            if (!txn_tail_desc_static_ok) {
+                txn_tail_reason = "tail_desc_static_rejected";
+            } else {
+                txn_tail_reason = qblock_txn_tail_page_enable ? "state_sampler_not_wired" : "proof_only";
+            }
+        }
+
+        fprintf(stderr,
+            "MTP_QBLOCK_TXN_TAIL_PAGE: node=%s layer=%d graph_inst=%d proof=%d requested=%d active=0 eligible=%d reason=%s desc_status=%u nq=%d nk=%d hq=%d hk=%d gqa_ratio=%d qprog=%d rows=%d rowmask=0x%x vpath=%s V=%s K=%s k_format=%s v4_page_stride=%lld k_page_stride=%llu\n",
+            pdmq_fattn_node_name(dst), pdmq_layer_index, fa_inst_i32,
+            qblock_txn_tail_page_proof ? 1 : 0,
+            qblock_txn_tail_page_enable ? 1 : 0,
+            txn_tail_desc_static_ok ? 1 : 0,
+            txn_tail_reason,
+            (unsigned) txn_tail_status,
+            nq, nk, n_heads_q, n_heads_k, gqa_ratio,
+            qblock_program.enabled,
+            qblock_program.rows_per_cta,
+            qblock_program.row_valid_mask,
+            pdmq_v_path_name(plan.v_path),
+            ggml_type_name(V->type),
+            ggml_type_name(K->type),
+            ggml_cuda_pdmq_k_format_name(pdmq_k_format),
+            (long long) V->nb[1],
+            (unsigned long long) (uint64_t(MTP_V4_144_PAGE_TOKENS) * packed16_desc.y_stride_bytes));
     }
 
     const bool v4_144_gqa6_wavegroup_active = v4_144_gqa6_wavegroup_requested && is_gqa6 &&
