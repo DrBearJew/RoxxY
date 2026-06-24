@@ -897,6 +897,406 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     //}
 }
 
+bool llama_kv_cache::seq_import_physical(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, size_t * bytes_copied, size_t * cells_copied, const char ** reason) {
+    auto fail = [&](const char * why) {
+        if (reason) {
+            *reason = why;
+        }
+        if (bytes_copied) {
+            *bytes_copied = 0;
+        }
+        if (cells_copied) {
+            *cells_copied = 0;
+        }
+        return false;
+    };
+
+    if (bytes_copied) {
+        *bytes_copied = 0;
+    }
+    if (cells_copied) {
+        *cells_copied = 0;
+    }
+
+    if (seq_id_src < 0 || seq_id_dst < 0 ||
+            (size_t) seq_id_src >= seq_to_stream.size() ||
+            (size_t) seq_id_dst >= seq_to_stream.size() ||
+            seq_id_src == seq_id_dst) {
+        return fail("invalid_seq");
+    }
+    if (v_trans) {
+        return fail("transposed_v_unsupported");
+    }
+
+    const uint32_t src_strm = seq_to_stream[seq_id_src];
+    const uint32_t dst_strm = seq_to_stream[seq_id_dst];
+    const auto & src_cells = v_cells[src_strm];
+
+    std::vector<uint32_t> src_idxs;
+    src_idxs.reserve(src_cells.size());
+    for (uint32_t i = 0; i < src_cells.size(); ++i) {
+        if (!src_cells.is_empty(i) && src_cells.seq_has(i, seq_id_src)) {
+            src_idxs.push_back(i);
+        }
+    }
+    if (src_idxs.empty()) {
+        return fail("source_seq_empty");
+    }
+
+    const char * rebind_unavailable_reason = nullptr;
+    bool can_rebind = src_strm == dst_strm;
+    if (!can_rebind) {
+        rebind_unavailable_reason = "cross_stream_rebind_unsupported";
+    } else {
+        const auto & cells = v_cells[src_strm];
+        for (const uint32_t src_idx : src_idxs) {
+            const bool has_dst = cells.seq_has(src_idx, seq_id_dst);
+            const int seq_count = cells.seq_count(src_idx);
+            if (!(seq_count == 1 || (has_dst && seq_count == 2))) {
+                can_rebind = false;
+                rebind_unavailable_reason = "source_seq_shared_unsupported";
+                break;
+            }
+            if (cells.get_shift(src_idx) != 0) {
+                can_rebind = false;
+                rebind_unavailable_reason = "source_shift_unsupported";
+                break;
+            }
+        }
+    }
+
+    if (can_rebind) {
+        std::vector<uint32_t> old_heads = v_heads;
+        std::vector<llama_kv_cells> old_cells = v_cells;
+
+        auto & cells = v_cells[src_strm];
+        auto & head  = v_heads[src_strm];
+
+        auto rollback_rebind = [&]() {
+            v_heads = old_heads;
+            v_cells = old_cells;
+        };
+
+        size_t copied_bytes = 0;
+        std::vector<uint8_t> copy_tmp;
+        auto copy_1d = [&](ggml_tensor * src_base, ggml_tensor * dst_base, int64_t ne0, size_t src_off, size_t dst_off) {
+            if (src_base == nullptr || dst_base == nullptr) {
+                return src_base == nullptr && dst_base == nullptr;
+            }
+            if (src_base->type != dst_base->type || src_base->buffer == nullptr || dst_base->buffer == nullptr || ne0 <= 0) {
+                return false;
+            }
+            const size_t nbytes = ggml_row_size(src_base->type, ne0);
+            if (src_off > ggml_nbytes(src_base) || nbytes > ggml_nbytes(src_base) - src_off ||
+                    dst_off > ggml_nbytes(dst_base) || nbytes > ggml_nbytes(dst_base) - dst_off) {
+                return false;
+            }
+            copy_tmp.resize(nbytes);
+            ggml_backend_tensor_get(src_base, copy_tmp.data(), src_off, nbytes);
+            ggml_backend_tensor_set(dst_base, copy_tmp.data(), dst_off, nbytes);
+            copied_bytes += nbytes;
+            return true;
+        };
+
+        auto copy_cell_payload = [&](uint32_t src_idx, uint32_t dst_idx) {
+            for (const auto & layer : layers) {
+                const uint32_t il = layer.il;
+                if (layer.k) {
+                    const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+                    const uint64_t k_size_row = ggml_row_size(layer.k->type, n_embd_k_gqa);
+                    if (!copy_1d(layer.k_stream[src_strm], layer.k_stream[dst_strm], n_embd_k_gqa,
+                                (size_t) src_idx * k_size_row,
+                                (size_t) dst_idx * k_size_row)) {
+                        return false;
+                    }
+                }
+
+                if (layer.k_payload) {
+                    const int64_t n_head_kv = hparams.n_head_kv(il);
+                    const int64_t k_payload_words = layer.k_payload->ne[0];
+                    const size_t k_payload_row = layer.k_payload->nb[1];
+                    for (int64_t h = 0; h < n_head_kv; ++h) {
+                        if (!copy_1d(layer.k_payload_stream[src_strm], layer.k_payload_stream[dst_strm], k_payload_words,
+                                    ((size_t) src_idx * (size_t) n_head_kv + (size_t) h) * k_payload_row,
+                                    ((size_t) dst_idx * (size_t) n_head_kv + (size_t) h) * k_payload_row)) {
+                            return false;
+                        }
+                    }
+                }
+
+                if (layer.k_scales) {
+                    const int64_t n_head_kv = hparams.n_head_kv(il);
+                    const int64_t k_scales_d32 = layer.k_scales->ne[0];
+                    const size_t k_scales_row = layer.k_scales->nb[1];
+                    for (int64_t h = 0; h < n_head_kv; ++h) {
+                        if (!copy_1d(layer.k_scales_stream[src_strm], layer.k_scales_stream[dst_strm], k_scales_d32,
+                                    ((size_t) src_idx * (size_t) n_head_kv + (size_t) h) * k_scales_row,
+                                    ((size_t) dst_idx * (size_t) n_head_kv + (size_t) h) * k_scales_row)) {
+                            return false;
+                        }
+                    }
+                }
+
+                ggml_tensor * v_src = layer.v_stream[src_strm];
+                ggml_tensor * v_dst = layer.v_stream[dst_strm];
+                if (v_src) {
+                    if (v_src->type == GGML_TYPE_V4_K16D16 || v_src->type == GGML_TYPE_V4_K16D16_144) {
+                        const int64_t n_head_kv = hparams.n_head_kv(il);
+                        const int64_t n_embd_head_v = hparams.n_embd_head_v(il);
+                        const uint64_t v_size_row = ggml_row_size(v_src->type, n_embd_head_v);
+                        for (int64_t h = 0; h < n_head_kv; ++h) {
+                            if (!copy_1d(v_src, v_dst, n_embd_head_v,
+                                        ((size_t) src_idx * (size_t) n_head_kv + (size_t) h) * v_size_row,
+                                        ((size_t) dst_idx * (size_t) n_head_kv + (size_t) h) * v_size_row)) {
+                                return false;
+                            }
+                        }
+                    } else {
+                        const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
+                        const uint64_t v_size_row = ggml_row_size(v_src->type, n_embd_v_gqa);
+                        if (!copy_1d(v_src, v_dst, n_embd_v_gqa,
+                                    (size_t) src_idx * v_size_row,
+                                    (size_t) dst_idx * v_size_row)) {
+                            return false;
+                        }
+                    }
+                }
+            }
+
+            return true;
+        };
+
+        std::vector<uint32_t> src_only_idxs;
+        std::vector<uint32_t> dst_only_idxs;
+        src_only_idxs.reserve(src_idxs.size());
+        dst_only_idxs.reserve(src_idxs.size());
+
+        for (const uint32_t src_idx : src_idxs) {
+            if (cells.is_empty(src_idx) || !cells.seq_has(src_idx, seq_id_src)) {
+                rollback_rebind();
+                return fail("source_seq_changed_during_rebind");
+            }
+            const bool has_dst = cells.seq_has(src_idx, seq_id_dst);
+            const int seq_count = cells.seq_count(src_idx);
+            if (!(seq_count == 1 || (has_dst && seq_count == 2))) {
+                rollback_rebind();
+                return fail("source_seq_shared_during_rebind");
+            }
+            if (!has_dst) {
+                src_only_idxs.push_back(src_idx);
+            }
+        }
+
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (!cells.is_empty(i) && cells.seq_has(i, seq_id_dst) && !cells.seq_has(i, seq_id_src)) {
+                dst_only_idxs.push_back(i);
+            }
+        }
+
+        std::vector<uint8_t> dst_used(dst_only_idxs.size(), 0);
+        for (const uint32_t src_idx : src_only_idxs) {
+            const llama_pos src_pos = cells.pos_get(src_idx);
+            const llama_kv_cell_ext src_ext = cells.ext_get(src_idx);
+            size_t match = dst_only_idxs.size();
+            for (size_t i = 0; i < dst_only_idxs.size(); ++i) {
+                if (dst_used[i]) {
+                    continue;
+                }
+                const uint32_t dst_idx = dst_only_idxs[i];
+                const llama_kv_cell_ext dst_ext = cells.ext_get(dst_idx);
+                if (cells.pos_get(dst_idx) == src_pos && dst_ext.x == src_ext.x && dst_ext.y == src_ext.y) {
+                    match = i;
+                    break;
+                }
+            }
+            if (match == dst_only_idxs.size()) {
+                rollback_rebind();
+                return fail("dst_tail_cell_missing");
+            }
+
+            const uint32_t dst_idx = dst_only_idxs[match];
+            if (!copy_cell_payload(src_idx, dst_idx)) {
+                rollback_rebind();
+                return fail("tail_cell_copy_failed");
+            }
+            dst_used[match] = 1;
+        }
+
+        for (size_t i = 0; i < dst_only_idxs.size(); ++i) {
+            if (dst_used[i]) {
+                continue;
+            }
+            const uint32_t dst_idx = dst_only_idxs[i];
+            if (!cells.is_empty(dst_idx) && cells.seq_has(dst_idx, seq_id_dst) && cells.seq_rm(dst_idx, seq_id_dst) && dst_idx < head) {
+                head = dst_idx;
+            }
+        }
+
+        if (bytes_copied) {
+            *bytes_copied = copied_bytes;
+        }
+        if (cells_copied) {
+            *cells_copied = src_only_idxs.size();
+        }
+        if (reason) {
+            *reason = copied_bytes == 0 ? "attention_physical_rebind_ok" : "attention_physical_tail_copy_ok";
+        }
+        return true;
+    }
+
+    const char * copy_fallback_env = getenv("LLAMA_MTP_QBLOCK_BRANCH_TXN_KV_PHYSICAL_IMPORT_COPY_FALLBACK");
+    const bool copy_fallback_enabled = copy_fallback_env && atoi(copy_fallback_env) != 0;
+    if (!copy_fallback_enabled) {
+        return fail(rebind_unavailable_reason ? rebind_unavailable_reason : "rebind_unavailable");
+    }
+
+    llama_batch_allocr balloc(hparams.n_pos_per_embd());
+    llama_ubatch ubatch = balloc.ubatch_reserve((uint32_t) src_idxs.size(), 1);
+    ubatch.seq_id_unq[0] = seq_id_dst;
+    for (uint32_t i = 0; i < (uint32_t) src_idxs.size(); ++i) {
+        const uint32_t src_idx = src_idxs[i];
+        const llama_pos pos = src_cells.pos_get(src_idx);
+        ubatch.pos[i] = pos;
+        if (hparams.n_pos_per_embd() > 1) {
+            const llama_kv_cell_ext ext = src_cells.ext_get(src_idx);
+            ubatch.pos[i + ubatch.n_tokens]     = ext.y;
+            ubatch.pos[i + ubatch.n_tokens * 2] = ext.x;
+        }
+        ubatch.n_seq_id[i] = 1;
+        ubatch.seq_id[i] = &seq_id_dst;
+        ubatch.output[i] = 0;
+    }
+
+    std::vector<uint32_t> old_heads = v_heads;
+    std::vector<llama_kv_cells> old_cells = v_cells;
+
+    if (!seq_rm(seq_id_dst, -1, -1)) {
+        return fail("dst_remove_failed");
+    }
+
+    slot_info sinfo = find_slot(ubatch, false);
+    if (sinfo.empty() || sinfo.n_stream() != 1 || sinfo.size() != src_idxs.size() || (uint32_t) sinfo.strm[0] != dst_strm) {
+        v_heads = std::move(old_heads);
+        v_cells = std::move(old_cells);
+        return fail("find_slot_failed");
+    }
+
+    apply_ubatch(sinfo, ubatch);
+
+    auto rollback = [&]() {
+        v_heads = old_heads;
+        v_cells = old_cells;
+    };
+
+    size_t copied_bytes = 0;
+    std::vector<uint8_t> copy_tmp;
+    const char * copy_pdmq_env = getenv("LLAMA_MTP_QBLOCK_BRANCH_TXN_KV_PHYSICAL_IMPORT_COPY_PDMQ");
+    const bool copy_pdmq_sidecars = copy_pdmq_env && atoi(copy_pdmq_env) != 0;
+    auto copy_1d = [&](ggml_tensor * src_base, ggml_tensor * dst_base, int64_t ne0, size_t src_off, size_t dst_off) {
+        if (src_base == nullptr || dst_base == nullptr) {
+            return src_base == nullptr && dst_base == nullptr;
+        }
+        if (src_base->type != dst_base->type || src_base->buffer == nullptr || dst_base->buffer == nullptr || ne0 <= 0) {
+            return false;
+        }
+        const size_t nbytes = ggml_row_size(src_base->type, ne0);
+        if (src_off > ggml_nbytes(src_base) || nbytes > ggml_nbytes(src_base) - src_off ||
+                dst_off > ggml_nbytes(dst_base) || nbytes > ggml_nbytes(dst_base) - dst_off) {
+            return false;
+        }
+        copy_tmp.resize(nbytes);
+        ggml_backend_tensor_get(src_base, copy_tmp.data(), src_off, nbytes);
+        ggml_backend_tensor_set(dst_base, copy_tmp.data(), dst_off, nbytes);
+        copied_bytes += nbytes;
+        return true;
+    };
+
+    const std::vector<uint32_t> & dst_idxs = sinfo.idxs[0];
+    for (const auto & layer : layers) {
+        const uint32_t il = layer.il;
+        if (layer.k) {
+            const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+            const uint64_t k_size_row = ggml_row_size(layer.k->type, n_embd_k_gqa);
+            ggml_tensor * k_src = layer.k_stream[src_strm];
+            ggml_tensor * k_dst = layer.k_stream[dst_strm];
+            for (size_t i = 0; i < src_idxs.size(); ++i) {
+                if (!copy_1d(k_src, k_dst, n_embd_k_gqa,
+                            (size_t) src_idxs[i] * k_size_row,
+                            (size_t) dst_idxs[i] * k_size_row)) {
+                    rollback();
+                    return fail("k_row_copy_failed");
+                }
+            }
+        }
+
+        if (copy_pdmq_sidecars && layer.k_payload) {
+            const int64_t n_head_kv = hparams.n_head_kv(il);
+            const int64_t k_payload_words = layer.k_payload->ne[0];
+            const size_t k_payload_row = layer.k_payload->nb[1];
+            ggml_tensor * kp_src = layer.k_payload_stream[src_strm];
+            ggml_tensor * kp_dst = layer.k_payload_stream[dst_strm];
+            for (size_t i = 0; i < src_idxs.size(); ++i) {
+                const size_t src_base = (size_t) src_idxs[i] * (size_t) n_head_kv;
+                const size_t dst_base = (size_t) dst_idxs[i] * (size_t) n_head_kv;
+                for (int64_t h = 0; h < n_head_kv; ++h) {
+                    if (!copy_1d(kp_src, kp_dst, k_payload_words,
+                                (src_base + (size_t) h) * k_payload_row,
+                                (dst_base + (size_t) h) * k_payload_row)) {
+                        rollback();
+                        return fail("k_payload_row_copy_failed");
+                    }
+                }
+            }
+        }
+
+        if (copy_pdmq_sidecars && layer.k_scales) {
+            const int64_t n_head_kv = hparams.n_head_kv(il);
+            const int64_t k_scales_d32 = layer.k_scales->ne[0];
+            const size_t k_scales_row = layer.k_scales->nb[1];
+            ggml_tensor * ks_src = layer.k_scales_stream[src_strm];
+            ggml_tensor * ks_dst = layer.k_scales_stream[dst_strm];
+            for (size_t i = 0; i < src_idxs.size(); ++i) {
+                const size_t src_base = (size_t) src_idxs[i] * (size_t) n_head_kv;
+                const size_t dst_base = (size_t) dst_idxs[i] * (size_t) n_head_kv;
+                for (int64_t h = 0; h < n_head_kv; ++h) {
+                    if (!copy_1d(ks_src, ks_dst, k_scales_d32,
+                                (src_base + (size_t) h) * k_scales_row,
+                                (dst_base + (size_t) h) * k_scales_row)) {
+                        rollback();
+                        return fail("k_scales_row_copy_failed");
+                    }
+                }
+            }
+        }
+
+        ggml_tensor * v_src = layer.v_stream[src_strm];
+        ggml_tensor * v_dst = layer.v_stream[dst_strm];
+        if (v_src) {
+            const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
+            const uint64_t v_size_row = ggml_row_size(v_src->type, n_embd_v_gqa);
+            for (size_t i = 0; i < src_idxs.size(); ++i) {
+                if (!copy_1d(v_src, v_dst, n_embd_v_gqa,
+                            (size_t) src_idxs[i] * v_size_row,
+                            (size_t) dst_idxs[i] * v_size_row)) {
+                    rollback();
+                    return fail("v_row_copy_failed");
+                }
+            }
+        }
+    }
+
+    if (bytes_copied) {
+        *bytes_copied = copied_bytes;
+    }
+    if (cells_copied) {
+        *cells_copied = src_idxs.size();
+    }
+    if (reason) {
+        *reason = "attention_physical_import_ok";
+    }
+    return true;
+}
+
 void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
@@ -2097,8 +2497,8 @@ struct args_set_input_kq_mask {
     int64_t n_tps;
 };
 
-template<bool causal, bool swa, bool is_2d, bool alibi>
-static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * data) {
+template<typename mask_t, bool causal, bool swa, bool is_2d, bool alibi>
+static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, mask_t * data) {
   //const auto & hparams = args.hparams;
     const auto & ubatch  = args.ubatch;
 
@@ -2230,46 +2630,46 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
                 }
 
                 if (alibi) {
-                    data[idst + j] = -std::abs(p0 - p1);
+                    data[idst + j] = llama_cast<mask_t>(-(float) std::abs(p0 - p1));
                 } else {
-                    data[idst + j] = 0.0f;
+                    data[idst + j] = llama_cast<mask_t>(0.0f);
                 }
 
                 continue;
 skip:
-                data[idst + j] = -INFINITY;
+                data[idst + j] = llama_cast<mask_t>(-INFINITY);
             }
         }
     }
 }
 
-template<bool causal, bool swa, bool is_2d>
-static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * data) {
+template<typename mask_t, bool causal, bool swa, bool is_2d>
+static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, mask_t * data) {
     const bool alibi = args.hparams.use_alibi;
     if (alibi) {
-        set_input_kq_mask_impl<causal, swa, is_2d, true> (args, data);
+        set_input_kq_mask_impl<mask_t, causal, swa, is_2d, true> (args, data);
     } else {
-        set_input_kq_mask_impl<causal, swa, is_2d, false>(args, data);
+        set_input_kq_mask_impl<mask_t, causal, swa, is_2d, false>(args, data);
     }
 }
 
-template<bool causal, bool swa>
-static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * data) {
+template<typename mask_t, bool causal, bool swa>
+static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, mask_t * data) {
     const bool is_2d = args.ubatch->is_pos_2d();
     if (is_2d) {
-        set_input_kq_mask_impl<causal, swa, true> (args, data);
+        set_input_kq_mask_impl<mask_t, causal, swa, true> (args, data);
     } else {
-        set_input_kq_mask_impl<causal, swa, false>(args, data);
+        set_input_kq_mask_impl<mask_t, causal, swa, false>(args, data);
     }
 }
 
-template<bool causal>
-static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * data) {
+template<typename mask_t, bool causal>
+static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, mask_t * data) {
     const bool swa = args.swa_type != LLAMA_SWA_TYPE_NONE;
     if (swa) {
-        set_input_kq_mask_impl<causal, true> (args, data);
+        set_input_kq_mask_impl<mask_t, causal, true> (args, data);
     } else {
-        set_input_kq_mask_impl<causal, false>(args, data);
+        set_input_kq_mask_impl<mask_t, causal, false>(args, data);
     }
 }
 
@@ -2277,8 +2677,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-    GGML_ASSERT(dst->type == GGML_TYPE_F32 && "KQ mask input is written as float data; FA paths must cast a separate graph tensor to F16");
-    float * data = (float *) dst->data;
+    GGML_ASSERT((dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16) && "KQ mask input must be F32 or typed F16");
 
     const int64_t n_kv     = dst->ne[0];
     const int64_t n_stream = dst->ne[3]; // num streams in the current ubatch
@@ -2302,11 +2701,28 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_tps            =*/ n_tps,
     };
 
-    if (causal_attn) {
-        set_input_kq_mask_impl<true> (args, data);
+    if (dst->type == GGML_TYPE_F16) {
+        ggml_fp16_t * data = (ggml_fp16_t *) dst->data;
+        if (causal_attn) {
+            set_input_kq_mask_impl<ggml_fp16_t, true> (args, data);
+        } else {
+            set_input_kq_mask_impl<ggml_fp16_t, false>(args, data);
+        }
     } else {
-        set_input_kq_mask_impl<false>(args, data);
+        float * data = (float *) dst->data;
+        if (causal_attn) {
+            set_input_kq_mask_impl<float, true> (args, data);
+        } else {
+            set_input_kq_mask_impl<float, false>(args, data);
+        }
     }
+
+    const auto get_mask_value = [&](uint64_t idx) -> float {
+        if (dst->type == GGML_TYPE_F16) {
+            return llama_cast<float>(((const ggml_fp16_t *) dst->data)[idx]);
+        }
+        return ((const float *) dst->data)[idx];
+    };
 
     if (const char * env = getenv("LLAMA_MTP_KQ_MASK_TRACE"); env && atoi(env) != 0) {
         static int trace_count = 0;
@@ -2358,7 +2774,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
                         ss << (j == 0 ? "" : ",") << "j" << j << ":missing";
                         continue;
                     }
-                    const float v = data[(uint64_t) n_kv * i + (uint64_t) cell_j];
+                    const float v = get_mask_value((uint64_t) n_kv * i + (uint64_t) cell_j);
                     const bool masked = std::isinf(v) && v < 0.0f;
                     if (causal_attn && pos_j > pos_i && !masked) {
                         future_leaks++;

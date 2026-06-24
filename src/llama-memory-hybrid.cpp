@@ -208,6 +208,10 @@ llama_memory_recurrent * llama_memory_hybrid::get_mem_recr() const {
     return mem_recr.get();
 }
 
+bool llama_memory_hybrid::seq_import_attn_physical(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, size_t * bytes_copied, size_t * cells_copied, const char ** reason) {
+    return mem_attn->seq_import_physical(seq_id_src, seq_id_dst, bytes_copied, cells_copied, reason);
+}
+
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_status status) : status(status) {}
 
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_hybrid * mem) :

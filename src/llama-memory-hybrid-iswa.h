@@ -83,6 +83,8 @@ public:
     llama_kv_cache_iswa * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
 
+    bool seq_import_attn_physical(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, size_t * bytes_copied = nullptr, size_t * cells_copied = nullptr, const char ** reason = nullptr);
+
 private:
     const llama_hparams & hparams;
 

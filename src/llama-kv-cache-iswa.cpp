@@ -91,6 +91,27 @@ void llama_kv_cache_iswa::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
     kv_swa ->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
+bool llama_kv_cache_iswa::seq_import_physical(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, size_t * bytes_copied, size_t * cells_copied, const char ** reason) {
+    size_t base_bytes = 0;
+    size_t base_cells = 0;
+    size_t swa_bytes = 0;
+    size_t swa_cells = 0;
+    const char * base_reason = nullptr;
+    const char * swa_reason = nullptr;
+    const bool base_ok = kv_base->seq_import_physical(seq_id_src, seq_id_dst, &base_bytes, &base_cells, &base_reason);
+    const bool swa_ok  = kv_swa ->seq_import_physical(seq_id_src, seq_id_dst, &swa_bytes,  &swa_cells,  &swa_reason);
+    if (bytes_copied) {
+        *bytes_copied = base_bytes + swa_bytes;
+    }
+    if (cells_copied) {
+        *cells_copied = base_cells + swa_cells;
+    }
+    if (reason) {
+        *reason = base_ok && swa_ok ? "attention_physical_import_ok" : (!base_ok ? base_reason : swa_reason);
+    }
+    return base_ok && swa_ok;
+}
+
 void llama_kv_cache_iswa::seq_keep(llama_seq_id seq_id) {
     kv_base->seq_keep(seq_id);
     kv_swa ->seq_keep(seq_id);
