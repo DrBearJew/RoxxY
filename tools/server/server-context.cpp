@@ -418,6 +418,14 @@ static bool mtp_draft_branch_candidates_enabled() {
     if (env && atoi(env) != 0) {
         return true;
     }
+    env = getenv("LLAMA_MTP_QBLOCK_BRANCH_TXN_KV_SPLIT_PROOF");
+    if (env && atoi(env) != 0) {
+        return true;
+    }
+    env = getenv("LLAMA_MTP_QBLOCK_BRANCH_TXN_KV_SPLIT_COMMIT");
+    if (env && atoi(env) != 0) {
+        return true;
+    }
     return mtp_qblock_sibling_logits_probe_enabled();
 }
 
@@ -463,6 +471,21 @@ static bool mtp_qblock_branch_txn_recurrent_commit_enabled() {
     return env && atoi(env) != 0;
 }
 
+static bool mtp_qblock_branch_txn_kv_split_proof_enabled() {
+    const char * env = getenv("LLAMA_MTP_QBLOCK_BRANCH_TXN_KV_SPLIT_PROOF");
+    return env && atoi(env) != 0;
+}
+
+static bool mtp_qblock_branch_txn_kv_split_commit_enabled() {
+    const char * env = getenv("LLAMA_MTP_QBLOCK_BRANCH_TXN_KV_SPLIT_COMMIT");
+    return env && atoi(env) != 0;
+}
+
+static bool mtp_qblock_branch_txn_kv_split_enabled() {
+    return mtp_qblock_branch_txn_kv_split_proof_enabled() ||
+        mtp_qblock_branch_txn_kv_split_commit_enabled();
+}
+
 static bool mtp_qblock_sibling_branch_plan_trace_enabled() {
     const char * env = getenv("LLAMA_MTP_QBLOCK_SIBLING_BRANCH_PLAN_TRACE");
     if (env && atoi(env) != 0) {
@@ -472,7 +495,9 @@ static bool mtp_qblock_sibling_branch_plan_trace_enabled() {
     if (env && atoi(env) != 0) {
         return true;
     }
-    if (mtp_qblock_branch_txn_sampler_commit_enabled() || mtp_qblock_branch_txn_recurrent_commit_enabled()) {
+    if (mtp_qblock_branch_txn_sampler_commit_enabled() ||
+            mtp_qblock_branch_txn_recurrent_commit_enabled() ||
+            mtp_qblock_branch_txn_kv_split_enabled()) {
         return true;
     }
     return mtp_qblock_sibling_logits_probe_enabled();
@@ -483,7 +508,7 @@ static bool mtp_qblock_sibling_branch_state_trace_enabled() {
     if (env && atoi(env) != 0) {
         return true;
     }
-    if (mtp_qblock_branch_txn_recurrent_commit_enabled()) {
+    if (mtp_qblock_branch_txn_recurrent_commit_enabled() || mtp_qblock_branch_txn_kv_split_enabled()) {
         return true;
     }
     return mtp_qblock_sibling_logits_probe_enabled();
@@ -522,7 +547,8 @@ static bool mtp_qblock_branch_replay_staging_enabled() {
     return mtp_qblock_sibling_branch_replay_trace_enabled() ||
         mtp_qblock_sibling_txn_proof_enabled() ||
         mtp_qblock_branch_txn_sampler_commit_enabled() ||
-        mtp_qblock_branch_txn_recurrent_commit_enabled();
+        mtp_qblock_branch_txn_recurrent_commit_enabled() ||
+        mtp_qblock_branch_txn_kv_split_enabled();
 }
 
 static bool mtp_qblock_branch_nextcycle_cache_compare_enabled() {
@@ -537,7 +563,9 @@ static bool mtp_qblock_branch_state_segment_compare_enabled() {
 
 static bool mtp_qblock_sibling_desc_probe_enabled() {
     const char * env = getenv("LLAMA_MTP_QBLOCK_SIBLING_DESC_PROBE");
-    return (env && atoi(env) != 0) || mtp_qblock_branch_txn_recurrent_commit_enabled();
+    return (env && atoi(env) != 0) ||
+        mtp_qblock_branch_txn_recurrent_commit_enabled() ||
+        mtp_qblock_branch_txn_kv_split_enabled();
 }
 
 static int mtp_qblock_sibling_desc_probe_max() {
@@ -557,7 +585,9 @@ static int mtp_qblock_sibling_desc_probe_max() {
 
 static bool mtp_qblock_sibling_target_rows_probe_enabled() {
     const char * env = getenv("LLAMA_MTP_QBLOCK_SIBLING_TARGET_ROWS_PROBE");
-    return (env && atoi(env) != 0) || mtp_qblock_branch_txn_recurrent_commit_enabled();
+    return (env && atoi(env) != 0) ||
+        mtp_qblock_branch_txn_recurrent_commit_enabled() ||
+        mtp_qblock_branch_txn_kv_split_enabled();
 }
 
 static int mtp_qblock_sibling_target_rows_probe_max() {
@@ -582,7 +612,9 @@ static bool mtp_qblock_sibling_target_rows_oracle_compare_enabled() {
 
 static bool mtp_qblock_sibling_target_rows_sampler_oracle_enabled() {
     const char * env = getenv("LLAMA_MTP_QBLOCK_SIBLING_TARGET_ROWS_SAMPLER_ORACLE");
-    return (env && atoi(env) != 0) || mtp_qblock_branch_txn_recurrent_commit_enabled();
+    return (env && atoi(env) != 0) ||
+        mtp_qblock_branch_txn_recurrent_commit_enabled() ||
+        mtp_qblock_branch_txn_kv_split_enabled();
 }
 
 static bool mtp_batch_row_is_qblock_sidecar(const llama_batch & batch, int32_t i) {
@@ -1127,12 +1159,11 @@ static mtp_rs_state_digest mtp_digest_partial_seq_state_canonical(const std::vec
     return res;
 }
 
-static std::vector<uint8_t> mtp_get_partial_seq_state_data(llama_context * ctx, llama_seq_id seq_id) {
+static std::vector<uint8_t> mtp_get_seq_state_data_ext(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags, const char * label) {
     if (ctx == nullptr) {
         return {};
     }
 
-    const llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
     const size_t size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
     if (size == 0) {
         return {};
@@ -1142,11 +1173,19 @@ static std::vector<uint8_t> mtp_get_partial_seq_state_data(llama_context * ctx, 
     const size_t n = llama_state_seq_get_data_ext(ctx, data.data(), data.size(), seq_id, flags);
     if (n != data.size()) {
         fprintf(stderr,
-                "MTP_RS_STATE_TRACE: state_capture_error seq=%d expected_size=%zu got=%zu\n",
-                (int) seq_id, data.size(), n);
+                "MTP_RS_STATE_TRACE: state_capture_error kind=%s seq=%d flags=%u expected_size=%zu got=%zu\n",
+                label ? label : "seq", (int) seq_id, (unsigned) flags, data.size(), n);
         data.resize(std::min(n, data.size()));
     }
     return data;
+}
+
+static std::vector<uint8_t> mtp_get_partial_seq_state_data(llama_context * ctx, llama_seq_id seq_id) {
+    return mtp_get_seq_state_data_ext(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, "partial");
+}
+
+static std::vector<uint8_t> mtp_get_full_seq_state_data(llama_context * ctx, llama_seq_id seq_id) {
+    return mtp_get_seq_state_data_ext(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE, "full");
 }
 
 static mtp_rs_state_digest mtp_digest_partial_seq_state(llama_context * ctx, llama_seq_id seq_id) {
@@ -1852,6 +1891,9 @@ struct server_slot {
     bool mtp_qblock_branch_replay_target_sampler_replay_prefix_state_ok = false;
     mtp_rs_state_digest mtp_qblock_branch_replay_target_sampler_replay_prefix_state_digest;
     std::vector<uint8_t> mtp_qblock_branch_replay_target_sampler_replay_prefix_state_data;
+    bool mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_ok = false;
+    mtp_rs_state_digest mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_digest;
+    std::vector<uint8_t> mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_data;
     size_t mtp_qblock_branch_replay_target_sampler_replay_prefix_tokens = 0;
     llama_tokens mtp_qblock_branch_replay_target_sampler_replay_tokens;
     bool mtp_qblock_branch_nextcycle_cache_compare_pending = false;
@@ -2025,6 +2067,13 @@ struct server_slot {
             mtp_qblock_branch_replay_target_sampler_replay_state_ok = false;
             mtp_qblock_branch_replay_target_sampler_replay_state_digest = {};
             mtp_qblock_branch_replay_target_sampler_replay_state_data.clear();
+            mtp_qblock_branch_replay_target_sampler_replay_prefix_state_ok = false;
+            mtp_qblock_branch_replay_target_sampler_replay_prefix_state_digest = {};
+            mtp_qblock_branch_replay_target_sampler_replay_prefix_state_data.clear();
+            mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_ok = false;
+            mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_digest = {};
+            mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_data.clear();
+            mtp_qblock_branch_replay_target_sampler_replay_prefix_tokens = 0;
             mtp_qblock_branch_replay_target_sampler_replay_tokens.clear();
             mtp_qblock_branch_nextcycle_cache_compare_pending = false;
             mtp_qblock_branch_nextcycle_cache_prev_token_match = false;
@@ -6606,6 +6655,9 @@ private:
                                 slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_state_ok = false;
                                 slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_state_digest = {};
                                 slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_state_data.clear();
+                                slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_ok = false;
+                                slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_digest = {};
+                                slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_data.clear();
                                 slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_tokens = 0;
                                 slot.mtp_qblock_branch_replay_target_sampler_replay_tokens.clear();
                             }
@@ -6852,6 +6904,9 @@ private:
                                             bool target_sampler_replay_prefix_state_ok = false;
                                             mtp_rs_state_digest target_sampler_replay_prefix_state_digest;
                                             std::vector<uint8_t> target_sampler_replay_prefix_state_data;
+                                            bool target_sampler_replay_prefix_full_state_ok = false;
+                                            mtp_rs_state_digest target_sampler_replay_prefix_full_state_digest;
+                                            std::vector<uint8_t> target_sampler_replay_prefix_full_state_data;
                                             size_t target_sampler_replay_prefix_tokens = 0;
                                             llama_tokens target_sampler_replay_tokens;
                                             std::vector<llama_pos> target_sampler_replay_pos;
@@ -7062,7 +7117,7 @@ private:
                                                         (strcmp(target_sampler_oracle_status, "ok") == 0 || strcmp(target_sampler_oracle_status, "mismatch") == 0) &&
                                                         !target_sampler_oracle_sampled_tokens.empty();
                                                     const bool target_sampler_replay_prefix_only =
-                                                        mtp_qblock_branch_txn_recurrent_commit_enabled() &&
+                                                        (mtp_qblock_branch_txn_recurrent_commit_enabled() || mtp_qblock_branch_txn_kv_split_enabled()) &&
                                                         target_sampler_oracle_sampled_tokens.empty() &&
                                                         target_decode_ok && strcmp(target_status, "ok") == 0;
                                                     if (target_sampler_replay_has_oracle_tail || target_sampler_replay_prefix_only) {
@@ -7112,6 +7167,11 @@ private:
                                                                 target_sampler_replay_prefix_state_data = mtp_get_partial_seq_state_data(slot.ctx_tgt, target_scratch_seq);
                                                                 target_sampler_replay_prefix_state_digest = mtp_digest_bytes(target_sampler_replay_prefix_state_data);
                                                                 target_sampler_replay_prefix_state_ok = !target_sampler_replay_prefix_state_data.empty();
+                                                                if (mtp_qblock_branch_txn_kv_split_enabled()) {
+                                                                    target_sampler_replay_prefix_full_state_data = mtp_get_full_seq_state_data(slot.ctx_tgt, target_scratch_seq);
+                                                                    target_sampler_replay_prefix_full_state_digest = mtp_digest_bytes(target_sampler_replay_prefix_full_state_data);
+                                                                    target_sampler_replay_prefix_full_state_ok = !target_sampler_replay_prefix_full_state_data.empty();
+                                                                }
                                                                 target_sampler_replay_prefix_tokens = target_sampler_replay_prefix_state_tokens;
                                                             }
                                                             if (branch_row) {
@@ -7353,7 +7413,13 @@ private:
                                                 slot.mtp_qblock_branch_replay_target_sampler_replay_state_data = mtp_qblock_branch_nextcycle_cache_compare_enabled() ? target_sampler_replay_state_data : std::vector<uint8_t>{};
                                                 slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_state_ok = target_sampler_replay_prefix_state_ok;
                                                 slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_state_digest = target_sampler_replay_prefix_state_digest;
-                                                slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_state_data = mtp_qblock_branch_txn_recurrent_commit_enabled() ? target_sampler_replay_prefix_state_data : std::vector<uint8_t>{};
+                                                slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_state_data =
+                                                    (mtp_qblock_branch_txn_recurrent_commit_enabled() || mtp_qblock_branch_txn_kv_split_enabled()) ?
+                                                    target_sampler_replay_prefix_state_data : std::vector<uint8_t>{};
+                                                slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_ok = target_sampler_replay_prefix_full_state_ok;
+                                                slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_digest = target_sampler_replay_prefix_full_state_digest;
+                                                slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_data =
+                                                    mtp_qblock_branch_txn_kv_split_enabled() ? target_sampler_replay_prefix_full_state_data : std::vector<uint8_t>{};
                                                 slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_tokens = target_sampler_replay_prefix_tokens;
                                                 slot.mtp_qblock_branch_replay_target_sampler_replay_tokens = target_sampler_replay_tokens;
                                             }
@@ -8542,6 +8608,286 @@ private:
                     fprintf(stderr, "]\n");
                 }
 
+                auto mtp_qblock_kv_split_txn_emit = [&]() {
+                    const bool kv_split_commit = mtp_qblock_branch_txn_kv_split_commit_enabled();
+                    const bool kv_split_proof = mtp_qblock_branch_txn_kv_split_proof_enabled();
+                    if (!(kv_split_commit || kv_split_proof) || !slot.mtp_qblock_branch_replay_staged) {
+                        return;
+                    }
+
+                    const llama_tokens & replay_tokens = slot.mtp_qblock_branch_replay_target_sampler_replay_tokens;
+                    llama_tokens replay_output_tokens;
+                    if (!replay_tokens.empty()) {
+                        replay_output_tokens.assign(replay_tokens.begin() + 1, replay_tokens.end());
+                    }
+                    const bool replay_output_match = ids.size() == replay_output_tokens.size() &&
+                        std::equal(ids.begin(), ids.end(), replay_output_tokens.begin());
+                    const bool prefix_full_state_available =
+                        slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_ok &&
+                        !slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_data.empty();
+                    const bool prefix_partial_state_available =
+                        slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_state_ok &&
+                        !slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_state_data.empty();
+                    const bool prefix_token_count_match =
+                        slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_tokens == ids.size();
+
+                    const char * kv_status = "skipped";
+                    const char * kv_reason = "disabled";
+                    const char * kv_mode = kv_split_commit ? "commit_candidate" : "proof";
+                    size_t branch_full_bytes_written = 0;
+                    size_t partial_restore_bytes_written = 0;
+                    size_t full_restore_bytes_written = 0;
+                    bool branch_full_import_ok = false;
+                    bool partial_restore_ok = false;
+                    bool full_restore_required = true;
+                    bool full_restore_ok = false;
+                    bool leave_split_active = false;
+
+                    mtp_rs_state_digest prefix_partial_canonical_digest;
+                    mtp_rs_state_digest pre_full_digest;
+                    mtp_rs_state_digest pre_partial_digest;
+                    mtp_rs_state_digest pre_partial_canonical_digest;
+                    mtp_rs_state_digest branch_import_full_digest;
+                    mtp_rs_state_digest branch_import_partial_digest;
+                    mtp_rs_state_digest branch_import_partial_canonical_digest;
+                    mtp_rs_state_digest split_full_digest;
+                    mtp_rs_state_digest split_partial_digest;
+                    mtp_rs_state_digest split_partial_canonical_digest;
+                    mtp_rs_state_digest restore_full_digest;
+                    mtp_rs_state_digest restore_partial_digest;
+                    mtp_rs_state_digest restore_partial_canonical_digest;
+
+                    bool pre_full_ok = false;
+                    bool pre_partial_ok = false;
+                    bool branch_import_full_ok = false;
+                    bool branch_import_partial_ok = false;
+                    bool branch_import_partial_matches_prefix = false;
+                    bool split_full_ok = false;
+                    bool split_partial_ok = false;
+                    bool split_partial_match_pre = false;
+                    bool split_full_changed_vs_pre = false;
+                    bool split_full_changed_vs_branch_import = false;
+                    bool restore_full_state_ok = false;
+                    bool restore_partial_ok = false;
+                    bool restore_full_match_pre = false;
+                    bool restore_partial_match_pre = false;
+
+                    if (replay_tokens.empty()) {
+                        kv_status = "no_replay_tokens";
+                        kv_reason = "target_sampler_replay_tokens_missing";
+                    } else if (!slot.mtp_qblock_branch_replay_target_sampler_replay_ok) {
+                        kv_status = "replay_unavailable";
+                        kv_reason = "target_sampler_replay_not_ok";
+                    } else if (!replay_output_match) {
+                        kv_status = "output_token_mismatch";
+                        kv_reason = "final_output_bundle_differs_from_sampler_replay";
+                    } else if (!prefix_full_state_available) {
+                        kv_status = "prefix_full_state_unavailable";
+                        kv_reason = "target_sampler_replay_prefix_full_state_missing";
+                    } else if (!prefix_partial_state_available) {
+                        kv_status = "prefix_partial_state_unavailable";
+                        kv_reason = "target_sampler_replay_prefix_partial_state_missing";
+                    } else if (!prefix_token_count_match) {
+                        kv_status = "prefix_token_count_mismatch";
+                        kv_reason = "prefix_state_token_count_does_not_match_output_bundle";
+                    } else {
+                        prefix_partial_canonical_digest = mtp_digest_partial_seq_state_canonical(
+                                slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_state_data);
+                        std::vector<uint8_t> pre_full_state_data = mtp_get_full_seq_state_data(slot.ctx_tgt, slot.id);
+                        std::vector<uint8_t> pre_partial_state_data = mtp_get_partial_seq_state_data(slot.ctx_tgt, slot.id);
+                        pre_full_digest = mtp_digest_bytes(pre_full_state_data);
+                        pre_partial_digest = mtp_digest_bytes(pre_partial_state_data);
+                        pre_partial_canonical_digest = mtp_digest_partial_seq_state_canonical(pre_partial_state_data);
+                        pre_full_ok = !pre_full_state_data.empty();
+                        pre_partial_ok = !pre_partial_state_data.empty();
+                        if (!pre_full_ok || !pre_partial_ok) {
+                            kv_status = "pre_state_unavailable";
+                            kv_reason = "post_commit_full_or_partial_state_backup_missing";
+                        } else {
+                            const llama_state_seq_flags full_remap_flags = LLAMA_STATE_SEQ_FLAGS_ALLOW_SEQ_REMAP;
+                            branch_full_bytes_written = llama_state_seq_set_data_ext(
+                                    slot.ctx_tgt,
+                                    slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_data.data(),
+                                    slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_data.size(),
+                                    slot.id,
+                                    full_remap_flags);
+                            branch_full_import_ok = branch_full_bytes_written ==
+                                slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_data.size();
+                            if (branch_full_import_ok) {
+                                std::vector<uint8_t> branch_import_full_state_data = mtp_get_full_seq_state_data(slot.ctx_tgt, slot.id);
+                                std::vector<uint8_t> branch_import_partial_state_data = mtp_get_partial_seq_state_data(slot.ctx_tgt, slot.id);
+                                branch_import_full_digest = mtp_digest_bytes(branch_import_full_state_data);
+                                branch_import_partial_digest = mtp_digest_bytes(branch_import_partial_state_data);
+                                branch_import_partial_canonical_digest = mtp_digest_partial_seq_state_canonical(branch_import_partial_state_data);
+                                branch_import_full_ok = !branch_import_full_state_data.empty();
+                                branch_import_partial_ok = !branch_import_partial_state_data.empty();
+                                branch_import_partial_matches_prefix = branch_import_partial_ok &&
+                                    branch_import_partial_canonical_digest.size == prefix_partial_canonical_digest.size &&
+                                    branch_import_partial_canonical_digest.hash == prefix_partial_canonical_digest.hash;
+
+                                const llama_state_seq_flags partial_remap_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ALLOW_SEQ_REMAP;
+                                partial_restore_bytes_written = llama_state_seq_set_data_ext(
+                                        slot.ctx_tgt,
+                                        pre_partial_state_data.data(),
+                                        pre_partial_state_data.size(),
+                                        slot.id,
+                                        partial_remap_flags);
+                                partial_restore_ok = partial_restore_bytes_written == pre_partial_state_data.size();
+                                if (partial_restore_ok) {
+                                    std::vector<uint8_t> split_full_state_data = mtp_get_full_seq_state_data(slot.ctx_tgt, slot.id);
+                                    std::vector<uint8_t> split_partial_state_data = mtp_get_partial_seq_state_data(slot.ctx_tgt, slot.id);
+                                    split_full_digest = mtp_digest_bytes(split_full_state_data);
+                                    split_partial_digest = mtp_digest_bytes(split_partial_state_data);
+                                    split_partial_canonical_digest = mtp_digest_partial_seq_state_canonical(split_partial_state_data);
+                                    split_full_ok = !split_full_state_data.empty();
+                                    split_partial_ok = !split_partial_state_data.empty();
+                                    split_partial_match_pre = split_partial_ok &&
+                                        split_partial_canonical_digest.size == pre_partial_canonical_digest.size &&
+                                        split_partial_canonical_digest.hash == pre_partial_canonical_digest.hash;
+                                    split_full_changed_vs_pre = split_full_ok &&
+                                        (split_full_digest.size != pre_full_digest.size ||
+                                         split_full_digest.hash != pre_full_digest.hash);
+                                    split_full_changed_vs_branch_import = split_full_ok && branch_import_full_ok &&
+                                        (split_full_digest.size != branch_import_full_digest.size ||
+                                         split_full_digest.hash != branch_import_full_digest.hash);
+                                    leave_split_active = kv_split_commit && split_partial_match_pre && split_full_changed_vs_pre;
+                                    full_restore_required = !leave_split_active;
+                                    if (leave_split_active) {
+                                        kv_status = "candidate_committed";
+                                        kv_reason = "branch_full_state_imported_then_production_recurrent_restored";
+                                    } else if (!split_partial_match_pre) {
+                                        kv_status = "partial_restore_mismatch";
+                                        kv_reason = "production_recurrent_state_not_restored_after_branch_full_import";
+                                    } else if (!split_full_changed_vs_pre) {
+                                        kv_status = "kv_state_unchanged";
+                                        kv_reason = "branch_full_import_plus_recurrent_restore_did_not_change_full_state";
+                                    } else {
+                                        kv_status = "ok";
+                                        kv_reason = "branch_kv_split_verified_and_restored";
+                                    }
+                                } else {
+                                    kv_status = "partial_restore_failed";
+                                    kv_reason = "llama_state_seq_set_data_ext_partial_restore_short_write";
+                                }
+                            } else {
+                                kv_status = "branch_full_import_failed";
+                                kv_reason = "llama_state_seq_set_data_ext_full_import_short_write";
+                            }
+
+                            if (full_restore_required && pre_full_ok) {
+                                full_restore_bytes_written = llama_state_seq_set_data_ext(
+                                        slot.ctx_tgt,
+                                        pre_full_state_data.data(),
+                                        pre_full_state_data.size(),
+                                        slot.id,
+                                        LLAMA_STATE_SEQ_FLAGS_NONE);
+                                full_restore_ok = full_restore_bytes_written == pre_full_state_data.size();
+                                std::vector<uint8_t> restore_full_state_data = mtp_get_full_seq_state_data(slot.ctx_tgt, slot.id);
+                                std::vector<uint8_t> restore_partial_state_data = mtp_get_partial_seq_state_data(slot.ctx_tgt, slot.id);
+                                restore_full_digest = mtp_digest_bytes(restore_full_state_data);
+                                restore_partial_digest = mtp_digest_bytes(restore_partial_state_data);
+                                restore_partial_canonical_digest = mtp_digest_partial_seq_state_canonical(restore_partial_state_data);
+                                restore_full_state_ok = !restore_full_state_data.empty();
+                                restore_partial_ok = !restore_partial_state_data.empty();
+                                restore_full_match_pre = restore_full_state_ok &&
+                                    restore_full_digest.size == pre_full_digest.size &&
+                                    restore_full_digest.hash == pre_full_digest.hash;
+                                restore_partial_match_pre = restore_partial_ok &&
+                                    restore_partial_canonical_digest.size == pre_partial_canonical_digest.size &&
+                                    restore_partial_canonical_digest.hash == pre_partial_canonical_digest.hash;
+                                if (!full_restore_ok || !restore_full_match_pre || !restore_partial_match_pre) {
+                                    kv_status = "full_restore_mismatch";
+                                    kv_reason = "proof_restore_to_post_commit_full_state_failed";
+                                }
+                            }
+                        }
+                    }
+
+                    const bool target_context_touched = branch_full_import_ok || partial_restore_ok || full_restore_ok;
+                    const bool production_mutation = leave_split_active ||
+                        (full_restore_required && branch_full_import_ok && (!restore_full_match_pre || !restore_partial_match_pre));
+                    fprintf(stderr,
+                            "MTP_QBLOCK_BRANCH_TXN_KV_SPLIT: slot=%d status=%s mode=%s reject_depth=%zu depth1=%zu selected=%d sampled=%d candidate_rank=%d ordinary_accepted=%zu rollback=%zu output_tokens=%zu replay_tokens=%zu replay_output_match=%d prefix_full_state_ok=%d prefix_full_state_size=%zu prefix_full_state_hash=%016" PRIx64 " prefix_partial_state_ok=%d prefix_partial_state_size=%zu prefix_partial_state_hash=%016" PRIx64 " prefix_partial_state_canonical_hash=%016" PRIx64 " prefix_state_tokens=%zu prefix_token_count_match=%d pre_full_ok=%d pre_full_size=%zu pre_full_hash=%016" PRIx64 " pre_partial_ok=%d pre_partial_size=%zu pre_partial_hash=%016" PRIx64 " pre_partial_canonical_hash=%016" PRIx64 " branch_full_bytes_written=%zu branch_full_import_ok=%d branch_import_full_ok=%d branch_import_full_size=%zu branch_import_full_hash=%016" PRIx64 " branch_import_partial_ok=%d branch_import_partial_size=%zu branch_import_partial_hash=%016" PRIx64 " branch_import_partial_canonical_hash=%016" PRIx64 " branch_import_partial_matches_prefix=%d partial_restore_bytes_written=%zu partial_restore_ok=%d split_full_ok=%d split_full_size=%zu split_full_hash=%016" PRIx64 " split_partial_ok=%d split_partial_size=%zu split_partial_hash=%016" PRIx64 " split_partial_canonical_hash=%016" PRIx64 " split_partial_match_pre=%d split_full_changed_vs_pre=%d split_full_changed_vs_branch_import=%d full_restore_required=%d full_restore_bytes_written=%zu full_restore_ok=%d restore_full_ok=%d restore_full_size=%zu restore_full_hash=%016" PRIx64 " restore_partial_ok=%d restore_partial_size=%zu restore_partial_hash=%016" PRIx64 " restore_partial_canonical_hash=%016" PRIx64 " restore_full_match_pre=%d restore_partial_match_pre=%d production_mutation=%d production_seq_touched=%d output_touched=0 prompt_touched=0 sampler_touched=0 target_touched=0 target_context_touched=%d kv_touched=%d recurrent_touched=%d recurrent_restored=%d draft_touched=0 same_cycle_replayable=0 safe_commit=0 source=post_final_kv_split_txn reason=%s output_token_list=[",
+                            slot.id,
+                            kv_status,
+                            kv_mode,
+                            slot.mtp_qblock_branch_replay_reject_depth,
+                            slot.mtp_qblock_branch_replay_reject_depth + 1,
+                            (int) slot.mtp_qblock_branch_replay_selected,
+                            (int) slot.mtp_qblock_branch_replay_sampled,
+                            slot.mtp_qblock_branch_replay_candidate_rank,
+                            slot.mtp_qblock_branch_replay_ordinary_accepted,
+                            slot.mtp_qblock_branch_replay_rollback,
+                            ids.size(),
+                            replay_tokens.size(),
+                            replay_output_match ? 1 : 0,
+                            prefix_full_state_available ? 1 : 0,
+                            slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_digest.size,
+                            slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_digest.hash,
+                            prefix_partial_state_available ? 1 : 0,
+                            slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_state_digest.size,
+                            slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_state_digest.hash,
+                            prefix_partial_canonical_digest.hash,
+                            slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_tokens,
+                            prefix_token_count_match ? 1 : 0,
+                            pre_full_ok ? 1 : 0,
+                            pre_full_digest.size,
+                            pre_full_digest.hash,
+                            pre_partial_ok ? 1 : 0,
+                            pre_partial_digest.size,
+                            pre_partial_digest.hash,
+                            pre_partial_canonical_digest.hash,
+                            branch_full_bytes_written,
+                            branch_full_import_ok ? 1 : 0,
+                            branch_import_full_ok ? 1 : 0,
+                            branch_import_full_digest.size,
+                            branch_import_full_digest.hash,
+                            branch_import_partial_ok ? 1 : 0,
+                            branch_import_partial_digest.size,
+                            branch_import_partial_digest.hash,
+                            branch_import_partial_canonical_digest.hash,
+                            branch_import_partial_matches_prefix ? 1 : 0,
+                            partial_restore_bytes_written,
+                            partial_restore_ok ? 1 : 0,
+                            split_full_ok ? 1 : 0,
+                            split_full_digest.size,
+                            split_full_digest.hash,
+                            split_partial_ok ? 1 : 0,
+                            split_partial_digest.size,
+                            split_partial_digest.hash,
+                            split_partial_canonical_digest.hash,
+                            split_partial_match_pre ? 1 : 0,
+                            split_full_changed_vs_pre ? 1 : 0,
+                            split_full_changed_vs_branch_import ? 1 : 0,
+                            full_restore_required ? 1 : 0,
+                            full_restore_bytes_written,
+                            full_restore_ok ? 1 : 0,
+                            restore_full_state_ok ? 1 : 0,
+                            restore_full_digest.size,
+                            restore_full_digest.hash,
+                            restore_partial_ok ? 1 : 0,
+                            restore_partial_digest.size,
+                            restore_partial_digest.hash,
+                            restore_partial_canonical_digest.hash,
+                            restore_full_match_pre ? 1 : 0,
+                            restore_partial_match_pre ? 1 : 0,
+                            production_mutation ? 1 : 0,
+                            production_mutation ? 1 : 0,
+                            target_context_touched ? 1 : 0,
+                            branch_full_import_ok ? 1 : 0,
+                            (branch_full_import_ok || partial_restore_ok) ? 1 : 0,
+                            split_partial_match_pre ? 1 : 0,
+                            kv_reason);
+                    for (size_t j = 0; j < ids.size(); ++j) {
+                        fprintf(stderr, "%s%d", j == 0 ? "" : ",", (int) ids[j]);
+                    }
+                    fprintf(stderr, "] replay_output_token_list=[");
+                    for (size_t j = 0; j < replay_output_tokens.size(); ++j) {
+                        fprintf(stderr, "%s%d", j == 0 ? "" : ",", (int) replay_output_tokens[j]);
+                    }
+                    fprintf(stderr, "]\n");
+                };
+
                 auto mtp_qblock_recurrent_txn_emit = [&]() {
                     if (mtp_qblock_branch_txn_recurrent_commit_enabled() && slot.mtp_qblock_branch_replay_staged) {
                     const llama_tokens & replay_tokens = slot.mtp_qblock_branch_replay_target_sampler_replay_tokens;
@@ -8828,6 +9174,7 @@ private:
                     }
                 }
 
+                mtp_qblock_kv_split_txn_emit();
                 mtp_qblock_recurrent_txn_emit();
                 if (slot.mtp_qblock_branch_replay_staged) {
                     slot.mtp_qblock_branch_replay_staged = false;
