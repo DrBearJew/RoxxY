@@ -978,6 +978,12 @@ bool llama_kv_cache::seq_import_physical(llama_seq_id seq_id_src, llama_seq_id s
         };
 
         size_t copied_bytes = 0;
+        ggml_init_params view_params = {
+            /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr view_ctx(ggml_init(view_params));
         std::vector<uint8_t> copy_tmp;
         auto copy_1d = [&](ggml_tensor * src_base, ggml_tensor * dst_base, int64_t ne0, size_t src_off, size_t dst_off) {
             if (src_base == nullptr || dst_base == nullptr) {
@@ -990,6 +996,18 @@ bool llama_kv_cache::seq_import_physical(llama_seq_id seq_id_src, llama_seq_id s
             if (src_off > ggml_nbytes(src_base) || nbytes > ggml_nbytes(src_base) - src_off ||
                     dst_off > ggml_nbytes(dst_base) || nbytes > ggml_nbytes(dst_base) - dst_off) {
                 return false;
+            }
+            if (view_ctx) {
+                ggml_reset(view_ctx.get());
+                ggml_tensor * src_view = ggml_view_1d(view_ctx.get(), src_base, ne0, src_off);
+                ggml_tensor * dst_view = ggml_view_1d(view_ctx.get(), dst_base, ne0, dst_off);
+                if (src_view != nullptr && dst_view != nullptr &&
+                        ggml_backend_view_init(src_view) == GGML_STATUS_SUCCESS &&
+                        ggml_backend_view_init(dst_view) == GGML_STATUS_SUCCESS) {
+                    ggml_backend_tensor_copy(src_view, dst_view);
+                    copied_bytes += nbytes;
+                    return true;
+                }
             }
             copy_tmp.resize(nbytes);
             ggml_backend_tensor_get(src_base, copy_tmp.data(), src_off, nbytes);
