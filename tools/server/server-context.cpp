@@ -8575,6 +8575,8 @@ private:
                     bool recurrent_post_match = false;
                     bool recurrent_restore_ok = false;
                     bool recurrent_restore_match = false;
+                    bool recurrent_pre_prefix_match = false;
+                    int64_t recurrent_pre_prefix_first_diff = -1;
                     if (replay_tokens.empty()) {
                         recurrent_status = "no_replay_tokens";
                         recurrent_reason = "target_sampler_replay_tokens_missing";
@@ -8597,6 +8599,13 @@ private:
                         recurrent_pre_digest = mtp_digest_bytes(pre_state_data);
                         recurrent_pre_canonical_digest = mtp_digest_partial_seq_state_canonical(pre_state_data);
                         recurrent_pre_ok = !pre_state_data.empty();
+                        recurrent_pre_prefix_match = recurrent_pre_ok &&
+                            recurrent_pre_canonical_digest.size == recurrent_prefix_canonical_digest.size &&
+                            recurrent_pre_canonical_digest.hash == recurrent_prefix_canonical_digest.hash;
+                        recurrent_pre_prefix_first_diff = recurrent_pre_ok ?
+                            mtp_first_diff_offset_partial_seq_state_canonical(
+                                    pre_state_data,
+                                    slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_state_data) : -1;
                         const llama_state_seq_flags remap_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ALLOW_SEQ_REMAP;
                         if (!recurrent_pre_ok) {
                             recurrent_status = "pre_state_unavailable";
@@ -8647,7 +8656,7 @@ private:
                     }
 
                     fprintf(stderr,
-                            "MTP_QBLOCK_BRANCH_TXN_RECURRENT_COMMIT: slot=%d status=%s reject_depth=%zu depth1=%zu selected=%d sampled=%d candidate_rank=%d ordinary_accepted=%zu rollback=%zu output_tokens=%zu replay_tokens=%zu replay_output_match=%d prefix_state_ok=%d prefix_state_tokens=%zu prefix_token_count_match=%d prefix_state_size=%zu prefix_state_hash=%016" PRIx64 " prefix_state_canonical_hash=%016" PRIx64 " pre_state_ok=%d pre_state_size=%zu pre_state_hash=%016" PRIx64 " pre_state_canonical_hash=%016" PRIx64 " state_bytes_written=%zu post_state_ok=%d post_state_size=%zu post_state_hash=%016" PRIx64 " post_state_canonical_hash=%016" PRIx64 " post_state_match=%d restore_bytes_written=%zu restore_state_ok=%d restore_state_size=%zu restore_state_hash=%016" PRIx64 " restore_state_canonical_hash=%016" PRIx64 " restore_state_match=%d production_mutation=0 production_seq_touched=0 output_touched=0 prompt_touched=0 sampler_touched=0 target_touched=0 target_context_touched=%d recurrent_touched=%d recurrent_restored=%d draft_touched=0 same_cycle_replayable=0 safe_commit=0 source=post_final_recurrent_txn reason=%s output_token_list=[",
+                            "MTP_QBLOCK_BRANCH_TXN_RECURRENT_COMMIT: slot=%d status=%s reject_depth=%zu depth1=%zu selected=%d sampled=%d candidate_rank=%d ordinary_accepted=%zu rollback=%zu output_tokens=%zu replay_tokens=%zu replay_output_match=%d prefix_state_ok=%d prefix_state_tokens=%zu prefix_token_count_match=%d prefix_state_size=%zu prefix_state_hash=%016" PRIx64 " prefix_state_canonical_hash=%016" PRIx64 " pre_state_ok=%d pre_state_size=%zu pre_state_hash=%016" PRIx64 " pre_state_canonical_hash=%016" PRIx64 " pre_prefix_state_match=%d pre_prefix_state_first_diff=%lld state_bytes_written=%zu post_state_ok=%d post_state_size=%zu post_state_hash=%016" PRIx64 " post_state_canonical_hash=%016" PRIx64 " post_state_match=%d restore_bytes_written=%zu restore_state_ok=%d restore_state_size=%zu restore_state_hash=%016" PRIx64 " restore_state_canonical_hash=%016" PRIx64 " restore_state_match=%d production_mutation=0 production_seq_touched=0 output_touched=0 prompt_touched=0 sampler_touched=0 target_touched=0 target_context_touched=%d recurrent_touched=%d recurrent_restored=%d draft_touched=0 same_cycle_replayable=0 safe_commit=0 source=post_final_recurrent_txn reason=%s output_token_list=[",
                             slot.id,
                             recurrent_status,
                             slot.mtp_qblock_branch_replay_reject_depth,
@@ -8670,6 +8679,8 @@ private:
                             recurrent_pre_digest.size,
                             recurrent_pre_digest.hash,
                             recurrent_pre_canonical_digest.hash,
+                            recurrent_pre_prefix_match ? 1 : 0,
+                            (long long) recurrent_pre_prefix_first_diff,
                             recurrent_state_bytes_written,
                             recurrent_post_ok ? 1 : 0,
                             recurrent_post_digest.size,
