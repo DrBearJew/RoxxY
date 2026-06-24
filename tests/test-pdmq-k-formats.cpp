@@ -6,6 +6,31 @@
 #include <random>
 #include <vector>
 
+#define DP16_PACKED_I8_DESC_HOST_ONLY
+#ifndef __host__
+#define TEST_PDMQ_DEFINED_HOST
+#endif
+#ifndef __device__
+#define TEST_PDMQ_DEFINED_DEVICE
+#endif
+#ifndef __forceinline__
+#define TEST_PDMQ_DEFINED_FORCEINLINE
+#endif
+#include "../ggml/src/ggml-cuda/dot4-packed16/mtp-v4-144-tail-page-desc.cuh"
+#undef DP16_PACKED_I8_DESC_HOST_ONLY
+#ifdef TEST_PDMQ_DEFINED_HOST
+#undef __host__
+#undef TEST_PDMQ_DEFINED_HOST
+#endif
+#ifdef TEST_PDMQ_DEFINED_DEVICE
+#undef __device__
+#undef TEST_PDMQ_DEFINED_DEVICE
+#endif
+#ifdef TEST_PDMQ_DEFINED_FORCEINLINE
+#undef __forceinline__
+#undef TEST_PDMQ_DEFINED_FORCEINLINE
+#endif
+
 #define CHECK(COND) do { \
     if (!(COND)) { \
         std::fprintf(stderr, "CHECK failed at %s:%d: %s\n", __FILE__, __LINE__, #COND); \
@@ -191,6 +216,92 @@ static void test_deterministic_dots() {
     CHECK(qk_expanded_i8(q, qs, k, ks) == 512.0f);
 }
 
+static void test_txn_tail_page_stage_contract() {
+    constexpr uint32_t idx0 = 7734;
+    constexpr uint32_t n_tokens = 5;
+    constexpr uint32_t kv_size = 40960;
+    constexpr uint32_t page_base = idx0 & ~(MTP_V4_144_PAGE_TOKENS - 1u);
+    constexpr uint32_t page_end = page_base + MTP_V4_144_PAGE_TOKENS;
+    constexpr uint32_t slot_begin = idx0 - page_base;
+    constexpr uint32_t slot_end = slot_begin + n_tokens;
+    CHECK(page_base == 7728);
+    CHECK(page_end == 7744);
+    CHECK(slot_begin == 6);
+    CHECK(slot_end == 11);
+    CHECK(MTP_PACKED16_K_ROW_BYTES == 272);
+    CHECK(MTP_PACKED16_K_PAGE_BYTES == 4352);
+    CHECK(MTP_V4_144_ROW_BYTES == 144);
+    CHECK(MTP_V4_144_PAGE_BYTES == 2304);
+
+    mtp_v4_144_tail_stage_desc_v1 k_stage = mtp_v4_144_tail_stage_make(
+        MTP_V4_144_TAIL_STAGE_KIND_PACKED16_K, kv_size, idx0, n_tokens, MTP_PACKED16_K_ROW_BYTES);
+    CHECK(k_stage.slots_before == 6);
+    CHECK(k_stage.slots_after == 5);
+    CHECK(k_stage.merge_copy_slots == 11);
+    CHECK(k_stage.payload_bytes == 1360);
+    CHECK(k_stage.merge_copy_bytes == 2992);
+    CHECK(mtp_v4_144_tail_stage_validate_static(k_stage) == MTP_V4_144_TAIL_STAGE_OK);
+    k_stage.row_bytes = 144;
+    CHECK(mtp_v4_144_tail_stage_validate_static(k_stage) == MTP_V4_144_TAIL_STAGE_BAD_ROW_BYTES);
+
+    mtp_v4_144_tail_stage_desc_v1 v_stage = mtp_v4_144_tail_stage_make(
+        MTP_V4_144_TAIL_STAGE_KIND_V4_144, kv_size, idx0, n_tokens, MTP_V4_144_ROW_BYTES);
+    CHECK(v_stage.payload_bytes == 720);
+    CHECK(v_stage.merge_copy_bytes == 1584);
+    CHECK(mtp_v4_144_tail_stage_validate_static(v_stage) == MTP_V4_144_TAIL_STAGE_OK);
+
+    dp16_packed_i8_desc_v1 k_desc = {};
+    k_desc.version = DP16_PACKED_I8_DESC_VERSION;
+    k_desc.lanes_per_vector = DP16_PACKED_I8X16_LANES;
+    k_desc.words_per_vector = DP16_PACKED_I8X16_WORDS;
+    k_desc.bytes_per_vector = DP16_PACKED_I8X16_BYTES;
+    k_desc.bytes_per_word = DP16_PACKED_I8_WORD_BYTES;
+    k_desc.layout_kind = DP16_PACKED_I8_LAYOUT_ROW;
+    k_desc.axis_x = DP16_PACKED_I8_AXIS_D16;
+    k_desc.axis_y = DP16_PACKED_I8_AXIS_TOKEN;
+    k_desc.axis_z = DP16_PACKED_I8_AXIS_HEAD;
+    k_desc.scale_layout = DP16_PACKED_I8_SCALE_LAYOUT_ROW;
+    k_desc.scale_axis_x = DP16_PACKED_I8_AXIS_QBLOCK;
+    k_desc.scale_axis_y = DP16_PACKED_I8_AXIS_TOKEN;
+    k_desc.scale_axis_z = DP16_PACKED_I8_AXIS_HEAD;
+    k_desc.logical_x = MTP_PACKED16_K_D / DP16_PACKED_I8X16_LANES;
+    k_desc.logical_y = kv_size;
+    k_desc.logical_z = 4;
+    k_desc.physical_x = k_desc.logical_x;
+    k_desc.physical_y = k_desc.logical_y;
+    k_desc.physical_z = k_desc.logical_z;
+    k_desc.x_stride_bytes = DP16_PACKED_I8X16_BYTES;
+    k_desc.y_stride_bytes = MTP_PACKED16_K_WORDS * sizeof(uint32_t);
+    k_desc.z_stride_bytes = uint64_t(kv_size) * k_desc.y_stride_bytes;
+    k_desc.scale_x_stride_bytes = sizeof(uint16_t);
+    k_desc.scale_y_stride_bytes = MTP_PACKED16_K_QBLOCKS * sizeof(uint16_t);
+    k_desc.scale_z_stride_bytes = uint64_t(kv_size) * k_desc.scale_y_stride_bytes;
+    CHECK(dp16_i8x16_desc_has_vector_abi(k_desc));
+    const uint64_t k_payload_first = dp16_packed_i8_payload_byte_offset(k_desc, 0, idx0, 0, 0);
+    const uint64_t k_payload_end = dp16_packed_i8_payload_byte_offset(k_desc, 0, idx0 + n_tokens - 1u, k_desc.logical_x - 1u, k_desc.words_per_vector - 1u) + k_desc.bytes_per_word;
+    const uint64_t k_scale_first = dp16_packed_i8_scale_byte_offset(k_desc, 0, idx0, 0);
+    const uint64_t k_scale_end = dp16_packed_i8_scale_byte_offset(k_desc, 0, idx0 + n_tokens - 1u, MTP_PACKED16_K_QBLOCKS - 1u) + sizeof(uint16_t);
+    CHECK(k_payload_first == 1979904);
+    CHECK(k_payload_end == 1981184);
+    CHECK(k_scale_first == 123744);
+    CHECK(k_scale_end == 123824);
+
+    mtp_v4_144_tail_page_desc_v1 v_desc = {};
+    v_desc.v4_page_stride_bytes = MTP_V4_144_PAGE_BYTES;
+    v_desc.v4_head_stride_bytes = uint64_t(kv_size) * MTP_V4_144_ROW_BYTES;
+    v_desc.v4_batch_stride_bytes = v_desc.v4_head_stride_bytes * 4u;
+    const uint32_t physical_page = page_base / MTP_V4_144_PAGE_TOKENS;
+    CHECK(physical_page == 483);
+    const uint64_t v_payload_first = mtp_v4_144_tail_page_v4_payload_byte_offset(v_desc, physical_page, slot_begin, 0, 0, 0);
+    const uint64_t v_payload_end = mtp_v4_144_tail_page_v4_payload_byte_offset(v_desc, physical_page, slot_end - 1u, MTP_V4_144_D - 1u, 0, 0) + sizeof(uint32_t);
+    const uint64_t v_scale_first = mtp_v4_144_tail_page_v4_scale_byte_offset(v_desc, physical_page, slot_begin, 0, 0, 0);
+    const uint64_t v_scale_end = mtp_v4_144_tail_page_v4_scale_byte_offset(v_desc, physical_page, slot_end - 1u, MTP_V4_144_D - MTP_V4_144_D32, 0, 0) + sizeof(uint16_t);
+    CHECK(v_payload_first == 1112832);
+    CHECK(v_payload_end == 1114880);
+    CHECK(v_scale_first == 1114892);
+    CHECK(v_scale_end == 1115126);
+}
+
 static void test_randomized_qk_and_attention() {
     std::mt19937 rng(0x5eed1234u);
     std::uniform_int_distribution<int> qi(-127, 127), code(0, 15);
@@ -243,6 +354,7 @@ static void test_randomized_qk_and_attention() {
 int main() {
     test_nibble_layout();
     test_deterministic_dots();
+    test_txn_tail_page_stage_contract();
     test_randomized_qk_and_attention();
     std::puts("test-pdmq-k-formats: PASS");
     return 0;

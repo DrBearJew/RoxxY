@@ -5,6 +5,31 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#define DP16_PACKED_I8_DESC_HOST_ONLY
+#ifndef __host__
+#define LLAMA_TXN_TAIL_DEFINED_HOST
+#endif
+#ifndef __device__
+#define LLAMA_TXN_TAIL_DEFINED_DEVICE
+#endif
+#ifndef __forceinline__
+#define LLAMA_TXN_TAIL_DEFINED_FORCEINLINE
+#endif
+#include "../ggml/src/ggml-cuda/dot4-packed16/mtp-v4-144-tail-page-desc.cuh"
+#undef DP16_PACKED_I8_DESC_HOST_ONLY
+#ifdef LLAMA_TXN_TAIL_DEFINED_HOST
+#undef __host__
+#undef LLAMA_TXN_TAIL_DEFINED_HOST
+#endif
+#ifdef LLAMA_TXN_TAIL_DEFINED_DEVICE
+#undef __device__
+#undef LLAMA_TXN_TAIL_DEFINED_DEVICE
+#endif
+#ifdef LLAMA_TXN_TAIL_DEFINED_FORCEINLINE
+#undef __forceinline__
+#undef LLAMA_TXN_TAIL_DEFINED_FORCEINLINE
+#endif
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -16,6 +41,128 @@
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
+}
+
+static bool llama_mtp_qblock_txn_tail_page_proof_enabled() {
+    const char * proof = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_PROOF");
+    const char * request = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE");
+    return (proof && atoi(proof) != 0) || (request && atoi(request) != 0);
+}
+
+static void llama_mtp_qblock_txn_tail_write_log(
+        const char * kind,
+        const int32_t il,
+        const ggml_tensor * cur,
+        const ggml_tensor * cache,
+        const llama_kv_cache::slot_info & sinfo) {
+    if (!llama_mtp_qblock_txn_tail_page_proof_enabled() || cur == nullptr || cache == nullptr || sinfo.empty() || sinfo.n_stream() != 1) {
+        return;
+    }
+
+    const int64_t n_tokens = cur->ne[2];
+    if (n_tokens <= 1 || n_tokens > 8 || sinfo.idxs[0].size() < (size_t) n_tokens) {
+        return;
+    }
+
+    const uint32_t idx0 = sinfo.idxs[0][0];
+    bool contiguous = true;
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        if (sinfo.idxs[0][(size_t) i] != idx0 + (uint32_t) i) {
+            contiguous = false;
+            break;
+        }
+    }
+
+    const uint32_t page_tokens = 16;
+    const uint32_t idx_last = idx0 + (uint32_t) n_tokens - 1u;
+    const uint32_t page_base = idx0 & ~(page_tokens - 1u);
+    const uint32_t page_end = page_base + page_tokens;
+    const uint32_t slot_begin = idx0 - page_base;
+    const uint32_t slot_end_excl = slot_begin + (uint32_t) n_tokens;
+    const bool spans_pages = slot_end_excl > page_tokens;
+    const uint32_t slots_before = slot_begin;
+    const uint32_t slots_after = spans_pages ? 0u : page_tokens - slot_end_excl;
+    const bool aligned = slot_begin == 0;
+    const bool boundary_copy_required = slots_before != 0 || slots_after != 0;
+    const bool capacity_ok = cache->ne[1] >= (int64_t) page_end;
+    const bool staged_page_eligible = contiguous && !spans_pages && capacity_ok;
+    const uint32_t merge_copy_slots = slots_before + slots_after;
+    const int64_t d = cur->ne[0];
+    int64_t staged_row_bytes = 0;
+    if (kind[0] == 'K' && d > 0 && (d % 32) == 0) {
+        staged_row_bytes = d + (d / 32) * (int64_t) sizeof(uint16_t);
+    } else if (kind[0] == 'V' && d > 0) {
+        staged_row_bytes = (int64_t) ggml_row_size(cache->type, d);
+    }
+    const int64_t staged_page_bytes = staged_row_bytes > 0 ? staged_row_bytes * (int64_t) page_tokens : 0;
+    const int64_t merge_copy_bytes = staged_row_bytes > 0 ? staged_row_bytes * (int64_t) merge_copy_slots : 0;
+    const int64_t payload_bytes = staged_row_bytes > 0 ? staged_row_bytes * n_tokens : 0;
+    fprintf(stderr,
+            "MTP_QBLOCK_TXN_TAIL_WRITE: kind=%s layer=%d active=0 eligible=%d aligned_page_eligible=%d n_tokens=%lld idx0=%u idx_last=%u contiguous=%d page_base=%u page_end=%u slot_begin=%u slot_end_excl=%u spans_pages=%d aligned16=%d slots_before=%u slots_after=%u merge_copy_slots=%u boundary_copy_required=%d capacity_ok=%d staged_row_bytes=%lld staged_page_bytes=%lld payload_bytes=%lld merge_copy_bytes=%lld cache_type=%s cur_type=%s cache_ne1=%lld cur_ne=(%lld,%lld,%lld,%lld)\n",
+            kind,
+            il,
+            staged_page_eligible ? 1 : 0,
+            (contiguous && aligned && !spans_pages && capacity_ok) ? 1 : 0,
+            (long long) n_tokens,
+            idx0,
+            idx_last,
+            contiguous ? 1 : 0,
+            page_base,
+            page_end,
+            slot_begin,
+            slot_end_excl,
+            spans_pages ? 1 : 0,
+            aligned ? 1 : 0,
+            slots_before,
+            slots_after,
+            merge_copy_slots,
+            boundary_copy_required ? 1 : 0,
+            capacity_ok ? 1 : 0,
+            (long long) staged_row_bytes,
+            (long long) staged_page_bytes,
+            (long long) payload_bytes,
+            (long long) merge_copy_bytes,
+            ggml_type_name(cache->type),
+            ggml_type_name(cur->type),
+            (long long) cache->ne[1],
+            (long long) cur->ne[0],
+            (long long) cur->ne[1],
+            (long long) cur->ne[2],
+            (long long) cur->ne[3]);
+
+    const uint32_t stage_kind = kind[0] == 'K' ? MTP_V4_144_TAIL_STAGE_KIND_PACKED16_K :
+        (kind[0] == 'V' ? MTP_V4_144_TAIL_STAGE_KIND_V4_144 : MTP_V4_144_TAIL_STAGE_KIND_NONE);
+    const mtp_v4_144_tail_stage_desc_v1 stage_desc = mtp_v4_144_tail_stage_make(
+        stage_kind,
+        cache->ne[1] >= 0 ? (uint32_t) cache->ne[1] : 0u,
+        idx0,
+        (uint32_t) n_tokens,
+        staged_row_bytes > 0 ? (uint32_t) staged_row_bytes : 0u);
+    const mtp_v4_144_tail_stage_status stage_status = mtp_v4_144_tail_stage_validate_static(stage_desc);
+    fprintf(stderr,
+            "MTP_QBLOCK_TXN_TAIL_STAGE: kind=%s layer=%d active=0 eligible=%d status=%u flags=0x%x page=[%u,%u) write=[%u,%u] slots=[%u,%u) copy_slots=%u+%u merge_copy_slots=%u bytes(row=%u page=%u payload=%u merge_copy=%u) cache_tokens=%u source_type=%s cache_type=%s layout_note=%s\n",
+            kind,
+            il,
+            (stage_status == MTP_V4_144_TAIL_STAGE_OK && contiguous) ? 1 : 0,
+            (unsigned) stage_status,
+            stage_desc.flags,
+            stage_desc.page_base_token,
+            stage_desc.page_end_token,
+            stage_desc.write_start_token,
+            idx_last,
+            stage_desc.slot_begin,
+            stage_desc.slot_end_excl,
+            stage_desc.slots_before,
+            stage_desc.slots_after,
+            stage_desc.merge_copy_slots,
+            stage_desc.row_bytes,
+            stage_desc.page_bytes,
+            stage_desc.payload_bytes,
+            stage_desc.merge_copy_bytes,
+            stage_desc.cache_tokens,
+            ggml_type_name(cur->type),
+            ggml_type_name(cache->type),
+            kind[0] == 'K' ? "packed16_row_accounting_only_desc_required_for_real_copy" : "v4_144_nibble_scale_slot_merge_required");
 }
 
 enum llama_pdmq_k_format {
@@ -1672,8 +1819,6 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
 }
 
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
-    GGML_UNUSED(sinfo);
-
     const int32_t ikv = map_layer_ids.at(il);
 
     ggml_tensor * k         = layers[ikv].k;
@@ -1693,10 +1838,12 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
             // Pack from the just-written FP16 shadow K.  Using the set_rows result
             // as the pack source keeps the exact-K shadow write in the graph;
             // otherwise the optimizer may only schedule the packed sidecar write.
+            llama_mtp_qblock_txn_tail_write_log("K", il, k_cur, k_payload, sinfo);
             ggml_tensor * pack = ggml_pack_k_packed16(ctx, k_shadow_write, k_payload, k_scales, k_idxs);
             return pack;
         }
         // Packed16-only mode (no shadow K): indexed pack is the primary K write.
+        llama_mtp_qblock_txn_tail_write_log("K", il, k_cur, k_payload, sinfo);
         ggml_tensor * pack = ggml_pack_k_packed16(ctx, k_cur, k_payload, k_scales, k_idxs);
         return pack;
     }
@@ -1737,6 +1884,7 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     }
     if (v && v->type == GGML_TYPE_V4_K16D16_144) {
         GGML_ASSERT(!v_trans && "V4_K16D16_144 cache is FA/non-transposed only");
+        llama_mtp_qblock_txn_tail_write_log("V", il, v_cur, v, sinfo);
         return ggml_pack_v4_k16d16_144(ctx, v_cur, v, v_idxs);
     }
 

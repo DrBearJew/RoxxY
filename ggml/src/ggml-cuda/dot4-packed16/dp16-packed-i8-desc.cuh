@@ -134,7 +134,9 @@ static __host__ __device__ __forceinline__ int32_t dp16_i8x16_dot_s32(
         const dp16_i8x16_words & a,
         const dp16_i8x16_words & b) {
     int32_t acc = 0;
+#ifndef DP16_PACKED_I8_DESC_HOST_ONLY
 #pragma unroll
+#endif
     for (int lane = 0; lane < (int) DP16_PACKED_I8X16_LANES; ++lane) {
         acc += (int32_t) dp16_i8x16_lane(a, lane) * (int32_t) dp16_i8x16_lane(b, lane);
     }

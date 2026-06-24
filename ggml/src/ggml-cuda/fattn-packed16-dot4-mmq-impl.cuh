@@ -4782,7 +4782,18 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     if ((qblock_txn_tail_page_proof || qblock_txn_tail_page_enable) && qblock_inst) {
         const char * txn_tail_reason = "ok";
         mtp_v4_144_tail_page_status txn_tail_status = MTP_V4_144_TAIL_PAGE_OK;
+        mtp_qblock_txn_lineage_status txn_lineage_status = MTP_QBLOCK_TXN_LINEAGE_OK;
         bool txn_tail_desc_static_ok = false;
+        bool txn_lineage_ok = false;
+        uint32_t txn_lineage_rows = 0;
+        uint32_t txn_lineage_accepted_len = 0;
+        uint32_t txn_lineage_new_valid_tail_tokens = 0;
+        uint8_t txn_lineage_final_state_slot = MTP_QBLOCK_TXN_INVALID_U8;
+
+        const uint32_t txn_page_tokens = MTP_V4_144_PAGE_TOKENS;
+        const uint32_t txn_capacity_tokens = pdmq_k_kv_capacity > (uint32_t) nk ? pdmq_k_kv_capacity : (uint32_t) nk;
+        const uint32_t txn_tail_physical_page = (uint32_t) nk / txn_page_tokens;
+        int32_t txn_tail_block_table[1] = { (int32_t) txn_tail_physical_page };
 
         if (K->type != GGML_TYPE_I32 || !k_persistent_i32) {
             txn_tail_reason = "not_packed16_i32_k";
@@ -4792,55 +4803,104 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
             txn_tail_reason = "bad_d";
         } else if (batch != 1) {
             txn_tail_reason = "batch_not_one";
-        } else if ((nk & ((int) MTP_V4_144_PAGE_TOKENS - 1)) != 0) {
+        } else if ((nk & ((int) txn_page_tokens - 1)) != 0) {
             txn_tail_reason = "kv_size_not_k16_aligned";
+        } else if (txn_capacity_tokens < (uint32_t) nk + txn_page_tokens) {
+            txn_tail_reason = "no_tail_page_capacity";
         } else if (!qblock_program.enabled) {
             txn_tail_reason = "qblock_program_disabled";
+        } else if (nq <= 0 || nq > (int) MTP_QBLOCK_TXN_MAX_ROWS) {
+            txn_tail_reason = "qblock_nq_out_of_range";
+        } else if (qblock_program.rows_per_cta <= 0 || qblock_program.rows_per_cta > DP16_FA_QBLOCK_MAX_ROWS) {
+            txn_tail_reason = "qblock_local_rows_out_of_range";
         } else {
-            static const int32_t txn_identity_block_table_stub[1] = { 0 };
-            mtp_v4_144_tail_page_desc_v1 tail_desc = {};
-            tail_desc.version = MTP_V4_144_TAIL_PAGE_ABI_VERSION;
-            tail_desc.abi_bytes = sizeof(mtp_v4_144_tail_page_desc_v1);
-            tail_desc.flags = MTP_V4_144_TAIL_FLAG_TAIL_ONLY | MTP_V4_144_TAIL_FLAG_ALIGNED_ONLY;
-            tail_desc.page_tokens = MTP_V4_144_PAGE_TOKENS;
-            tail_desc.d = MTP_V4_144_D;
-            tail_desc.logical_base_token = 0;
-            tail_desc.logical_tokens = (uint32_t) nk;
-            tail_desc.block_table = txn_identity_block_table_stub;
-            tail_desc.block_table_pages = mtp_v4_144_tail_page_count_for_tokens((uint32_t) nk);
-            tail_desc.physical_pages = tail_desc.block_table_pages;
-            tail_desc.valid_tail_tokens = (uint32_t) nk;
-            tail_desc.prefix_tokens = (uint32_t) nk;
-            tail_desc.boundary_slot = 0;
-            tail_desc.k_payload_base = packed16_payload ? packed16_payload->data : nullptr;
-            tail_desc.k_scale_base = packed16_scales ? packed16_scales->data : nullptr;
-            tail_desc.k_head_stride_bytes = packed16_desc.z_stride_bytes;
-            tail_desc.k_page_stride_bytes = uint64_t(MTP_V4_144_PAGE_TOKENS) * packed16_desc.y_stride_bytes;
-            tail_desc.v4_base = V->data;
-            tail_desc.v4_head_stride_bytes = (uint64_t) V->nb[2];
-            tail_desc.v4_page_stride_bytes = (uint64_t) V->nb[1];
-            tail_desc.v4_batch_stride_bytes = (uint64_t) V->nb[3];
-            tail_desc.kv_heads = (uint32_t) n_heads_k;
-            tail_desc.batch = (uint32_t) batch;
-            tail_desc.gqa_ratio = (uint32_t) gqa_ratio;
-            tail_desc.k_desc = packed16_desc;
-            txn_tail_status = mtp_v4_144_tail_page_validate_static(tail_desc);
-            txn_tail_desc_static_ok = txn_tail_status == MTP_V4_144_TAIL_PAGE_OK;
-            if (!txn_tail_desc_static_ok) {
-                txn_tail_reason = "tail_desc_static_rejected";
+            const uint32_t local_row_mask_expected = (uint32_t(1) << (uint32_t) qblock_program.rows_per_cta) - 1u;
+            bool local_linear = (qblock_program.row_valid_mask & (int) local_row_mask_expected) == (int) local_row_mask_expected && qblock_program.row_parent[0] < 0;
+            for (int row = 1; row < qblock_program.rows_per_cta && local_linear; ++row) {
+                local_linear = qblock_program.row_parent[row] == row - 1;
+            }
+
+            if (!local_linear) {
+                txn_tail_reason = "qblock_local_lineage_not_linear";
             } else {
-                txn_tail_reason = qblock_txn_tail_page_enable ? "state_sampler_not_wired" : "proof_only";
+                mtp_v4_144_tail_page_desc_v1 tail_desc = {};
+                tail_desc.version = MTP_V4_144_TAIL_PAGE_ABI_VERSION;
+                tail_desc.abi_bytes = sizeof(mtp_v4_144_tail_page_desc_v1);
+                tail_desc.flags = MTP_V4_144_TAIL_FLAG_TAIL_ONLY | MTP_V4_144_TAIL_FLAG_ALIGNED_ONLY;
+                tail_desc.page_tokens = txn_page_tokens;
+                tail_desc.d = MTP_V4_144_D;
+                tail_desc.logical_base_token = (uint32_t) nk;
+                tail_desc.logical_tokens = txn_page_tokens;
+                tail_desc.block_table = txn_tail_block_table;
+                tail_desc.block_table_pages = 1;
+                tail_desc.physical_pages = mtp_v4_144_tail_page_count_for_tokens(txn_capacity_tokens);
+                tail_desc.valid_tail_tokens = 0;
+                tail_desc.prefix_tokens = (uint32_t) nk;
+                tail_desc.boundary_slot = (uint32_t) nk & (txn_page_tokens - 1u);
+                tail_desc.k_payload_base = packed16_payload ? packed16_payload->data : nullptr;
+                tail_desc.k_scale_base = packed16_scales ? packed16_scales->data : nullptr;
+                tail_desc.k_head_stride_bytes = packed16_desc.z_stride_bytes;
+                tail_desc.k_page_stride_bytes = uint64_t(txn_page_tokens) * packed16_desc.y_stride_bytes;
+                tail_desc.v4_base = V->data;
+                tail_desc.v4_head_stride_bytes = (uint64_t) V->nb[2];
+                tail_desc.v4_page_stride_bytes = uint64_t(txn_page_tokens) * (uint64_t) V->nb[1];
+                tail_desc.v4_batch_stride_bytes = (uint64_t) V->nb[3];
+                tail_desc.kv_heads = (uint32_t) n_heads_k;
+                tail_desc.batch = (uint32_t) batch;
+                tail_desc.gqa_ratio = (uint32_t) gqa_ratio;
+                tail_desc.k_desc = packed16_desc;
+                txn_tail_status = mtp_v4_144_tail_page_validate_static(tail_desc);
+                txn_tail_desc_static_ok = txn_tail_status == MTP_V4_144_TAIL_PAGE_OK;
+
+                if (txn_tail_desc_static_ok) {
+                    mtp_qblock_txn_lineage_v1 lineage = {};
+                    lineage.version = MTP_QBLOCK_TXN_LINEAGE_ABI_VERSION;
+                    lineage.abi_bytes = sizeof(mtp_qblock_txn_lineage_v1);
+                    lineage.n_rows = (uint32_t) nq;
+                    lineage.root_row = MTP_QBLOCK_TXN_ROOT_ROW;
+                    lineage.flags = MTP_QBLOCK_TXN_LINEAGE_FLAG_IMPLICIT_CHAIN |
+                        MTP_QBLOCK_TXN_LINEAGE_FLAG_CONTIGUOUS_COMMIT |
+                        MTP_QBLOCK_TXN_LINEAGE_FLAG_CANONICAL_SLOT_ORDER;
+                    lineage.accepted_leaf = (uint8_t) (lineage.n_rows - 1u);
+                    lineage.accepted_len = (uint8_t) (lineage.n_rows - 1u);
+                    lineage.accepted_mask = mtp_qblock_txn_lineage_chain_mask(lineage.accepted_len);
+                    for (uint32_t row = 0; row < lineage.n_rows; ++row) {
+                        lineage.parent[row] = row == 0 ? (uint8_t) MTP_QBLOCK_TXN_ROOT_ROW : (uint8_t) (row - 1u);
+                        lineage.depth[row] = (uint8_t) row;
+                        lineage.kv_slot[row] = row == 0 ? 0 : (uint8_t) (row - 1u);
+                        lineage.state_slot[row] = (uint8_t) row;
+                    }
+                    txn_lineage_status = mtp_qblock_txn_lineage_validate_commit(lineage, tail_desc);
+                    txn_lineage_ok = txn_lineage_status == MTP_QBLOCK_TXN_LINEAGE_OK;
+                    txn_lineage_rows = lineage.n_rows;
+                    txn_lineage_accepted_len = lineage.accepted_len;
+                    txn_lineage_new_valid_tail_tokens = mtp_qblock_txn_lineage_new_valid_tail_tokens(tail_desc, lineage);
+                    txn_lineage_final_state_slot = mtp_qblock_txn_lineage_final_state_slot(lineage);
+                }
+
+                if (!txn_tail_desc_static_ok) {
+                    txn_tail_reason = "tail_desc_static_rejected";
+                } else if (!txn_lineage_ok) {
+                    txn_tail_reason = "lineage_rejected";
+                } else {
+                    txn_tail_reason = qblock_txn_tail_page_enable ? "state_sampler_not_wired" : "lineage_proof_only";
+                }
             }
         }
 
         fprintf(stderr,
-            "MTP_QBLOCK_TXN_TAIL_PAGE: node=%s layer=%d graph_inst=%d proof=%d requested=%d active=0 eligible=%d reason=%s desc_status=%u nq=%d nk=%d hq=%d hk=%d gqa_ratio=%d qprog=%d rows=%d rowmask=0x%x vpath=%s V=%s K=%s k_format=%s v4_page_stride=%lld k_page_stride=%llu\n",
+            "MTP_QBLOCK_TXN_TAIL_PAGE: node=%s layer=%d graph_inst=%d proof=%d requested=%d active=0 eligible=%d reason=%s desc_status=%u lineage_status=%u lineage_rows=%u accepted_len=%u new_valid_tail=%u final_state_slot=%u nq=%d nk=%d hq=%d hk=%d gqa_ratio=%d qprog=%d rows=%d rowmask=0x%x vpath=%s V=%s K=%s k_format=%s capacity=%u tail_phys_page=%u v4_page_stride=%lld k_page_stride=%llu\n",
             pdmq_fattn_node_name(dst), pdmq_layer_index, fa_inst_i32,
             qblock_txn_tail_page_proof ? 1 : 0,
             qblock_txn_tail_page_enable ? 1 : 0,
-            txn_tail_desc_static_ok ? 1 : 0,
+            (txn_tail_desc_static_ok && txn_lineage_ok) ? 1 : 0,
             txn_tail_reason,
             (unsigned) txn_tail_status,
+            (unsigned) txn_lineage_status,
+            txn_lineage_rows,
+            txn_lineage_accepted_len,
+            txn_lineage_new_valid_tail_tokens,
+            (unsigned) txn_lineage_final_state_slot,
             nq, nk, n_heads_q, n_heads_k, gqa_ratio,
             qblock_program.enabled,
             qblock_program.rows_per_cta,
@@ -4849,8 +4909,10 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
             ggml_type_name(V->type),
             ggml_type_name(K->type),
             ggml_cuda_pdmq_k_format_name(pdmq_k_format),
-            (long long) V->nb[1],
-            (unsigned long long) (uint64_t(MTP_V4_144_PAGE_TOKENS) * packed16_desc.y_stride_bytes));
+            pdmq_k_kv_capacity,
+            txn_tail_physical_page,
+            (long long) (uint64_t(txn_page_tokens) * (uint64_t) V->nb[1]),
+            (unsigned long long) (uint64_t(txn_page_tokens) * packed16_desc.y_stride_bytes));
     }
 
     const bool v4_144_gqa6_wavegroup_active = v4_144_gqa6_wavegroup_requested && is_gqa6 &&

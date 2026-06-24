@@ -11,8 +11,10 @@
 //   V: GGML_TYPE_V4_K16D16_144
 //   D: 256
 //   page: 16 tokens
-// It is an unused descriptor in this patch. Runtime dispatch must still perform
-// tensor type checks before constructing it.
+// The tail-page descriptor is consumed only by proof/diagnostic paths here.
+// Runtime dispatch must still perform tensor type checks before constructing it.
+// Partial-page producer staging uses a separate descriptor below to avoid mixing
+// committed-page visibility with scratch read/merge/write accounting.
 static constexpr uint32_t MTP_V4_144_TAIL_PAGE_ABI_VERSION = 1;
 static constexpr uint32_t MTP_V4_144_PAGE_TOKENS = 16;
 static constexpr uint32_t MTP_V4_144_D = 256;
@@ -116,6 +118,68 @@ struct mtp_v4_144_tail_page_desc_v1 {
     dp16_packed_i8_desc_v1 k_desc = {};
 };
 
+static constexpr uint32_t MTP_V4_144_TAIL_STAGE_ABI_VERSION = 1;
+
+enum mtp_v4_144_tail_stage_kind : uint32_t {
+    MTP_V4_144_TAIL_STAGE_KIND_NONE       = 0,
+    MTP_V4_144_TAIL_STAGE_KIND_PACKED16_K = 1,
+    MTP_V4_144_TAIL_STAGE_KIND_V4_144     = 2,
+};
+
+enum mtp_v4_144_tail_stage_flags : uint32_t {
+    MTP_V4_144_TAIL_STAGE_FLAG_READ_MERGE_WRITE = 1u << 0,
+    MTP_V4_144_TAIL_STAGE_FLAG_BOUNDARY_COPY    = 1u << 1,
+    MTP_V4_144_TAIL_STAGE_FLAG_FULL_PAGE_PAYLOAD = 1u << 2,
+};
+
+enum mtp_v4_144_tail_stage_status : uint32_t {
+    MTP_V4_144_TAIL_STAGE_OK = 0,
+    MTP_V4_144_TAIL_STAGE_BAD_VERSION,
+    MTP_V4_144_TAIL_STAGE_BAD_ABI_BYTES,
+    MTP_V4_144_TAIL_STAGE_BAD_KIND,
+    MTP_V4_144_TAIL_STAGE_MISSING_READ_MERGE_WRITE,
+    MTP_V4_144_TAIL_STAGE_BAD_PAGE_TOKENS,
+    MTP_V4_144_TAIL_STAGE_BAD_D,
+    MTP_V4_144_TAIL_STAGE_BAD_WRITE_TOKENS,
+    MTP_V4_144_TAIL_STAGE_BAD_PAGE_BASE,
+    MTP_V4_144_TAIL_STAGE_BAD_PAGE_END,
+    MTP_V4_144_TAIL_STAGE_BAD_SLOT_RANGE,
+    MTP_V4_144_TAIL_STAGE_SPANS_PAGE,
+    MTP_V4_144_TAIL_STAGE_BAD_CACHE_TOKENS,
+    MTP_V4_144_TAIL_STAGE_BAD_MERGE_FLAGS,
+    MTP_V4_144_TAIL_STAGE_BAD_ROW_BYTES,
+    MTP_V4_144_TAIL_STAGE_BAD_PAGE_BYTES,
+    MTP_V4_144_TAIL_STAGE_BAD_PAYLOAD_BYTES,
+    MTP_V4_144_TAIL_STAGE_BAD_MERGE_COPY_BYTES,
+};
+
+struct mtp_v4_144_tail_stage_desc_v1 {
+    uint32_t version = 0;
+    uint32_t abi_bytes = 0;
+    uint32_t kind = 0;
+    uint32_t flags = 0;
+
+    uint32_t page_tokens = 0;
+    uint32_t d = 0;
+    uint32_t page_base_token = 0;
+    uint32_t page_end_token = 0;
+
+    uint32_t write_start_token = 0;
+    uint32_t write_tokens = 0;
+    uint32_t slot_begin = 0;
+    uint32_t slot_end_excl = 0;
+
+    uint32_t slots_before = 0;
+    uint32_t slots_after = 0;
+    uint32_t merge_copy_slots = 0;
+    uint32_t cache_tokens = 0;
+
+    uint32_t row_bytes = 0;
+    uint32_t page_bytes = 0;
+    uint32_t payload_bytes = 0;
+    uint32_t merge_copy_bytes = 0;
+};
+
 static __host__ __device__ __forceinline__ uint32_t mtp_v4_144_tail_page_div_round_up(
         const uint32_t n,
         const uint32_t d) {
@@ -125,6 +189,116 @@ static __host__ __device__ __forceinline__ uint32_t mtp_v4_144_tail_page_div_rou
 static __host__ __device__ __forceinline__ uint32_t mtp_v4_144_tail_page_count_for_tokens(
         const uint32_t tokens) {
     return mtp_v4_144_tail_page_div_round_up(tokens, MTP_V4_144_PAGE_TOKENS);
+}
+
+static __host__ __device__ __forceinline__ uint32_t mtp_v4_144_tail_stage_expected_row_bytes(
+        const uint32_t kind) {
+    if (kind == MTP_V4_144_TAIL_STAGE_KIND_PACKED16_K) {
+        return MTP_PACKED16_K_ROW_BYTES;
+    }
+    if (kind == MTP_V4_144_TAIL_STAGE_KIND_V4_144) {
+        return MTP_V4_144_ROW_BYTES;
+    }
+    return 0;
+}
+
+static __host__ __device__ __forceinline__ mtp_v4_144_tail_stage_desc_v1 mtp_v4_144_tail_stage_make(
+        const uint32_t kind,
+        const uint32_t cache_tokens,
+        const uint32_t write_start_token,
+        const uint32_t write_tokens,
+        const uint32_t row_bytes) {
+    mtp_v4_144_tail_stage_desc_v1 desc = {};
+    desc.version = MTP_V4_144_TAIL_STAGE_ABI_VERSION;
+    desc.abi_bytes = sizeof(mtp_v4_144_tail_stage_desc_v1);
+    desc.kind = kind;
+    desc.page_tokens = MTP_V4_144_PAGE_TOKENS;
+    desc.d = MTP_V4_144_D;
+    desc.page_base_token = write_start_token & ~(MTP_V4_144_PAGE_TOKENS - 1u);
+    desc.page_end_token = desc.page_base_token + MTP_V4_144_PAGE_TOKENS;
+    desc.write_start_token = write_start_token;
+    desc.write_tokens = write_tokens;
+    desc.slot_begin = write_start_token - desc.page_base_token;
+    desc.slot_end_excl = desc.slot_begin + write_tokens;
+    desc.slots_before = desc.slot_begin;
+    desc.slots_after = desc.slot_end_excl > MTP_V4_144_PAGE_TOKENS ? 0u : MTP_V4_144_PAGE_TOKENS - desc.slot_end_excl;
+    desc.merge_copy_slots = desc.slots_before + desc.slots_after;
+    desc.cache_tokens = cache_tokens;
+    desc.row_bytes = row_bytes;
+    desc.page_bytes = row_bytes * MTP_V4_144_PAGE_TOKENS;
+    desc.payload_bytes = row_bytes * write_tokens;
+    desc.merge_copy_bytes = row_bytes * desc.merge_copy_slots;
+    desc.flags = MTP_V4_144_TAIL_STAGE_FLAG_READ_MERGE_WRITE |
+        (desc.merge_copy_slots != 0 ? MTP_V4_144_TAIL_STAGE_FLAG_BOUNDARY_COPY : 0u) |
+        ((desc.slot_begin == 0 && write_tokens == MTP_V4_144_PAGE_TOKENS) ? MTP_V4_144_TAIL_STAGE_FLAG_FULL_PAGE_PAYLOAD : 0u);
+    return desc;
+}
+
+static __host__ __device__ __forceinline__ mtp_v4_144_tail_stage_status mtp_v4_144_tail_stage_validate_static(
+        const mtp_v4_144_tail_stage_desc_v1 & desc) {
+    if (desc.version != MTP_V4_144_TAIL_STAGE_ABI_VERSION) {
+        return MTP_V4_144_TAIL_STAGE_BAD_VERSION;
+    }
+    if (desc.abi_bytes != sizeof(mtp_v4_144_tail_stage_desc_v1)) {
+        return MTP_V4_144_TAIL_STAGE_BAD_ABI_BYTES;
+    }
+    if (desc.kind != MTP_V4_144_TAIL_STAGE_KIND_PACKED16_K && desc.kind != MTP_V4_144_TAIL_STAGE_KIND_V4_144) {
+        return MTP_V4_144_TAIL_STAGE_BAD_KIND;
+    }
+    if ((desc.flags & MTP_V4_144_TAIL_STAGE_FLAG_READ_MERGE_WRITE) == 0) {
+        return MTP_V4_144_TAIL_STAGE_MISSING_READ_MERGE_WRITE;
+    }
+    if (desc.page_tokens != MTP_V4_144_PAGE_TOKENS) {
+        return MTP_V4_144_TAIL_STAGE_BAD_PAGE_TOKENS;
+    }
+    if (desc.d != MTP_V4_144_D) {
+        return MTP_V4_144_TAIL_STAGE_BAD_D;
+    }
+    if (desc.write_tokens == 0 || desc.write_tokens > desc.page_tokens) {
+        return MTP_V4_144_TAIL_STAGE_BAD_WRITE_TOKENS;
+    }
+    if ((desc.page_base_token & (MTP_V4_144_PAGE_TOKENS - 1u)) != 0) {
+        return MTP_V4_144_TAIL_STAGE_BAD_PAGE_BASE;
+    }
+    if (desc.page_end_token != desc.page_base_token + desc.page_tokens) {
+        return MTP_V4_144_TAIL_STAGE_BAD_PAGE_END;
+    }
+    if (desc.write_start_token < desc.page_base_token || desc.slot_begin != desc.write_start_token - desc.page_base_token) {
+        return MTP_V4_144_TAIL_STAGE_BAD_SLOT_RANGE;
+    }
+    if (desc.slot_end_excl != desc.slot_begin + desc.write_tokens || desc.slot_begin >= desc.page_tokens) {
+        return MTP_V4_144_TAIL_STAGE_BAD_SLOT_RANGE;
+    }
+    if (desc.slot_end_excl > desc.page_tokens) {
+        return MTP_V4_144_TAIL_STAGE_SPANS_PAGE;
+    }
+    if (desc.cache_tokens < desc.page_end_token) {
+        return MTP_V4_144_TAIL_STAGE_BAD_CACHE_TOKENS;
+    }
+    const uint32_t slots_before = desc.slot_begin;
+    const uint32_t slots_after = desc.page_tokens - desc.slot_end_excl;
+    const uint32_t merge_copy_slots = slots_before + slots_after;
+    const bool boundary_copy_required = merge_copy_slots != 0;
+    const bool full_page_payload = desc.slot_begin == 0 && desc.write_tokens == desc.page_tokens;
+    if (desc.slots_before != slots_before || desc.slots_after != slots_after || desc.merge_copy_slots != merge_copy_slots ||
+            (((desc.flags & MTP_V4_144_TAIL_STAGE_FLAG_BOUNDARY_COPY) != 0) != boundary_copy_required) ||
+            (((desc.flags & MTP_V4_144_TAIL_STAGE_FLAG_FULL_PAGE_PAYLOAD) != 0) != full_page_payload)) {
+        return MTP_V4_144_TAIL_STAGE_BAD_MERGE_FLAGS;
+    }
+    const uint32_t expected_row_bytes = mtp_v4_144_tail_stage_expected_row_bytes(desc.kind);
+    if (desc.row_bytes != expected_row_bytes) {
+        return MTP_V4_144_TAIL_STAGE_BAD_ROW_BYTES;
+    }
+    if (desc.page_bytes != expected_row_bytes * desc.page_tokens) {
+        return MTP_V4_144_TAIL_STAGE_BAD_PAGE_BYTES;
+    }
+    if (desc.payload_bytes != expected_row_bytes * desc.write_tokens) {
+        return MTP_V4_144_TAIL_STAGE_BAD_PAYLOAD_BYTES;
+    }
+    if (desc.merge_copy_bytes != expected_row_bytes * desc.merge_copy_slots) {
+        return MTP_V4_144_TAIL_STAGE_BAD_MERGE_COPY_BYTES;
+    }
+    return MTP_V4_144_TAIL_STAGE_OK;
 }
 
 static __host__ __device__ __forceinline__ mtp_v4_144_tail_page_status mtp_v4_144_tail_page_validate_k_desc(

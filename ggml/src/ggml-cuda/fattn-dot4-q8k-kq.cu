@@ -1,4 +1,5 @@
 #include "fattn-dot4-q8k-kq.cuh"
+#include "dot4-packed16/mtp-v4-144-tail-page-desc.cuh"
 
 #include <cmath>
 #include <cstdio>
@@ -299,6 +300,118 @@ static inline bool ggml_cuda_q8k_dot4_kq_env_enabled(const char * name) {
 static inline int ggml_cuda_q8k_dot4_kq_env_int(const char * name, int fallback) {
     const char * env = getenv(name);
     return env ? atoi(env) : fallback;
+}
+
+static inline bool ggml_cuda_mtp_qblock_txn_tail_backend_proof_enabled() {
+    return ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_PROOF") ||
+        ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE");
+}
+
+static inline bool ggml_cuda_mtp_qblock_txn_tail_page_requested() {
+    return ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE");
+}
+
+static mtp_v4_144_tail_stage_status ggml_cuda_mtp_qblock_txn_tail_backend_geom_status(
+        const uint32_t kind,
+        const uint32_t cache_tokens,
+        const uint32_t row_bytes) {
+    const mtp_v4_144_tail_stage_desc_v1 desc = mtp_v4_144_tail_stage_make(
+        kind,
+        cache_tokens,
+        0,
+        MTP_V4_144_PAGE_TOKENS,
+        row_bytes);
+    return mtp_v4_144_tail_stage_validate_static(desc);
+}
+
+struct ggml_cuda_mtp_qblock_txn_tail_backend_idx_probe {
+    bool copied = false;
+    bool capture_skipped = false;
+    bool contiguous = false;
+    bool capacity_ok = false;
+    bool spans_pages = false;
+    uint32_t n = 0;
+    uint32_t idx0 = 0;
+    uint32_t idx_last = 0;
+    uint32_t page_base = 0;
+    uint32_t page_end = 0;
+    uint32_t slot_begin = 0;
+    uint32_t slot_end_excl = 0;
+    uint32_t slots_before = 0;
+    uint32_t slots_after = 0;
+    uint32_t merge_copy_slots = 0;
+    mtp_v4_144_tail_stage_status status = MTP_V4_144_TAIL_STAGE_BAD_WRITE_TOKENS;
+};
+
+static ggml_cuda_mtp_qblock_txn_tail_backend_idx_probe ggml_cuda_mtp_qblock_txn_tail_backend_probe_indices(
+        const ggml_tensor * idxs,
+        const int nk_cur,
+        const int kv_size,
+        const uint32_t kind,
+        const uint32_t row_bytes,
+        cudaStream_t stream) {
+    ggml_cuda_mtp_qblock_txn_tail_backend_idx_probe probe = {};
+    if (idxs == nullptr || idxs->data == nullptr || nk_cur <= 0 || nk_cur > 8 || kv_size <= 0) {
+        return probe;
+    }
+    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+    CUDA_CHECK(hipStreamIsCapturing(stream, &capture_status));
+    if (capture_status != hipStreamCaptureStatusNone) {
+        probe.capture_skipped = true;
+        probe.status = MTP_V4_144_TAIL_STAGE_OK;
+        return probe;
+    }
+
+    int64_t h_idx[8] = {};
+    if (idxs->type == GGML_TYPE_I64) {
+        CUDA_CHECK(cudaMemcpyAsync(h_idx, idxs->data, (size_t) nk_cur * sizeof(int64_t), cudaMemcpyDeviceToHost, stream));
+    } else if (idxs->type == GGML_TYPE_I32) {
+        int32_t h_idx32[8] = {};
+        CUDA_CHECK(cudaMemcpyAsync(h_idx32, idxs->data, (size_t) nk_cur * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        for (int i = 0; i < nk_cur; ++i) {
+            h_idx[i] = h_idx32[i];
+        }
+    } else {
+        return probe;
+    }
+    if (idxs->type == GGML_TYPE_I64) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+
+    probe.copied = true;
+    probe.n = (uint32_t) nk_cur;
+    if (h_idx[0] < 0 || h_idx[0] >= kv_size) {
+        probe.status = MTP_V4_144_TAIL_STAGE_BAD_SLOT_RANGE;
+        return probe;
+    }
+    probe.idx0 = (uint32_t) h_idx[0];
+    probe.contiguous = true;
+    for (int i = 0; i < nk_cur; ++i) {
+        if (h_idx[i] != (int64_t) probe.idx0 + i || h_idx[i] < 0 || h_idx[i] >= kv_size) {
+            probe.contiguous = false;
+            break;
+        }
+    }
+    probe.idx_last = probe.idx0 + (uint32_t) nk_cur - 1u;
+    probe.page_base = probe.idx0 & ~(MTP_V4_144_PAGE_TOKENS - 1u);
+    probe.page_end = probe.page_base + MTP_V4_144_PAGE_TOKENS;
+    probe.slot_begin = probe.idx0 - probe.page_base;
+    probe.slot_end_excl = probe.slot_begin + (uint32_t) nk_cur;
+    probe.spans_pages = probe.slot_end_excl > MTP_V4_144_PAGE_TOKENS;
+    probe.slots_before = probe.slot_begin;
+    probe.slots_after = probe.spans_pages ? 0u : MTP_V4_144_PAGE_TOKENS - probe.slot_end_excl;
+    probe.merge_copy_slots = probe.slots_before + probe.slots_after;
+    probe.capacity_ok = (uint32_t) kv_size >= probe.page_end;
+
+    const mtp_v4_144_tail_stage_desc_v1 desc = mtp_v4_144_tail_stage_make(
+        kind,
+        (uint32_t) kv_size,
+        probe.idx0,
+        (uint32_t) nk_cur,
+        row_bytes);
+    probe.status = mtp_v4_144_tail_stage_validate_static(desc);
+    return probe;
 }
 
 static inline const char * ggml_cuda_q8k_dot4_k_physical_name(const ggml_tensor * K) {
@@ -1414,6 +1527,7 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_quant_k_packed16_inde
         float scale_mul,
         int scale_group_qblocks,
         bool tile16_layout) {
+    GGML_UNUSED(nb02);
     const int tid = threadIdx.x;
     const int k_local = blockIdx.x;
     const int hk = blockIdx.y;
@@ -1538,6 +1652,85 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_quant_k_packed16_inde
     ((int8_t *) dst_word)[d & 3] = (int8_t) qi;
     if (lane == 0) {
         k_scales[ggml_cuda_packed16_k_scale_index(head_base, kv_size, int(cell), q_block, tile16_layout)] = __float2half(scale);
+    }
+}
+
+static __global__ __launch_bounds__(128, 1) void ggml_cuda_mtp_qblock_txn_tail_k_copy_page_to_scratch_kernel(
+        const int  * __restrict__ k_payload,
+        const half * __restrict__ k_scales,
+        int        * __restrict__ scratch_payload,
+        half       * __restrict__ scratch_scales,
+        int page_base,
+        int kv_size,
+        int n_heads_k,
+        bool tile16_layout) {
+    const int tid = threadIdx.x;
+    const int slot = blockIdx.x;
+    const int hk = blockIdx.y;
+    const int b = blockIdx.z;
+    if (slot >= MTP_V4_144_PAGE_TOKENS || hk >= n_heads_k) {
+        return;
+    }
+
+    const int token = page_base + slot;
+    if (token < 0 || token >= kv_size) {
+        return;
+    }
+    const size_t head_base = (size_t(b) * size_t(n_heads_k) + size_t(hk)) * size_t(kv_size);
+    const size_t scratch_row = (size_t(b) * size_t(n_heads_k) + size_t(hk)) * size_t(MTP_V4_144_PAGE_TOKENS) + size_t(slot);
+
+    for (int d_word = tid; d_word < GGML_CUDA_PACKED16_K_WORDS; d_word += blockDim.x) {
+        scratch_payload[scratch_row * size_t(GGML_CUDA_PACKED16_K_WORDS) + size_t(d_word)] =
+            k_payload[ggml_cuda_packed16_k_payload_index(head_base, kv_size, token, d_word, tile16_layout)];
+    }
+    for (int qblk = tid; qblk < GGML_CUDA_PACKED16_K_QBLOCKS; qblk += blockDim.x) {
+        scratch_scales[scratch_row * size_t(GGML_CUDA_PACKED16_K_QBLOCKS) + size_t(qblk)] =
+            k_scales[ggml_cuda_packed16_k_scale_index(head_base, kv_size, token, qblk, tile16_layout)];
+    }
+}
+
+template <typename idx_t>
+static __global__ __launch_bounds__(32, 1) void ggml_cuda_mtp_qblock_txn_tail_k_fill_local_idxs_kernel(
+        idx_t * __restrict__ local_idxs,
+        int nk_cur,
+        int slot_begin) {
+    const int i = threadIdx.x;
+    if (i < nk_cur) {
+        local_idxs[i] = (idx_t) (slot_begin + i);
+    }
+}
+
+static __global__ __launch_bounds__(128, 1) void ggml_cuda_mtp_qblock_txn_tail_k_commit_scratch_page_kernel(
+        const int  * __restrict__ scratch_payload,
+        const half * __restrict__ scratch_scales,
+        int        * __restrict__ k_payload,
+        half       * __restrict__ k_scales,
+        int page_base,
+        int kv_size,
+        int n_heads_k,
+        bool tile16_layout) {
+    const int tid = threadIdx.x;
+    const int slot = blockIdx.x;
+    const int hk = blockIdx.y;
+    const int b = blockIdx.z;
+    if (slot >= MTP_V4_144_PAGE_TOKENS || hk >= n_heads_k) {
+        return;
+    }
+
+    const int token = page_base + slot;
+    if (token < 0 || token >= kv_size) {
+        return;
+    }
+    const size_t head_base = (size_t(b) * size_t(n_heads_k) + size_t(hk)) * size_t(kv_size);
+    const size_t scratch_row = (size_t(b) * size_t(n_heads_k) + size_t(hk)) * size_t(MTP_V4_144_PAGE_TOKENS) + size_t(slot);
+
+    for (int d_word = tid; d_word < GGML_CUDA_PACKED16_K_WORDS; d_word += blockDim.x) {
+        k_payload[ggml_cuda_packed16_k_payload_index(head_base, kv_size, token, d_word, tile16_layout)] =
+            scratch_payload[scratch_row * size_t(GGML_CUDA_PACKED16_K_WORDS) + size_t(d_word)];
+    }
+    for (int qblk = tid; qblk < GGML_CUDA_PACKED16_K_QBLOCKS; qblk += blockDim.x) {
+        k_scales[ggml_cuda_packed16_k_scale_index(head_base, kv_size, token, qblk, tile16_layout)] =
+            scratch_scales[scratch_row * size_t(GGML_CUDA_PACKED16_K_QBLOCKS) + size_t(qblk)];
     }
 }
 
@@ -2444,6 +2637,124 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
     const int packed8_q4_scale_mode = ggml_cuda_pack_k_packed8_q4_scale_mode();
     const float packed8_q4_scale_mul = ggml_cuda_pack_k_packed8_q4_scale_mul();
     const bool tile16_layout = ggml_cuda_packed16_k_layout_tile16();
+    const int layout_kind = tile16_layout ? GGML_CUDA_PACKED16_K_LAYOUT_D16_PLANAR : GGML_CUDA_PACKED16_K_LAYOUT_ROW;
+    const int k_format = payload_is_packed8 ? GGML_CUDA_PDMQ_K_FORMAT_PACKED8_Q4_144 : GGML_CUDA_PDMQ_K_FORMAT_PACKED16_Q8_272;
+    const int effective_layout = payload_is_packed8 ? GGML_CUDA_PACKED16_K_LAYOUT_ROW : layout_kind;
+    cudaStream_t stream = ctx.stream();
+
+    const bool txn_tail_backend_proof = ggml_cuda_mtp_qblock_txn_tail_backend_proof_enabled();
+    const bool txn_tail_page_request = ggml_cuda_mtp_qblock_txn_tail_page_requested();
+    ggml_cuda_packed16_sidecar_meta txn_meta = {};
+    uint32_t txn_row_bytes = payload_is_packed16 ? MTP_PACKED16_K_ROW_BYTES : 0u;
+    mtp_v4_144_tail_stage_status txn_geom_status = MTP_V4_144_TAIL_STAGE_BAD_KIND;
+    ggml_cuda_mtp_qblock_txn_tail_backend_idx_probe txn_idx_probe = {};
+    bool txn_k_page_merge_active = false;
+
+    if (txn_tail_backend_proof && nk_cur > 1 && nk_cur <= 8) {
+        txn_meta = ggml_cuda_make_pdmq_k_sidecar_meta(payload, scales, k_format, effective_layout, (uint32_t) kv_size, (uint32_t) D, 0);
+        const dp16_packed_i8_desc_v1 & desc = txn_meta.packed_i8_desc;
+        txn_geom_status = ggml_cuda_mtp_qblock_txn_tail_backend_geom_status(
+            payload_is_packed16 ? MTP_V4_144_TAIL_STAGE_KIND_PACKED16_K : MTP_V4_144_TAIL_STAGE_KIND_NONE,
+            (uint32_t) kv_size,
+            txn_row_bytes);
+        txn_idx_probe = ggml_cuda_mtp_qblock_txn_tail_backend_probe_indices(
+            k_idxs,
+            nk_cur,
+            kv_size,
+            payload_is_packed16 ? MTP_V4_144_TAIL_STAGE_KIND_PACKED16_K : MTP_V4_144_TAIL_STAGE_KIND_NONE,
+            txn_row_bytes,
+            stream);
+        txn_k_page_merge_active = txn_tail_page_request && payload_is_packed16 && !is_q8_k &&
+            txn_idx_probe.copied && txn_idx_probe.status == MTP_V4_144_TAIL_STAGE_OK && txn_idx_probe.contiguous &&
+            txn_idx_probe.capacity_ok && !txn_idx_probe.spans_pages && txn_idx_probe.merge_copy_slots != 0 &&
+            k_cur->type == GGML_TYPE_F32 &&
+            (k_idxs->type == GGML_TYPE_I64 || k_idxs->type == GGML_TYPE_I32);
+        fprintf(stderr,
+            "MTP_QBLOCK_TXN_TAIL_BACKEND: kind=K active=%d eligible=%d geom_status=%u idx_status=%u idx_probe=%d idx_capture_skipped=%d idx_contiguous=%d idx_capacity_ok=%d idx0=%u idx_last=%u page=[%u,%u) slots=[%u,%u) merge_copy_slots=%u spans_pages=%d nk_cur=%d n_heads=%d batch=%d kv_size=%d idx_type=%s src_type=%s format=%s layout=%s payload_ne=(%lld,%lld,%lld,%lld) scales_ne=(%lld,%lld,%lld,%lld) row_bytes=%u page_bytes=%u payload_words_per_token=%u qblocks=%u payload_token_stride_words=%zu payload_head_stride_words=%zu scale_token_stride_halfs=%zu scale_head_stride_halfs=%zu desc_layout=%u desc_scale_layout=%u desc_y_stride=%llu desc_scale_y_stride=%llu src_token_stride=%lld src_head_stride=%lld source_note=%s\n",
+            txn_k_page_merge_active ? 1 : 0,
+            (txn_geom_status == MTP_V4_144_TAIL_STAGE_OK && payload_is_packed16 && (txn_idx_probe.capture_skipped || (txn_idx_probe.status == MTP_V4_144_TAIL_STAGE_OK && txn_idx_probe.contiguous))) ? 1 : 0,
+            (unsigned) txn_geom_status,
+            (unsigned) txn_idx_probe.status,
+            txn_idx_probe.copied ? 1 : 0,
+            txn_idx_probe.capture_skipped ? 1 : 0,
+            txn_idx_probe.contiguous ? 1 : 0,
+            txn_idx_probe.capacity_ok ? 1 : 0,
+            txn_idx_probe.idx0,
+            txn_idx_probe.idx_last,
+            txn_idx_probe.page_base,
+            txn_idx_probe.page_end,
+            txn_idx_probe.slot_begin,
+            txn_idx_probe.slot_end_excl,
+            txn_idx_probe.merge_copy_slots,
+            txn_idx_probe.spans_pages ? 1 : 0,
+            nk_cur,
+            n_heads,
+            batch,
+            kv_size,
+            k_idxs->type == GGML_TYPE_I64 ? "i64" : "i32",
+            ggml_type_name(k_cur->type),
+            ggml_cuda_pdmq_k_format_name(k_format),
+            ggml_cuda_packed16_k_layout_kind_name(effective_layout),
+            (long long) payload->ne[0], (long long) payload->ne[1], (long long) payload->ne[2], (long long) payload->ne[3],
+            (long long) scales->ne[0], (long long) scales->ne[1], (long long) scales->ne[2], (long long) scales->ne[3],
+            txn_row_bytes,
+            txn_row_bytes * MTP_V4_144_PAGE_TOKENS,
+            txn_meta.payload_words_per_token,
+            (uint32_t) (D / QK8_0),
+            txn_meta.payload_token_stride,
+            txn_meta.payload_head_stride,
+            txn_meta.scale_token_stride,
+            txn_meta.scale_head_stride,
+            (unsigned) desc.layout_kind,
+            (unsigned) desc.scale_layout,
+            (unsigned long long) desc.y_stride_bytes,
+            (unsigned long long) desc.scale_y_stride_bytes,
+            (long long) src_token_stride_bytes,
+            (long long) src_head_stride_bytes,
+            is_q8_k ? "q8_shadow_source" : "f16_or_f32_source");
+        if (txn_idx_probe.copied && payload_is_packed16 && txn_idx_probe.status == MTP_V4_144_TAIL_STAGE_OK) {
+            const uint32_t first_slot = txn_idx_probe.slot_begin;
+            const uint32_t last_slot = txn_idx_probe.slot_end_excl - 1u;
+            const uint32_t first_token = txn_idx_probe.page_base + first_slot;
+            const uint32_t last_token = txn_idx_probe.page_base + last_slot;
+            const uint32_t last_x = desc.logical_x ? desc.logical_x - 1u : 0u;
+            const uint32_t last_payload_word = desc.words_per_vector ? desc.words_per_vector - 1u : 0u;
+            const uint32_t last_qblock = (uint32_t) (D / QK8_0 - 1);
+            const uint64_t payload_first = dp16_packed_i8_payload_byte_offset(desc, 0, first_token, 0, 0);
+            const uint64_t payload_last_end = dp16_packed_i8_payload_byte_offset(desc, 0, last_token, last_x, last_payload_word) + desc.bytes_per_word;
+            const uint64_t scale_first = dp16_packed_i8_scale_byte_offset(desc, 0, first_token, 0);
+            const uint64_t scale_last_end = dp16_packed_i8_scale_byte_offset(desc, 0, last_token, last_qblock) + sizeof(uint16_t);
+            const uint32_t payload_row_bytes = (uint32_t) (desc.logical_x * desc.words_per_vector * desc.bytes_per_word);
+            const uint32_t scale_row_bytes = (uint32_t) ((D / QK8_0) * sizeof(uint16_t));
+            const bool row_payload_contiguous = desc.y_stride_bytes == payload_row_bytes;
+            const bool row_scale_contiguous = desc.scale_y_stride_bytes == scale_row_bytes;
+            fprintf(stderr,
+                "MTP_QBLOCK_TXN_TAIL_ADDR: kind=K active=%d eligible=%d page=[%u,%u) slots=[%u,%u) token=[%u,%u] payload_byte_span=[%llu,%llu) scale_byte_span=[%llu,%llu) payload_row_bytes=%u scale_row_bytes=%u row_payload_contiguous=%d row_scale_contiguous=%d layout=%s desc_x_stride=%llu desc_y_stride=%llu desc_z_stride=%llu desc_scale_x_stride=%llu desc_scale_y_stride=%llu desc_scale_z_stride=%llu\n",
+                txn_k_page_merge_active ? 1 : 0,
+                (!txn_idx_probe.spans_pages && txn_idx_probe.capacity_ok) ? 1 : 0,
+                txn_idx_probe.page_base,
+                txn_idx_probe.page_end,
+                txn_idx_probe.slot_begin,
+                txn_idx_probe.slot_end_excl,
+                first_token,
+                last_token,
+                (unsigned long long) payload_first,
+                (unsigned long long) payload_last_end,
+                (unsigned long long) scale_first,
+                (unsigned long long) scale_last_end,
+                payload_row_bytes,
+                scale_row_bytes,
+                row_payload_contiguous ? 1 : 0,
+                row_scale_contiguous ? 1 : 0,
+                ggml_cuda_packed16_k_layout_kind_name(effective_layout),
+                (unsigned long long) desc.x_stride_bytes,
+                (unsigned long long) desc.y_stride_bytes,
+                (unsigned long long) desc.z_stride_bytes,
+                (unsigned long long) desc.scale_x_stride_bytes,
+                (unsigned long long) desc.scale_y_stride_bytes,
+                (unsigned long long) desc.scale_z_stride_bytes);
+        }
+    }
 
     static bool pack_debug_printed = false;
     if (!pack_debug_printed && ggml_cuda_pack_k_packed16_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_KQ_DEBUG_I32")) {
@@ -2462,9 +2773,72 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
 
     dim3 grid(nk_cur, n_heads, batch);
     dim3 block(256);
-    cudaStream_t stream = ctx.stream();
 
-    if (payload_is_packed8 && is_q8_k) {
+    if (txn_k_page_merge_active) {
+        ggml_cuda_pool & pool = ctx.pool();
+        const size_t scratch_rows = size_t(batch) * size_t(n_heads) * size_t(MTP_V4_144_PAGE_TOKENS);
+        ggml_cuda_pool_alloc<int>  scratch_payload_alloc(pool);
+        ggml_cuda_pool_alloc<half> scratch_scales_alloc(pool);
+        int  * scratch_payload = scratch_payload_alloc.alloc(scratch_rows * size_t(GGML_CUDA_PACKED16_K_WORDS));
+        half * scratch_scales  = scratch_scales_alloc.alloc (scratch_rows * size_t(GGML_CUDA_PACKED16_K_QBLOCKS));
+
+        dim3 page_grid(MTP_V4_144_PAGE_TOKENS, n_heads, batch);
+        dim3 page_block(128);
+        ggml_cuda_mtp_qblock_txn_tail_k_copy_page_to_scratch_kernel<<<page_grid, page_block, 0, stream>>>(
+            (const int *) payload->data,
+            (const half *) scales->data,
+            scratch_payload,
+            scratch_scales,
+            (int) txn_idx_probe.page_base,
+            kv_size,
+            n_heads,
+            tile16_layout);
+        CUDA_CHECK(cudaGetLastError());
+
+        if (k_idxs->type == GGML_TYPE_I64) {
+            ggml_cuda_pool_alloc<int64_t> local_idxs_alloc(pool);
+            int64_t * local_idxs = local_idxs_alloc.alloc((size_t) nk_cur);
+            ggml_cuda_mtp_qblock_txn_tail_k_fill_local_idxs_kernel<int64_t><<<1, 32, 0, stream>>>(
+                local_idxs, nk_cur, (int) txn_idx_probe.slot_begin);
+            CUDA_CHECK(cudaGetLastError());
+            ggml_cuda_quant_k_packed16_indexed_kernel<int64_t><<<grid, block, 0, stream>>>(
+                (const half *) k_cur->data,
+                scratch_payload,
+                scratch_scales,
+                local_idxs,
+                src_token_stride_bytes, k_cur->nb[2], k_cur->nb[3],
+                src_head_stride_bytes,
+                nk_cur, n_heads, batch, MTP_V4_144_PAGE_TOKENS,
+                k_scale_mode, k_scale_mul, k_scale_group_qblocks, false);
+        } else {
+            GGML_ASSERT(k_idxs->type == GGML_TYPE_I32);
+            ggml_cuda_pool_alloc<int32_t> local_idxs_alloc(pool);
+            int32_t * local_idxs = local_idxs_alloc.alloc((size_t) nk_cur);
+            ggml_cuda_mtp_qblock_txn_tail_k_fill_local_idxs_kernel<int32_t><<<1, 32, 0, stream>>>(
+                local_idxs, nk_cur, (int) txn_idx_probe.slot_begin);
+            CUDA_CHECK(cudaGetLastError());
+            ggml_cuda_quant_k_packed16_indexed_kernel<int32_t><<<grid, block, 0, stream>>>(
+                (const half *) k_cur->data,
+                scratch_payload,
+                scratch_scales,
+                local_idxs,
+                src_token_stride_bytes, k_cur->nb[2], k_cur->nb[3],
+                src_head_stride_bytes,
+                nk_cur, n_heads, batch, MTP_V4_144_PAGE_TOKENS,
+                k_scale_mode, k_scale_mul, k_scale_group_qblocks, false);
+        }
+        CUDA_CHECK(cudaGetLastError());
+
+        ggml_cuda_mtp_qblock_txn_tail_k_commit_scratch_page_kernel<<<page_grid, page_block, 0, stream>>>(
+            scratch_payload,
+            scratch_scales,
+            (int *) payload->data,
+            (half *) scales->data,
+            (int) txn_idx_probe.page_base,
+            kv_size,
+            n_heads,
+            tile16_layout);
+    } else if (payload_is_packed8 && is_q8_k) {
         GGML_ABORT("packed8 q4 K writer does not yet accept q8_0 source rows");
     } else if (is_q8_k) {
         // Indexed pack from q8_0 cache blocks preserves calibrated quantization.
@@ -2511,9 +2885,6 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
 
     // Bind the just-produced sidecar bytes to their physical layout. Consumers
     // must use this metadata instead of re-reading the environment later.
-    const int layout_kind = tile16_layout ? GGML_CUDA_PACKED16_K_LAYOUT_D16_PLANAR : GGML_CUDA_PACKED16_K_LAYOUT_ROW;
-    const int k_format = payload_is_packed8 ? GGML_CUDA_PDMQ_K_FORMAT_PACKED8_Q4_144 : GGML_CUDA_PDMQ_K_FORMAT_PACKED16_Q8_272;
-    const int effective_layout = payload_is_packed8 ? GGML_CUDA_PACKED16_K_LAYOUT_ROW : layout_kind;
     llama_kv_cache_register_pdmq_k_with_layout_info(dst->data, payload, scales, k_format, effective_layout, (uint32_t) kv_size, (uint32_t) D);
     if (k_cur && k_cur->data) {
         llama_kv_cache_register_pdmq_k_with_layout_info(k_cur->data, payload, scales, k_format, effective_layout, (uint32_t) kv_size, (uint32_t) D);
@@ -2802,6 +3173,46 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_pack_v4_k16d16_144_in
     }
 }
 
+static __global__ __launch_bounds__(256, 1) void ggml_cuda_mtp_qblock_txn_tail_v4_144_copy_page_to_scratch_kernel(
+        const char * __restrict__ v144_cache,
+        char       * __restrict__ scratch_page,
+        int page_base,
+        int64_t v144_nb1,
+        int64_t v144_nb2,
+        int kv_size,
+        int n_heads_v) {
+    const int word = int(blockIdx.x) * int(blockDim.x) + int(threadIdx.x);
+    const int hv = int(blockIdx.y);
+    const int b = int(blockIdx.z);
+    constexpr int page_words = GGML_CUDA_V4_K16D16_144_BLOCK_BYTES / (int) sizeof(uint32_t);
+    if (word >= page_words || hv >= n_heads_v) {
+        return;
+    }
+    const char * src_page = v144_cache + int64_t(b) * v144_nb2 + int64_t(hv * kv_size + page_base) * v144_nb1;
+    char * dst_page = scratch_page + (int64_t(b) * n_heads_v + hv) * GGML_CUDA_V4_K16D16_144_BLOCK_BYTES;
+    ((uint32_t *) dst_page)[word] = ((const uint32_t *) src_page)[word];
+}
+
+static __global__ __launch_bounds__(256, 1) void ggml_cuda_mtp_qblock_txn_tail_v4_144_commit_scratch_page_kernel(
+        const char * __restrict__ scratch_page,
+        char       * __restrict__ v144_cache,
+        int page_base,
+        int64_t v144_nb1,
+        int64_t v144_nb2,
+        int kv_size,
+        int n_heads_v) {
+    const int word = int(blockIdx.x) * int(blockDim.x) + int(threadIdx.x);
+    const int hv = int(blockIdx.y);
+    const int b = int(blockIdx.z);
+    constexpr int page_words = GGML_CUDA_V4_K16D16_144_BLOCK_BYTES / (int) sizeof(uint32_t);
+    if (word >= page_words || hv >= n_heads_v) {
+        return;
+    }
+    const char * src_page = scratch_page + (int64_t(b) * n_heads_v + hv) * GGML_CUDA_V4_K16D16_144_BLOCK_BYTES;
+    char * dst_page = v144_cache + int64_t(b) * v144_nb2 + int64_t(hv * kv_size + page_base) * v144_nb1;
+    ((uint32_t *) dst_page)[word] = ((const uint32_t *) src_page)[word];
+}
+
 void ggml_cuda_op_pack_v4_k16d16_144(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_tensor * v_cur  = dst->src[0];
     ggml_tensor * v_idxs = dst->src[2];
@@ -2835,10 +3246,155 @@ void ggml_cuda_op_pack_v4_k16d16_144(ggml_backend_cuda_context & ctx, ggml_tenso
     GGML_ASSERT(v144->nb[1] == GGML_CUDA_V4_K16D16_144_ROW_BYTES);
 
     const int64_t src_token_stride_bytes = (v_cur->ne[0] == D) ? v_cur->nb[2] : v_cur->nb[1];
+    cudaStream_t stream = ctx.stream();
+    const bool txn_tail_backend_proof = ggml_cuda_mtp_qblock_txn_tail_backend_proof_enabled();
+    const bool txn_tail_page_request = ggml_cuda_mtp_qblock_txn_tail_page_requested();
+    const bool txn_v_stride_ok = v144->nb[1] == MTP_V4_144_ROW_BYTES && v144->nb[1] * MTP_V4_144_PAGE_TOKENS == MTP_V4_144_PAGE_BYTES;
+    mtp_v4_144_tail_stage_status txn_v_geom_status = MTP_V4_144_TAIL_STAGE_BAD_KIND;
+    ggml_cuda_mtp_qblock_txn_tail_backend_idx_probe txn_v_idx_probe = {};
+    bool txn_v_page_merge_active = false;
+
+    if (txn_tail_backend_proof && nk_cur > 1 && nk_cur <= 8) {
+        txn_v_geom_status = ggml_cuda_mtp_qblock_txn_tail_backend_geom_status(
+            MTP_V4_144_TAIL_STAGE_KIND_V4_144,
+            (uint32_t) kv_size,
+            MTP_V4_144_ROW_BYTES);
+        txn_v_idx_probe = ggml_cuda_mtp_qblock_txn_tail_backend_probe_indices(
+            v_idxs,
+            nk_cur,
+            kv_size,
+            MTP_V4_144_TAIL_STAGE_KIND_V4_144,
+            MTP_V4_144_ROW_BYTES,
+            stream);
+        txn_v_page_merge_active = txn_tail_page_request && txn_v_stride_ok &&
+            txn_v_idx_probe.copied && txn_v_idx_probe.status == MTP_V4_144_TAIL_STAGE_OK && txn_v_idx_probe.contiguous &&
+            txn_v_idx_probe.capacity_ok && !txn_v_idx_probe.spans_pages && txn_v_idx_probe.merge_copy_slots != 0 &&
+            (v_cur->type == GGML_TYPE_F32 || v_cur->type == GGML_TYPE_F16) &&
+            (v_idxs->type == GGML_TYPE_I64 || v_idxs->type == GGML_TYPE_I32);
+        fprintf(stderr,
+            "MTP_QBLOCK_TXN_TAIL_BACKEND: kind=V active=%d eligible=%d geom_status=%u idx_status=%u idx_probe=%d idx_capture_skipped=%d idx_contiguous=%d idx_capacity_ok=%d idx0=%u idx_last=%u page=[%u,%u) slots=[%u,%u) merge_copy_slots=%u spans_pages=%d nk_cur=%d n_heads=%d batch=%d kv_size=%d idx_type=%s src_type=%s row_bytes=%u page_bytes=%u payload_bytes_per_page=%u scale_bytes_per_page=%u v144_ne=(%lld,%lld,%lld,%lld) v144_nb=(%zu,%zu,%zu,%zu) src_token_stride=%lld src_head_stride=%lld src_nb=(%zu,%zu,%zu,%zu) nibble_slot_atomic=1 scale_slot_merge=1 layout_note=v4_144_payload_words_pack_8_slots\n",
+            txn_v_page_merge_active ? 1 : 0,
+            (txn_v_geom_status == MTP_V4_144_TAIL_STAGE_OK && txn_v_stride_ok && (txn_v_idx_probe.capture_skipped || (txn_v_idx_probe.status == MTP_V4_144_TAIL_STAGE_OK && txn_v_idx_probe.contiguous))) ? 1 : 0,
+            (unsigned) txn_v_geom_status,
+            (unsigned) txn_v_idx_probe.status,
+            txn_v_idx_probe.copied ? 1 : 0,
+            txn_v_idx_probe.capture_skipped ? 1 : 0,
+            txn_v_idx_probe.contiguous ? 1 : 0,
+            txn_v_idx_probe.capacity_ok ? 1 : 0,
+            txn_v_idx_probe.idx0,
+            txn_v_idx_probe.idx_last,
+            txn_v_idx_probe.page_base,
+            txn_v_idx_probe.page_end,
+            txn_v_idx_probe.slot_begin,
+            txn_v_idx_probe.slot_end_excl,
+            txn_v_idx_probe.merge_copy_slots,
+            txn_v_idx_probe.spans_pages ? 1 : 0,
+            nk_cur,
+            n_heads,
+            batch,
+            kv_size,
+            v_idxs->type == GGML_TYPE_I64 ? "i64" : "i32",
+            ggml_type_name(v_cur->type),
+            MTP_V4_144_ROW_BYTES,
+            MTP_V4_144_PAGE_BYTES,
+            MTP_V4_144_PAYLOAD_BYTES_PER_PAGE,
+            MTP_V4_144_SCALE_BYTES_PER_PAGE,
+            (long long) v144->ne[0], (long long) v144->ne[1], (long long) v144->ne[2], (long long) v144->ne[3],
+            v144->nb[0], v144->nb[1], v144->nb[2], v144->nb[3],
+            (long long) src_token_stride_bytes,
+            (long long) src_head_stride_bytes,
+            v_cur->nb[0], v_cur->nb[1], v_cur->nb[2], v_cur->nb[3]);
+        if (txn_v_idx_probe.copied && txn_v_idx_probe.status == MTP_V4_144_TAIL_STAGE_OK) {
+            mtp_v4_144_tail_page_desc_v1 addr_desc = {};
+            addr_desc.v4_head_stride_bytes = (uint64_t) v144->nb[2];
+            addr_desc.v4_page_stride_bytes = (uint64_t) v144->nb[1] * MTP_V4_144_PAGE_TOKENS;
+            addr_desc.v4_batch_stride_bytes = (uint64_t) v144->nb[3];
+            const uint32_t physical_page = txn_v_idx_probe.page_base / MTP_V4_144_PAGE_TOKENS;
+            const uint32_t first_slot = txn_v_idx_probe.slot_begin;
+            const uint32_t last_slot = txn_v_idx_probe.slot_end_excl - 1u;
+            const uint64_t payload_first = mtp_v4_144_tail_page_v4_payload_byte_offset(addr_desc, physical_page, first_slot, 0, 0, 0);
+            const uint64_t payload_last_end = mtp_v4_144_tail_page_v4_payload_byte_offset(addr_desc, physical_page, last_slot, MTP_V4_144_D - 1u, 0, 0) + sizeof(uint32_t);
+            const uint64_t scale_first = mtp_v4_144_tail_page_v4_scale_byte_offset(addr_desc, physical_page, first_slot, 0, 0, 0);
+            const uint64_t scale_last_end = mtp_v4_144_tail_page_v4_scale_byte_offset(addr_desc, physical_page, last_slot, MTP_V4_144_D - MTP_V4_144_D32, 0, 0) + sizeof(uint16_t);
+            fprintf(stderr,
+                "MTP_QBLOCK_TXN_TAIL_ADDR: kind=V active=%d eligible=%d page=[%u,%u) slots=[%u,%u) physical_page=%u payload_byte_span=[%llu,%llu) scale_byte_span=[%llu,%llu) v4_page_stride=%llu v4_head_stride=%llu payload_bytes_per_page=%u scale_bytes_per_page=%u payload_word_groups=2 slot_group_first=%u slot_group_last=%u scale_slot_merge=1\n",
+                txn_v_page_merge_active ? 1 : 0,
+                (!txn_v_idx_probe.spans_pages && txn_v_idx_probe.capacity_ok && txn_v_stride_ok) ? 1 : 0,
+                txn_v_idx_probe.page_base,
+                txn_v_idx_probe.page_end,
+                txn_v_idx_probe.slot_begin,
+                txn_v_idx_probe.slot_end_excl,
+                physical_page,
+                (unsigned long long) payload_first,
+                (unsigned long long) payload_last_end,
+                (unsigned long long) scale_first,
+                (unsigned long long) scale_last_end,
+                (unsigned long long) addr_desc.v4_page_stride_bytes,
+                (unsigned long long) addr_desc.v4_head_stride_bytes,
+                MTP_V4_144_PAYLOAD_BYTES_PER_PAGE,
+                MTP_V4_144_SCALE_BYTES_PER_PAGE,
+                first_slot >> 3,
+                last_slot >> 3);
+        }
+    }
     dim3 grid(nk_cur, n_heads, batch);
     dim3 block(D);
-    cudaStream_t stream = ctx.stream();
-    if (v_idxs->type == GGML_TYPE_I64) {
+    if (txn_v_page_merge_active) {
+        ggml_cuda_pool & pool = ctx.pool();
+        const size_t scratch_bytes = size_t(batch) * size_t(n_heads) * size_t(GGML_CUDA_V4_K16D16_144_BLOCK_BYTES);
+        ggml_cuda_pool_alloc<char> scratch_page_alloc(pool);
+        char * scratch_page = scratch_page_alloc.alloc(scratch_bytes);
+
+        constexpr int v4_page_words = GGML_CUDA_V4_K16D16_144_BLOCK_BYTES / (int) sizeof(uint32_t);
+        dim3 page_grid((v4_page_words + 255) / 256, n_heads, batch);
+        dim3 page_block(256);
+        ggml_cuda_mtp_qblock_txn_tail_v4_144_copy_page_to_scratch_kernel<<<page_grid, page_block, 0, stream>>>(
+            (const char *) v144->data,
+            scratch_page,
+            (int) txn_v_idx_probe.page_base,
+            v144->nb[1],
+            v144->nb[2],
+            kv_size,
+            n_heads);
+        CUDA_CHECK(cudaGetLastError());
+
+        if (v_idxs->type == GGML_TYPE_I64) {
+            ggml_cuda_pool_alloc<int64_t> local_idxs_alloc(pool);
+            int64_t * local_idxs = local_idxs_alloc.alloc((size_t) nk_cur);
+            ggml_cuda_mtp_qblock_txn_tail_k_fill_local_idxs_kernel<int64_t><<<1, 32, 0, stream>>>(
+                local_idxs, nk_cur, (int) txn_v_idx_probe.slot_begin);
+            CUDA_CHECK(cudaGetLastError());
+            ggml_cuda_pack_v4_k16d16_144_indexed_kernel<int64_t><<<grid, block, 0, stream>>>(
+                (const char *) v_cur->data, scratch_page, local_idxs,
+                src_token_stride_bytes, v_cur->nb[2], v_cur->nb[3], src_head_stride_bytes,
+                GGML_CUDA_V4_K16D16_144_ROW_BYTES,
+                int64_t(n_heads) * GGML_CUDA_V4_K16D16_144_BLOCK_BYTES,
+                nk_cur, n_heads, batch, MTP_V4_144_PAGE_TOKENS, src_f16);
+        } else {
+            GGML_ASSERT(v_idxs->type == GGML_TYPE_I32);
+            ggml_cuda_pool_alloc<int32_t> local_idxs_alloc(pool);
+            int32_t * local_idxs = local_idxs_alloc.alloc((size_t) nk_cur);
+            ggml_cuda_mtp_qblock_txn_tail_k_fill_local_idxs_kernel<int32_t><<<1, 32, 0, stream>>>(
+                local_idxs, nk_cur, (int) txn_v_idx_probe.slot_begin);
+            CUDA_CHECK(cudaGetLastError());
+            ggml_cuda_pack_v4_k16d16_144_indexed_kernel<int32_t><<<grid, block, 0, stream>>>(
+                (const char *) v_cur->data, scratch_page, local_idxs,
+                src_token_stride_bytes, v_cur->nb[2], v_cur->nb[3], src_head_stride_bytes,
+                GGML_CUDA_V4_K16D16_144_ROW_BYTES,
+                int64_t(n_heads) * GGML_CUDA_V4_K16D16_144_BLOCK_BYTES,
+                nk_cur, n_heads, batch, MTP_V4_144_PAGE_TOKENS, src_f16);
+        }
+        CUDA_CHECK(cudaGetLastError());
+
+        ggml_cuda_mtp_qblock_txn_tail_v4_144_commit_scratch_page_kernel<<<page_grid, page_block, 0, stream>>>(
+            scratch_page,
+            (char *) v144->data,
+            (int) txn_v_idx_probe.page_base,
+            v144->nb[1],
+            v144->nb[2],
+            kv_size,
+            n_heads);
+    } else if (v_idxs->type == GGML_TYPE_I64) {
         ggml_cuda_pack_v4_k16d16_144_indexed_kernel<int64_t><<<grid, block, 0, stream>>>(
             (const char *) v_cur->data, (char *) v144->data, (const int64_t *) v_idxs->data,
             src_token_stride_bytes, v_cur->nb[2], v_cur->nb[3], src_head_stride_bytes,
