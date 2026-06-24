@@ -186,12 +186,16 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_iswa::memory_br
 
 void llama_memory_hybrid_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     mem_attn->state_write(io, seq_id, flags);
-    mem_recr->state_write(io, seq_id, flags);
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_ATTENTION_ONLY) == 0) {
+        mem_recr->state_write(io, seq_id, flags);
+    }
 }
 
 void llama_memory_hybrid_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     mem_attn->state_read(io, seq_id, flags);
-    mem_recr->state_read(io, seq_id, flags);
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_ATTENTION_ONLY) == 0) {
+        mem_recr->state_read(io, seq_id, flags);
+    }
 }
 
 llama_kv_cache_iswa * llama_memory_hybrid_iswa::get_mem_attn() const {

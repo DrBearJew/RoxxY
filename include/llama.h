@@ -905,6 +905,9 @@ extern "C" {
 // allow loading a saved sequence state into a different destination sequence id
 #define LLAMA_STATE_SEQ_FLAGS_ALLOW_SEQ_REMAP 4
 
+// work only with attention KV cache state, excluding recurrent cache state
+#define LLAMA_STATE_SEQ_FLAGS_ATTENTION_ONLY 8
+
     typedef uint32_t llama_state_seq_flags;
 
     LLAMA_API size_t llama_state_seq_get_size_ext(

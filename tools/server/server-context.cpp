@@ -426,6 +426,10 @@ static bool mtp_draft_branch_candidates_enabled() {
     if (env && atoi(env) != 0) {
         return true;
     }
+    env = getenv("LLAMA_MTP_QBLOCK_BRANCH_TXN_KV_ATTENTION_IMPORT_COMMIT");
+    if (env && atoi(env) != 0) {
+        return true;
+    }
     return mtp_qblock_sibling_logits_probe_enabled();
 }
 
@@ -481,9 +485,19 @@ static bool mtp_qblock_branch_txn_kv_split_commit_enabled() {
     return env && atoi(env) != 0;
 }
 
+static bool mtp_qblock_branch_txn_kv_attention_import_commit_enabled() {
+    const char * env = getenv("LLAMA_MTP_QBLOCK_BRANCH_TXN_KV_ATTENTION_IMPORT_COMMIT");
+    return env && atoi(env) != 0;
+}
+
 static bool mtp_qblock_branch_txn_kv_split_enabled() {
     return mtp_qblock_branch_txn_kv_split_proof_enabled() ||
         mtp_qblock_branch_txn_kv_split_commit_enabled();
+}
+
+static bool mtp_qblock_branch_txn_kv_any_enabled() {
+    return mtp_qblock_branch_txn_kv_split_enabled() ||
+        mtp_qblock_branch_txn_kv_attention_import_commit_enabled();
 }
 
 static bool mtp_qblock_sibling_branch_plan_trace_enabled() {
@@ -497,7 +511,7 @@ static bool mtp_qblock_sibling_branch_plan_trace_enabled() {
     }
     if (mtp_qblock_branch_txn_sampler_commit_enabled() ||
             mtp_qblock_branch_txn_recurrent_commit_enabled() ||
-            mtp_qblock_branch_txn_kv_split_enabled()) {
+            mtp_qblock_branch_txn_kv_any_enabled()) {
         return true;
     }
     return mtp_qblock_sibling_logits_probe_enabled();
@@ -508,7 +522,7 @@ static bool mtp_qblock_sibling_branch_state_trace_enabled() {
     if (env && atoi(env) != 0) {
         return true;
     }
-    if (mtp_qblock_branch_txn_recurrent_commit_enabled() || mtp_qblock_branch_txn_kv_split_enabled()) {
+    if (mtp_qblock_branch_txn_recurrent_commit_enabled() || mtp_qblock_branch_txn_kv_any_enabled()) {
         return true;
     }
     return mtp_qblock_sibling_logits_probe_enabled();
@@ -548,7 +562,7 @@ static bool mtp_qblock_branch_replay_staging_enabled() {
         mtp_qblock_sibling_txn_proof_enabled() ||
         mtp_qblock_branch_txn_sampler_commit_enabled() ||
         mtp_qblock_branch_txn_recurrent_commit_enabled() ||
-        mtp_qblock_branch_txn_kv_split_enabled();
+        mtp_qblock_branch_txn_kv_any_enabled();
 }
 
 static bool mtp_qblock_branch_nextcycle_cache_compare_enabled() {
@@ -565,7 +579,7 @@ static bool mtp_qblock_sibling_desc_probe_enabled() {
     const char * env = getenv("LLAMA_MTP_QBLOCK_SIBLING_DESC_PROBE");
     return (env && atoi(env) != 0) ||
         mtp_qblock_branch_txn_recurrent_commit_enabled() ||
-        mtp_qblock_branch_txn_kv_split_enabled();
+        mtp_qblock_branch_txn_kv_any_enabled();
 }
 
 static int mtp_qblock_sibling_desc_probe_max() {
@@ -587,7 +601,7 @@ static bool mtp_qblock_sibling_target_rows_probe_enabled() {
     const char * env = getenv("LLAMA_MTP_QBLOCK_SIBLING_TARGET_ROWS_PROBE");
     return (env && atoi(env) != 0) ||
         mtp_qblock_branch_txn_recurrent_commit_enabled() ||
-        mtp_qblock_branch_txn_kv_split_enabled();
+        mtp_qblock_branch_txn_kv_any_enabled();
 }
 
 static int mtp_qblock_sibling_target_rows_probe_max() {
@@ -614,7 +628,7 @@ static bool mtp_qblock_sibling_target_rows_sampler_oracle_enabled() {
     const char * env = getenv("LLAMA_MTP_QBLOCK_SIBLING_TARGET_ROWS_SAMPLER_ORACLE");
     return (env && atoi(env) != 0) ||
         mtp_qblock_branch_txn_recurrent_commit_enabled() ||
-        mtp_qblock_branch_txn_kv_split_enabled();
+        mtp_qblock_branch_txn_kv_any_enabled();
 }
 
 static bool mtp_batch_row_is_qblock_sidecar(const llama_batch & batch, int32_t i) {
@@ -1186,6 +1200,10 @@ static std::vector<uint8_t> mtp_get_partial_seq_state_data(llama_context * ctx, 
 
 static std::vector<uint8_t> mtp_get_full_seq_state_data(llama_context * ctx, llama_seq_id seq_id) {
     return mtp_get_seq_state_data_ext(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE, "full");
+}
+
+static std::vector<uint8_t> mtp_get_attention_seq_state_data(llama_context * ctx, llama_seq_id seq_id) {
+    return mtp_get_seq_state_data_ext(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_ATTENTION_ONLY, "attention");
 }
 
 static mtp_rs_state_digest mtp_digest_partial_seq_state(llama_context * ctx, llama_seq_id seq_id) {
@@ -1894,6 +1912,9 @@ struct server_slot {
     bool mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_ok = false;
     mtp_rs_state_digest mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_digest;
     std::vector<uint8_t> mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_data;
+    bool mtp_qblock_branch_replay_target_sampler_replay_prefix_attention_state_ok = false;
+    mtp_rs_state_digest mtp_qblock_branch_replay_target_sampler_replay_prefix_attention_state_digest;
+    std::vector<uint8_t> mtp_qblock_branch_replay_target_sampler_replay_prefix_attention_state_data;
     size_t mtp_qblock_branch_replay_target_sampler_replay_prefix_tokens = 0;
     llama_tokens mtp_qblock_branch_replay_target_sampler_replay_tokens;
     bool mtp_qblock_branch_nextcycle_cache_compare_pending = false;
@@ -2073,6 +2094,9 @@ struct server_slot {
             mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_ok = false;
             mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_digest = {};
             mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_data.clear();
+            mtp_qblock_branch_replay_target_sampler_replay_prefix_attention_state_ok = false;
+            mtp_qblock_branch_replay_target_sampler_replay_prefix_attention_state_digest = {};
+            mtp_qblock_branch_replay_target_sampler_replay_prefix_attention_state_data.clear();
             mtp_qblock_branch_replay_target_sampler_replay_prefix_tokens = 0;
             mtp_qblock_branch_replay_target_sampler_replay_tokens.clear();
             mtp_qblock_branch_nextcycle_cache_compare_pending = false;
@@ -6658,6 +6682,9 @@ private:
                                 slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_ok = false;
                                 slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_digest = {};
                                 slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_data.clear();
+                                slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_attention_state_ok = false;
+                                slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_attention_state_digest = {};
+                                slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_attention_state_data.clear();
                                 slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_tokens = 0;
                                 slot.mtp_qblock_branch_replay_target_sampler_replay_tokens.clear();
                             }
@@ -6907,6 +6934,9 @@ private:
                                             bool target_sampler_replay_prefix_full_state_ok = false;
                                             mtp_rs_state_digest target_sampler_replay_prefix_full_state_digest;
                                             std::vector<uint8_t> target_sampler_replay_prefix_full_state_data;
+                                            bool target_sampler_replay_prefix_attention_state_ok = false;
+                                            mtp_rs_state_digest target_sampler_replay_prefix_attention_state_digest;
+                                            std::vector<uint8_t> target_sampler_replay_prefix_attention_state_data;
                                             size_t target_sampler_replay_prefix_tokens = 0;
                                             llama_tokens target_sampler_replay_tokens;
                                             std::vector<llama_pos> target_sampler_replay_pos;
@@ -7117,7 +7147,7 @@ private:
                                                         (strcmp(target_sampler_oracle_status, "ok") == 0 || strcmp(target_sampler_oracle_status, "mismatch") == 0) &&
                                                         !target_sampler_oracle_sampled_tokens.empty();
                                                     const bool target_sampler_replay_prefix_only =
-                                                        (mtp_qblock_branch_txn_recurrent_commit_enabled() || mtp_qblock_branch_txn_kv_split_enabled()) &&
+                                                        (mtp_qblock_branch_txn_recurrent_commit_enabled() || mtp_qblock_branch_txn_kv_any_enabled()) &&
                                                         target_sampler_oracle_sampled_tokens.empty() &&
                                                         target_decode_ok && strcmp(target_status, "ok") == 0;
                                                     if (target_sampler_replay_has_oracle_tail || target_sampler_replay_prefix_only) {
@@ -7145,6 +7175,12 @@ private:
                                                             target_sampler_replay_scratch_copied = true;
                                                         }
                                                         bool target_sampler_replay_decode_ok = target_sampler_replay_scratch_removed_before && target_sampler_replay_scratch_copied;
+                                                        const bool target_sampler_replay_partial_state_capture_requested =
+                                                            mtp_qblock_branch_txn_recurrent_commit_enabled() ||
+                                                            mtp_qblock_branch_txn_kv_split_enabled() ||
+                                                            mtp_qblock_branch_nextcycle_cache_compare_enabled();
+                                                        const bool target_sampler_replay_attention_state_capture_requested =
+                                                            mtp_qblock_branch_txn_kv_attention_import_commit_enabled();
                                                         const size_t target_sampler_replay_prefix_state_tokens =
                                                             target_sampler_replay_tokens.size() > 1 ? target_sampler_replay_tokens.size() - 1 : 0;
                                                         for (size_t j = 0; target_sampler_replay_decode_ok && j < target_sampler_replay_tokens.size(); ++j) {
@@ -7164,13 +7200,20 @@ private:
                                                             }
                                                             if (target_sampler_replay_prefix_state_tokens > 0 &&
                                                                     j + 1 == target_sampler_replay_prefix_state_tokens) {
-                                                                target_sampler_replay_prefix_state_data = mtp_get_partial_seq_state_data(slot.ctx_tgt, target_scratch_seq);
-                                                                target_sampler_replay_prefix_state_digest = mtp_digest_bytes(target_sampler_replay_prefix_state_data);
-                                                                target_sampler_replay_prefix_state_ok = !target_sampler_replay_prefix_state_data.empty();
+                                                                if (target_sampler_replay_partial_state_capture_requested) {
+                                                                    target_sampler_replay_prefix_state_data = mtp_get_partial_seq_state_data(slot.ctx_tgt, target_scratch_seq);
+                                                                    target_sampler_replay_prefix_state_digest = mtp_digest_bytes(target_sampler_replay_prefix_state_data);
+                                                                    target_sampler_replay_prefix_state_ok = !target_sampler_replay_prefix_state_data.empty();
+                                                                }
                                                                 if (mtp_qblock_branch_txn_kv_split_enabled()) {
                                                                     target_sampler_replay_prefix_full_state_data = mtp_get_full_seq_state_data(slot.ctx_tgt, target_scratch_seq);
                                                                     target_sampler_replay_prefix_full_state_digest = mtp_digest_bytes(target_sampler_replay_prefix_full_state_data);
                                                                     target_sampler_replay_prefix_full_state_ok = !target_sampler_replay_prefix_full_state_data.empty();
+                                                                }
+                                                                if (target_sampler_replay_attention_state_capture_requested) {
+                                                                    target_sampler_replay_prefix_attention_state_data = mtp_get_attention_seq_state_data(slot.ctx_tgt, target_scratch_seq);
+                                                                    target_sampler_replay_prefix_attention_state_digest = mtp_digest_bytes(target_sampler_replay_prefix_attention_state_data);
+                                                                    target_sampler_replay_prefix_attention_state_ok = !target_sampler_replay_prefix_attention_state_data.empty();
                                                                 }
                                                                 target_sampler_replay_prefix_tokens = target_sampler_replay_prefix_state_tokens;
                                                             }
@@ -7182,7 +7225,7 @@ private:
                                                                 }
                                                             }
                                                         }
-                                                        if (target_sampler_replay_decode_ok) {
+                                                        if (target_sampler_replay_decode_ok && target_sampler_replay_partial_state_capture_requested) {
                                                             target_sampler_replay_state_data = mtp_get_partial_seq_state_data(slot.ctx_tgt, target_scratch_seq);
                                                             target_sampler_replay_state_digest = mtp_digest_bytes(target_sampler_replay_state_data);
                                                             target_sampler_replay_state_ok = !target_sampler_replay_state_data.empty();
@@ -7420,6 +7463,10 @@ private:
                                                 slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_digest = target_sampler_replay_prefix_full_state_digest;
                                                 slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_full_state_data =
                                                     mtp_qblock_branch_txn_kv_split_enabled() ? target_sampler_replay_prefix_full_state_data : std::vector<uint8_t>{};
+                                                slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_attention_state_ok = target_sampler_replay_prefix_attention_state_ok;
+                                                slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_attention_state_digest = target_sampler_replay_prefix_attention_state_digest;
+                                                slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_attention_state_data =
+                                                    mtp_qblock_branch_txn_kv_attention_import_commit_enabled() ? target_sampler_replay_prefix_attention_state_data : std::vector<uint8_t>{};
                                                 slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_tokens = target_sampler_replay_prefix_tokens;
                                                 slot.mtp_qblock_branch_replay_target_sampler_replay_tokens = target_sampler_replay_tokens;
                                             }
@@ -8608,6 +8655,100 @@ private:
                     fprintf(stderr, "]\n");
                 }
 
+                auto mtp_qblock_kv_attention_import_txn_emit = [&]() {
+                    if (!mtp_qblock_branch_txn_kv_attention_import_commit_enabled() || !slot.mtp_qblock_branch_replay_staged) {
+                        return;
+                    }
+
+                    const llama_tokens & replay_tokens = slot.mtp_qblock_branch_replay_target_sampler_replay_tokens;
+                    llama_tokens replay_output_tokens;
+                    if (!replay_tokens.empty()) {
+                        replay_output_tokens.assign(replay_tokens.begin() + 1, replay_tokens.end());
+                    }
+                    const bool replay_output_match = ids.size() == replay_output_tokens.size() &&
+                        std::equal(ids.begin(), ids.end(), replay_output_tokens.begin());
+                    const bool prefix_attention_state_available =
+                        slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_attention_state_ok &&
+                        !slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_attention_state_data.empty();
+                    const bool prefix_token_count_match =
+                        slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_tokens == ids.size();
+
+                    const char * attn_status = "skipped";
+                    const char * attn_reason = "disabled";
+                    size_t attention_bytes_written = 0;
+                    bool attention_import_ok = false;
+
+                    if (replay_tokens.empty()) {
+                        attn_status = "no_replay_tokens";
+                        attn_reason = "target_sampler_replay_tokens_missing";
+                    } else if (!slot.mtp_qblock_branch_replay_target_sampler_replay_ok) {
+                        attn_status = "replay_unavailable";
+                        attn_reason = "target_sampler_replay_not_ok";
+                    } else if (!replay_output_match) {
+                        attn_status = "output_token_mismatch";
+                        attn_reason = "final_output_bundle_differs_from_sampler_replay";
+                    } else if (!prefix_attention_state_available) {
+                        attn_status = "prefix_attention_state_unavailable";
+                        attn_reason = "target_sampler_replay_prefix_attention_state_missing";
+                    } else if (!prefix_token_count_match) {
+                        attn_status = "prefix_token_count_mismatch";
+                        attn_reason = "prefix_state_token_count_does_not_match_output_bundle";
+                    } else {
+                        const llama_state_seq_flags attention_remap_flags =
+                            LLAMA_STATE_SEQ_FLAGS_ATTENTION_ONLY | LLAMA_STATE_SEQ_FLAGS_ALLOW_SEQ_REMAP;
+                        attention_bytes_written = llama_state_seq_set_data_ext(
+                                slot.ctx_tgt,
+                                slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_attention_state_data.data(),
+                                slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_attention_state_data.size(),
+                                slot.id,
+                                attention_remap_flags);
+                        attention_import_ok = attention_bytes_written ==
+                            slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_attention_state_data.size();
+                        if (attention_import_ok) {
+                            attn_status = "candidate_committed";
+                            attn_reason = "branch_attention_state_imported_recurrent_untouched";
+                        } else {
+                            attn_status = "attention_import_failed";
+                            attn_reason = "llama_state_seq_set_data_ext_attention_import_short_write";
+                        }
+                    }
+
+                    fprintf(stderr,
+                            "MTP_QBLOCK_BRANCH_TXN_KV_ATTENTION_IMPORT: slot=%d status=%s reject_depth=%zu depth1=%zu selected=%d sampled=%d candidate_rank=%d ordinary_accepted=%zu rollback=%zu output_tokens=%zu replay_tokens=%zu replay_output_match=%d prefix_attention_state_ok=%d prefix_attention_state_size=%zu prefix_attention_state_hash=%016" PRIx64 " prefix_state_tokens=%zu prefix_token_count_match=%d attention_bytes_written=%zu attention_import_ok=%d production_mutation=%d production_seq_touched=%d output_touched=0 prompt_touched=0 sampler_touched=0 target_touched=0 target_context_touched=%d kv_touched=%d recurrent_touched=0 recurrent_restored=0 draft_touched=0 same_cycle_replayable=0 safe_commit=0 source=post_final_kv_attention_import_txn reason=%s output_token_list=[",
+                            slot.id,
+                            attn_status,
+                            slot.mtp_qblock_branch_replay_reject_depth,
+                            slot.mtp_qblock_branch_replay_reject_depth + 1,
+                            (int) slot.mtp_qblock_branch_replay_selected,
+                            (int) slot.mtp_qblock_branch_replay_sampled,
+                            slot.mtp_qblock_branch_replay_candidate_rank,
+                            slot.mtp_qblock_branch_replay_ordinary_accepted,
+                            slot.mtp_qblock_branch_replay_rollback,
+                            ids.size(),
+                            replay_tokens.size(),
+                            replay_output_match ? 1 : 0,
+                            prefix_attention_state_available ? 1 : 0,
+                            slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_attention_state_digest.size,
+                            slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_attention_state_digest.hash,
+                            slot.mtp_qblock_branch_replay_target_sampler_replay_prefix_tokens,
+                            prefix_token_count_match ? 1 : 0,
+                            attention_bytes_written,
+                            attention_import_ok ? 1 : 0,
+                            attention_import_ok ? 1 : 0,
+                            attention_import_ok ? 1 : 0,
+                            attention_import_ok ? 1 : 0,
+                            attention_import_ok ? 1 : 0,
+                            attn_reason);
+                    for (size_t j = 0; j < ids.size(); ++j) {
+                        fprintf(stderr, "%s%d", j == 0 ? "" : ",", (int) ids[j]);
+                    }
+                    fprintf(stderr, "] replay_output_token_list=[");
+                    for (size_t j = 0; j < replay_output_tokens.size(); ++j) {
+                        fprintf(stderr, "%s%d", j == 0 ? "" : ",", (int) replay_output_tokens[j]);
+                    }
+                    fprintf(stderr, "]\n");
+                };
+
                 auto mtp_qblock_kv_split_txn_emit = [&]() {
                     const bool kv_split_commit = mtp_qblock_branch_txn_kv_split_commit_enabled();
                     const bool kv_split_proof = mtp_qblock_branch_txn_kv_split_proof_enabled();
@@ -9174,6 +9315,7 @@ private:
                     }
                 }
 
+                mtp_qblock_kv_attention_import_txn_emit();
                 mtp_qblock_kv_split_txn_emit();
                 mtp_qblock_recurrent_txn_emit();
                 if (slot.mtp_qblock_branch_replay_staged) {
