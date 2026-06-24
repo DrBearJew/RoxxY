@@ -8767,6 +8767,7 @@ private:
                     const char * import_reason = "not_attempted";
                     size_t import_bytes = 0;
                     size_t import_cells = 0;
+                    double import_ms = 0.0;
                     bool import_ok = false;
                     bool cleanup_ok = false;
                     auto * mem_tgt = llama_get_memory(slot.ctx_tgt);
@@ -8788,6 +8789,7 @@ private:
                         phy_status = "scratch_unavailable";
                         phy_reason = "sampler_replay_scratch_not_retained";
                     } else {
+                        const int64_t import_t0 = ggml_time_us();
                         import_ok = mtp_attention_memory_seq_import_physical(
                                 mem_tgt,
                                 scratch_seq,
@@ -8795,6 +8797,7 @@ private:
                                 &import_bytes,
                                 &import_cells,
                                 &import_reason);
+                        import_ms = double(ggml_time_us() - import_t0) / 1000.0;
                         cleanup_ok = llama_memory_seq_rm(mem_tgt, scratch_seq, -1, -1);
                         if (import_ok && cleanup_ok) {
                             phy_status = "candidate_committed";
@@ -8815,7 +8818,7 @@ private:
                     slot.mtp_qblock_branch_replay_target_sampler_replay_physical_scratch_seq = -1;
 
                     fprintf(stderr,
-                            "MTP_QBLOCK_BRANCH_TXN_KV_PHYSICAL_IMPORT: slot=%d status=%s reject_depth=%zu depth1=%zu selected=%d sampled=%d candidate_rank=%d ordinary_accepted=%zu rollback=%zu output_tokens=%zu replay_tokens=%zu replay_output_match=%d prefix_state_tokens=%zu prefix_token_count_match=%d scratch_ready=%d scratch_seq=%d import_bytes=%zu import_cells=%zu tail_bytes_copied=%zu tail_cells_copied=%zu import_ok=%d cleanup_ok=%d import_reason=%s production_mutation=%d production_seq_touched=%d output_touched=0 prompt_touched=0 sampler_touched=0 target_touched=0 target_context_touched=%d kv_touched=%d recurrent_touched=0 recurrent_restored=0 draft_touched=0 same_cycle_replayable=0 safe_commit=0 source=post_final_kv_physical_import_txn reason=%s output_token_list=[",
+                            "MTP_QBLOCK_BRANCH_TXN_KV_PHYSICAL_IMPORT: slot=%d status=%s reject_depth=%zu depth1=%zu selected=%d sampled=%d candidate_rank=%d ordinary_accepted=%zu rollback=%zu output_tokens=%zu replay_tokens=%zu replay_output_match=%d prefix_state_tokens=%zu prefix_token_count_match=%d scratch_ready=%d scratch_seq=%d import_bytes=%zu import_cells=%zu tail_bytes_copied=%zu tail_cells_copied=%zu import_ms=%.3f import_ok=%d cleanup_ok=%d import_reason=%s production_mutation=%d production_seq_touched=%d output_touched=0 prompt_touched=0 sampler_touched=0 target_touched=0 target_context_touched=%d kv_touched=%d recurrent_touched=0 recurrent_restored=0 draft_touched=0 same_cycle_replayable=0 safe_commit=0 source=post_final_kv_physical_import_txn reason=%s output_token_list=[",
                             slot.id,
                             phy_status,
                             slot.mtp_qblock_branch_replay_reject_depth,
@@ -8836,6 +8839,7 @@ private:
                             import_cells,
                             import_bytes,
                             import_cells,
+                            import_ms,
                             import_ok ? 1 : 0,
                             cleanup_ok ? 1 : 0,
                             import_reason,
