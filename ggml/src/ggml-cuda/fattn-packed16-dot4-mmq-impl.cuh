@@ -4779,7 +4779,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         const char * v = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE");
         return v && atoi(v) != 0;
     }();
-    if ((qblock_txn_tail_page_proof || qblock_txn_tail_page_enable) && qblock_inst) {
+    if (qblock_txn_tail_page_proof && qblock_inst) {
         const char * txn_tail_reason = "ok";
         mtp_v4_144_tail_page_status txn_tail_status = MTP_V4_144_TAIL_PAGE_OK;
         mtp_qblock_txn_lineage_status txn_lineage_status = MTP_QBLOCK_TXN_LINEAGE_OK;

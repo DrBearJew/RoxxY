@@ -45,8 +45,7 @@ static bool ggml_is_power_of_2(int n) {
 
 static bool llama_mtp_qblock_txn_tail_page_proof_enabled() {
     const char * proof = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_PROOF");
-    const char * request = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE");
-    return (proof && atoi(proof) != 0) || (request && atoi(request) != 0);
+    return proof && atoi(proof) != 0;
 }
 
 static void llama_mtp_qblock_txn_tail_write_log(

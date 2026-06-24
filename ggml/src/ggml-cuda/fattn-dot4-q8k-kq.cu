@@ -303,8 +303,7 @@ static inline int ggml_cuda_q8k_dot4_kq_env_int(const char * name, int fallback)
 }
 
 static inline bool ggml_cuda_mtp_qblock_txn_tail_backend_proof_enabled() {
-    return ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_PROOF") ||
-        ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE");
+    return ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_PROOF");
 }
 
 static inline bool ggml_cuda_mtp_qblock_txn_tail_page_requested() {
@@ -2642,15 +2641,16 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
     const int effective_layout = payload_is_packed8 ? GGML_CUDA_PACKED16_K_LAYOUT_ROW : layout_kind;
     cudaStream_t stream = ctx.stream();
 
-    const bool txn_tail_backend_proof = ggml_cuda_mtp_qblock_txn_tail_backend_proof_enabled();
+    const bool txn_tail_backend_trace = ggml_cuda_mtp_qblock_txn_tail_backend_proof_enabled();
     const bool txn_tail_page_request = ggml_cuda_mtp_qblock_txn_tail_page_requested();
+    const bool txn_tail_backend_probe = txn_tail_backend_trace || txn_tail_page_request;
     ggml_cuda_packed16_sidecar_meta txn_meta = {};
     uint32_t txn_row_bytes = payload_is_packed16 ? MTP_PACKED16_K_ROW_BYTES : 0u;
     mtp_v4_144_tail_stage_status txn_geom_status = MTP_V4_144_TAIL_STAGE_BAD_KIND;
     ggml_cuda_mtp_qblock_txn_tail_backend_idx_probe txn_idx_probe = {};
     bool txn_k_page_merge_active = false;
 
-    if (txn_tail_backend_proof && nk_cur > 1 && nk_cur <= 8) {
+    if (txn_tail_backend_probe && nk_cur > 1 && nk_cur <= 8) {
         txn_meta = ggml_cuda_make_pdmq_k_sidecar_meta(payload, scales, k_format, effective_layout, (uint32_t) kv_size, (uint32_t) D, 0);
         const dp16_packed_i8_desc_v1 & desc = txn_meta.packed_i8_desc;
         txn_geom_status = ggml_cuda_mtp_qblock_txn_tail_backend_geom_status(
@@ -2669,7 +2669,8 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
             txn_idx_probe.capacity_ok && !txn_idx_probe.spans_pages && txn_idx_probe.merge_copy_slots != 0 &&
             k_cur->type == GGML_TYPE_F32 &&
             (k_idxs->type == GGML_TYPE_I64 || k_idxs->type == GGML_TYPE_I32);
-        fprintf(stderr,
+        if (txn_tail_backend_trace) {
+            fprintf(stderr,
             "MTP_QBLOCK_TXN_TAIL_BACKEND: kind=K active=%d eligible=%d geom_status=%u idx_status=%u idx_probe=%d idx_capture_skipped=%d idx_contiguous=%d idx_capacity_ok=%d idx0=%u idx_last=%u page=[%u,%u) slots=[%u,%u) merge_copy_slots=%u spans_pages=%d nk_cur=%d n_heads=%d batch=%d kv_size=%d idx_type=%s src_type=%s format=%s layout=%s payload_ne=(%lld,%lld,%lld,%lld) scales_ne=(%lld,%lld,%lld,%lld) row_bytes=%u page_bytes=%u payload_words_per_token=%u qblocks=%u payload_token_stride_words=%zu payload_head_stride_words=%zu scale_token_stride_halfs=%zu scale_head_stride_halfs=%zu desc_layout=%u desc_scale_layout=%u desc_y_stride=%llu desc_scale_y_stride=%llu src_token_stride=%lld src_head_stride=%lld source_note=%s\n",
             txn_k_page_merge_active ? 1 : 0,
             (txn_geom_status == MTP_V4_144_TAIL_STAGE_OK && payload_is_packed16 && (txn_idx_probe.capture_skipped || (txn_idx_probe.status == MTP_V4_144_TAIL_STAGE_OK && txn_idx_probe.contiguous))) ? 1 : 0,
@@ -2753,6 +2754,7 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
                 (unsigned long long) desc.scale_x_stride_bytes,
                 (unsigned long long) desc.scale_y_stride_bytes,
                 (unsigned long long) desc.scale_z_stride_bytes);
+            }
         }
     }
 
@@ -3247,14 +3249,15 @@ void ggml_cuda_op_pack_v4_k16d16_144(ggml_backend_cuda_context & ctx, ggml_tenso
 
     const int64_t src_token_stride_bytes = (v_cur->ne[0] == D) ? v_cur->nb[2] : v_cur->nb[1];
     cudaStream_t stream = ctx.stream();
-    const bool txn_tail_backend_proof = ggml_cuda_mtp_qblock_txn_tail_backend_proof_enabled();
+    const bool txn_tail_backend_trace = ggml_cuda_mtp_qblock_txn_tail_backend_proof_enabled();
     const bool txn_tail_page_request = ggml_cuda_mtp_qblock_txn_tail_page_requested();
+    const bool txn_tail_backend_probe = txn_tail_backend_trace || txn_tail_page_request;
     const bool txn_v_stride_ok = v144->nb[1] == MTP_V4_144_ROW_BYTES && v144->nb[1] * MTP_V4_144_PAGE_TOKENS == MTP_V4_144_PAGE_BYTES;
     mtp_v4_144_tail_stage_status txn_v_geom_status = MTP_V4_144_TAIL_STAGE_BAD_KIND;
     ggml_cuda_mtp_qblock_txn_tail_backend_idx_probe txn_v_idx_probe = {};
     bool txn_v_page_merge_active = false;
 
-    if (txn_tail_backend_proof && nk_cur > 1 && nk_cur <= 8) {
+    if (txn_tail_backend_probe && nk_cur > 1 && nk_cur <= 8) {
         txn_v_geom_status = ggml_cuda_mtp_qblock_txn_tail_backend_geom_status(
             MTP_V4_144_TAIL_STAGE_KIND_V4_144,
             (uint32_t) kv_size,
@@ -3271,7 +3274,8 @@ void ggml_cuda_op_pack_v4_k16d16_144(ggml_backend_cuda_context & ctx, ggml_tenso
             txn_v_idx_probe.capacity_ok && !txn_v_idx_probe.spans_pages && txn_v_idx_probe.merge_copy_slots != 0 &&
             (v_cur->type == GGML_TYPE_F32 || v_cur->type == GGML_TYPE_F16) &&
             (v_idxs->type == GGML_TYPE_I64 || v_idxs->type == GGML_TYPE_I32);
-        fprintf(stderr,
+        if (txn_tail_backend_trace) {
+            fprintf(stderr,
             "MTP_QBLOCK_TXN_TAIL_BACKEND: kind=V active=%d eligible=%d geom_status=%u idx_status=%u idx_probe=%d idx_capture_skipped=%d idx_contiguous=%d idx_capacity_ok=%d idx0=%u idx_last=%u page=[%u,%u) slots=[%u,%u) merge_copy_slots=%u spans_pages=%d nk_cur=%d n_heads=%d batch=%d kv_size=%d idx_type=%s src_type=%s row_bytes=%u page_bytes=%u payload_bytes_per_page=%u scale_bytes_per_page=%u v144_ne=(%lld,%lld,%lld,%lld) v144_nb=(%zu,%zu,%zu,%zu) src_token_stride=%lld src_head_stride=%lld src_nb=(%zu,%zu,%zu,%zu) nibble_slot_atomic=1 scale_slot_merge=1 layout_note=v4_144_payload_words_pack_8_slots\n",
             txn_v_page_merge_active ? 1 : 0,
             (txn_v_geom_status == MTP_V4_144_TAIL_STAGE_OK && txn_v_stride_ok && (txn_v_idx_probe.capture_skipped || (txn_v_idx_probe.status == MTP_V4_144_TAIL_STAGE_OK && txn_v_idx_probe.contiguous))) ? 1 : 0,
@@ -3335,6 +3339,7 @@ void ggml_cuda_op_pack_v4_k16d16_144(ggml_backend_cuda_context & ctx, ggml_tenso
                 MTP_V4_144_SCALE_BYTES_PER_PAGE,
                 first_slot >> 3,
                 last_slot >> 3);
+            }
         }
     }
     dim3 grid(nk_cur, n_heads, batch);
