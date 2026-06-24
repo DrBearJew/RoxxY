@@ -406,6 +406,14 @@ static bool mtp_draft_branch_candidates_enabled() {
     if (env && atoi(env) != 0) {
         return true;
     }
+    env = getenv("LLAMA_MTP_QBLOCK_SIBLING_TXN_PROOF");
+    if (env && atoi(env) != 0) {
+        return true;
+    }
+    env = getenv("LLAMA_MTP_QBLOCK_BRANCH_TXN_SAMPLER_COMMIT");
+    if (env && atoi(env) != 0) {
+        return true;
+    }
     return mtp_qblock_sibling_logits_probe_enabled();
 }
 
@@ -441,9 +449,21 @@ static bool mtp_qblock_sibling_rows_trace_enabled() {
     return env && atoi(env) != 0;
 }
 
+static bool mtp_qblock_branch_txn_sampler_commit_enabled() {
+    const char * env = getenv("LLAMA_MTP_QBLOCK_BRANCH_TXN_SAMPLER_COMMIT");
+    return env && atoi(env) != 0;
+}
+
 static bool mtp_qblock_sibling_branch_plan_trace_enabled() {
     const char * env = getenv("LLAMA_MTP_QBLOCK_SIBLING_BRANCH_PLAN_TRACE");
     if (env && atoi(env) != 0) {
+        return true;
+    }
+    env = getenv("LLAMA_MTP_QBLOCK_SIBLING_TXN_PROOF");
+    if (env && atoi(env) != 0) {
+        return true;
+    }
+    if (mtp_qblock_branch_txn_sampler_commit_enabled()) {
         return true;
     }
     return mtp_qblock_sibling_logits_probe_enabled();
@@ -484,6 +504,12 @@ static bool mtp_qblock_sibling_branch_replay_trace_enabled() {
 static bool mtp_qblock_sibling_txn_proof_enabled() {
     const char * env = getenv("LLAMA_MTP_QBLOCK_SIBLING_TXN_PROOF");
     return env && atoi(env) != 0;
+}
+
+static bool mtp_qblock_branch_replay_staging_enabled() {
+    return mtp_qblock_sibling_branch_replay_trace_enabled() ||
+        mtp_qblock_sibling_txn_proof_enabled() ||
+        mtp_qblock_branch_txn_sampler_commit_enabled();
 }
 
 static bool mtp_qblock_branch_nextcycle_cache_compare_enabled() {
@@ -6475,6 +6501,12 @@ private:
                 std::vector<uint8_t> verify_compare_candidate_state_data;
                 mtp_rs_state_digest verify_compare_candidate_state_digest;
                 bool verify_compare_candidate_state_ok = false;
+                bool mtp_qblock_branch_txn_sampler_commit_requested = false;
+                const char * mtp_qblock_branch_txn_sampler_commit_status = "disabled";
+                const char * mtp_qblock_branch_txn_sampler_commit_reason = "disabled";
+                bool mtp_qblock_branch_txn_sampler_commit_clone_ok = false;
+                size_t mtp_qblock_branch_txn_sampler_commit_accept_count = 0;
+                common_sampler_ptr mtp_qblock_branch_txn_sampler_commit_smpl;
 
                 // verify and try to accept the draft
                 {
@@ -6524,7 +6556,7 @@ private:
                                     ordinary_accepted,
                                     rollback,
                                     cand ? "same_cycle_branch_descendants_not_captured" : "target_sample_not_in_branch_candidates");
-                            if (cand && mtp_qblock_sibling_branch_replay_trace_enabled()) {
+                            if (cand && mtp_qblock_branch_replay_staging_enabled()) {
                                 slot.mtp_qblock_branch_replay_staged = true;
                                 slot.mtp_qblock_branch_replay_reject_depth = reject_depth;
                                 slot.mtp_qblock_branch_replay_ordinary_accepted = ordinary_accepted;
@@ -7558,6 +7590,38 @@ private:
                         }
                     }
 
+                    if (slot.mtp_qblock_branch_replay_staged && mtp_qblock_branch_txn_sampler_commit_enabled()) {
+                        mtp_qblock_branch_txn_sampler_commit_requested = true;
+                        const size_t expected_sampled_output_index = slot.mtp_qblock_branch_replay_ordinary_accepted;
+                        const bool output_nonempty = !accepted.empty();
+                        const bool expected_sampled_index_in_output = output_nonempty &&
+                            expected_sampled_output_index < accepted.size();
+                        const bool expected_sampled_token_match = expected_sampled_index_in_output &&
+                            accepted[expected_sampled_output_index] == slot.mtp_qblock_branch_replay_sampled;
+
+                        if (!output_nonempty) {
+                            mtp_qblock_branch_txn_sampler_commit_status = "no_output";
+                            mtp_qblock_branch_txn_sampler_commit_reason = "empty_accepted_bundle";
+                        } else if (!expected_sampled_token_match) {
+                            mtp_qblock_branch_txn_sampler_commit_status = "sampled_index_mismatch";
+                            mtp_qblock_branch_txn_sampler_commit_reason = "committed_output_missing_sampled_sibling_at_expected_index";
+                        } else {
+                            mtp_qblock_branch_txn_sampler_commit_smpl.reset(common_sampler_clone(smpl_save.get()));
+                            mtp_qblock_branch_txn_sampler_commit_clone_ok = (bool) mtp_qblock_branch_txn_sampler_commit_smpl;
+                            if (!mtp_qblock_branch_txn_sampler_commit_clone_ok) {
+                                mtp_qblock_branch_txn_sampler_commit_status = "clone_failed";
+                                mtp_qblock_branch_txn_sampler_commit_reason = "common_sampler_clone_failed";
+                            } else {
+                                for (const llama_token tok : accepted) {
+                                    common_sampler_accept(mtp_qblock_branch_txn_sampler_commit_smpl.get(), tok, true);
+                                }
+                                mtp_qblock_branch_txn_sampler_commit_accept_count = accepted.size();
+                                mtp_qblock_branch_txn_sampler_commit_status = "prepared";
+                                mtp_qblock_branch_txn_sampler_commit_reason = "accepted_committed_output_tokens_on_sampler_clone";
+                            }
+                        }
+                    }
+
                     if (slot.mtp_qblock_branch_replay_staged && mtp_qblock_sibling_txn_proof_enabled() &&
                             !accepted.empty() && accepted.back() != slot.mtp_qblock_branch_replay_sampled) {
                         const size_t expected_sampled_output_index = slot.mtp_qblock_branch_replay_ordinary_accepted;
@@ -8374,6 +8438,62 @@ private:
                         for (size_t j = 0; j + 1 < ids.size(); ++j) {
                             fprintf(stderr, "%s%d", j == 0 ? "" : ",", (int) ids[j]);
                         }
+                    }
+                    fprintf(stderr, "]\n");
+                }
+
+                if (mtp_qblock_branch_txn_sampler_commit_requested) {
+                    const size_t expected_sampled_output_index = slot.mtp_qblock_branch_replay_ordinary_accepted;
+                    const bool output_nonempty = !ids.empty();
+                    const bool expected_sampled_index_in_output = output_nonempty &&
+                        expected_sampled_output_index < ids.size();
+                    const bool expected_sampled_token_match = expected_sampled_index_in_output &&
+                        ids[expected_sampled_output_index] == slot.mtp_qblock_branch_replay_sampled;
+                    const size_t sibling_output_index = expected_sampled_token_match ? expected_sampled_output_index : (size_t) -1;
+                    const size_t output_tail_after_sampled =
+                        sibling_output_index != (size_t) -1 && ids.size() > sibling_output_index + 1 ? ids.size() - sibling_output_index - 1 : 0;
+                    bool sampler_commit_final_ok =
+                        strcmp(mtp_qblock_branch_txn_sampler_commit_status, "prepared") == 0 &&
+                        expected_sampled_token_match &&
+                        mtp_qblock_branch_txn_sampler_commit_accept_count == ids.size() &&
+                        (bool) mtp_qblock_branch_txn_sampler_commit_smpl;
+                    bool sampler_commit_touched = false;
+                    if (sampler_commit_final_ok) {
+                        slot.smpl = std::move(mtp_qblock_branch_txn_sampler_commit_smpl);
+                        sampler_commit_touched = true;
+                        mtp_qblock_branch_txn_sampler_commit_status = "ok";
+                        mtp_qblock_branch_txn_sampler_commit_reason = "sampler_state_rebased_to_committed_output";
+                    } else if (strcmp(mtp_qblock_branch_txn_sampler_commit_status, "prepared") == 0) {
+                        mtp_qblock_branch_txn_sampler_commit_status = "final_invariant_mismatch";
+                        mtp_qblock_branch_txn_sampler_commit_reason = "prepared_sampler_clone_no_longer_matches_final_output_bundle";
+                    }
+
+                    fprintf(stderr,
+                            "MTP_QBLOCK_BRANCH_TXN_SAMPLER_COMMIT: slot=%d status=%s reject_depth=%zu depth1=%zu selected=%d sampled=%d candidate_rank=%d ordinary_accepted=%zu rollback=%zu output_tokens=%zu output_contains_sampled=%d output_sampled_index=%lld output_sampled_expected_index=%zu output_sampled_expected_match=%d final_sampled=%d output_tail_after_sampled=%zu clone_ok=%d accepted_on_clone=%zu final_invariant_ok=%d production_mutation=%d production_seq_touched=0 output_touched=0 prompt_touched=0 sampler_touched=%d target_touched=0 target_context_touched=0 draft_touched=0 same_cycle_replayable=0 safe_commit=0 source=pre_final_sampler_commit reason=%s output_token_list=[",
+                            slot.id,
+                            mtp_qblock_branch_txn_sampler_commit_status,
+                            slot.mtp_qblock_branch_replay_reject_depth,
+                            slot.mtp_qblock_branch_replay_reject_depth + 1,
+                            (int) slot.mtp_qblock_branch_replay_selected,
+                            (int) slot.mtp_qblock_branch_replay_sampled,
+                            slot.mtp_qblock_branch_replay_candidate_rank,
+                            slot.mtp_qblock_branch_replay_ordinary_accepted,
+                            slot.mtp_qblock_branch_replay_rollback,
+                            ids.size(),
+                            sibling_output_index != (size_t) -1 ? 1 : 0,
+                            sibling_output_index != (size_t) -1 ? (long long) sibling_output_index : -1LL,
+                            expected_sampled_output_index,
+                            expected_sampled_token_match ? 1 : 0,
+                            output_nonempty ? (int) ids.back() : (int) LLAMA_TOKEN_NULL,
+                            output_tail_after_sampled,
+                            mtp_qblock_branch_txn_sampler_commit_clone_ok ? 1 : 0,
+                            mtp_qblock_branch_txn_sampler_commit_accept_count,
+                            sampler_commit_final_ok ? 1 : 0,
+                            sampler_commit_touched ? 1 : 0,
+                            sampler_commit_touched ? 1 : 0,
+                            mtp_qblock_branch_txn_sampler_commit_reason);
+                    for (size_t j = 0; j < ids.size(); ++j) {
+                        fprintf(stderr, "%s%d", j == 0 ? "" : ",", (int) ids[j]);
                     }
                     fprintf(stderr, "]\n");
                 }

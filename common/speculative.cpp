@@ -596,7 +596,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             backend_topk_require = false;
         }
         const bool branch_candidates_requested = common_speculative_env_enabled("LLAMA_MTP_DRAFT_CANDIDATES_TRACE") ||
-            common_speculative_env_enabled("LLAMA_MTP_DRAFT_BRANCH_CANDIDATES");
+            common_speculative_env_enabled("LLAMA_MTP_DRAFT_BRANCH_CANDIDATES") ||
+            common_speculative_env_enabled("LLAMA_MTP_QBLOCK_SIBLING_TXN_PROOF") ||
+            common_speculative_env_enabled("LLAMA_MTP_QBLOCK_BRANCH_TXN_SAMPLER_COMMIT");
         if (const char * env = getenv("LLAMA_MTP_DRAFT_MARGIN_MIN")) {
             char * end = nullptr;
             const float v = std::strtof(env, &end);
