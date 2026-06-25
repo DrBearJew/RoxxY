@@ -258,7 +258,8 @@ private:
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                                   bool   reserve_synthetic_implicit_causal_fa_mask = false) const;
 
     llm_graph_cb graph_get_cb() const;
 

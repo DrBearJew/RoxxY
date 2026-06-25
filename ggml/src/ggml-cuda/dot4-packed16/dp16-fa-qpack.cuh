@@ -9,8 +9,9 @@
 #include <cstring>
 #include <cstdint>
 
-static constexpr int DP16_FA_QBLOCK_MAX_ROWS       = 16;
-static constexpr int DP16_FA_QBLOCK_MAX_HEAD_SLOTS = 8;
+static constexpr int DP16_FA_QBLOCK_MAX_ROWS            = 16;
+static constexpr int DP16_FA_QBLOCK_MAX_HEAD_SLOTS      = 8;
+static constexpr int DP16_FA_QBLOCK_TAIL_PAGE_MAX_PAGES = 4;
 
 // QBlock execution metadata shared by QPACK and DOT4/PV kernels.  This is the
 // narrow verifier program contract: QPACK still owns transient-Q layout, while
@@ -66,6 +67,18 @@ struct dp16_fa_qblock_program {
 
     int output_mode;
     int commit_mode;
+
+    // Optional read-side tail-page consumer. Logical K positions remain the
+    // attention/mask contract; only physical K/V cache addresses are remapped.
+    // This is fail-closed and inactive unless a host path binds a validated
+    // page table into the program before launch.
+    int tail_page_mode;
+    int tail_page_logical_base_token;
+    int tail_page_valid_tail_tokens;
+    int tail_page_page_tokens;
+    int tail_page_physical_pages;
+    int tail_page_block_table_pages;
+    int tail_page_block_table[DP16_FA_QBLOCK_TAIL_PAGE_MAX_PAGES];
 };
 
 enum dp16_fa_qblock_row_kind {
@@ -159,6 +172,11 @@ enum dp16_fa_qblock_output_mode {
 enum dp16_fa_qblock_commit_mode {
     DP16_FA_QBLOCK_COMMIT_NONE = 0,
     DP16_FA_QBLOCK_COMMIT_VERIFIER_FAIL_CLOSED,
+};
+
+enum dp16_fa_qblock_tail_page_mode {
+    DP16_FA_QBLOCK_TAIL_PAGE_NONE = 0,
+    DP16_FA_QBLOCK_TAIL_PAGE_TABLE,
 };
 
 static __host__ __device__ __forceinline__ int dp16_fa_qblock_full_mask(const int n) {
@@ -345,6 +363,7 @@ static __host__ __device__ __forceinline__ dp16_fa_qblock_program dp16_fa_qblock
 
     p.output_mode = DP16_FA_QBLOCK_OUTPUT_ATTENTION_O;
     p.commit_mode = DP16_FA_QBLOCK_COMMIT_VERIFIER_FAIL_CLOSED;
+    p.tail_page_mode = DP16_FA_QBLOCK_TAIL_PAGE_NONE;
     return p;
 }
 
@@ -479,6 +498,42 @@ static __host__ __device__ __forceinline__ int dp16_fa_qblock_program_q_last_liv
         }
     }
     return q_last >= 0 ? q_last : (q0 < nq ? q0 : nq - 1);
+}
+
+static __host__ __device__ __forceinline__ bool dp16_fa_qblock_tail_page_consumer_active(
+        const dp16_fa_qblock_program & program) {
+    return program.tail_page_mode == DP16_FA_QBLOCK_TAIL_PAGE_TABLE &&
+        program.tail_page_page_tokens > 0 &&
+        program.tail_page_valid_tail_tokens > 0 &&
+        program.tail_page_block_table_pages > 0 &&
+        program.tail_page_block_table_pages <= DP16_FA_QBLOCK_TAIL_PAGE_MAX_PAGES;
+}
+
+static __host__ __device__ __forceinline__ bool dp16_fa_qblock_tail_page_covers_k(
+        const dp16_fa_qblock_program & program,
+        const int k) {
+    return dp16_fa_qblock_tail_page_consumer_active(program) &&
+        k >= program.tail_page_logical_base_token &&
+        k < program.tail_page_logical_base_token + program.tail_page_valid_tail_tokens;
+}
+
+static __host__ __device__ __forceinline__ int dp16_fa_qblock_tail_page_physical_k(
+        const dp16_fa_qblock_program & program,
+        const int k) {
+    if (!dp16_fa_qblock_tail_page_covers_k(program, k)) {
+        return k;
+    }
+    const int rel = k - program.tail_page_logical_base_token;
+    const int logical_page = rel / program.tail_page_page_tokens;
+    if (logical_page < 0 || logical_page >= program.tail_page_block_table_pages ||
+            logical_page >= DP16_FA_QBLOCK_TAIL_PAGE_MAX_PAGES) {
+        return -1;
+    }
+    const int physical_page = program.tail_page_block_table[logical_page];
+    if (physical_page < 0 || physical_page >= program.tail_page_physical_pages) {
+        return -1;
+    }
+    return physical_page * program.tail_page_page_tokens + (rel - logical_page * program.tail_page_page_tokens);
 }
 
 static constexpr uint32_t DP16_FA_QBLOCK_META_MAGIC   = 0x51424d01u;

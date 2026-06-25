@@ -344,12 +344,17 @@ public:
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
+    const int32_t * get_kq_mask_meta() const { return self_kq_mask_meta_enabled ? self_kq_mask_meta : nullptr; }
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
     ggml_tensor * self_kq_mask     = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //     [n_kv, n_batch/n_stream, 1, n_stream]
+
+    bool    self_kq_mask_meta_enabled   = false;
+    bool    self_kq_mask_meta_synthetic = false; // reservation-only topology probe; must never be executed
+    int32_t self_kq_mask_meta[4]        = { 0, 0, 0, 0 }; // valid_n_kv, q_offset, flags, reserved
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -694,6 +699,11 @@ struct llm_graph_params {
     // topology-affecting and must participate in graph reuse checks.
     bool    mtp_prefix_roweq_layer_ffn_batch = false;
 
+    // Reservation-only: allow synthetic implicit causal FA mask metadata so
+    // worst-case scheduler reserve does not allocate dense KQ mask tensors.
+    // Runtime graph construction must keep using the strict KV-cell proof.
+    bool    reserve_synthetic_implicit_causal_fa_mask = false;
+
     llm_graph_cb cb;
 
     llm_graph_result * res;
@@ -752,6 +762,10 @@ struct llm_graph_params {
         }
 
         if (mtp_prefix_roweq_layer_ffn_batch != other.mtp_prefix_roweq_layer_ffn_batch) {
+            return false;
+        }
+
+        if (reserve_synthetic_implicit_causal_fa_mask != other.reserve_synthetic_implicit_causal_fa_mask) {
             return false;
         }
 
@@ -930,6 +944,8 @@ struct llm_graph_context {
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
+    const bool reserve_synthetic_implicit_causal_fa_mask;
+
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
@@ -1072,7 +1088,8 @@ struct llm_graph_context {
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            const int32_t * kq_mask_meta = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

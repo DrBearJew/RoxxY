@@ -104,7 +104,7 @@ static inline void dp16_trace_emit_fa_plan(const dp16_fa_problem & problem, cons
         "q_type=%s k_type=%s v_type=%s q_layout=%s k_layout=%s v_layout=%s k_repr=%s "
         "shape=%s vpath=%s qtok_tile=%d gqa_tile=%d logical_q=%d k_tile=%d "
         "experimental=%d fallback=%d capture=%d capture_safe=%d default_allowed=%d route_required=%d "
-        "causal=%d mask=%d sliding_window=%d sink=%d graph_key=0x%llx\n",
+        "causal=%d mask=%d effective_mask=%d sliding_window=%d sink=%d graph_key=0x%llx\n",
         plan.selected ? "selected" : "reject",
         dp16_fa_inst_name(problem.inst),
         dp16_fa_plane_name(plan.plane),
@@ -139,6 +139,7 @@ static inline void dp16_trace_emit_fa_plan(const dp16_fa_problem & problem, cons
         problem.route_required ? 1 : 0,
         problem.causal ? 1 : 0,
         problem.has_mask ? 1 : 0,
+        problem.effective_mask ? 1 : 0,
         problem.has_sliding_window ? 1 : 0,
         problem.has_sink ? 1 : 0,
         (unsigned long long) graph_hash);

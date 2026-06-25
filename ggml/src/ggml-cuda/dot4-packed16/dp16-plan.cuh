@@ -62,7 +62,8 @@ struct dp16_fa_problem {
     dp16_layout v_layout;
 
     bool causal;
-    bool has_mask;
+    bool has_mask;       // physical dense mask tensor is present
+    bool effective_mask; // dense mask tensor or implicit causal-mask metadata affects semantics
     bool has_sliding_window;
     bool has_sink;
 
@@ -132,7 +133,8 @@ struct dp16_fa_graph_key {
     int k_shards_per_q_stage;
 
     bool causal;
-    bool has_mask;
+    bool has_mask;       // physical dense mask tensor is present
+    bool effective_mask; // dense mask tensor or implicit causal-mask metadata affects semantics
     bool has_sliding_window;
     bool has_sink;
 
@@ -689,6 +691,7 @@ static inline dp16_fa_graph_key dp16_make_fa_graph_key(
     key.k_shards_per_q_stage = plan.k_shards_per_q_stage;
     key.causal = p.causal;
     key.has_mask = p.has_mask;
+    key.effective_mask = p.effective_mask;
     key.has_sliding_window = p.has_sliding_window;
     key.has_sink = p.has_sink;
     key.capture_safe = plan.capture_safe;
@@ -730,7 +733,7 @@ static inline uint64_t dp16_hash_fa_graph_key(const dp16_fa_graph_key & key) {
     mix((uint64_t) key.k_tile);
     mix((uint64_t) key.k_shards_per_q_stage);
     mix(key.causal ? 1u : 0u);
-    mix(key.has_mask ? 1u : 0u);
+    mix(key.effective_mask ? 1u : 0u);
     mix(key.has_sliding_window ? 1u : 0u);
     mix(key.has_sink ? 1u : 0u);
     mix(key.capture_safe ? 1u : 0u);

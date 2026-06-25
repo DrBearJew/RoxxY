@@ -4,6 +4,7 @@
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
+#include "llama-mtp-qblock-paged-state.h"
 
 #include <cstdint>
 #include <unordered_map>
@@ -14,6 +15,7 @@ struct llama_hparams;
 struct llama_model;
 struct llama_context;
 struct llama_kv_cache_direct_tx;
+struct ggml_cuda_mtp_qblock_tail_page_map_v1;
 
 // Consumer-requested V layout for get_v() overload.
 // DEFAULT delegates to the legacy v_trans heuristic.
@@ -176,6 +178,7 @@ public:
     //
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
+    bool get_implicit_causal_mask_meta(const slot_info & sinfo, const llama_ubatch * ubatch, bool causal_attn, int32_t meta[4]) const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -192,6 +195,55 @@ public:
     bool direct_tx_validate_metadata(const llama_kv_cache_direct_tx & tx) const;
     void direct_tx_rollback(llama_kv_cache_direct_tx & tx);
     void direct_tx_commit(llama_kv_cache_direct_tx & tx);
+
+    // Opt-in QBlock tail-page consumer map publication. These helpers bind only
+    // validated packed16 sidecar views and fail closed by clearing stale maps.
+    bool register_mtp_qblock_tail_page_map(const ggml_cuda_mtp_qblock_tail_page_map_v1 & map) const;
+    bool register_mtp_qblock_tail_page_map_from_commit(
+            llama_pos logical_base_token,
+            uint32_t accepted_tokens,
+            uint64_t generation,
+            ggml_cuda_mtp_qblock_tail_page_map_v1 * out_map = nullptr,
+            const char ** reason = nullptr) const;
+    bool register_mtp_qblock_tail_page_map_from_active_producer(
+            llama_pos logical_base_token,
+            uint32_t accepted_tokens,
+            uint64_t generation,
+            ggml_cuda_mtp_qblock_tail_page_map_v1 * out_map = nullptr,
+            const char ** reason = nullptr) const;
+    bool snapshot_mtp_qblock_tail_page_map_from_active_producer(
+            llama_pos logical_base_token,
+            uint32_t accepted_tokens,
+            ggml_cuda_mtp_qblock_tail_page_map_v1 * out_map = nullptr,
+            const char ** reason = nullptr) const;
+    bool register_mtp_qblock_tail_page_map_from_producer_snapshot(
+            llama_pos logical_base_token,
+            uint32_t accepted_tokens,
+            uint64_t generation,
+            const ggml_cuda_mtp_qblock_tail_page_map_v1 & producer_map,
+            ggml_cuda_mtp_qblock_tail_page_map_v1 * out_map = nullptr,
+            const char ** reason = nullptr) const;
+    bool register_mtp_qblock_tail_page_map_from_paged_state(
+            ggml_cuda_mtp_qblock_tail_page_map_v1 * out_map = nullptr,
+            const char ** reason = nullptr,
+            uint32_t flags = 0) const;
+    void clear_mtp_qblock_tail_page_maps(const char * reason = "unspecified", bool data_invalidates = true) const;
+
+    // Cache-owned QBlock paged-KV metadata scaffold. This is the durable owner
+    // state that future completed QBlock PagedAttention commits promote into;
+    // current FA publication remains fail-closed and default-off.
+    bool init_mtp_qblock_paged_state(llama_pos logical_base_token, uint32_t physical_pages, const char ** reason = nullptr) const;
+    void clear_mtp_qblock_paged_state() const;
+    bool get_mtp_qblock_paged_state(llama_mtp_qblock_paged_state_v1 * out_state) const;
+    bool mtp_qblock_paged_state_alloc_txn_page(uint32_t * out_page, const char ** reason = nullptr) const;
+    bool mtp_qblock_paged_state_claim_txn_page(uint32_t physical_page, uint32_t * out_slot = nullptr, const char ** reason = nullptr) const;
+    bool mtp_qblock_paged_state_commit_pages(
+            uint32_t valid_tail_tokens,
+            const int32_t * block_table,
+            uint32_t block_table_pages,
+            uint32_t final_state_slot,
+            const char ** reason = nullptr) const;
+    bool mtp_qblock_paged_state_rollback_txn_pages(const char ** reason = nullptr) const;
 
     // Direct graph write helpers. These only build write nodes; callers own graph allocation/compute/rollback ordering.
     ggml_tensor * direct_cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const llama_kv_cache_direct_tx & tx) const;
@@ -230,8 +282,9 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
-    void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_kq_mask     (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask_meta(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_pos_bucket  (ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
@@ -316,6 +369,8 @@ private:
     stream_copy_info sc_info;
 
     std::vector<kv_layer> layers;
+
+    mutable llama_mtp_qblock_paged_state_v1 mtp_qblock_paged_state;
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
@@ -412,6 +467,7 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    bool get_implicit_causal_mask_meta(const llama_ubatch * ubatch, bool causal_attn, int32_t meta[4]) const;
 
     // last position recorded in the cache for this sequence; -1 if absent.
     // exposed for cross-context KV consumers (e.g. MTP draft) that need to
@@ -447,9 +503,10 @@ public:
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
-    void set_input_k_shift   (ggml_tensor * dst) const;
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
-    void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_k_shift     (ggml_tensor * dst) const;
+    void set_input_kq_mask     (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask_meta(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_pos_bucket  (ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
@@ -491,6 +548,42 @@ private:
 // Packed16 K cache registry (shared between KV-cache ctor and DOT4 FA dispatch).
 // Defined in ggml/src/ggml-cuda/fattn-dot4-q8k-kq.cu.  The metadata call binds
 // sidecar bytes to their producer-selected physical layout/generation.
+#ifndef GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_V1_DEFINED
+#define GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_V1_DEFINED
+static constexpr uint32_t GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_VERSION = 1;
+static constexpr uint32_t GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES = 4;
+static constexpr uint32_t GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_SCRATCH_OVERLAY = 1u << 0;
+struct ggml_cuda_mtp_qblock_tail_page_map_v1 {
+    uint32_t version = 0;
+    uint32_t abi_bytes = 0;
+    uint32_t active = 0;
+    uint32_t flags = 0;
+    uint32_t logical_base_token = 0;
+    uint32_t valid_tail_tokens = 0;
+    uint32_t page_tokens = 0;
+    uint32_t physical_pages = 0;
+    uint32_t block_table_pages = 0;
+    int32_t block_table[GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES] = {};
+    uint64_t generation = 0;
+};
+#endif
+#ifndef GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_DISPATCH_BIND_V1_DEFINED
+#define GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_DISPATCH_BIND_V1_DEFINED
+static constexpr uint32_t GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_DISPATCH_BIND_VERSION = 1;
+static constexpr uint32_t GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_DISPATCH_BIND_NODE_NAME_MAX = 96;
+struct ggml_cuda_mtp_qblock_tail_page_dispatch_bind_v1 {
+    uint32_t version = 0;
+    uint32_t abi_bytes = 0;
+    uint32_t active = 0;
+    uint32_t reserved = 0;
+    ggml_cuda_mtp_qblock_tail_page_map_v1 map = {};
+    uint64_t bind_count = 0;
+    int32_t layer = -1;
+    int32_t graph_inst = -1;
+    int32_t nk = 0;
+    char node_name[GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_DISPATCH_BIND_NODE_NAME_MAX] = {};
+};
+#endif
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -504,6 +597,15 @@ void llama_kv_cache_get_packed16_metadata(const void * k_view_data, int * layout
 void llama_kv_cache_get_packed16_shadow_k(const void * k_view_data, struct ggml_tensor ** shadow_k);
 void llama_kv_cache_register_v4_k16d16(const void * v_view_data, struct ggml_tensor * v_cache, struct ggml_tensor * v_tail);
 void llama_kv_cache_get_v4_k16d16_tensors(const void * v_view_data, struct ggml_tensor ** v_cache, struct ggml_tensor ** v_tail);
+void llama_kv_cache_register_mtp_qblock_tail_page_map(const void * k_view_data, const struct ggml_cuda_mtp_qblock_tail_page_map_v1 * map);
+void llama_kv_cache_clear_mtp_qblock_tail_page_map(const void * k_view_data);
+void llama_kv_cache_get_mtp_qblock_tail_page_map(const void * k_view_data, struct ggml_cuda_mtp_qblock_tail_page_map_v1 * map);
+bool llama_kv_cache_get_mtp_qblock_tail_page_published_map(struct ggml_cuda_mtp_qblock_tail_page_map_v1 * map);
+void llama_kv_cache_record_mtp_qblock_tail_page_dispatch_bind(const void * k_view_data, const struct ggml_cuda_mtp_qblock_tail_page_map_v1 * map, const char * node_name, int layer, int graph_inst, int nk);
+void llama_kv_cache_note_mtp_qblock_tail_page_pending_dispatch_bind(const struct ggml_cuda_mtp_qblock_tail_page_map_v1 * map, uint64_t req_begin, uint64_t req_end, int slot);
+bool llama_kv_cache_get_mtp_qblock_tail_page_last_dispatch_bind(struct ggml_cuda_mtp_qblock_tail_page_dispatch_bind_v1 * out);
+void llama_kv_cache_reset_mtp_qblock_tail_page_lifecycle(bool data_invalidates);
+void llama_kv_cache_reset_mtp_qblock_tail_page_lifecycle_preserve_snapshot(bool data_invalidates, bool keep_producer_snapshot);
 #ifdef __cplusplus
 }
 #endif

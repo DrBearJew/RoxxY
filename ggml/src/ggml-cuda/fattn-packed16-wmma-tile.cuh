@@ -13,6 +13,8 @@
 #include "fattn-packed16-wmma-builtin.cuh"
 
 #include <atomic>
+#include <string>
+#include <vector>
 
 extern "C" {
 void llama_kv_cache_get_packed16_tensors(const void * k_view_data,
@@ -62,6 +64,70 @@ static inline bool ggml_cuda_pwmma_log_enabled() {
     return v && atoi(v) != 0;
 }
 
+static int ggml_cuda_rocm_packed16_wmma_streamk_splits() {
+    const char * s = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_STREAMK_SPLITS");
+    const int splits = (!s || !*s) ? 2 : atoi(s);
+    if (splits >= 2 && splits <= 64) {
+        return splits;
+    }
+    GGML_ABORT("invalid GGML_CUDA_ROCM_PACKED16_WMMA_STREAMK_SPLITS=%s; expected 2..64", s ? s : "");
+}
+
+static inline bool ggml_cuda_rocm_packed16_fa_debug_qk_enabled() {
+    const char * s = getenv("GGML_CUDA_ROCM_PACKED16_FA_DEBUG_QK");
+    return s && atoi(s) != 0;
+}
+
+static inline int ggml_cuda_rocm_env_i32(const char * name, int def) {
+    const char * s = getenv(name);
+    return s && *s ? atoi(s) : def;
+}
+
+static inline int ggml_cuda_rocm_packed16_debug_layer_from_name(const char * name) {
+    if (name == nullptr) {
+        return -1;
+    }
+    const char * dash = strrchr(name, '-');
+    if (dash == nullptr || dash[1] == '\0') {
+        return -1;
+    }
+    char * end = nullptr;
+    const long v = strtol(dash + 1, &end, 10);
+    return end && *end == '\0' ? (int) v : -1;
+}
+
+static inline bool ggml_cuda_rocm_packed16_debug_layer_matches(const ggml_tensor * dst) {
+    const int want = ggml_cuda_rocm_env_i32("GGML_CUDA_ROCM_PACKED16_FA_DEBUG_LAYER", -1);
+    if (want < 0) {
+        return true;
+    }
+    return ggml_cuda_rocm_packed16_debug_layer_from_name(dst ? dst->name : nullptr) == want;
+}
+
+static inline uint64_t ggml_cuda_rocm_packed16_debug_fnv1a64(const float * data, size_t n) {
+    const uint8_t * bytes = reinterpret_cast<const uint8_t *>(data);
+    const size_t nbytes = n * sizeof(float);
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < nbytes; ++i) {
+        h ^= (uint64_t) bytes[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static inline void ggml_cuda_rocm_packed16_debug_write_f32(
+        const std::string & path,
+        const float * data,
+        size_t n) {
+    FILE * f = fopen(path.c_str(), "wb");
+    if (!f) {
+        fprintf(stderr, "PWMMA DEBUG QK: failed to open %s\n", path.c_str());
+        return;
+    }
+    fwrite(data, sizeof(float), n, f);
+    fclose(f);
+}
+
 static int ggml_cuda_rocm_packed16_wmma_impl() {
     const char * s = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL");
     if (!s || !*s) return 0;  // 0 = smem (default, known-good)
@@ -83,6 +149,8 @@ static int ggml_cuda_rocm_packed16_wmma_impl() {
     if (strcmp(s, "bm64_i8qk_pvwmma_bn32_512t_wavegate_stagev") == 0) return 15;
     if (strcmp(s, "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev") == 0) return 16;
     if (strcmp(s, "bm64_i8qk_packed8_expand_pvwmma_dbv_512t_wavegate_stagev") == 0) return 17;
+    if (strcmp(s, "bm64_i8qk_pvwmma_dbv_streamk_512t_wavegate_stagev") == 0) return 18;
+    if (strcmp(s, "bm64_i8qk_pvwmma_dbv_kshared_512t_wavegate_stagev") == 0) return 19;
     GGML_ABORT("invalid GGML_CUDA_ROCM_PACKED16_WMMA_IMPL=%s", s);
 }
 
@@ -221,6 +289,37 @@ static __device__ __forceinline__ float pwmma_mask_val(
     return isfinite(v) ? v : -INFINITY;
 }
 
+static __device__ __forceinline__ bool pwmma_mask_keep_and_bias(
+        const char * __restrict__ mask,
+        int64_t mask_ne00, int64_t mask_ne01, int64_t mask_ne03,
+        int64_t mask_nb00, int64_t mask_nb01, int64_t mask_nb03,
+        int q, int k, int b,
+        float * __restrict__ bias,
+        int implicit_n_kv,
+        int implicit_q_offset,
+        int implicit_flags) {
+    *bias = 0.0f;
+    if ((implicit_flags & 1) != 0) {
+        if (k >= implicit_n_kv || k > q + implicit_q_offset) {
+            return false;
+        }
+    }
+    if (!mask) {
+        return true;
+    }
+    if (q < 0 || q >= mask_ne01 || k < 0 || k >= mask_ne00) {
+        return false;
+    }
+    const int mb = mask_ne03 > 1 ? (b % mask_ne03) : 0;
+    const half hv = *(const half *)(mask + int64_t(mb)*mask_nb03 + int64_t(q)*mask_nb01 + int64_t(k)*mask_nb00);
+    const float v = __half2float(hv);
+    if (!isfinite(v) || v <= -60000.0f) {
+        return false;
+    }
+    *bias = v;
+    return true;
+}
+
 // ── Materializers ─────────────────────────────────────────────────
 
 template<int BM, int D>
@@ -320,21 +419,25 @@ struct pwmma_kernel_profile {
 };
 
 #define PWMMA_PROFILE_PHASE_BEGIN() do { \
-    if (profile) { \
-        __syncthreads(); \
-        if (threadIdx.x == 0) { profile_t0 = clock64(); } \
-        __syncthreads(); \
+    if constexpr (PWMMA_PROFILE_COMPILE_ENABLED) { \
+        if (profile) { \
+            __syncthreads(); \
+            if (threadIdx.x == 0) { profile_t0 = clock64(); } \
+            __syncthreads(); \
+        } \
     } \
 } while (0)
 
 #define PWMMA_PROFILE_PHASE_END(FIELD) do { \
-    if (profile) { \
-        __syncthreads(); \
-        if (threadIdx.x == 0) { \
-            const unsigned long long profile_t1 = clock64(); \
-            atomicAdd(&profile->FIELD, profile_t1 >= profile_t0 ? profile_t1 - profile_t0 : 0ull); \
+    if constexpr (PWMMA_PROFILE_COMPILE_ENABLED) { \
+        if (profile) { \
+            __syncthreads(); \
+            if (threadIdx.x == 0) { \
+                const unsigned long long profile_t1 = clock64(); \
+                atomicAdd(&profile->FIELD, profile_t1 >= profile_t0 ? profile_t1 - profile_t0 : 0ull); \
+            } \
+            __syncthreads(); \
         } \
-        __syncthreads(); \
     } \
 } while (0)
 
@@ -1992,6 +2095,7 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_512t_wavegate_stagev_kernel(
         pwmma_kernel_profile * __restrict__ profile) {
 
     GGML_UNUSED(causal_skip_enabled);
+    constexpr bool PWMMA_PROFILE_COMPILE_ENABLED = true;
     const int q_tile = blockIdx.x, hq = blockIdx.y, b = blockIdx.z, hk = hq / gqa_ratio;
     const int head_stride = packed_rows / n_heads_k;
     const size_t k_head_base = size_t(hk) * size_t(head_stride);
@@ -2426,7 +2530,9 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_512t_wavegate_stagev_kernel(
 }
 
 // ── BM64_I8QK PV-WMMA DBV: dedicated scaffold for V double-buffer route ──
-template<packed16_wmma_v_type V_TYPE, bool PACKED8_K = false>
+template<packed16_wmma_v_type V_TYPE, bool PACKED8_K = false, bool FORCE_K_SHARED = false,
+         bool ENABLE_STREAMK = true, bool ENABLE_BOUNDS = true, bool ENABLE_PROFILE = true, bool ENABLE_DEBUG_QK = true,
+         bool DOUBLE_BUFFER_V = true, bool PROBS_OVERLAY = false, bool DBV_GQA2 = false, bool SKIP_LOGITS_INIT = false>
 static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev_kernel(
         const float * __restrict__ Q, const char * __restrict__ V, float * __restrict__ dst,
         int64_t q_nb01, int64_t q_nb02, int64_t q_nb03,
@@ -2443,16 +2549,47 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
         unsigned long long * __restrict__ skip_counter,
         bool causal_skip_enabled,
         pwmma_debug_error * __restrict__ bounds_err,
-        pwmma_kernel_profile * __restrict__ profile) {
+        pwmma_kernel_profile * __restrict__ profile,
+        float * __restrict__ partial_m,
+        float * __restrict__ partial_l,
+        float * __restrict__ partial_out,
+        int streamk_splits,
+        float * __restrict__ debug_qk_raw,
+        float * __restrict__ debug_qk_masked,
+        float * __restrict__ debug_probs,
+        float * __restrict__ debug_m,
+        float * __restrict__ debug_l,
+        float * __restrict__ debug_alpha,
+        int debug_qtile,
+        int debug_hq,
+        int debug_b,
+        int debug_kt,
+        int implicit_n_kv_arg,
+        int implicit_q_offset_arg,
+        int implicit_flags_arg) {
 
     GGML_UNUSED(causal_skip_enabled);
-    const int q_tile = blockIdx.x, hq = blockIdx.y, b = blockIdx.z, hk = hq / gqa_ratio;
+    constexpr bool PWMMA_PROFILE_COMPILE_ENABLED = ENABLE_PROFILE;
+    const bool streamk_mode = ENABLE_STREAMK && partial_out != nullptr;
+    const int split = streamk_mode ? (int(blockIdx.z) % streamk_splits) : 0;
+    const int q_tile = blockIdx.x;
+    const int gy = blockIdx.y;
+    const int b = streamk_mode ? (int(blockIdx.z) / streamk_splits) : int(blockIdx.z);
+    constexpr int DBV_GQA_GROUP = DBV_GQA2 ? 2 : 1;
+    constexpr int ROWS_PER_HEAD = DBV_GQA2 ? (PWMMA_BM64 / 2) : PWMMA_BM64;
+    const int groups_per_kv_dbv = DBV_GQA2 ? CEIL_DIV(gqa_ratio, DBV_GQA_GROUP) : 1;
+    const int hk = DBV_GQA2 ? (gy / groups_per_kv_dbv) : (gy / gqa_ratio);
+    const int local_group = DBV_GQA2 ? (gy - hk * groups_per_kv_dbv) : 0;
+    const int hq_base = DBV_GQA2 ? (hk * gqa_ratio + local_group * DBV_GQA_GROUP) : gy;
+    const int hq = hq_base;
+    const int batch_eff = streamk_mode ? (int(gridDim.z) / streamk_splits) : int(gridDim.z);
+    const size_t rows_per_split = size_t(batch_eff) * size_t(nq) * size_t(n_heads_q);
     const int head_stride = packed_rows / n_heads_k;
     const size_t k_head_base = size_t(hk) * size_t(head_stride);
-    const int q0 = q_tile * PWMMA_BM64;
+    const int q0 = q_tile * ROWS_PER_HEAD;
     constexpr bool PROBS_F16 = true;
     constexpr bool K32_ACC = false;
-    constexpr bool K_SHARED = PACKED8_K;
+    constexpr bool K_SHARED = PACKED8_K || FORCE_K_SHARED;
     constexpr bool PV_WMMA = true;
     constexpr bool BN32 = false;
     constexpr int Q_SCALE_BLOCK = 32;
@@ -2460,11 +2597,19 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
     constexpr int BN_TILE = PWMMA_BN;
 
     using prob_t = typename pwmma_prob_storage_type<PROBS_F16>::type;
+    constexpr int V_BUFFER_COUNT = DOUBLE_BUFFER_V ? 2 : 1;
+    constexpr int PROBS_STORAGE_ROWS = PROBS_OVERLAY ? 1 : PWMMA_BM64;
     __shared__ int q_i32[PWMMA_BM64][PWMMA_D/4];
     __shared__ float  q_s [PWMMA_BM64][Q_SCALE_BLOCKS];
-    __shared__ half   v_tile_f16_db[2][BN_TILE][PWMMA_D];
+    __shared__ half   v_tile_f16_db[V_BUFFER_COUNT][BN_TILE][PWMMA_D];
     __shared__ float logits_f32[PWMMA_BM64][BN_TILE];
-    __shared__ prob_t probs [PWMMA_BM64][BN_TILE];
+    __shared__ prob_t probs [PROBS_STORAGE_ROWS][BN_TILE];
+    prob_t (* const probs_overlay)[BN_TILE * 2] = reinterpret_cast<prob_t (*)[BN_TILE * 2]>(logits_f32);
+#define PWMMA_DBV_PROB_SET(R, C, V) do { \
+    if constexpr (PROBS_OVERLAY) { probs_overlay[(R)][(C)] = (V); } \
+    else { probs[(R)][(C)] = (V); } \
+} while (0)
+#define PWMMA_DBV_PROB_GET(R, C) (PROBS_OVERLAY ? probs_overlay[(R)][(C)] : probs[(R)][(C)])
     __shared__ float row_m_smem[PWMMA_BM64], row_l_smem[PWMMA_BM64], alpha_smem[PWMMA_BM64];
     __shared__ bool  wave_active[4];
     __shared__ unsigned long long profile_t0;
@@ -2478,15 +2623,19 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
     for (int idx = threadIdx.x; idx < PWMMA_BM64 * Q_SCALE_BLOCKS; idx += blockDim.x) {
         const int r = idx / Q_SCALE_BLOCKS;
         const int sb = idx % Q_SCALE_BLOCKS;
-        const int qq = q0 + r;
+        const int slot = DBV_GQA2 ? (r / ROWS_PER_HEAD) : 0;
+        const int local_r = DBV_GQA2 ? (r - slot * ROWS_PER_HEAD) : r;
+        const int hq_row = hq_base + slot;
+        const bool slot_valid = !DBV_GQA2 || (slot < DBV_GQA_GROUP && hq_row < n_heads_q && hq_row < (hk + 1) * gqa_ratio);
+        const int qq = q0 + local_r;
         const int d_base = sb * Q_SCALE_BLOCK;
         float amax = 0.0f;
         float vals[Q_SCALE_BLOCK];
         #pragma unroll
         for (int i = 0; i < Q_SCALE_BLOCK; ++i) {
             const int dd = d_base + i;
-            const float x = (qq < nq)
-                ? Q[qq * (int)(q_nb01 / sizeof(float)) + hq * (int)(q_nb02 / sizeof(float)) + b * (int)(q_nb03 / sizeof(float)) + dd]
+            const float x = (slot_valid && qq < nq)
+                ? Q[qq * (int)(q_nb01 / sizeof(float)) + hq_row * (int)(q_nb02 / sizeof(float)) + b * (int)(q_nb03 / sizeof(float)) + dd]
                 : 0.0f;
             vals[i] = x;
             amax = fmaxf(amax, fabsf(x));
@@ -2520,15 +2669,29 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
     __syncthreads();
 
     const int num_k_tiles = CEIL_DIV(nk, BN_TILE);
-    for (int kt = 0; kt < num_k_tiles; ++kt) {
+    const int kt_begin = streamk_mode ? (split * num_k_tiles) / streamk_splits : 0;
+    const int kt_end   = streamk_mode ? ((split + 1) * num_k_tiles) / streamk_splits : num_k_tiles;
+    for (int kt = kt_begin; kt < kt_end; ++kt) {
+        const bool debug_tile = ENABLE_DEBUG_QK && debug_qk_raw != nullptr &&
+            q_tile == debug_qtile && hq == debug_hq && b == debug_b && kt == debug_kt;
         const int k0 = kt * BN_TILE, valid_k = min(BN_TILE, nk - k0);
-        const int q_offset = nk - nq;
+        const bool implicit_causal = (implicit_flags_arg & 1) != 0;
+        const int implicit_n_kv = implicit_causal ? implicit_n_kv_arg : nk;
+        const int q_offset = implicit_causal ? implicit_q_offset_arg : (nk - nq);
+        const int mask_flags = implicit_causal ? implicit_flags_arg : 0;
+        if (implicit_causal && k0 >= implicit_n_kv) {
+            break;
+        }
 
         if (threadIdx.x < 4) {
             const int w = threadIdx.x;
-            const int wg_first = q0 + w * 16;
+            const int slot = DBV_GQA2 ? ((w * 16) / ROWS_PER_HEAD) : 0;
+            const int local_first = DBV_GQA2 ? ((w * 16) - slot * ROWS_PER_HEAD) : (w * 16);
+            const int hq_wave = hq_base + slot;
+            const bool slot_valid = !DBV_GQA2 || (slot < DBV_GQA_GROUP && hq_wave < n_heads_q && hq_wave < (hk + 1) * gqa_ratio);
+            const int wg_first = q0 + local_first;
             const int wg_last  = min(nq - 1, wg_first + 15);
-            wave_active[w] = (wg_first < nq) && (k0 <= q_offset + wg_last);
+            wave_active[w] = slot_valid && (wg_first < nq) && (k0 <= q_offset + wg_last);
         }
         __syncthreads();
         if (!wave_active[0] && !wave_active[1] && !wave_active[2] && !wave_active[3]) {
@@ -2536,9 +2699,10 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
             continue;
         }
 
+        const int vbuf = DOUBLE_BUFFER_V ? (kt & 1) : 0;
         for (int idx = threadIdx.x; idx < BN_TILE * PWMMA_D; idx += blockDim.x) {
             const int c = idx / PWMMA_D, dd = idx % PWMMA_D;
-            v_tile_f16_db[kt & 1][c][dd] = (_Float16)pwmma_v_element<V_TYPE>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, v_layout, k0 + c, hk, b, dd);
+            v_tile_f16_db[vbuf][c][dd] = (_Float16)pwmma_v_element<V_TYPE>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, v_layout, k0 + c, hk, b, dd);
         }
         if constexpr (K_SHARED) {
             for (int idx = threadIdx.x; idx < PWMMA_I8_KSHARED_I32_COUNT; idx += blockDim.x) {
@@ -2579,7 +2743,9 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
                 }
             }
         }
-        for (int idx = threadIdx.x; idx < PWMMA_BM64 * BN_TILE; idx += blockDim.x) logits_f32[idx / BN_TILE][idx % BN_TILE] = 0.0f;
+        if constexpr (!SKIP_LOGITS_INIT) {
+            for (int idx = threadIdx.x; idx < PWMMA_BM64 * BN_TILE; idx += blockDim.x) logits_f32[idx / BN_TILE][idx % BN_TILE] = 0.0f;
+        }
         __syncthreads();
 
         PWMMA_PROFILE_PHASE_BEGIN();
@@ -2625,7 +2791,7 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
                                 }
                             }
                             acc_i = pbwmma_mma_i8(a_frag, b_frag, acc_i);
-                            if (bounds_err && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && kt == 0) {
+                            if constexpr (ENABLE_BOUNDS) if (bounds_err && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && kt == 0) {
                                 #pragma unroll
                                 for (int i = 0; i < 8; ++i) {
                                     const int rr = r_base + pbwmma_i8_d_row_from_acc(i, lane_hi);
@@ -2685,7 +2851,7 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
                         }
                         pbwmma_v8i32 acc_i = {0,0,0,0,0,0,0,0};
                         acc_i = pbwmma_mma_i8(a_frag, b_frag, acc_i);
-                        if (bounds_err && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && kt == 0) {
+                        if constexpr (ENABLE_BOUNDS) if (bounds_err && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && kt == 0) {
                             #pragma unroll
                             for (int i = 0; i < 8; ++i) {
                                 const int rr = r_base + pbwmma_i8_d_row_from_acc(i, lane_hi);
@@ -2736,26 +2902,60 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
             }
         }
         __syncthreads();
+        if constexpr (ENABLE_DEBUG_QK) if (debug_tile) {
+            for (int idx = threadIdx.x; idx < PWMMA_BM64 * BN_TILE; idx += blockDim.x) {
+                debug_qk_raw[idx] = logits_f32[idx / BN_TILE][idx % BN_TILE];
+            }
+            __syncthreads();
+        }
         PWMMA_PROFILE_PHASE_END(qk_cycles);
         PWMMA_PROFILE_PHASE_BEGIN();
 
         for (int idx = threadIdx.x; idx < PWMMA_BM64 * BN_TILE; idx += blockDim.x) {
-            const int r = idx / BN_TILE, c = idx % BN_TILE, qq = q0 + r;
-            float v = logits_f32[r][c];
-            if (qq >= nq || c >= valid_k || !wave_active[r >> 4]) v = -FLT_MAX/2.0f;
-            else if (mask) v += pwmma_mask_val(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, qq, k0+c, b);
+            const int r = idx / BN_TILE, c = idx % BN_TILE;
+            const int slot = DBV_GQA2 ? (r / ROWS_PER_HEAD) : 0;
+            const int local_r = DBV_GQA2 ? (r - slot * ROWS_PER_HEAD) : r;
+            const int hq_row = hq_base + slot;
+            const bool slot_valid = !DBV_GQA2 || (slot < DBV_GQA_GROUP && hq_row < n_heads_q && hq_row < (hk + 1) * gqa_ratio);
+            const int qq = q0 + local_r;
+            const int kk = k0 + c;
+            float v;
+            if (!slot_valid || qq >= nq || c >= valid_k || !wave_active[r >> 4]) {
+                v = -FLT_MAX/2.0f;
+            } else {
+                v = logits_f32[r][c];
+                if (mask || implicit_causal) {
+                    float mask_bias = 0.0f;
+                    if (!pwmma_mask_keep_and_bias(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03,
+                            qq, kk, b, &mask_bias, implicit_n_kv, q_offset, mask_flags)) {
+                        v = -INFINITY;
+                    } else {
+                        v += mask_bias;
+                    }
+                }
+            }
             logits_f32[r][c] = v;
         }
         __syncthreads();
+        if constexpr (ENABLE_DEBUG_QK) if (debug_tile && debug_qk_masked != nullptr) {
+            for (int idx = threadIdx.x; idx < PWMMA_BM64 * BN_TILE; idx += blockDim.x) {
+                debug_qk_masked[idx] = logits_f32[idx / BN_TILE][idx % BN_TILE];
+            }
+        }
 
         for (int r = threadIdx.x; r < PWMMA_BM64; r += blockDim.x) {
-            const int wave_id = r >> 4, qq = q0 + r;
-            if (qq >= nq || !wave_active[wave_id]) {
+            const int wave_id = r >> 4;
+            const int slot = DBV_GQA2 ? (r / ROWS_PER_HEAD) : 0;
+            const int local_r = DBV_GQA2 ? (r - slot * ROWS_PER_HEAD) : r;
+            const int hq_row = hq_base + slot;
+            const bool slot_valid = !DBV_GQA2 || (slot < DBV_GQA_GROUP && hq_row < n_heads_q && hq_row < (hk + 1) * gqa_ratio);
+            const int qq = q0 + local_r;
+            if (!slot_valid || qq >= nq || !wave_active[wave_id]) {
                 alpha_smem[r] = 0.0f;
                 #pragma unroll
                 for (int c = 0; c < BN_TILE; ++c) {
-                    if constexpr (PROBS_F16) probs[r][c] = __float2half(0.0f);
-                    else probs[r][c] = 0.0f;
+                    if constexpr (PROBS_F16) PWMMA_DBV_PROB_SET(r, c, __float2half(0.0f));
+                    else PWMMA_DBV_PROB_SET(r, c, 0.0f);
                 }
                 continue;
             }
@@ -2768,13 +2968,26 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
             #pragma unroll
             for (int c = 0; c < valid_k; ++c) {
                 const float p = expf(logits_f32[r][c] - new_m);
-                if constexpr (PROBS_F16) probs[r][c] = __float2half(p);
-                else probs[r][c] = p;
+                if constexpr (PROBS_F16) PWMMA_DBV_PROB_SET(r, c, __float2half(p));
+                else PWMMA_DBV_PROB_SET(r, c, p);
                 p_sum += p;
             }
             alpha_smem[r] = alpha; row_m_smem[r] = new_m; row_l_smem[r] = row_l_smem[r] * alpha + p_sum;
         }
         __syncthreads();
+        if constexpr (ENABLE_DEBUG_QK) if (debug_tile) {
+            for (int idx = threadIdx.x; idx < PWMMA_BM64 * BN_TILE; idx += blockDim.x) {
+                float p;
+                if constexpr (PROBS_F16) p = __half2float(PWMMA_DBV_PROB_GET(idx / BN_TILE, idx % BN_TILE));
+                else p = PWMMA_DBV_PROB_GET(idx / BN_TILE, idx % BN_TILE);
+                if (debug_probs != nullptr) debug_probs[idx] = p;
+            }
+            for (int r = threadIdx.x; r < PWMMA_BM64; r += blockDim.x) {
+                if (debug_m != nullptr) debug_m[r] = row_m_smem[r];
+                if (debug_l != nullptr) debug_l[r] = row_l_smem[r];
+                if (debug_alpha != nullptr) debug_alpha[r] = alpha_smem[r];
+            }
+        }
         PWMMA_PROFILE_PHASE_END(softmax_cycles);
         PWMMA_PROFILE_PHASE_BEGIN();
 
@@ -2800,7 +3013,7 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
                 for (int kk = 0; kk < 16; ++kk) {
                     const int kc = kc_base + kk;
                     b_frag[kk] = kc < valid_k
-                        ? v_tile_f16_db[kt & 1][kc][d_tile * 16 + pbwmma_f16_b_col_from_lane_lo(lane_lo)]
+                        ? v_tile_f16_db[vbuf][kc][d_tile * 16 + pbwmma_f16_b_col_from_lane_lo(lane_lo)]
                         : __float2half(0.0f);
                 }
                 #pragma unroll
@@ -2811,8 +3024,8 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
                         for (int kk = 0; kk < 16; ++kk) {
                             const int kc = kc_base + kk;
                             if (kc < valid_k) {
-                                if constexpr (PROBS_F16) a_frag[kk] = probs[rb * 16 + pbwmma_f16_a_row_from_lane_lo(lane_lo)][kc];
-                                else a_frag[kk] = __float2half(probs[rb * 16 + pbwmma_f16_a_row_from_lane_lo(lane_lo)][kc]);
+                                if constexpr (PROBS_F16) a_frag[kk] = PWMMA_DBV_PROB_GET(rb * 16 + pbwmma_f16_a_row_from_lane_lo(lane_lo), kc);
+                                else a_frag[kk] = __float2half(PWMMA_DBV_PROB_GET(rb * 16 + pbwmma_f16_a_row_from_lane_lo(lane_lo), kc));
                             } else {
                                 a_frag[kk] = __float2half(0.0f);
                             }
@@ -2826,13 +3039,13 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
                     #pragma unroll
                     for (int i = 0; i < 8; ++i) {
                         const int global_r = rb * 16 + pbwmma_f16_d_row_from_acc(i, lane_hi);
-                        if (bounds_err && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
+                        if constexpr (ENABLE_BOUNDS) if (bounds_err && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
                             float ref = 0.0f;
                             if (wave_active[rb]) {
                                 #pragma unroll
                                 for (int c = 0; c < 16; ++c) {
                                     const int kc = kc_base + c;
-                                    if (kc < valid_k) ref += __half2float(probs[global_r][kc]) * __half2float(v_tile_f16_db[kt & 1][kc][d_tile * 16 + lane_lo]);
+                                    if (kc < valid_k) ref += __half2float(PWMMA_DBV_PROB_GET(global_r, kc)) * __half2float(v_tile_f16_db[vbuf][kc][d_tile * 16 + lane_lo]);
                                 }
                             }
                             const float tol = 2.5e-2f * fmaxf(1.0f, fabsf(ref));
@@ -2875,9 +3088,9 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
                     for (int r = 0; r < 32; ++r) {
                         if (wave_active[(row_base + r) >> 4]) {
                             float p;
-                            if constexpr (PROBS_F16) p = __half2float(probs[row_base + r][c]);
-                            else p = probs[row_base + r][c];
-                            out[r] += p * __half2float(v_tile_f16_db[kt & 1][c][d]);
+                            if constexpr (PROBS_F16) p = __half2float(PWMMA_DBV_PROB_GET(row_base + r, c));
+                            else p = PWMMA_DBV_PROB_GET(row_base + r, c);
+                            out[r] += p * __half2float(v_tile_f16_db[vbuf][c][d]);
                         }
                     }
                 }
@@ -2886,6 +3099,9 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
         __syncthreads();
         PWMMA_PROFILE_PHASE_END(pv_cycles);
     }
+
+#undef PWMMA_DBV_PROB_GET
+#undef PWMMA_DBV_PROB_SET
 
     if constexpr (PV_WMMA) {
         const int lane    = threadIdx.x & 31;
@@ -2898,20 +3114,92 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
             #pragma unroll
             for (int i = 0; i < 8; ++i) {
                 const int rr = pbwmma_f16_d_row_from_acc(i, lane_hi);
-                const int qq = q0 + rb * 16 + rr;
-                if (qq >= nq) continue;
-                const float l = row_l_smem[rb * 16 + rr]; if (l <= 0.0f) continue;
-                dst[((size_t(b)*nq + qq)*n_heads_q + hq)*PWMMA_D + dd] = out_pv[rb][i] / l;
+                const int global_r = rb * 16 + rr;
+                const int slot = DBV_GQA2 ? (global_r / ROWS_PER_HEAD) : 0;
+                const int local_r = DBV_GQA2 ? (global_r - slot * ROWS_PER_HEAD) : global_r;
+                const int hq_out = hq_base + slot;
+                const bool slot_valid = !DBV_GQA2 || (slot < DBV_GQA_GROUP && hq_out < n_heads_q && hq_out < (hk + 1) * gqa_ratio);
+                const int qq = q0 + local_r;
+                if (!slot_valid || qq >= nq) continue;
+                const float l = row_l_smem[global_r];
+                if (ENABLE_STREAMK && streamk_mode) {
+                    const size_t dst_row = (size_t(b) * size_t(nq) + size_t(qq)) * size_t(n_heads_q) + size_t(hq_out);
+                    const size_t partial_row = size_t(split) * rows_per_split + dst_row;
+                    if (dd == 0) {
+                        partial_m[partial_row] = row_m_smem[global_r];
+                        partial_l[partial_row] = l;
+                    }
+                    partial_out[partial_row * size_t(PWMMA_D) + size_t(dd)] = l > 0.0f ? out_pv[rb][i] : 0.0f;
+                } else {
+                    if (l <= 0.0f) continue;
+                    dst[((size_t(b)*nq + qq)*n_heads_q + hq_out)*PWMMA_D + dd] = out_pv[rb][i] / l;
+                }
             }
         }
     } else if (d < PWMMA_D) {
         for (int r = 0; r < 32; ++r) {
-            const int qq = q0 + row_base + r;
-            if (qq >= nq) continue;
-            const float l = row_l_smem[row_base + r]; if (l <= 0.0f) continue;
-            dst[((size_t(b)*nq + qq)*n_heads_q + hq)*PWMMA_D + d] = out[r] / l;
+            const int global_r = row_base + r;
+            const int slot = DBV_GQA2 ? (global_r / ROWS_PER_HEAD) : 0;
+            const int local_r = DBV_GQA2 ? (global_r - slot * ROWS_PER_HEAD) : global_r;
+            const int hq_out = hq_base + slot;
+            const bool slot_valid = !DBV_GQA2 || (slot < DBV_GQA_GROUP && hq_out < n_heads_q && hq_out < (hk + 1) * gqa_ratio);
+            const int qq = q0 + local_r;
+            if (!slot_valid || qq >= nq) continue;
+            const float l = row_l_smem[global_r];
+            if (ENABLE_STREAMK && streamk_mode) {
+                const size_t dst_row = (size_t(b) * size_t(nq) + size_t(qq)) * size_t(n_heads_q) + size_t(hq_out);
+                const size_t partial_row = size_t(split) * rows_per_split + dst_row;
+                if (d == 0) {
+                    partial_m[partial_row] = row_m_smem[global_r];
+                    partial_l[partial_row] = l;
+                }
+                partial_out[partial_row * size_t(PWMMA_D) + size_t(d)] = l > 0.0f ? out[r] : 0.0f;
+            } else {
+                if (l <= 0.0f) continue;
+                dst[((size_t(b)*nq + qq)*n_heads_q + hq_out)*PWMMA_D + d] = out[r] / l;
+            }
         }
     }
+}
+
+static __global__ void packed16_wmma_streamk_combine_kernel(
+        const float * __restrict__ partial_m,
+        const float * __restrict__ partial_l,
+        const float * __restrict__ partial_out,
+        float       * __restrict__ dst,
+        int rows_per_split,
+        int streamk_splits) {
+    const size_t idx = size_t(blockIdx.x) * size_t(blockDim.x) + size_t(threadIdx.x);
+    const size_t total = size_t(rows_per_split) * size_t(PWMMA_D);
+    if (idx >= total) {
+        return;
+    }
+
+    const int d = int(idx % PWMMA_D);
+    const size_t row = idx / size_t(PWMMA_D);
+
+    float m = -FLT_MAX/2.0f;
+    for (int s = 0; s < streamk_splits; ++s) {
+        m = fmaxf(m, partial_m[size_t(s) * size_t(rows_per_split) + row]);
+    }
+
+    float l = 0.0f;
+    float out = 0.0f;
+    if (m > -FLT_MAX/4.0f) {
+        for (int s = 0; s < streamk_splits; ++s) {
+            const size_t prow = size_t(s) * size_t(rows_per_split) + row;
+            const float ms = partial_m[prow];
+            const float ls = partial_l[prow];
+            if (ms <= -FLT_MAX/4.0f || ls <= 0.0f) {
+                continue;
+            }
+            const float scale = expf(ms - m);
+            l += ls * scale;
+            out += partial_out[prow * size_t(PWMMA_D) + size_t(d)] * scale;
+        }
+    }
+
+    dst[row * size_t(PWMMA_D) + size_t(d)] = l > 0.0f ? out / l : 0.0f;
 }
 
 template<packed16_wmma_v_type V_TYPE>
@@ -3660,13 +3948,20 @@ static __global__ void packed16_wmma_tile_bm16_gqa2_kernel(
             }
         }
 
-        // V load: once per K tile, shared by both Q-head slots
-        if (V_TYPE == PACKED16_WMMA_V_Q4_0)
+        // V load: once per K tile, shared by both Q-head slots. Use the generic
+        // element loader for V4_144 because it is not a plain F16 tensor layout.
+        if constexpr (V_TYPE == PACKED16_WMMA_V4_K16D16_144) {
+            for (int idx = threadIdx.x; idx < BN * D; idx += blockDim.x) {
+                const int c = idx / D, dd = idx % D;
+                v_tile_f16[c][dd] = (_Float16)pwmma_v_element<V_TYPE>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, v_layout, k0 + c, hk, b, dd);
+            }
+        } else if (V_TYPE == PACKED16_WMMA_V_Q4_0) {
             pwmma_v_q4_0_load<BN, D>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, kt, valid_k, hk, b, (half*)v_tile_f16);
-        else if (V_TYPE == PACKED16_WMMA_V_Q8_0)
+        } else if (V_TYPE == PACKED16_WMMA_V_Q8_0) {
             pwmma_v_q8_0_load<BN, D>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, kt, valid_k, hk, b, (half*)v_tile_f16);
-        else
+        } else {
             pwmma_v_f16_load<BN, D>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, v_layout, kt, valid_k, hk, b, (half*)v_tile_f16);
+        }
 
         // WMMA QK: two waves — wave 0 → slot 0, wave 1 → slot 1
         for (int idx = threadIdx.x; idx < GQA_GROUP * BM * BN; idx += blockDim.x) {
@@ -3896,6 +4191,9 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
     const int64_t mask_nb00 = mask ? mask->nb[0] : 0;
     const int64_t mask_nb01 = mask ? mask->nb[1] : 0;
     const int64_t mask_nb03 = mask ? mask->nb[3] : 0;
+    const int implicit_n_kv = ggml_get_op_params_i32(dst, 5);
+    const int implicit_q_offset = ggml_get_op_params_i32(dst, 6);
+    const int implicit_flags = ggml_get_op_params_i32(dst, 7);
 
     const int bm = ggml_cuda_rocm_packed16_wmma_bm();
     const int gqa_group = ggml_cuda_rocm_packed16_wmma_gqa_group();
@@ -3906,7 +4204,7 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
 
     // impl validation: bm32_regout only valid with BM32; bm64_regout only valid with BM64
     const bool impl_bm32_regout = (impl == 1 || impl == 2);
-    const bool impl_bm64_regout = (impl == 3 || impl == 4 || impl == 5 || impl == 6 || impl == 7 || impl == 8 || impl == 9 || impl == 10 || impl == 11 || impl == 12 || impl == 13 || impl == 14 || impl == 15 || impl == 16 || impl == 17);
+    const bool impl_bm64_regout = (impl == 3 || impl == 4 || impl == 5 || impl == 6 || impl == 7 || impl == 8 || impl == 9 || impl == 10 || impl == 11 || impl == 12 || impl == 13 || impl == 14 || impl == 15 || impl == 16 || impl == 17 || impl == 18 || impl == 19);
     if (impl_bm32_regout && !is_bm32) GGML_ABORT("PWMMA BM32 regout impl requires BM=32, got BM=%d impl=%d", bm, impl);
     if (impl_bm64_regout && !is_bm64) GGML_ABORT("PWMMA BM64 regout impl requires BM=64, got BM=%d impl=%d", bm, impl);
 
@@ -3928,6 +4226,8 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
         (impl == 15) ? "bm64_i8qk_pvwmma_bn32_512t_wavegate_stagev" :
         (impl == 16) ? "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev" :
         (impl == 17) ? "bm64_i8qk_packed8_expand_pvwmma_dbv_512t_wavegate_stagev" :
+        (impl == 18) ? "bm64_i8qk_pvwmma_dbv_streamk_512t_wavegate_stagev" :
+        (impl == 19) ? "bm64_i8qk_pvwmma_dbv_kshared_512t_wavegate_stagev" :
         "unknown";
 
     // GQA2 validation: only BM16, GQA ratio >= 2, nq > 1
@@ -3974,8 +4274,15 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
     if (!k_payload_packed8 && impl == 17) {
         GGML_ABORT("packed8_q4 PWMMA impl requires packed8_q4_144 K payload");
     }
-    const bool impl_i8qk = (impl == 9 || impl == 10 || impl == 11 || impl == 12 || impl == 13 || impl == 14 || impl == 15 || impl == 16 || impl == 17);
-    const bool impl_pvwmma = (impl == 14 || impl == 15 || impl == 16 || impl == 17);
+    if (k_payload_packed8 && impl == 18) {
+        GGML_ABORT("PWMMA stream-K skeleton currently supports packed16_q8_272 K only, got packed8_q4_144");
+    }
+    const bool impl_i8qk = (impl == 9 || impl == 10 || impl == 11 || impl == 12 || impl == 13 || impl == 14 || impl == 15 || impl == 16 || impl == 17 || impl == 18 || impl == 19);
+    const bool impl_pvwmma = (impl == 14 || impl == 15 || impl == 16 || impl == 17 || impl == 18 || impl == 19);
+    const bool impl_dbv = (impl == 16 || impl == 17 || impl == 18 || impl == 19);
+    if ((implicit_flags & 1) && !impl_dbv) {
+        GGML_ABORT("packed16 implicit causal mask metadata requires DBV impl, got %s", impl_name);
+    }
     const bool live_dot4_shadow_requested = impl_i8qk && getenv("GGML_CUDA_PWMMA_I8_LIVE_DOT4_SHADOW");
     const bool live_pv_shadow_requested = impl_pvwmma && getenv("GGML_CUDA_PWMMA_PV_WMMA_SHADOW");
     bool live_dot4_shadow = live_dot4_shadow_requested || live_pv_shadow_requested;
@@ -4078,6 +4385,7 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
             case GGML_TYPE_Q4_0: LAUNCH_GQA2(PACKED16_WMMA_V_Q4_0); break;
             case GGML_TYPE_Q8_0: LAUNCH_GQA2(PACKED16_WMMA_V_Q8_0); break;
             case GGML_TYPE_F16:  LAUNCH_GQA2(PACKED16_WMMA_V_F16);  break;
+            case GGML_TYPE_V4_K16D16_144: LAUNCH_GQA2(PACKED16_WMMA_V4_K16D16_144); break;
             default: GGML_ABORT("pwmma gqa2: unsupported V type");
         }
 #undef LAUNCH_GQA2
@@ -4203,24 +4511,205 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
                 case GGML_TYPE_Q4_0: LAUNCH_BM64_I8QK_PV_BN32(PACKED16_WMMA_V_Q4_0); break;
                 case GGML_TYPE_Q8_0: LAUNCH_BM64_I8QK_PV_BN32(PACKED16_WMMA_V_Q8_0); break;
                 case GGML_TYPE_F16:  LAUNCH_BM64_I8QK_PV_BN32(PACKED16_WMMA_V_F16);  break;
+                case GGML_TYPE_V4_K16D16_144: LAUNCH_BM64_I8QK_PV_BN32(PACKED16_WMMA_V4_K16D16_144); break;
                 default: GGML_ABORT("pwmma bm64 i8qk pvwmma bn32: unsupported V type");
             }
 #undef LAUNCH_BM64_I8QK_PV_BN32
-        } else if (impl == 16 || impl == 17) {
+        } else if (impl == 16 || impl == 17 || impl == 18 || impl == 19) {
             dim3 block512(512);
-            const size_t kshared_smem = impl == 17 ? PWMMA_I8_KSHARED_SMEM_BYTES : 0;
-#define LAUNCH_BM64_I8QK_DBV(VT, PACKED8V) \
-    packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev_kernel<VT, PACKED8V><<<grid, block512, kshared_smem, stream>>>( \
+            const bool streamk_active = impl == 18;
+            int streamk_splits = 1;
+            ggml_cuda_pool_alloc<float> partial_m;
+            ggml_cuda_pool_alloc<float> partial_l;
+            ggml_cuda_pool_alloc<float> partial_out;
+            dim3 dbv_grid = grid;
+            if (streamk_active) {
+                const int num_k_tiles = CEIL_DIV(nk, PWMMA_BN);
+                streamk_splits = std::min(ggml_cuda_rocm_packed16_wmma_streamk_splits(), num_k_tiles);
+                if (streamk_splits < 2) {
+                    GGML_ABORT("PWMMA stream-K requested but nk=%d gives only %d K tile(s)", nk, num_k_tiles);
+                }
+                const size_t rows_per_split = size_t(batch) * size_t(nq) * size_t(n_heads_q);
+                const size_t partial_rows = rows_per_split * size_t(streamk_splits);
+                ggml_cuda_pool & pool = ctx.pool();
+                partial_m.alloc(pool, partial_rows);
+                partial_l.alloc(pool, partial_rows);
+                partial_out.alloc(pool, partial_rows * size_t(PWMMA_D));
+                dbv_grid.z = batch * streamk_splits;
+                if (pwmma_log) {
+                    const double mib = double((partial_rows * 2 + partial_rows * size_t(PWMMA_D)) * sizeof(float)) / (1024.0 * 1024.0);
+                    fprintf(stderr, "PWMMA STREAMK: splits=%d rows_per_split=%zu partial_rows=%zu workspace_mib=%.1f grid=(%u,%u,%u)\n",
+                        streamk_splits, rows_per_split, partial_rows, mib,
+                        (unsigned)dbv_grid.x, (unsigned)dbv_grid.y, (unsigned)dbv_grid.z);
+                }
+            }
+            constexpr size_t PWMMA_DEBUG_QK_ELEMS = size_t(PWMMA_BM64) * size_t(PWMMA_BN);
+            constexpr size_t PWMMA_DEBUG_ROW_ELEMS = size_t(PWMMA_BM64);
+            const int debug_nk_filter = ggml_cuda_rocm_env_i32("GGML_CUDA_ROCM_PACKED16_FA_DEBUG_NK", -1);
+            bool debug_qk_active = ggml_cuda_rocm_packed16_fa_debug_qk_enabled() && !streamk_active &&
+                ggml_cuda_rocm_packed16_debug_layer_matches(dst) &&
+                (debug_nk_filter < 0 || debug_nk_filter == nk);
+            const int debug_qtile = ggml_cuda_rocm_env_i32("GGML_CUDA_ROCM_PACKED16_FA_DEBUG_QTILE", 0);
+            const int debug_hq    = ggml_cuda_rocm_env_i32("GGML_CUDA_ROCM_PACKED16_FA_DEBUG_HEAD", 0);
+            const int debug_b     = ggml_cuda_rocm_env_i32("GGML_CUDA_ROCM_PACKED16_FA_DEBUG_BATCH", 0);
+            const int debug_kt    = ggml_cuda_rocm_env_i32("GGML_CUDA_ROCM_PACKED16_FA_DEBUG_KT", 0);
+            ggml_cuda_pool_alloc<float> debug_qk_raw;
+            ggml_cuda_pool_alloc<float> debug_qk_masked;
+            ggml_cuda_pool_alloc<float> debug_probs;
+            ggml_cuda_pool_alloc<float> debug_m;
+            ggml_cuda_pool_alloc<float> debug_l;
+            ggml_cuda_pool_alloc<float> debug_alpha;
+            if (debug_qk_active) {
+                hipStreamCaptureStatus debug_cap_status = hipStreamCaptureStatusNone;
+                if (hipStreamIsCapturing(stream, &debug_cap_status) == hipSuccess && debug_cap_status != hipStreamCaptureStatusNone) {
+                    static bool debug_capture_warned = false;
+                    if (!debug_capture_warned) {
+                        debug_capture_warned = true;
+                        fprintf(stderr, "PWMMA DEBUG QK skipped during graph capture\n");
+                    }
+                    debug_qk_active = false;
+                }
+            }
+            if (debug_qk_active) {
+                const int num_k_tiles = CEIL_DIV(nk, PWMMA_BN);
+                if (debug_qtile < 0 || debug_qtile >= (int) grid.x || debug_hq < 0 || debug_hq >= n_heads_q ||
+                        debug_b < 0 || debug_b >= batch || debug_kt < 0) {
+                    GGML_ABORT("PWMMA DEBUG QK invalid tile qtile=%d/%u head=%d/%d batch=%d/%d kt=%d/%d",
+                        debug_qtile, (unsigned) grid.x, debug_hq, n_heads_q, debug_b, batch, debug_kt, num_k_tiles);
+                }
+                if (debug_kt >= num_k_tiles) {
+                    debug_qk_active = false;
+                }
+            }
+            if (debug_qk_active) {
+                ggml_cuda_pool & pool = ctx.pool();
+                debug_qk_raw.alloc(pool, PWMMA_DEBUG_QK_ELEMS);
+                debug_qk_masked.alloc(pool, PWMMA_DEBUG_QK_ELEMS);
+                debug_probs.alloc(pool, PWMMA_DEBUG_QK_ELEMS);
+                debug_m.alloc(pool, PWMMA_DEBUG_ROW_ELEMS);
+                debug_l.alloc(pool, PWMMA_DEBUG_ROW_ELEMS);
+                debug_alpha.alloc(pool, PWMMA_DEBUG_ROW_ELEMS);
+                CUDA_CHECK(hipMemsetAsync(debug_qk_raw.get(),    0, PWMMA_DEBUG_QK_ELEMS  * sizeof(float), stream));
+                CUDA_CHECK(hipMemsetAsync(debug_qk_masked.get(), 0, PWMMA_DEBUG_QK_ELEMS  * sizeof(float), stream));
+                CUDA_CHECK(hipMemsetAsync(debug_probs.get(),     0, PWMMA_DEBUG_QK_ELEMS  * sizeof(float), stream));
+                CUDA_CHECK(hipMemsetAsync(debug_m.get(),         0, PWMMA_DEBUG_ROW_ELEMS * sizeof(float), stream));
+                CUDA_CHECK(hipMemsetAsync(debug_l.get(),         0, PWMMA_DEBUG_ROW_ELEMS * sizeof(float), stream));
+                CUDA_CHECK(hipMemsetAsync(debug_alpha.get(),     0, PWMMA_DEBUG_ROW_ELEMS * sizeof(float), stream));
+                fprintf(stderr, "PWMMA DEBUG QK: armed node=%s impl=%s nq=%d nk=%d qtile=%d head=%d batch=%d kt=%d q0=%d k0=%d\n",
+                    dst->name, impl_name, nq, nk, debug_qtile, debug_hq, debug_b, debug_kt, debug_qtile * PWMMA_BM64, debug_kt * PWMMA_BN);
+            }
+            const size_t kshared_smem = (impl == 17 || impl == 19) ? PWMMA_I8_KSHARED_SMEM_BYTES : 0;
+            const bool dbv_prod_specialization_ok = impl == 16 && !streamk_active && !debug_qk_active &&
+                !profile_enabled && !live_dot4_shadow;
+            const bool dbv_gqa2_active = dbv_prod_specialization_ok && gqa_ratio >= 2 &&
+                ggml_cuda_rocm_env_i32("GGML_CUDA_ROCM_PACKED16_DBV_GQA2", 0) != 0;
+            if (dbv_gqa2_active) {
+                dbv_grid.x = CEIL_DIV(nq, PWMMA_BM64 / 2);
+                dbv_grid.y = n_heads_k * CEIL_DIV(gqa_ratio, 2);
+            }
+            const bool dbv_no_logits_init_active = dbv_prod_specialization_ok && !dbv_gqa2_active &&
+                ggml_cuda_rocm_env_i32("GGML_CUDA_ROCM_PACKED16_DBV_NO_LOGITS_INIT", 0) != 0;
+            const bool dbv_probs_overlay_active = dbv_prod_specialization_ok && !dbv_gqa2_active && !dbv_no_logits_init_active &&
+                ggml_cuda_rocm_env_i32("GGML_CUDA_ROCM_PACKED16_DBV_PROBS_OVERLAY", 0) != 0;
+            const bool dbv_single_vbuf_active = dbv_prod_specialization_ok && !dbv_gqa2_active && !dbv_no_logits_init_active && !dbv_probs_overlay_active &&
+                ggml_cuda_rocm_env_i32("GGML_CUDA_ROCM_PACKED16_DBV_SINGLE_VBUF", 0) != 0;
+            const bool dbv_lean_active = dbv_prod_specialization_ok && !dbv_gqa2_active && !dbv_no_logits_init_active && !dbv_probs_overlay_active && !dbv_single_vbuf_active &&
+                ggml_cuda_rocm_env_i32("GGML_CUDA_ROCM_PACKED16_DBV_LEAN", 0) != 0;
+            if ((dbv_lean_active || dbv_single_vbuf_active || dbv_probs_overlay_active || dbv_gqa2_active || dbv_no_logits_init_active) && pwmma_log) {
+                static bool dbv_prod_specialization_logged = false;
+                if (!dbv_prod_specialization_logged) {
+                    dbv_prod_specialization_logged = true;
+                    fprintf(stderr, "PWMMA DBV %s: enabled impl=16 nq=%d nk=%d grid=(%u,%u,%u)\n",
+                        dbv_gqa2_active ? "GQA2" : (dbv_no_logits_init_active ? "NO_LOGITS_INIT" : (dbv_probs_overlay_active ? "PROBS_OVERLAY" : (dbv_single_vbuf_active ? "SINGLE_VBUF" : "LEAN"))),
+                        nq, nk, (unsigned) dbv_grid.x, (unsigned) dbv_grid.y, (unsigned) dbv_grid.z);
+                }
+            }
+#define LAUNCH_BM64_I8QK_DBV(VT, PACKED8V, FORCE_KSHAREDV) \
+    packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev_kernel<VT, PACKED8V, FORCE_KSHAREDV><<<dbv_grid, block512, kshared_smem, stream>>>( \
         (const float*)Q->data, (const char*)V->data, (float*)dst->data, \
         Q->nb[1], Q->nb[2], Q->nb[3], V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
         v_layout, \
         mask ? (const char*)mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
         k_payload, k_scales, k_payload_row_stride_i32, k_scales_row_stride_half, \
         nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_kv_size, attention_scale, \
-        d_skip_counter, causal_skip_active, d_live_shadow_err, profile_dev)
+        d_skip_counter, causal_skip_active, d_live_shadow_err, profile_dev, \
+        partial_m.get(), partial_l.get(), partial_out.get(), streamk_splits, \
+        debug_qk_active ? debug_qk_raw.get() : nullptr, \
+        debug_qk_active ? debug_qk_masked.get() : nullptr, \
+        debug_qk_active ? debug_probs.get() : nullptr, \
+        debug_qk_active ? debug_m.get() : nullptr, \
+        debug_qk_active ? debug_l.get() : nullptr, \
+        debug_qk_active ? debug_alpha.get() : nullptr, \
+        debug_qtile, debug_hq, debug_b, debug_kt, implicit_n_kv, implicit_q_offset, implicit_flags)
+#define LAUNCH_BM64_I8QK_DBV_LEAN(VT) \
+    packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev_kernel<VT, false, false, false, false, false, false><<<grid, block512, 0, stream>>>( \
+        (const float*)Q->data, (const char*)V->data, (float*)dst->data, \
+        Q->nb[1], Q->nb[2], Q->nb[3], V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
+        v_layout, \
+        mask ? (const char*)mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+        k_payload, k_scales, k_payload_row_stride_i32, k_scales_row_stride_half, \
+        nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_kv_size, attention_scale, \
+        d_skip_counter, causal_skip_active, nullptr, nullptr, \
+        nullptr, nullptr, nullptr, 1, \
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, \
+        0, 0, 0, 0, implicit_n_kv, implicit_q_offset, implicit_flags)
+#define LAUNCH_BM64_I8QK_DBV_SINGLE_VBUF(VT) \
+    packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev_kernel<VT, false, false, false, false, false, false, false><<<grid, block512, 0, stream>>>( \
+        (const float*)Q->data, (const char*)V->data, (float*)dst->data, \
+        Q->nb[1], Q->nb[2], Q->nb[3], V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
+        v_layout, \
+        mask ? (const char*)mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+        k_payload, k_scales, k_payload_row_stride_i32, k_scales_row_stride_half, \
+        nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_kv_size, attention_scale, \
+        d_skip_counter, causal_skip_active, nullptr, nullptr, \
+        nullptr, nullptr, nullptr, 1, \
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, \
+        0, 0, 0, 0, implicit_n_kv, implicit_q_offset, implicit_flags)
+#define LAUNCH_BM64_I8QK_DBV_PROBS_OVERLAY(VT) \
+    packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev_kernel<VT, false, false, false, false, false, false, false, true><<<grid, block512, 0, stream>>>( \
+        (const float*)Q->data, (const char*)V->data, (float*)dst->data, \
+        Q->nb[1], Q->nb[2], Q->nb[3], V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
+        v_layout, \
+        mask ? (const char*)mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+        k_payload, k_scales, k_payload_row_stride_i32, k_scales_row_stride_half, \
+        nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_kv_size, attention_scale, \
+        d_skip_counter, causal_skip_active, nullptr, nullptr, \
+        nullptr, nullptr, nullptr, 1, \
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, \
+        0, 0, 0, 0, implicit_n_kv, implicit_q_offset, implicit_flags)
+#define LAUNCH_BM64_I8QK_DBV_GQA2(VT) \
+    packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev_kernel<VT, false, false, false, false, false, false, false, false, true><<<dbv_grid, block512, 0, stream>>>( \
+        (const float*)Q->data, (const char*)V->data, (float*)dst->data, \
+        Q->nb[1], Q->nb[2], Q->nb[3], V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
+        v_layout, \
+        mask ? (const char*)mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+        k_payload, k_scales, k_payload_row_stride_i32, k_scales_row_stride_half, \
+        nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_kv_size, attention_scale, \
+        d_skip_counter, causal_skip_active, nullptr, nullptr, \
+        nullptr, nullptr, nullptr, 1, \
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, \
+        0, 0, 0, 0, implicit_n_kv, implicit_q_offset, implicit_flags)
+#define LAUNCH_BM64_I8QK_DBV_NO_LOGITS_INIT(VT) \
+    packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev_kernel<VT, false, false, false, false, false, false, false, false, false, true><<<grid, block512, 0, stream>>>( \
+        (const float*)Q->data, (const char*)V->data, (float*)dst->data, \
+        Q->nb[1], Q->nb[2], Q->nb[3], V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
+        v_layout, \
+        mask ? (const char*)mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+        k_payload, k_scales, k_payload_row_stride_i32, k_scales_row_stride_half, \
+        nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_kv_size, attention_scale, \
+        d_skip_counter, causal_skip_active, nullptr, nullptr, \
+        nullptr, nullptr, nullptr, 1, \
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, \
+        0, 0, 0, 0, implicit_n_kv, implicit_q_offset, implicit_flags)
 #define LAUNCH_BM64_I8QK_DBV_SELECT(VT) do { \
-    if (impl == 17) { LAUNCH_BM64_I8QK_DBV(VT, true); } \
-    else { LAUNCH_BM64_I8QK_DBV(VT, false); } \
+    if (dbv_gqa2_active) { LAUNCH_BM64_I8QK_DBV_GQA2(VT); } \
+    else if (dbv_no_logits_init_active) { LAUNCH_BM64_I8QK_DBV_NO_LOGITS_INIT(VT); } \
+    else if (dbv_probs_overlay_active) { LAUNCH_BM64_I8QK_DBV_PROBS_OVERLAY(VT); } \
+    else if (dbv_single_vbuf_active) { LAUNCH_BM64_I8QK_DBV_SINGLE_VBUF(VT); } \
+    else if (dbv_lean_active) { LAUNCH_BM64_I8QK_DBV_LEAN(VT); } \
+    else if (impl == 17) { LAUNCH_BM64_I8QK_DBV(VT, true, false); } \
+    else if (impl == 19) { LAUNCH_BM64_I8QK_DBV(VT, false, true); } \
+    else { LAUNCH_BM64_I8QK_DBV(VT, false, false); } \
 } while (0)
             switch (V->type) {
                 case GGML_TYPE_Q4_0: LAUNCH_BM64_I8QK_DBV_SELECT(PACKED16_WMMA_V_Q4_0); break;
@@ -4230,7 +4719,61 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
                 default: GGML_ABORT("pwmma bm64 i8qk pvwmma dbv: unsupported V type");
             }
 #undef LAUNCH_BM64_I8QK_DBV_SELECT
+#undef LAUNCH_BM64_I8QK_DBV_NO_LOGITS_INIT
+#undef LAUNCH_BM64_I8QK_DBV_GQA2
+#undef LAUNCH_BM64_I8QK_DBV_PROBS_OVERLAY
+#undef LAUNCH_BM64_I8QK_DBV_SINGLE_VBUF
+#undef LAUNCH_BM64_I8QK_DBV_LEAN
 #undef LAUNCH_BM64_I8QK_DBV
+            if (streamk_active) {
+                const size_t rows_per_split = size_t(batch) * size_t(nq) * size_t(n_heads_q);
+                const size_t merge_elems = rows_per_split * size_t(PWMMA_D);
+                const int merge_threads = 256;
+                const int merge_blocks = (int)((merge_elems + size_t(merge_threads) - 1) / size_t(merge_threads));
+                packed16_wmma_streamk_combine_kernel<<<merge_blocks, merge_threads, 0, stream>>>(
+                    partial_m.get(), partial_l.get(), partial_out.get(), (float *) dst->data,
+                    (int) rows_per_split, streamk_splits);
+            }
+            if (debug_qk_active) {
+                CUDA_CHECK(hipGetLastError());
+                std::vector<float> h_qk_raw(PWMMA_DEBUG_QK_ELEMS);
+                std::vector<float> h_qk_masked(PWMMA_DEBUG_QK_ELEMS);
+                std::vector<float> h_probs(PWMMA_DEBUG_QK_ELEMS);
+                std::vector<float> h_m(PWMMA_DEBUG_ROW_ELEMS);
+                std::vector<float> h_l(PWMMA_DEBUG_ROW_ELEMS);
+                std::vector<float> h_alpha(PWMMA_DEBUG_ROW_ELEMS);
+                CUDA_CHECK(hipMemcpyAsync(h_qk_raw.data(),    debug_qk_raw.get(),    h_qk_raw.size()    * sizeof(float), hipMemcpyDeviceToHost, stream));
+                CUDA_CHECK(hipMemcpyAsync(h_qk_masked.data(), debug_qk_masked.get(), h_qk_masked.size() * sizeof(float), hipMemcpyDeviceToHost, stream));
+                CUDA_CHECK(hipMemcpyAsync(h_probs.data(),     debug_probs.get(),     h_probs.size()     * sizeof(float), hipMemcpyDeviceToHost, stream));
+                CUDA_CHECK(hipMemcpyAsync(h_m.data(),         debug_m.get(),         h_m.size()         * sizeof(float), hipMemcpyDeviceToHost, stream));
+                CUDA_CHECK(hipMemcpyAsync(h_l.data(),         debug_l.get(),         h_l.size()         * sizeof(float), hipMemcpyDeviceToHost, stream));
+                CUDA_CHECK(hipMemcpyAsync(h_alpha.data(),     debug_alpha.get(),     h_alpha.size()     * sizeof(float), hipMemcpyDeviceToHost, stream));
+                CUDA_CHECK(hipStreamSynchronize(stream));
+                const char * dump_env = getenv("GGML_CUDA_ROCM_PACKED16_FA_DEBUG_DUMP");
+                const std::string base = (dump_env && *dump_env) ? dump_env : "/tmp/packed16-fa-debug";
+                ggml_cuda_rocm_packed16_debug_write_f32(base + ".qk_raw.f32",    h_qk_raw.data(),    h_qk_raw.size());
+                ggml_cuda_rocm_packed16_debug_write_f32(base + ".qk_masked.f32", h_qk_masked.data(), h_qk_masked.size());
+                ggml_cuda_rocm_packed16_debug_write_f32(base + ".probs.f32",     h_probs.data(),     h_probs.size());
+                ggml_cuda_rocm_packed16_debug_write_f32(base + ".m.f32",         h_m.data(),         h_m.size());
+                ggml_cuda_rocm_packed16_debug_write_f32(base + ".l.f32",         h_l.data(),         h_l.size());
+                ggml_cuda_rocm_packed16_debug_write_f32(base + ".alpha.f32",     h_alpha.data(),     h_alpha.size());
+                FILE * meta = fopen((base + ".meta").c_str(), "w");
+                if (meta) {
+                    fprintf(meta, "node=%s\nimpl=%s\nshape_qk=64,16\nshape_row=64\nnq=%d\nnk=%d\nhead=%d\nbatch=%d\nqtile=%d\nkt=%d\nq0=%d\nk0=%d\nraw_hash=%016llx\nmasked_hash=%016llx\nprobs_hash=%016llx\n",
+                        dst->name, impl_name, nq, nk, debug_hq, debug_b, debug_qtile, debug_kt,
+                        debug_qtile * PWMMA_BM64, debug_kt * PWMMA_BN,
+                        (unsigned long long) ggml_cuda_rocm_packed16_debug_fnv1a64(h_qk_raw.data(), h_qk_raw.size()),
+                        (unsigned long long) ggml_cuda_rocm_packed16_debug_fnv1a64(h_qk_masked.data(), h_qk_masked.size()),
+                        (unsigned long long) ggml_cuda_rocm_packed16_debug_fnv1a64(h_probs.data(), h_probs.size()));
+                    fclose(meta);
+                }
+                fprintf(stderr, "PWMMA DEBUG QK: wrote %s.{qk_raw,qk_masked,probs,m,l,alpha}.f32 raw_hash=%016llx masked_hash=%016llx probs_hash=%016llx first_raw=%g first_masked=%g first_prob=%g\n",
+                    base.c_str(),
+                    (unsigned long long) ggml_cuda_rocm_packed16_debug_fnv1a64(h_qk_raw.data(), h_qk_raw.size()),
+                    (unsigned long long) ggml_cuda_rocm_packed16_debug_fnv1a64(h_qk_masked.data(), h_qk_masked.size()),
+                    (unsigned long long) ggml_cuda_rocm_packed16_debug_fnv1a64(h_probs.data(), h_probs.size()),
+                    (double) h_qk_raw[0], (double) h_qk_masked[0], (double) h_probs[0]);
+            }
         } else if (impl_i8qk) {
             dim3 block512(512);
 #define LAUNCH_BM64_I8QK_WG_SV(VT, P16, K32, KSHARED, PVWMMA, BN32V) \
@@ -4349,6 +4892,7 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
             case GGML_TYPE_Q4_0: LAUNCH_BM16(PACKED16_WMMA_V_Q4_0); break;
             case GGML_TYPE_Q8_0: LAUNCH_BM16(PACKED16_WMMA_V_Q8_0); break;
             case GGML_TYPE_F16:  LAUNCH_BM16(PACKED16_WMMA_V_F16);  break;
+            case GGML_TYPE_V4_K16D16_144: LAUNCH_BM16(PACKED16_WMMA_V4_K16D16_144); break;
             default: GGML_ABORT("pwmma bm16: unsupported V type");
         }
 #undef LAUNCH_BM16

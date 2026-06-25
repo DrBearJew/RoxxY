@@ -2493,8 +2493,11 @@ static dp16_fa_problem ggml_cuda_make_dp16_fa_problem(
     problem.k_layout = ggml_cuda_dp16_fa_layout_from_tensor(K, true);
     problem.v_layout = ggml_cuda_dp16_fa_layout_from_tensor(V);
 
-    problem.causal = mask != nullptr && max_bias == 0.0f;
+    const int implicit_flags = ggml_get_op_params_i32(dst, 7);
+    const bool implicit_causal_mask = (implicit_flags & 1) != 0;
+    problem.causal = (mask != nullptr || implicit_causal_mask) && max_bias == 0.0f;
     problem.has_mask = mask != nullptr;
+    problem.effective_mask = mask != nullptr || implicit_causal_mask;
     problem.has_sliding_window = false;
     problem.has_sink = sinks != nullptr;
 
@@ -4050,8 +4053,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             const bool impl_autoset =
                 getenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL_AUTOSET") &&
                 atoi(getenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL_AUTOSET")) != 0;
+            const bool force_smem_wmma = ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_PACKED16_WMMA_FORCE_SMEM");
             const bool impl_is_wmma =
-                explicit_impl && (
+                explicit_impl && ((force_smem_wmma && strcmp(explicit_impl, "smem") == 0) ||
                     strcmp(explicit_impl, "bm32_regout_directv") == 0 ||
                     strcmp(explicit_impl, "bm32_regout_stagev") == 0 ||
                     strcmp(explicit_impl, "bm64_regout_directv") == 0 ||
@@ -4068,8 +4072,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                     strcmp(explicit_impl, "bm64_i8qk_pvwmma_512t_wavegate_stagev") == 0 ||
                     strcmp(explicit_impl, "bm64_i8qk_pvwmma_bn32_512t_wavegate_stagev") == 0 ||
                     strcmp(explicit_impl, "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev") == 0 ||
-                    strcmp(explicit_impl, "bm64_i8qk_packed8_expand_pvwmma_dbv_512t_wavegate_stagev") == 0);
-            const bool impl_auto = impl_autoset || !explicit_impl || !*explicit_impl || strcmp(explicit_impl, "smem") == 0;
+                    strcmp(explicit_impl, "bm64_i8qk_pvwmma_dbv_kshared_512t_wavegate_stagev") == 0 ||
+                    strcmp(explicit_impl, "bm64_i8qk_packed8_expand_pvwmma_dbv_512t_wavegate_stagev") == 0 ||
+                    strcmp(explicit_impl, "bm64_i8qk_pvwmma_dbv_streamk_512t_wavegate_stagev") == 0);
+            const bool impl_auto = !force_smem_wmma && (impl_autoset || !explicit_impl || !*explicit_impl || strcmp(explicit_impl, "smem") == 0);
             // Qwen 27B-like shape: gqa_ratio=6, heads_q=24, heads_k=4.
             // Qwen 35B-like shape: gqa_ratio=8, heads_q=16, heads_k=2.
             // A/B showed BM32 reg-out direct-V already wins at pp512 for these
@@ -4084,7 +4090,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             const bool wmma_available = wmma_sup;
             const char * dbv_auto_env = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_DBV_AUTO");
             const bool dbv_auto_enabled = !dbv_auto_env || atoi(dbv_auto_env) != 0;
-            const bool use_pvwmma = dbv_auto_enabled && impl_auto && wmma_available && (is_pvwmma_context || packed8_pwmma_prefill);
+            const bool kshared_prefill_requested = ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_PACKED16_WMMA_DBV_KSHARED_PREFILL");
+            const bool streamk_prefill_requested = ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_PACKED16_WMMA_STREAMK_PREFILL");
+            const bool bn32_prefill_requested = ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_PACKED16_WMMA_BN32_PREFILL");
+            const bool use_kshared_pvwmma = kshared_prefill_requested && impl_auto && wmma_available && pure_prefill_inst &&
+                !packed8_pwmma_prefill && is_pvwmma_context;
+            const bool use_bn32_pvwmma = bn32_prefill_requested && !use_kshared_pvwmma && impl_auto && wmma_available && pure_prefill_inst &&
+                !packed8_pwmma_prefill && is_pvwmma_context;
+            const bool use_streamk_pvwmma = streamk_prefill_requested && !use_kshared_pvwmma && !use_bn32_pvwmma && impl_auto && wmma_available && pure_prefill_inst &&
+                !packed8_pwmma_prefill && is_pvwmma_context;
+            const bool use_pvwmma = use_kshared_pvwmma || use_bn32_pvwmma || (dbv_auto_enabled && impl_auto && wmma_available && (is_pvwmma_context || packed8_pwmma_prefill)) || use_streamk_pvwmma;
             const bool use_bm32_regout = !packed8_pwmma_prefill && !use_pvwmma && impl_auto && wmma_available &&
                 (v4_144_nomtp_prefill || v4_144_mtp_pwmma || is_big_q || is_27b_like || is_35b_like || is_long_context);
             const bool use_auto_wmma = use_pvwmma || use_bm32_regout;
@@ -4096,7 +4111,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             if (use_auto_wmma || (impl_is_wmma && wmma_available)) {
                 if (use_pvwmma) {
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL",
-                        packed8_pwmma_prefill ? "bm64_i8qk_packed8_expand_pvwmma_dbv_512t_wavegate_stagev" : "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev", 1);
+                        use_kshared_pvwmma ? "bm64_i8qk_pvwmma_dbv_kshared_512t_wavegate_stagev" :
+                            (use_bn32_pvwmma ? "bm64_i8qk_pvwmma_bn32_512t_wavegate_stagev" :
+                                (use_streamk_pvwmma ? "bm64_i8qk_pvwmma_dbv_streamk_512t_wavegate_stagev" :
+                                    (packed8_pwmma_prefill ? "bm64_i8qk_packed8_expand_pvwmma_dbv_512t_wavegate_stagev" : "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev"))), 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL_AUTOSET", "1", 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM", "64", 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_CAUSAL_SKIP", "1", 1);
@@ -4108,13 +4126,22 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 }
                 packed16_kernel = BEST_FATTN_KERNEL_PACKED16_WMMA_TILE;
                 if (use_pvwmma) {
-                    packed16_route_name = packed8_pwmma_prefill ? "pwmma_bm64_i8qk_packed8_expand_pvwmma_dbv" : "pwmma_bm64_i8qk_pvwmma_dbv";
+                    packed16_route_name = use_kshared_pvwmma ? "pwmma_bm64_i8qk_pvwmma_dbv_kshared" :
+                        (use_bn32_pvwmma ? "pwmma_bm64_i8qk_pvwmma_bn32" :
+                            (use_streamk_pvwmma ? "pwmma_bm64_i8qk_pvwmma_dbv_streamk" :
+                                (packed8_pwmma_prefill ? "pwmma_bm64_i8qk_packed8_expand_pvwmma_dbv" : "pwmma_bm64_i8qk_pvwmma_dbv")));
                 } else if (use_bm32_regout) {
                     packed16_route_name = "pwmma_bm32_regout_directv";
                 } else {
                     explicit_impl = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL");
                     if (explicit_impl && strcmp(explicit_impl, "bm64_i8qk_packed8_expand_pvwmma_dbv_512t_wavegate_stagev") == 0) {
                         packed16_route_name = "pwmma_bm64_i8qk_packed8_expand_pvwmma_dbv";
+                    } else if (explicit_impl && strcmp(explicit_impl, "bm64_i8qk_pvwmma_dbv_streamk_512t_wavegate_stagev") == 0) {
+                        packed16_route_name = "pwmma_bm64_i8qk_pvwmma_dbv_streamk";
+                    } else if (explicit_impl && strcmp(explicit_impl, "bm64_i8qk_pvwmma_bn32_512t_wavegate_stagev") == 0) {
+                        packed16_route_name = "pwmma_bm64_i8qk_pvwmma_bn32";
+                    } else if (explicit_impl && strcmp(explicit_impl, "bm64_i8qk_pvwmma_dbv_kshared_512t_wavegate_stagev") == 0) {
+                        packed16_route_name = "pwmma_bm64_i8qk_pvwmma_dbv_kshared";
                     } else if (explicit_impl && strcmp(explicit_impl, "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev") == 0) {
                         packed16_route_name = "pwmma_bm64_i8qk_pvwmma_dbv";
                     } else if (explicit_impl && strcmp(explicit_impl, "bm64_i8qk_pvwmma_512t_wavegate_stagev") == 0) {
@@ -4136,17 +4163,30 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             const bool impl_autoset =
                 getenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL_AUTOSET") &&
                 atoi(getenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL_AUTOSET")) != 0;
-            const bool impl_auto = impl_autoset || !explicit_impl || !*explicit_impl || strcmp(explicit_impl, "smem") == 0;
+            const bool force_smem_wmma = ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_PACKED16_WMMA_FORCE_SMEM");
+            const bool impl_auto = !force_smem_wmma && (impl_autoset || !explicit_impl || !*explicit_impl || strcmp(explicit_impl, "smem") == 0);
             if (impl_auto) {
                 const char * dbv_auto_env = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_DBV_AUTO");
                 const bool dbv_auto_enabled = !dbv_auto_env || atoi(dbv_auto_env) != 0;
-                if (packed8_pwmma_prefill || (dbv_auto_enabled && K->ne[1] >= 1024)) {
+                const bool kshared_prefill_requested = ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_PACKED16_WMMA_DBV_KSHARED_PREFILL");
+                const bool streamk_prefill_requested = ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_PACKED16_WMMA_STREAMK_PREFILL");
+                const bool bn32_prefill_requested = ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_PACKED16_WMMA_BN32_PREFILL");
+                const bool use_kshared_pvwmma = kshared_prefill_requested && pure_prefill_inst && !packed8_pwmma_prefill && K->ne[1] >= 1024;
+                const bool use_bn32_pvwmma = bn32_prefill_requested && !use_kshared_pvwmma && pure_prefill_inst && !packed8_pwmma_prefill && K->ne[1] >= 1024;
+                const bool use_streamk_pvwmma = streamk_prefill_requested && !use_kshared_pvwmma && !use_bn32_pvwmma && pure_prefill_inst && !packed8_pwmma_prefill && K->ne[1] >= 1024;
+                if (packed8_pwmma_prefill || use_kshared_pvwmma || use_bn32_pvwmma || use_streamk_pvwmma || (dbv_auto_enabled && K->ne[1] >= 1024)) {
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL",
-                        packed8_pwmma_prefill ? "bm64_i8qk_packed8_expand_pvwmma_dbv_512t_wavegate_stagev" : "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev", 1);
+                        use_kshared_pvwmma ? "bm64_i8qk_pvwmma_dbv_kshared_512t_wavegate_stagev" :
+                            (use_bn32_pvwmma ? "bm64_i8qk_pvwmma_bn32_512t_wavegate_stagev" :
+                                (use_streamk_pvwmma ? "bm64_i8qk_pvwmma_dbv_streamk_512t_wavegate_stagev" :
+                                    (packed8_pwmma_prefill ? "bm64_i8qk_packed8_expand_pvwmma_dbv_512t_wavegate_stagev" : "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev"))), 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL_AUTOSET", "1", 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_BM", "64", 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_CAUSAL_SKIP", "1", 1);
-                    packed16_route_name = packed8_pwmma_prefill ? "pwmma_bm64_i8qk_packed8_expand_pvwmma_dbv" : "pwmma_bm64_i8qk_pvwmma_dbv";
+                    packed16_route_name = use_kshared_pvwmma ? "pwmma_bm64_i8qk_pvwmma_dbv_kshared" :
+                        (use_bn32_pvwmma ? "pwmma_bm64_i8qk_pvwmma_bn32" :
+                            (use_streamk_pvwmma ? "pwmma_bm64_i8qk_pvwmma_dbv_streamk" :
+                                (packed8_pwmma_prefill ? "pwmma_bm64_i8qk_packed8_expand_pvwmma_dbv" : "pwmma_bm64_i8qk_pvwmma_dbv")));
                 } else {
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL", "bm32_regout_directv", 1);
                     setenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL_AUTOSET", "1", 1);
@@ -4158,6 +4198,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 explicit_impl = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL");
                 if (explicit_impl && strcmp(explicit_impl, "bm64_i8qk_packed8_expand_pvwmma_dbv_512t_wavegate_stagev") == 0) {
                     packed16_route_name = "pwmma_bm64_i8qk_packed8_expand_pvwmma_dbv";
+                } else if (explicit_impl && strcmp(explicit_impl, "bm64_i8qk_pvwmma_dbv_streamk_512t_wavegate_stagev") == 0) {
+                    packed16_route_name = "pwmma_bm64_i8qk_pvwmma_dbv_streamk";
+                } else if (explicit_impl && strcmp(explicit_impl, "bm64_i8qk_pvwmma_bn32_512t_wavegate_stagev") == 0) {
+                    packed16_route_name = "pwmma_bm64_i8qk_pvwmma_bn32";
+                } else if (explicit_impl && strcmp(explicit_impl, "bm64_i8qk_pvwmma_dbv_kshared_512t_wavegate_stagev") == 0) {
+                    packed16_route_name = "pwmma_bm64_i8qk_pvwmma_dbv_kshared";
                 } else if (explicit_impl && strcmp(explicit_impl, "bm64_i8qk_pvwmma_dbv_512t_wavegate_stagev") == 0) {
                     packed16_route_name = "pwmma_bm64_i8qk_pvwmma_dbv";
                 } else if (explicit_impl && strcmp(explicit_impl, "bm64_i8qk_pvwmma_512t_wavegate_stagev") == 0) {
@@ -4635,6 +4681,13 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         fprintf(stderr, "FATTN COMPUTE ENTER dst=%p\n", (void*)dst); fflush(stderr);
     }
     const best_fattn_kernel best_kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    const int implicit_flags = ggml_get_op_params_i32(dst, 7);
+    if ((implicit_flags & 1) &&
+            best_kernel != BEST_FATTN_KERNEL_PACKED16_WMMA_TILE &&
+            best_kernel != BEST_FATTN_KERNEL_PACKED16_DOT4_MMQ) {
+        GGML_ABORT("implicit causal FA mask metadata requires a metadata-aware packed16 dispatch; selected=%s node=%s",
+            ggml_cuda_fattn_kernel_name(best_kernel), ggml_cuda_fattn_node_name(dst));
+    }
     if (fattn_dispatch_trace) {
         fprintf(stderr, "FATTN COMPUTE SELECT selected=%d name=%s dst=%p\n", (int)best_kernel, ggml_cuda_fattn_kernel_name(best_kernel), (void*)dst); fflush(stderr);
     }

@@ -942,6 +942,69 @@ static char * fmt_size(size_t size) {
     return buffer;
 }
 
+static bool ggml_backend_sched_trace_kq_mask_copies(void) {
+    const char * env = getenv("GGML_SCHED_TRACE_KQ_MASK_COPIES");
+    return env && atoi(env) != 0;
+}
+
+static size_t ggml_backend_sched_split_large_unsupported_inputs_threshold(void) {
+    static const size_t threshold = []() {
+        const char * env = getenv("GGML_SCHED_SPLIT_LARGE_UNSUPPORTED_INPUTS_MB");
+        if (!env || env[0] == '\0') {
+            return (size_t) 0;
+        }
+
+        char * end = nullptr;
+        const unsigned long long mb = strtoull(env, &end, 10);
+        if (end == env || mb == 0) {
+            return (size_t) 0;
+        }
+
+        const unsigned long long max_mb = ((unsigned long long) ((size_t) -1))/(1024ull*1024ull);
+        return (size_t) (mb > max_mb ? (size_t) -1 : mb*1024ull*1024ull);
+    }();
+    return threshold;
+}
+
+static bool ggml_backend_sched_is_kq_mask_tensor(const struct ggml_tensor * tensor) {
+    return tensor && strstr(tensor->name, "kq_mask") != NULL;
+}
+
+static void ggml_backend_sched_trace_kq_mask_copy(
+        ggml_backend_sched_t sched,
+        const struct ggml_tensor * src,
+        const struct ggml_tensor * node,
+        int src_backend_id,
+        int dst_backend_id,
+        bool supported) {
+    if (!ggml_backend_sched_trace_kq_mask_copies()) {
+        return;
+    }
+    if (!ggml_backend_sched_is_kq_mask_tensor(src) && !ggml_backend_sched_is_kq_mask_tensor(node)) {
+        return;
+    }
+
+    const char * src_backend = src_backend_id >= 0 ? ggml_backend_name(sched->backends[src_backend_id]) : "none";
+    const char * dst_backend = dst_backend_id >= 0 ? ggml_backend_name(sched->backends[dst_backend_id]) : "none";
+    const char * src_buft = src_backend_id >= 0 ? ggml_backend_buft_name(sched->bufts[src_backend_id]) : "none";
+    const char * dst_buft = dst_backend_id >= 0 ? ggml_backend_buft_name(sched->bufts[dst_backend_id]) : "none";
+
+    GGML_LOG_WARN(
+            "GGML_SCHED_KQ_MASK_COPY: src=%s type=%s bytes=%zu shape=(%lld,%lld,%lld,%lld) "
+            "src_backend=%s src_buft=%s dst_node=%s op=%s dst_backend=%s dst_buft=%s supported=%d\n",
+            src->name,
+            ggml_type_name(src->type),
+            ggml_nbytes(src),
+            (long long) src->ne[0], (long long) src->ne[1], (long long) src->ne[2], (long long) src->ne[3],
+            src_backend,
+            src_buft,
+            node ? node->name : "(null)",
+            node ? ggml_op_name(node->op) : "(null)",
+            dst_backend,
+            dst_buft,
+            supported ? 1 : 0);
+}
+
 static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     int cur_split = 0;
     for (int i = 0; i < graph->n_nodes; i++) {
@@ -1271,7 +1334,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
             // check if we should start a new split based on the sources of the current node
             bool need_new_split = false;
-            if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
+            if (node_backend_id == cur_backend_id) {
+                const size_t large_input_split_threshold = ggml_backend_sched_split_large_unsupported_inputs_threshold();
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     struct ggml_tensor * src = node->src[j];
                     if (src == NULL) {
@@ -1279,7 +1343,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                     // check if a weight is on a different and incompatible backend
                     // by starting a new split, the memory of the previously offloaded weights can be reused
-                    if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                    if (split->n_inputs > 0 && src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                         int src_backend_id = tensor_backend_id(src);
                         if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
                             need_new_split = true;
@@ -1293,6 +1357,29 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         int src_backend_id = sched->hv_tensor_backend_ids[id];
                         bool supported = ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
                         if (src_backend_id != cur_backend_id && tensor_id_copy(id, cur_backend_id, 0) == NULL && !supported) {
+                            need_new_split = true;
+                            break;
+                        }
+                    }
+                    // For large user inputs that must be copied into this backend, start a
+                    // fresh split at the first consumer. This keeps scheduler-created device
+                    // input copies from being allocated across earlier same-backend work.
+                    if (large_input_split_threshold > 0 && split->i_start < i && (src->flags & GGML_TENSOR_FLAG_INPUT) && ggml_nbytes(src) >= large_input_split_threshold) {
+                        const size_t id = hash_id(src);
+                        int src_backend_id = sched->hv_tensor_backend_ids[id];
+                        bool supported = ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
+                        if (src_backend_id != cur_backend_id && tensor_id_copy(id, cur_backend_id, 0) == NULL && !supported) {
+                            if (ggml_backend_sched_trace_kq_mask_copies() && ggml_backend_sched_is_kq_mask_tensor(src)) {
+                                GGML_LOG_WARN(
+                                        "GGML_SCHED_KQ_MASK_SPLIT: src=%s type=%s bytes=%zu threshold=%zu before_node=%s op=%s backend=%s\n",
+                                        src->name,
+                                        ggml_type_name(src->type),
+                                        ggml_nbytes(src),
+                                        large_input_split_threshold,
+                                        node->name,
+                                        ggml_op_name(node->op),
+                                        ggml_backend_name(sched->backends[cur_backend_id]));
+                            }
                             need_new_split = true;
                             break;
                         }
@@ -1349,7 +1436,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                 }
 
-                if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                const bool src_supported_by_cur_backend = ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
+                ggml_backend_sched_trace_kq_mask_copy(sched, src, node, src_backend_id, cur_backend_id, src_supported_by_cur_backend);
+                if (src_backend_id != cur_backend_id && !src_supported_by_cur_backend) {
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];

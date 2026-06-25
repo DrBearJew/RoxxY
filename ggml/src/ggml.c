@@ -5866,6 +5866,18 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
+void ggml_flash_attn_ext_set_causal_mask_meta(
+        struct ggml_tensor * a,
+        int32_t              valid_n_kv,
+        int32_t              q_offset,
+        int32_t              flags) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    ggml_set_op_params_i32(a, 5, valid_n_kv);
+    ggml_set_op_params_i32(a, 6, q_offset);
+    ggml_set_op_params_i32(a, 7, flags);
+}
+
 void ggml_flash_attn_ext_set_instruction(
         struct ggml_tensor * a,
         enum ggml_fattn_instruction inst) {

@@ -2566,6 +2566,14 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // Optional backend-specific causal metadata for exact mask-elision experiments.
+    // Stored in op_params[5..7]: valid_n_kv, q_offset, flags.
+    GGML_API void ggml_flash_attn_ext_set_causal_mask_meta(
+            struct ggml_tensor * a,
+            int32_t              valid_n_kv,
+            int32_t              q_offset,
+            int32_t              flags);
+
     // FlashAttention instruction — workload classification, not backend preference.
     // NONE preserves existing behavior for unannotated FA ops.
     //

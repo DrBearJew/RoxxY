@@ -63,6 +63,45 @@ static inline uint32_t ggml_cuda_pdmq_k_payload_words_per_token(const int format
     return bits ? (d * bits) / 32u : 0u;
 }
 
+#ifndef GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_V1_DEFINED
+#define GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_V1_DEFINED
+static constexpr uint32_t GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_VERSION = 1;
+static constexpr uint32_t GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES = 4;
+static constexpr uint32_t GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_SCRATCH_OVERLAY = 1u << 0;
+
+struct ggml_cuda_mtp_qblock_tail_page_map_v1 {
+    uint32_t version = 0;
+    uint32_t abi_bytes = 0;
+    uint32_t active = 0;
+    uint32_t flags = 0;
+    uint32_t logical_base_token = 0;
+    uint32_t valid_tail_tokens = 0;
+    uint32_t page_tokens = 0;
+    uint32_t physical_pages = 0;
+    uint32_t block_table_pages = 0;
+    int32_t block_table[GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES] = {};
+    uint64_t generation = 0;
+};
+#endif
+
+#ifndef GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_DISPATCH_BIND_V1_DEFINED
+#define GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_DISPATCH_BIND_V1_DEFINED
+static constexpr uint32_t GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_DISPATCH_BIND_VERSION = 1;
+static constexpr uint32_t GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_DISPATCH_BIND_NODE_NAME_MAX = 96;
+struct ggml_cuda_mtp_qblock_tail_page_dispatch_bind_v1 {
+    uint32_t version = 0;
+    uint32_t abi_bytes = 0;
+    uint32_t active = 0;
+    uint32_t reserved = 0;
+    ggml_cuda_mtp_qblock_tail_page_map_v1 map = {};
+    uint64_t bind_count = 0;
+    int32_t layer = -1;
+    int32_t graph_inst = -1;
+    int32_t nk = 0;
+    char node_name[GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_DISPATCH_BIND_NODE_NAME_MAX] = {};
+};
+#endif
+
 struct ggml_cuda_packed16_sidecar_meta {
     uint32_t format_version = 0;
     uint64_t generation = 0;
@@ -96,6 +135,18 @@ void llama_kv_cache_get_packed16_sidecar_meta(const void * k_view_data, struct g
 void llama_kv_cache_get_pdmq_k_sidecar_meta(const void * k_view_data, struct ggml_cuda_packed16_sidecar_meta * meta);
 void llama_kv_cache_get_packed16_packed_i8_desc(const void * k_view_data, struct dp16_packed_i8_desc_v1 * desc);
 void llama_kv_cache_get_packed16_shadow_k(const void * k_view_data, struct ggml_tensor ** shadow_k);
+void llama_kv_cache_register_mtp_qblock_tail_page_map(const void * k_view_data, const struct ggml_cuda_mtp_qblock_tail_page_map_v1 * map);
+void llama_kv_cache_clear_mtp_qblock_tail_page_map(const void * k_view_data);
+void llama_kv_cache_get_mtp_qblock_tail_page_map(const void * k_view_data, struct ggml_cuda_mtp_qblock_tail_page_map_v1 * map);
+bool llama_kv_cache_get_mtp_qblock_tail_page_published_map(struct ggml_cuda_mtp_qblock_tail_page_map_v1 * map);
+void llama_kv_cache_record_mtp_qblock_tail_page_dispatch_bind(const void * k_view_data, const struct ggml_cuda_mtp_qblock_tail_page_map_v1 * map, const char * node_name, int layer, int graph_inst, int nk);
+void llama_kv_cache_note_mtp_qblock_tail_page_pending_dispatch_bind(const struct ggml_cuda_mtp_qblock_tail_page_map_v1 * map, uint64_t req_begin, uint64_t req_end, int slot);
+bool llama_kv_cache_get_mtp_qblock_tail_page_last_dispatch_bind(struct ggml_cuda_mtp_qblock_tail_page_dispatch_bind_v1 * out);
+void llama_kv_cache_record_mtp_qblock_tail_page_consumer_miss(uint32_t nk, const char * reason);
+uint32_t llama_kv_cache_get_mtp_qblock_tail_page_consumer_no_map_nk_max(void);
+void llama_kv_cache_reset_mtp_qblock_tail_page_lifecycle(bool data_invalidates);
+void llama_kv_cache_reset_mtp_qblock_tail_page_lifecycle_preserve_snapshot(bool data_invalidates, bool keep_producer_snapshot);
+bool llama_kv_cache_mtp_qblock_tail_page_published_scratch_map_covers(uint32_t logical_base, uint32_t n_tokens);
 }
 
 static constexpr int GGML_CUDA_PACKED16_K_TILE_D = 256;

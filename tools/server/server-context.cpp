@@ -14,6 +14,32 @@
 #include "../../src/llama-kv-cache-iswa.h"
 #include "../../src/llama-memory-hybrid.h"
 #include "../../src/llama-memory-hybrid-iswa.h"
+
+#define DP16_PACKED_I8_DESC_HOST_ONLY
+#ifndef __host__
+#define SERVER_MTP_TAIL_DEFINED_HOST
+#endif
+#ifndef __device__
+#define SERVER_MTP_TAIL_DEFINED_DEVICE
+#endif
+#ifndef __forceinline__
+#define SERVER_MTP_TAIL_DEFINED_FORCEINLINE
+#endif
+#include "../../ggml/src/ggml-cuda/dot4-packed16/mtp-v4-144-tail-page-state.cuh"
+#undef DP16_PACKED_I8_DESC_HOST_ONLY
+#ifdef SERVER_MTP_TAIL_DEFINED_HOST
+#undef __host__
+#undef SERVER_MTP_TAIL_DEFINED_HOST
+#endif
+#ifdef SERVER_MTP_TAIL_DEFINED_DEVICE
+#undef __device__
+#undef SERVER_MTP_TAIL_DEFINED_DEVICE
+#endif
+#ifdef SERVER_MTP_TAIL_DEFINED_FORCEINLINE
+#undef __forceinline__
+#undef SERVER_MTP_TAIL_DEFINED_FORCEINLINE
+#endif
+
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -503,6 +529,171 @@ static bool mtp_qblock_branch_txn_kv_physical_import_commit_enabled() {
     return env && atoi(env) != 0;
 }
 
+static bool mtp_qblock_branch_txn_kv_physical_import_direct_replay_enabled() {
+    const char * env = getenv("LLAMA_MTP_QBLOCK_BRANCH_TXN_KV_PHYSICAL_IMPORT_DIRECT_REPLAY");
+    return !env || atoi(env) != 0;
+}
+
+static bool mtp_qblock_txn_tail_page_requested() {
+    const char * env = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE");
+    return env && atoi(env) != 0;
+}
+
+static bool mtp_qblock_txn_tail_page_proof_enabled() {
+    const char * env = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_PROOF");
+    return env && atoi(env) != 0;
+}
+
+static bool mtp_qblock_txn_tail_page_consumer_requested() {
+    const char * env = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_CONSUMER");
+    return env && atoi(env) != 0;
+}
+
+static bool mtp_qblock_txn_tail_page_producer_state_import_requested() {
+    const char * env = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_PRODUCER_STATE_IMPORT");
+    return env && atoi(env) != 0;
+}
+
+static dp16_packed_i8_desc_v1 mtp_qblock_txn_tail_page_runtime_packed16_desc(uint32_t kv_size, uint32_t heads) {
+    dp16_packed_i8_desc_v1 k_desc = {};
+    k_desc.version = DP16_PACKED_I8_DESC_VERSION;
+    k_desc.lanes_per_vector = DP16_PACKED_I8X16_LANES;
+    k_desc.words_per_vector = DP16_PACKED_I8X16_WORDS;
+    k_desc.bytes_per_vector = DP16_PACKED_I8X16_BYTES;
+    k_desc.bytes_per_word = DP16_PACKED_I8_WORD_BYTES;
+    k_desc.layout_kind = DP16_PACKED_I8_LAYOUT_ROW;
+    k_desc.axis_x = DP16_PACKED_I8_AXIS_D16;
+    k_desc.axis_y = DP16_PACKED_I8_AXIS_TOKEN;
+    k_desc.axis_z = DP16_PACKED_I8_AXIS_HEAD;
+    k_desc.logical_x = MTP_PACKED16_K_D / DP16_PACKED_I8X16_LANES;
+    k_desc.logical_y = kv_size;
+    k_desc.logical_z = heads;
+    k_desc.physical_x = k_desc.logical_x;
+    k_desc.physical_y = k_desc.logical_y;
+    k_desc.physical_z = k_desc.logical_z;
+    k_desc.x_stride_bytes = DP16_PACKED_I8X16_BYTES;
+    k_desc.y_stride_bytes = MTP_PACKED16_K_WORDS * sizeof(uint32_t);
+    k_desc.z_stride_bytes = uint64_t(kv_size) * k_desc.y_stride_bytes;
+    k_desc.scale_layout = DP16_PACKED_I8_SCALE_LAYOUT_ROW;
+    k_desc.scale_axis_x = DP16_PACKED_I8_AXIS_QBLOCK;
+    k_desc.scale_axis_y = DP16_PACKED_I8_AXIS_TOKEN;
+    k_desc.scale_axis_z = DP16_PACKED_I8_AXIS_HEAD;
+    k_desc.scale_x_stride_bytes = sizeof(uint16_t);
+    k_desc.scale_y_stride_bytes = MTP_PACKED16_K_QBLOCKS * sizeof(uint16_t);
+    k_desc.scale_z_stride_bytes = uint64_t(kv_size) * k_desc.scale_y_stride_bytes;
+    return k_desc;
+}
+
+struct mtp_qblock_txn_tail_page_runtime_contract_result {
+    mtp_v4_144_tail_page_status tail_status = MTP_V4_144_TAIL_PAGE_OK;
+    mtp_qblock_txn_lineage_status lineage_status = MTP_QBLOCK_TXN_LINEAGE_OK;
+    mtp_v4_144_tail_state_status state_status = MTP_V4_144_TAIL_STATE_OK;
+    uint32_t accepted_len = 0;
+    uint32_t new_valid_tail = 0;
+    uint32_t final_state_slot = MTP_QBLOCK_TXN_INVALID_U8;
+    uint32_t state_valid_tail = 0;
+    uint32_t state_page_valid = 0;
+    uint32_t state_free = 0;
+    uint32_t boundary_slot = 0;
+    uint32_t logical_tokens = 0;
+    uint32_t physical_page = 0;
+};
+
+static mtp_qblock_txn_tail_page_runtime_contract_result mtp_qblock_txn_tail_page_runtime_contract(
+        llama_pos logical_base_token,
+        size_t output_tokens) {
+    mtp_qblock_txn_tail_page_runtime_contract_result result;
+    result.accepted_len = output_tokens <= UINT32_MAX ? (uint32_t) output_tokens : UINT32_MAX;
+    if (logical_base_token < 0 || output_tokens == 0 || output_tokens > MTP_QBLOCK_TXN_MAX_ROWS - 1u) {
+        result.lineage_status = MTP_QBLOCK_TXN_LINEAGE_BAD_ACCEPTED_LEN;
+        result.state_status = MTP_V4_144_TAIL_STATE_LINEAGE_REJECTED;
+        return result;
+    }
+
+    const uint32_t base = (uint32_t) logical_base_token;
+    result.boundary_slot = base & (MTP_V4_144_PAGE_TOKENS - 1u);
+    result.logical_tokens = MTP_V4_144_PAGE_TOKENS - result.boundary_slot;
+    result.physical_page = 0;
+    int32_t block_table[1] = { (int32_t) result.physical_page };
+    static uint8_t dummy_k_payload = 0;
+    static uint8_t dummy_k_scale = 0;
+    static uint8_t dummy_v4 = 0;
+
+    mtp_v4_144_tail_page_desc_v1 tail = {};
+    tail.version = MTP_V4_144_TAIL_PAGE_ABI_VERSION;
+    tail.abi_bytes = sizeof(mtp_v4_144_tail_page_desc_v1);
+    tail.flags = MTP_V4_144_TAIL_FLAG_TAIL_ONLY;
+    tail.page_tokens = MTP_V4_144_PAGE_TOKENS;
+    tail.d = MTP_V4_144_D;
+    tail.logical_base_token = base;
+    tail.logical_tokens = result.logical_tokens;
+    tail.block_table = block_table;
+    tail.block_table_pages = 1;
+    tail.physical_pages = 3;
+    tail.valid_tail_tokens = 0;
+    tail.prefix_tokens = base;
+    tail.boundary_slot = result.boundary_slot;
+    tail.k_payload_base = &dummy_k_payload;
+    tail.k_scale_base = &dummy_k_scale;
+    tail.k_head_stride_bytes = MTP_PACKED16_K_PAGE_BYTES;
+    tail.k_page_stride_bytes = MTP_PACKED16_K_PAGE_BYTES;
+    tail.v4_base = &dummy_v4;
+    tail.v4_head_stride_bytes = MTP_V4_144_PAGE_BYTES;
+    tail.v4_page_stride_bytes = MTP_V4_144_PAGE_BYTES;
+    tail.v4_batch_stride_bytes = MTP_V4_144_PAGE_BYTES;
+    tail.kv_heads = 1;
+    tail.batch = 1;
+    tail.gqa_ratio = 1;
+    tail.k_desc = mtp_qblock_txn_tail_page_runtime_packed16_desc(MTP_V4_144_PAGE_TOKENS, 1);
+
+    result.tail_status = mtp_v4_144_tail_page_validate_static(tail);
+    if (result.tail_status != MTP_V4_144_TAIL_PAGE_OK) {
+        result.state_status = MTP_V4_144_TAIL_STATE_TAIL_DESC_REJECTED;
+        return result;
+    }
+
+    mtp_qblock_txn_lineage_v1 lineage = {};
+    lineage.version = MTP_QBLOCK_TXN_LINEAGE_ABI_VERSION;
+    lineage.abi_bytes = sizeof(mtp_qblock_txn_lineage_v1);
+    lineage.n_rows = result.accepted_len + 1u;
+    lineage.root_row = MTP_QBLOCK_TXN_ROOT_ROW;
+    lineage.flags = MTP_QBLOCK_TXN_LINEAGE_FLAG_IMPLICIT_CHAIN |
+        MTP_QBLOCK_TXN_LINEAGE_FLAG_CONTIGUOUS_COMMIT |
+        MTP_QBLOCK_TXN_LINEAGE_FLAG_CANONICAL_SLOT_ORDER;
+    lineage.accepted_leaf = (uint8_t) result.accepted_len;
+    lineage.accepted_len = (uint8_t) result.accepted_len;
+    lineage.accepted_mask = mtp_qblock_txn_lineage_chain_mask(lineage.accepted_len);
+    for (uint32_t row = 0; row < lineage.n_rows; ++row) {
+        lineage.parent[row] = row == 0 ? (uint8_t) MTP_QBLOCK_TXN_ROOT_ROW : (uint8_t) (row - 1u);
+        lineage.depth[row] = (uint8_t) row;
+        lineage.kv_slot[row] = row == 0 ? (uint8_t) result.boundary_slot : (uint8_t) (result.boundary_slot + row - 1u);
+        lineage.state_slot[row] = (uint8_t) row;
+    }
+    result.lineage_status = mtp_qblock_txn_lineage_validate_commit(lineage, tail);
+    result.new_valid_tail = mtp_qblock_txn_lineage_new_valid_tail_tokens(tail, lineage);
+    result.final_state_slot = mtp_qblock_txn_lineage_final_state_slot(lineage);
+    if (result.lineage_status != MTP_QBLOCK_TXN_LINEAGE_OK) {
+        result.state_status = MTP_V4_144_TAIL_STATE_LINEAGE_REJECTED;
+        return result;
+    }
+
+    mtp_v4_144_tail_page_state_v1 state = {};
+    result.state_status = mtp_v4_144_tail_state_init(state, tail.logical_base_token, tail.physical_pages);
+    uint32_t page = 0;
+    if (result.state_status == MTP_V4_144_TAIL_STATE_OK) {
+        result.state_status = mtp_v4_144_tail_state_alloc_page(state, MTP_V4_144_TAIL_PAGE_OWNER_TXN, &page);
+    }
+    if (result.state_status == MTP_V4_144_TAIL_STATE_OK) {
+        block_table[0] = (int32_t) page;
+        result.physical_page = page;
+        result.state_status = mtp_v4_144_tail_state_commit_lineage(state, tail, lineage);
+    }
+    result.state_valid_tail = state.valid_tail_tokens;
+    result.state_free = state.free_count;
+    result.state_page_valid = page < state.physical_pages ? state.page_valid_tokens[page] : 0u;
+    return result;
+}
+
 static bool mtp_qblock_branch_txn_kv_split_enabled() {
     return mtp_qblock_branch_txn_kv_split_proof_enabled() ||
         mtp_qblock_branch_txn_kv_split_commit_enabled();
@@ -790,6 +981,11 @@ static bool mtp_spec_single_slot_only_enabled() {
 
 static bool mtp_rs_state_trace_enabled() {
     const char * env = getenv("LLAMA_MTP_RS_STATE_TRACE");
+    return env && atoi(env) != 0;
+}
+
+static bool mtp_qblock_replay_oracle_trace_enabled() {
+    const char * env = getenv("LLAMA_MTP_QBLOCK_REPLAY_ORACLE_TRACE");
     return env && atoi(env) != 0;
 }
 
@@ -1255,6 +1451,268 @@ static bool mtp_attention_memory_seq_import_physical(llama_memory_t mem, llama_s
     }
     if (auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
         return kv_iswa->seq_import_physical(seq_id_src, seq_id_dst, bytes_copied, cells_copied, reason);
+    }
+    return fail("unsupported_memory_type");
+}
+
+static void mtp_attention_memory_clear_tail_page_maps(llama_memory_t mem) {
+    if (mem == nullptr) {
+        return;
+    }
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        hybrid->get_mem_attn()->clear_mtp_qblock_tail_page_maps();
+        return;
+    }
+    if (auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        hybrid_iswa->get_mem_attn()->get_base()->clear_mtp_qblock_tail_page_maps();
+        hybrid_iswa->get_mem_attn()->get_swa()->clear_mtp_qblock_tail_page_maps();
+        return;
+    }
+    if (auto * kv = dynamic_cast<llama_kv_cache *>(mem)) {
+        kv->clear_mtp_qblock_tail_page_maps();
+        return;
+    }
+    if (auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
+        kv_iswa->get_base()->clear_mtp_qblock_tail_page_maps();
+        kv_iswa->get_swa()->clear_mtp_qblock_tail_page_maps();
+    }
+}
+
+static bool mtp_attention_memory_register_tail_page_map_from_commit(
+        llama_memory_t mem,
+        llama_pos logical_base_token,
+        uint32_t accepted_tokens,
+        uint64_t generation,
+        ggml_cuda_mtp_qblock_tail_page_map_v1 * out_map,
+        const char ** reason) {
+    auto fail = [&](const char * why) {
+        if (reason) {
+            *reason = why;
+        }
+        if (out_map) {
+            *out_map = {};
+        }
+        mtp_attention_memory_clear_tail_page_maps(mem);
+        return false;
+    };
+    if (mem == nullptr) {
+        return fail("memory_unavailable");
+    }
+
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return hybrid->get_mem_attn()->register_mtp_qblock_tail_page_map_from_commit(
+                logical_base_token, accepted_tokens, generation, out_map, reason);
+    }
+    if (auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        const char * base_reason = nullptr;
+        const bool base_ok = hybrid_iswa->get_mem_attn()->get_base()->register_mtp_qblock_tail_page_map_from_commit(
+                logical_base_token, accepted_tokens, generation, out_map, &base_reason);
+        const bool swa_ok = hybrid_iswa->get_mem_attn()->get_swa()->register_mtp_qblock_tail_page_map_from_commit(
+                logical_base_token, accepted_tokens, generation, base_ok ? nullptr : out_map, reason);
+        if (reason && base_ok) {
+            *reason = "ok";
+        } else if (reason && !swa_ok && base_reason != nullptr) {
+            *reason = base_reason;
+        }
+        return base_ok || swa_ok;
+    }
+    if (auto * kv = dynamic_cast<llama_kv_cache *>(mem)) {
+        return kv->register_mtp_qblock_tail_page_map_from_commit(
+                logical_base_token, accepted_tokens, generation, out_map, reason);
+    }
+    if (auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
+        const char * base_reason = nullptr;
+        const bool base_ok = kv_iswa->get_base()->register_mtp_qblock_tail_page_map_from_commit(
+                logical_base_token, accepted_tokens, generation, out_map, &base_reason);
+        const bool swa_ok = kv_iswa->get_swa()->register_mtp_qblock_tail_page_map_from_commit(
+                logical_base_token, accepted_tokens, generation, base_ok ? nullptr : out_map, reason);
+        if (reason && base_ok) {
+            *reason = "ok";
+        } else if (reason && !swa_ok && base_reason != nullptr) {
+            *reason = base_reason;
+        }
+        return base_ok || swa_ok;
+    }
+    return fail("unsupported_memory_type");
+}
+
+static bool mtp_attention_memory_register_tail_page_map_from_active_producer(
+        llama_memory_t mem,
+        llama_pos logical_base_token,
+        uint32_t accepted_tokens,
+        uint64_t generation,
+        ggml_cuda_mtp_qblock_tail_page_map_v1 * out_map,
+        const char ** reason) {
+    auto fail = [&](const char * why) {
+        if (reason) {
+            *reason = why;
+        }
+        if (out_map) {
+            *out_map = {};
+        }
+        mtp_attention_memory_clear_tail_page_maps(mem);
+        return false;
+    };
+    if (mem == nullptr) {
+        return fail("memory_unavailable");
+    }
+
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return hybrid->get_mem_attn()->register_mtp_qblock_tail_page_map_from_active_producer(
+                logical_base_token, accepted_tokens, generation, out_map, reason);
+    }
+    if (auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        const char * base_reason = nullptr;
+        const bool base_ok = hybrid_iswa->get_mem_attn()->get_base()->register_mtp_qblock_tail_page_map_from_active_producer(
+                logical_base_token, accepted_tokens, generation, out_map, &base_reason);
+        const bool swa_ok = hybrid_iswa->get_mem_attn()->get_swa()->register_mtp_qblock_tail_page_map_from_active_producer(
+                logical_base_token, accepted_tokens, generation, base_ok ? nullptr : out_map, reason);
+        if (reason && base_ok) {
+            *reason = "ok";
+        } else if (reason && !swa_ok && base_reason != nullptr) {
+            *reason = base_reason;
+        }
+        return base_ok || swa_ok;
+    }
+    if (auto * kv = dynamic_cast<llama_kv_cache *>(mem)) {
+        return kv->register_mtp_qblock_tail_page_map_from_active_producer(
+                logical_base_token, accepted_tokens, generation, out_map, reason);
+    }
+    if (auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
+        const char * base_reason = nullptr;
+        const bool base_ok = kv_iswa->get_base()->register_mtp_qblock_tail_page_map_from_active_producer(
+                logical_base_token, accepted_tokens, generation, out_map, &base_reason);
+        const bool swa_ok = kv_iswa->get_swa()->register_mtp_qblock_tail_page_map_from_active_producer(
+                logical_base_token, accepted_tokens, generation, base_ok ? nullptr : out_map, reason);
+        if (reason && base_ok) {
+            *reason = "ok";
+        } else if (reason && !swa_ok && base_reason != nullptr) {
+            *reason = base_reason;
+        }
+        return base_ok || swa_ok;
+    }
+    return fail("unsupported_memory_type");
+}
+
+static bool mtp_attention_memory_snapshot_tail_page_map_from_active_producer(
+        llama_memory_t mem,
+        llama_pos logical_base_token,
+        uint32_t accepted_tokens,
+        ggml_cuda_mtp_qblock_tail_page_map_v1 * out_map,
+        const char ** reason) {
+    auto fail = [&](const char * why) {
+        if (reason) {
+            *reason = why;
+        }
+        if (out_map) {
+            *out_map = {};
+        }
+        return false;
+    };
+    if (mem == nullptr) {
+        return fail("memory_unavailable");
+    }
+
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return hybrid->get_mem_attn()->snapshot_mtp_qblock_tail_page_map_from_active_producer(
+                logical_base_token, accepted_tokens, out_map, reason);
+    }
+    if (auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        const char * base_reason = nullptr;
+        const bool base_ok = hybrid_iswa->get_mem_attn()->get_base()->snapshot_mtp_qblock_tail_page_map_from_active_producer(
+                logical_base_token, accepted_tokens, out_map, &base_reason);
+        if (base_ok) {
+            if (reason) {
+                *reason = "ok";
+            }
+            return true;
+        }
+        const bool swa_ok = hybrid_iswa->get_mem_attn()->get_swa()->snapshot_mtp_qblock_tail_page_map_from_active_producer(
+                logical_base_token, accepted_tokens, out_map, reason);
+        if (reason && !swa_ok && base_reason != nullptr) {
+            *reason = base_reason;
+        }
+        return swa_ok;
+    }
+    if (auto * kv = dynamic_cast<llama_kv_cache *>(mem)) {
+        return kv->snapshot_mtp_qblock_tail_page_map_from_active_producer(
+                logical_base_token, accepted_tokens, out_map, reason);
+    }
+    if (auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
+        const char * base_reason = nullptr;
+        const bool base_ok = kv_iswa->get_base()->snapshot_mtp_qblock_tail_page_map_from_active_producer(
+                logical_base_token, accepted_tokens, out_map, &base_reason);
+        if (base_ok) {
+            if (reason) {
+                *reason = "ok";
+            }
+            return true;
+        }
+        const bool swa_ok = kv_iswa->get_swa()->snapshot_mtp_qblock_tail_page_map_from_active_producer(
+                logical_base_token, accepted_tokens, out_map, reason);
+        if (reason && !swa_ok && base_reason != nullptr) {
+            *reason = base_reason;
+        }
+        return swa_ok;
+    }
+    return fail("unsupported_memory_type");
+}
+
+static bool mtp_attention_memory_register_tail_page_map_from_producer_snapshot(
+        llama_memory_t mem,
+        llama_pos logical_base_token,
+        uint32_t accepted_tokens,
+        uint64_t generation,
+        const ggml_cuda_mtp_qblock_tail_page_map_v1 & producer_map,
+        ggml_cuda_mtp_qblock_tail_page_map_v1 * out_map,
+        const char ** reason) {
+    auto fail = [&](const char * why) {
+        if (reason) {
+            *reason = why;
+        }
+        if (out_map) {
+            *out_map = {};
+        }
+        mtp_attention_memory_clear_tail_page_maps(mem);
+        return false;
+    };
+    if (mem == nullptr) {
+        return fail("memory_unavailable");
+    }
+
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return hybrid->get_mem_attn()->register_mtp_qblock_tail_page_map_from_producer_snapshot(
+                logical_base_token, accepted_tokens, generation, producer_map, out_map, reason);
+    }
+    if (auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        const char * base_reason = nullptr;
+        const bool base_ok = hybrid_iswa->get_mem_attn()->get_base()->register_mtp_qblock_tail_page_map_from_producer_snapshot(
+                logical_base_token, accepted_tokens, generation, producer_map, out_map, &base_reason);
+        const bool swa_ok = hybrid_iswa->get_mem_attn()->get_swa()->register_mtp_qblock_tail_page_map_from_producer_snapshot(
+                logical_base_token, accepted_tokens, generation, producer_map, base_ok ? nullptr : out_map, reason);
+        if (reason && base_ok) {
+            *reason = "ok";
+        } else if (reason && !swa_ok && base_reason != nullptr) {
+            *reason = base_reason;
+        }
+        return base_ok || swa_ok;
+    }
+    if (auto * kv = dynamic_cast<llama_kv_cache *>(mem)) {
+        return kv->register_mtp_qblock_tail_page_map_from_producer_snapshot(
+                logical_base_token, accepted_tokens, generation, producer_map, out_map, reason);
+    }
+    if (auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
+        const char * base_reason = nullptr;
+        const bool base_ok = kv_iswa->get_base()->register_mtp_qblock_tail_page_map_from_producer_snapshot(
+                logical_base_token, accepted_tokens, generation, producer_map, out_map, &base_reason);
+        const bool swa_ok = kv_iswa->get_swa()->register_mtp_qblock_tail_page_map_from_producer_snapshot(
+                logical_base_token, accepted_tokens, generation, producer_map, base_ok ? nullptr : out_map, reason);
+        if (reason && base_ok) {
+            *reason = "ok";
+        } else if (reason && !swa_ok && base_reason != nullptr) {
+            *reason = base_reason;
+        }
+        return base_ok || swa_ok;
     }
     return fail("unsupported_memory_type");
 }
@@ -6654,6 +7112,20 @@ private:
                 bool mtp_qblock_branch_txn_sampler_commit_clone_ok = false;
                 size_t mtp_qblock_branch_txn_sampler_commit_accept_count = 0;
                 common_sampler_ptr mtp_qblock_branch_txn_sampler_commit_smpl;
+                bool mtp_qblock_txn_runtime_sampler_ok = false;
+                bool mtp_qblock_txn_runtime_sampler_touched = false;
+                bool mtp_qblock_txn_runtime_kv_attempted = false;
+                bool mtp_qblock_txn_runtime_kv_ok = false;
+                bool mtp_qblock_txn_runtime_kv_touched = false;
+                const char * mtp_qblock_txn_runtime_kv_kind = "none";
+                const char * mtp_qblock_txn_runtime_kv_status = "disabled";
+                const char * mtp_qblock_txn_runtime_kv_reason = "disabled";
+                bool mtp_qblock_txn_runtime_recurrent_attempted = false;
+                bool mtp_qblock_txn_runtime_recurrent_ok = false;
+                bool mtp_qblock_txn_runtime_recurrent_touched = false;
+                bool mtp_qblock_txn_runtime_recurrent_restored = false;
+                const char * mtp_qblock_txn_runtime_recurrent_status = "disabled";
+                const char * mtp_qblock_txn_runtime_recurrent_reason = "disabled";
 
                 // verify and try to accept the draft
                 {
@@ -6950,6 +7422,10 @@ private:
                                             bool target_scratch_removed_before = false;
                                             bool target_scratch_removed_after = false;
                                             bool target_decode_ok = false;
+                                            double target_probe_decode_ms = 0.0;
+                                            double target_sampler_replay_decode_ms = 0.0;
+                                            double target_sampler_replay_total_ms = 0.0;
+                                            int64_t target_sampler_replay_total_t0 = 0;
                                             llama_seq_id target_scratch_seq = -1;
                                             size_t target_branch_rows_captured = 0;
                                             size_t logits_rows_captured = 0;
@@ -6960,7 +7436,22 @@ private:
                                             float sibling_watch_logit = NAN;
                                             llama_token descendant_last_top1 = LLAMA_TOKEN_NULL;
                                             llama_token descendant_last_top2 = LLAMA_TOKEN_NULL;
-                                            const bool target_oracle_compare_requested = mtp_qblock_sibling_target_rows_oracle_compare_enabled();
+                                            const char * target_rows_probe_env = getenv("LLAMA_MTP_QBLOCK_SIBLING_TARGET_ROWS_PROBE");
+                                            const char * target_sampler_oracle_env = getenv("LLAMA_MTP_QBLOCK_SIBLING_TARGET_ROWS_SAMPLER_ORACLE");
+                                            const bool target_rows_probe_explicit = target_rows_probe_env && atoi(target_rows_probe_env) != 0;
+                                            const bool target_sampler_oracle_explicit = target_sampler_oracle_env && atoi(target_sampler_oracle_env) != 0;
+                                            const bool physical_direct_replay_requested =
+                                                mtp_qblock_branch_txn_kv_physical_import_commit_enabled() &&
+                                                mtp_qblock_branch_txn_kv_physical_import_direct_replay_enabled() &&
+                                                !mtp_qblock_branch_txn_sampler_commit_enabled() &&
+                                                !mtp_qblock_branch_txn_recurrent_commit_enabled() &&
+                                                !mtp_qblock_branch_txn_kv_split_enabled() &&
+                                                !mtp_qblock_branch_txn_kv_attention_import_commit_enabled() &&
+                                                !target_rows_probe_explicit &&
+                                                !target_sampler_oracle_explicit &&
+                                                !mtp_qblock_sibling_target_rows_oracle_compare_enabled();
+                                            const bool target_oracle_compare_requested =
+                                                !physical_direct_replay_requested && mtp_qblock_sibling_target_rows_oracle_compare_enabled();
                                             const char * target_oracle_status = target_oracle_compare_requested ? "skipped" : "disabled";
                                             size_t target_oracle_rows_captured = 0;
                                             size_t target_oracle_logits_rows_captured = 0;
@@ -6969,7 +7460,8 @@ private:
                                             int target_oracle_watch_rank_mismatch_count = 0;
                                             int target_oracle_digest_mismatch_count = 0;
                                             float target_oracle_watch_logit_absmax = 0.0f;
-                                            const bool target_sampler_oracle_requested = mtp_qblock_sibling_target_rows_sampler_oracle_enabled();
+                                            const bool target_sampler_oracle_requested =
+                                                !physical_direct_replay_requested && mtp_qblock_sibling_target_rows_sampler_oracle_enabled();
                                             const char * target_sampler_oracle_status = target_sampler_oracle_requested ? "skipped" : "disabled";
                                             size_t target_sampler_oracle_expected_rows = desc_for_target;
                                             size_t target_sampler_oracle_rows = 0;
@@ -6982,6 +7474,13 @@ private:
                                             common_sampler_ptr target_sampler_oracle_smpl;
                                             bool target_sampler_oracle_active = false;
                                             const char * target_sampler_replay_status = target_sampler_oracle_requested ? "skipped" : "disabled";
+                                            bool target_sampler_replay_batched = false;
+                                            bool target_sampler_replay_prefix_copied = false;
+                                            double target_sampler_replay_rm_ms = 0.0;
+                                            double target_sampler_replay_cp_ms = 0.0;
+                                            double target_sampler_replay_ckpt_load_ms = 0.0;
+                                            double target_sampler_replay_sync_ms = 0.0;
+                                            double target_sampler_replay_cleanup_ms = 0.0;
                                             bool target_sampler_replay_scratch_removed_before = false;
                                             bool target_sampler_replay_scratch_copied = false;
                                             bool target_sampler_replay_scratch_removed_after = false;
@@ -7126,6 +7625,12 @@ private:
                                                     target_status = "no_spec_ckpt";
                                                 } else {
                                                     auto * mem_tgt = llama_get_memory(slot.ctx_tgt);
+                                                    mtp_llama_batch_scope target_probe_batch_scope(1);
+                                                    llama_batch & target_probe_batch = target_probe_batch_scope.batch;
+                                                    if (physical_direct_replay_requested) {
+                                                        target_decode_ok = true;
+                                                        target_status = "physical_direct_replay";
+                                                    } else {
                                                     llama_synchronize(slot.ctx_tgt);
                                                     target_scratch_removed_before = llama_memory_seq_rm(mem_tgt, target_scratch_seq, -1, -1);
                                                     if (target_scratch_removed_before) {
@@ -7134,8 +7639,6 @@ private:
                                                         slot.spec_ckpt.load_tgt(slot.ctx_tgt, target_scratch_seq, remap_flags);
                                                         target_scratch_copied = true;
                                                     }
-                                                    mtp_llama_batch_scope target_probe_batch_scope(1);
-                                                    llama_batch & target_probe_batch = target_probe_batch_scope.batch;
                                                     target_decode_ok = target_scratch_removed_before && target_scratch_copied;
                                                     for (size_t j = 0; target_decode_ok && j < target_replay_tokens.size(); ++j) {
                                                         const bool branch_row = j >= prefix_tokens_replayed;
@@ -7144,7 +7647,9 @@ private:
                                                         int ret_target_probe = 0;
                                                         {
                                                             mtp_roctx_range roctx_mtp_target_branch_probe("MTP:target_branch_probe_scratch");
+                                                            const int64_t target_probe_decode_t0 = ggml_time_us();
                                                             ret_target_probe = llama_decode(slot.ctx_tgt, target_probe_batch);
+                                                            target_probe_decode_ms += double(ggml_time_us() - target_probe_decode_t0) / 1000.0;
                                                         }
                                                         metrics.on_decoded(slots);
                                                         if (ret_target_probe != 0) {
@@ -7206,7 +7711,11 @@ private:
                                                             target_sampler_oracle_status = "ok";
                                                         }
                                                     }
+                                                    }
 
+                                                    const bool target_base_available = target_decode_ok &&
+                                                        (strcmp(target_status, "ok") == 0 ||
+                                                         strcmp(target_status, "physical_direct_replay") == 0);
                                                     const bool target_sampler_replay_has_oracle_tail =
                                                         target_sampler_oracle_requested &&
                                                         (strcmp(target_sampler_oracle_status, "ok") == 0 || strcmp(target_sampler_oracle_status, "mismatch") == 0) &&
@@ -7214,7 +7723,7 @@ private:
                                                     const bool target_sampler_replay_prefix_only =
                                                         (mtp_qblock_branch_txn_recurrent_commit_enabled() || mtp_qblock_branch_txn_kv_any_enabled()) &&
                                                         target_sampler_oracle_sampled_tokens.empty() &&
-                                                        target_decode_ok && strcmp(target_status, "ok") == 0;
+                                                        target_base_available;
                                                     if (target_sampler_replay_has_oracle_tail || target_sampler_replay_prefix_only) {
                                                         target_sampler_replay_tokens.reserve(prefix_tokens_replayed + 1 + target_sampler_oracle_sampled_tokens.size());
                                                         target_sampler_replay_pos.reserve(prefix_tokens_replayed + 1 + target_sampler_oracle_sampled_tokens.size());
@@ -7232,15 +7741,6 @@ private:
                                                         target_sampler_replay_rows_expected = 1 + target_sampler_oracle_sampled_tokens.size();
                                                         target_sampler_replay_status = "ok";
 
-                                                        target_sampler_replay_scratch_removed_before = llama_memory_seq_rm(mem_tgt, target_scratch_seq, -1, -1);
-                                                        if (target_sampler_replay_scratch_removed_before) {
-                                                            llama_memory_seq_cp(mem_tgt, slot.id, target_scratch_seq, -1, slot.spec_ckpt.pos_max + 1);
-                                                            const llama_state_seq_flags remap_flags = mtp_spec_state_flags() | LLAMA_STATE_SEQ_FLAGS_ALLOW_SEQ_REMAP;
-                                                            slot.spec_ckpt.load_tgt(slot.ctx_tgt, target_scratch_seq, remap_flags);
-                                                            target_sampler_replay_scratch_copied = true;
-                                                        }
-                                                        bool target_sampler_replay_decode_ok = target_sampler_replay_scratch_removed_before && target_sampler_replay_scratch_copied;
-                                                        bool target_sampler_replay_prefix_only_physical_retained = false;
                                                         const bool target_sampler_replay_partial_state_capture_requested =
                                                             mtp_qblock_branch_txn_recurrent_commit_enabled() ||
                                                             mtp_qblock_branch_txn_kv_split_enabled() ||
@@ -7251,51 +7751,125 @@ private:
                                                             mtp_qblock_branch_txn_kv_physical_import_commit_enabled();
                                                         const size_t target_sampler_replay_prefix_state_tokens =
                                                             target_sampler_replay_tokens.size() > 1 ? target_sampler_replay_tokens.size() - 1 : 0;
-                                                        for (size_t j = 0; target_sampler_replay_decode_ok && j < target_sampler_replay_tokens.size(); ++j) {
-                                                            const bool branch_row = j >= prefix_tokens_replayed;
-                                                            common_batch_clear(target_probe_batch);
-                                                            common_batch_add(target_probe_batch, target_sampler_replay_tokens[j], target_sampler_replay_pos[j], { target_scratch_seq }, branch_row);
+                                                        const bool target_sampler_replay_physical_prefix_copy =
+                                                            physical_direct_replay_requested &&
+                                                            target_sampler_replay_prefix_only &&
+                                                            target_sampler_replay_physical_scratch_requested &&
+                                                            !target_sampler_replay_partial_state_capture_requested &&
+                                                            target_sampler_oracle_sampled_tokens.empty() &&
+                                                            target_sampler_replay_prefix_state_tokens > 0;
+                                                        const bool target_sampler_replay_physical_direct_batched =
+                                                            physical_direct_replay_requested &&
+                                                            target_sampler_replay_prefix_only &&
+                                                            target_sampler_replay_physical_scratch_requested &&
+                                                            !target_sampler_replay_partial_state_capture_requested &&
+                                                            target_sampler_replay_prefix_state_tokens > 0 &&
+                                                            target_sampler_replay_prefix_state_tokens <= target_sampler_replay_tokens.size();
+
+                                                        target_sampler_replay_total_t0 = ggml_time_us();
+                                                        {
+                                                            const int64_t replay_rm_t0 = ggml_time_us();
+                                                            target_sampler_replay_scratch_removed_before = llama_memory_seq_rm(mem_tgt, target_scratch_seq, -1, -1);
+                                                            target_sampler_replay_rm_ms += double(ggml_time_us() - replay_rm_t0) / 1000.0;
+                                                        }
+                                                        if (target_sampler_replay_scratch_removed_before) {
+                                                            {
+                                                                const int64_t replay_cp_t0 = ggml_time_us();
+                                                                const llama_pos replay_cp_to = slot.spec_ckpt.pos_max + 1 +
+                                                                    (target_sampler_replay_physical_prefix_copy ? (llama_pos) target_sampler_replay_prefix_state_tokens : 0);
+                                                                llama_memory_seq_cp(mem_tgt, slot.id, target_scratch_seq, -1, replay_cp_to);
+                                                                target_sampler_replay_cp_ms += double(ggml_time_us() - replay_cp_t0) / 1000.0;
+                                                            }
+                                                            if (!target_sampler_replay_physical_prefix_copy) {
+                                                                const llama_state_seq_flags remap_flags = mtp_spec_state_flags() | LLAMA_STATE_SEQ_FLAGS_ALLOW_SEQ_REMAP;
+                                                                const int64_t replay_ckpt_load_t0 = ggml_time_us();
+                                                                slot.spec_ckpt.load_tgt(slot.ctx_tgt, target_scratch_seq, remap_flags);
+                                                                target_sampler_replay_ckpt_load_ms += double(ggml_time_us() - replay_ckpt_load_t0) / 1000.0;
+                                                            }
+                                                            target_sampler_replay_scratch_copied = true;
+                                                        }
+                                                        bool target_sampler_replay_decode_ok = target_sampler_replay_scratch_removed_before && target_sampler_replay_scratch_copied;
+                                                        bool target_sampler_replay_prefix_only_physical_retained = false;
+                                                        if (target_sampler_replay_decode_ok && target_sampler_replay_physical_prefix_copy) {
+                                                            target_sampler_replay_prefix_copied = true;
+                                                            target_sampler_replay_prefix_tokens = target_sampler_replay_prefix_state_tokens;
+                                                            target_sampler_replay_physical_scratch_pending = true;
+                                                            target_sampler_replay_physical_scratch_seq = target_scratch_seq;
+                                                            target_sampler_replay_prefix_only_physical_retained = true;
+                                                        } else if (target_sampler_replay_decode_ok && target_sampler_replay_physical_direct_batched) {
+                                                            target_sampler_replay_batched = true;
+                                                            mtp_llama_batch_scope target_sampler_replay_batch_scope((int32_t) target_sampler_replay_prefix_state_tokens);
+                                                            llama_batch & target_sampler_replay_batch = target_sampler_replay_batch_scope.batch;
+                                                            common_batch_clear(target_sampler_replay_batch);
+                                                            for (size_t j = 0; j < target_sampler_replay_prefix_state_tokens; ++j) {
+                                                                common_batch_add(target_sampler_replay_batch, target_sampler_replay_tokens[j], target_sampler_replay_pos[j], { target_scratch_seq }, false);
+                                                            }
                                                             int ret_sampler_replay = 0;
                                                             {
-                                                                mtp_roctx_range roctx_mtp_target_sampler_replay("MTP:target_branch_sampler_oracle_replay");
-                                                                ret_sampler_replay = llama_decode(slot.ctx_tgt, target_probe_batch);
+                                                                mtp_roctx_range roctx_mtp_target_sampler_replay("MTP:target_branch_sampler_oracle_replay_batched");
+                                                                const int64_t sampler_replay_decode_t0 = ggml_time_us();
+                                                                ret_sampler_replay = llama_decode(slot.ctx_tgt, target_sampler_replay_batch);
+                                                                target_sampler_replay_decode_ms += double(ggml_time_us() - sampler_replay_decode_t0) / 1000.0;
                                                             }
                                                             metrics.on_decoded(slots);
                                                             if (ret_sampler_replay != 0) {
                                                                 target_sampler_replay_decode_ok = false;
                                                                 target_sampler_replay_status = "decode_failed";
-                                                                break;
-                                                            }
-                                                            if (target_sampler_replay_prefix_state_tokens > 0 &&
-                                                                    j + 1 == target_sampler_replay_prefix_state_tokens) {
-                                                                if (target_sampler_replay_partial_state_capture_requested) {
-                                                                    target_sampler_replay_prefix_state_data = mtp_get_partial_seq_state_data(slot.ctx_tgt, target_scratch_seq);
-                                                                    target_sampler_replay_prefix_state_digest = mtp_digest_bytes(target_sampler_replay_prefix_state_data);
-                                                                    target_sampler_replay_prefix_state_ok = !target_sampler_replay_prefix_state_data.empty();
-                                                                }
-                                                                if (mtp_qblock_branch_txn_kv_split_enabled()) {
-                                                                    target_sampler_replay_prefix_full_state_data = mtp_get_full_seq_state_data(slot.ctx_tgt, target_scratch_seq);
-                                                                    target_sampler_replay_prefix_full_state_digest = mtp_digest_bytes(target_sampler_replay_prefix_full_state_data);
-                                                                    target_sampler_replay_prefix_full_state_ok = !target_sampler_replay_prefix_full_state_data.empty();
-                                                                }
-                                                                if (target_sampler_replay_attention_state_capture_requested) {
-                                                                    target_sampler_replay_prefix_attention_state_data = mtp_get_attention_seq_state_data(slot.ctx_tgt, target_scratch_seq);
-                                                                    target_sampler_replay_prefix_attention_state_digest = mtp_digest_bytes(target_sampler_replay_prefix_attention_state_data);
-                                                                    target_sampler_replay_prefix_attention_state_ok = !target_sampler_replay_prefix_attention_state_data.empty();
-                                                                }
+                                                            } else {
                                                                 target_sampler_replay_prefix_tokens = target_sampler_replay_prefix_state_tokens;
-                                                                if (target_sampler_replay_physical_scratch_requested && !target_sampler_replay_partial_state_capture_requested) {
-                                                                    target_sampler_replay_physical_scratch_pending = true;
-                                                                    target_sampler_replay_physical_scratch_seq = target_scratch_seq;
-                                                                    target_sampler_replay_prefix_only_physical_retained = true;
+                                                                target_sampler_replay_physical_scratch_pending = true;
+                                                                target_sampler_replay_physical_scratch_seq = target_scratch_seq;
+                                                                target_sampler_replay_prefix_only_physical_retained = true;
+                                                            }
+                                                        } else {
+                                                            for (size_t j = 0; target_sampler_replay_decode_ok && j < target_sampler_replay_tokens.size(); ++j) {
+                                                                const bool branch_row = j >= prefix_tokens_replayed;
+                                                                common_batch_clear(target_probe_batch);
+                                                                common_batch_add(target_probe_batch, target_sampler_replay_tokens[j], target_sampler_replay_pos[j], { target_scratch_seq }, branch_row);
+                                                                int ret_sampler_replay = 0;
+                                                                {
+                                                                    mtp_roctx_range roctx_mtp_target_sampler_replay("MTP:target_branch_sampler_oracle_replay");
+                                                                    const int64_t sampler_replay_decode_t0 = ggml_time_us();
+                                                                    ret_sampler_replay = llama_decode(slot.ctx_tgt, target_probe_batch);
+                                                                    target_sampler_replay_decode_ms += double(ggml_time_us() - sampler_replay_decode_t0) / 1000.0;
+                                                                }
+                                                                metrics.on_decoded(slots);
+                                                                if (ret_sampler_replay != 0) {
+                                                                    target_sampler_replay_decode_ok = false;
+                                                                    target_sampler_replay_status = "decode_failed";
                                                                     break;
                                                                 }
-                                                            }
-                                                            if (branch_row) {
-                                                                target_sampler_replay_rows_captured++;
-                                                                const mtp_target_branch_logit_summary row_summary = scan_logits(LLAMA_TOKEN_NULL);
-                                                                if (row_summary.ok) {
-                                                                    target_sampler_replay_logits_rows_captured++;
+                                                                if (target_sampler_replay_prefix_state_tokens > 0 &&
+                                                                        j + 1 == target_sampler_replay_prefix_state_tokens) {
+                                                                    if (target_sampler_replay_partial_state_capture_requested) {
+                                                                        target_sampler_replay_prefix_state_data = mtp_get_partial_seq_state_data(slot.ctx_tgt, target_scratch_seq);
+                                                                        target_sampler_replay_prefix_state_digest = mtp_digest_bytes(target_sampler_replay_prefix_state_data);
+                                                                        target_sampler_replay_prefix_state_ok = !target_sampler_replay_prefix_state_data.empty();
+                                                                    }
+                                                                    if (mtp_qblock_branch_txn_kv_split_enabled()) {
+                                                                        target_sampler_replay_prefix_full_state_data = mtp_get_full_seq_state_data(slot.ctx_tgt, target_scratch_seq);
+                                                                        target_sampler_replay_prefix_full_state_digest = mtp_digest_bytes(target_sampler_replay_prefix_full_state_data);
+                                                                        target_sampler_replay_prefix_full_state_ok = !target_sampler_replay_prefix_full_state_data.empty();
+                                                                    }
+                                                                    if (target_sampler_replay_attention_state_capture_requested) {
+                                                                        target_sampler_replay_prefix_attention_state_data = mtp_get_attention_seq_state_data(slot.ctx_tgt, target_scratch_seq);
+                                                                        target_sampler_replay_prefix_attention_state_digest = mtp_digest_bytes(target_sampler_replay_prefix_attention_state_data);
+                                                                        target_sampler_replay_prefix_attention_state_ok = !target_sampler_replay_prefix_attention_state_data.empty();
+                                                                    }
+                                                                    target_sampler_replay_prefix_tokens = target_sampler_replay_prefix_state_tokens;
+                                                                    if (target_sampler_replay_physical_scratch_requested && !target_sampler_replay_partial_state_capture_requested) {
+                                                                        target_sampler_replay_physical_scratch_pending = true;
+                                                                        target_sampler_replay_physical_scratch_seq = target_scratch_seq;
+                                                                        target_sampler_replay_prefix_only_physical_retained = true;
+                                                                        break;
+                                                                    }
+                                                                }
+                                                                if (branch_row) {
+                                                                    target_sampler_replay_rows_captured++;
+                                                                    const mtp_target_branch_logit_summary row_summary = scan_logits(LLAMA_TOKEN_NULL);
+                                                                    if (row_summary.ok) {
+                                                                        target_sampler_replay_logits_rows_captured++;
+                                                                    }
                                                                 }
                                                             }
                                                         }
@@ -7304,7 +7878,11 @@ private:
                                                             target_sampler_replay_state_digest = mtp_digest_bytes(target_sampler_replay_state_data);
                                                             target_sampler_replay_state_ok = !target_sampler_replay_state_data.empty();
                                                         }
-                                                        llama_synchronize(slot.ctx_tgt);
+                                                        if (!target_sampler_replay_prefix_copied) {
+                                                            const int64_t replay_sync_t0 = ggml_time_us();
+                                                            llama_synchronize(slot.ctx_tgt);
+                                                            target_sampler_replay_sync_ms += double(ggml_time_us() - replay_sync_t0) / 1000.0;
+                                                        }
                                                         target_sampler_replay_physical_scratch_pending =
                                                             target_sampler_replay_physical_scratch_requested &&
                                                             target_sampler_replay_decode_ok &&
@@ -7317,7 +7895,9 @@ private:
                                                                 target_sampler_replay_logits_rows_captured = target_sampler_replay_rows_captured;
                                                             }
                                                         } else {
+                                                            const int64_t replay_cleanup_t0 = ggml_time_us();
                                                             target_sampler_replay_scratch_removed_after = llama_memory_seq_rm(mem_tgt, target_scratch_seq, -1, -1);
+                                                            target_sampler_replay_cleanup_ms += double(ggml_time_us() - replay_cleanup_t0) / 1000.0;
                                                         }
                                                         if (!target_sampler_replay_scratch_removed_before || !target_sampler_replay_scratch_copied) {
                                                             target_sampler_replay_status = "scratch_init_failed";
@@ -7330,6 +7910,9 @@ private:
                                                         }
                                                     } else if (target_sampler_oracle_requested && strcmp(target_sampler_replay_status, "skipped") == 0) {
                                                         target_sampler_replay_status = "no_sampler_tokens";
+                                                    }
+                                                    if (target_sampler_replay_total_t0 != 0) {
+                                                        target_sampler_replay_total_ms = double(ggml_time_us() - target_sampler_replay_total_t0) / 1000.0;
                                                     }
 
                                                     if (target_oracle_compare_requested) {
@@ -7428,7 +8011,7 @@ private:
                                             }
 
                                             fprintf(stderr,
-                                                    "MTP_QBLOCK_BRANCH_TARGET_PROBE: slot=%d status=%s reject_depth=%zu depth1=%zu parent_i_batch=%d parent_row=%zu sibling_pos=%d selected=%d sampled=%d candidate_rank=%d ordinary_accepted=%zu rollback=%u prefix_tokens_replayed=%zu descendants_captured=%zu target_rows_max=%d target_branch_rows_expected=%zu target_branch_rows_captured=%zu logits_rows_captured=%zu target_scratch_seq=%d target_scratch_available=%d target_scratch_copied=%d target_scratch_removed_before=%d target_scratch_removed_after=%d production_seq_touched=0 target_context_touched=1 draft_touched=0 sampler_touched=0 prompt_touched=0 same_cycle_replayable=0 safe_commit=0 sibling_row_top1=%d sibling_row_top2=%d sibling_watch=%d sibling_watch_rank=%d sibling_watch_logit=%.8g descendant_last_top1=%d descendant_last_top2=%d oracle_compare=%d oracle_status=%s oracle_rows_captured=%zu oracle_logits_rows_captured=%zu oracle_top1_mismatch_count=%d oracle_top2_mismatch_count=%d oracle_watch_rank_mismatch_count=%d oracle_watch_logit_absmax=%.8g oracle_digest_mismatch_count=%d sampler_oracle=%d sampler_oracle_status=%s sampler_oracle_expected_rows=%zu sampler_oracle_rows=%zu sampler_oracle_match_count=%zu sampler_oracle_mismatch_count=%zu sampler_oracle_first_mismatch=%lld sampler_replay_status=%s sampler_replay_rows_expected=%zu sampler_replay_rows_captured=%zu sampler_replay_logits_rows_captured=%zu sampler_replay_state_ok=%d sampler_replay_state_size=%zu sampler_replay_state_hash=%016" PRIx64 " sampler_replay_scratch_copied=%d sampler_replay_scratch_removed_before=%d sampler_replay_scratch_removed_after=%d reason=target_rows_scratch_trace_only_transaction_not_committed target_replay_token_list=[",
+                                                    "MTP_QBLOCK_BRANCH_TARGET_PROBE: slot=%d status=%s reject_depth=%zu depth1=%zu parent_i_batch=%d parent_row=%zu sibling_pos=%d selected=%d sampled=%d candidate_rank=%d ordinary_accepted=%zu rollback=%u prefix_tokens_replayed=%zu descendants_captured=%zu target_rows_max=%d target_branch_rows_expected=%zu target_branch_rows_captured=%zu logits_rows_captured=%zu target_scratch_seq=%d target_scratch_available=%d target_scratch_copied=%d target_scratch_removed_before=%d target_scratch_removed_after=%d target_probe_decode_ms=%.3f sampler_replay_decode_ms=%.3f sampler_replay_total_ms=%.3f sampler_replay_batched=%d sampler_replay_prefix_copied=%d sampler_replay_rm_ms=%.3f sampler_replay_cp_ms=%.3f sampler_replay_ckpt_load_ms=%.3f sampler_replay_sync_ms=%.3f sampler_replay_cleanup_ms=%.3f production_seq_touched=0 target_context_touched=1 draft_touched=0 sampler_touched=0 prompt_touched=0 same_cycle_replayable=0 safe_commit=0 sibling_row_top1=%d sibling_row_top2=%d sibling_watch=%d sibling_watch_rank=%d sibling_watch_logit=%.8g descendant_last_top1=%d descendant_last_top2=%d oracle_compare=%d oracle_status=%s oracle_rows_captured=%zu oracle_logits_rows_captured=%zu oracle_top1_mismatch_count=%d oracle_top2_mismatch_count=%d oracle_watch_rank_mismatch_count=%d oracle_watch_logit_absmax=%.8g oracle_digest_mismatch_count=%d sampler_oracle=%d sampler_oracle_status=%s sampler_oracle_expected_rows=%zu sampler_oracle_rows=%zu sampler_oracle_match_count=%zu sampler_oracle_mismatch_count=%zu sampler_oracle_first_mismatch=%lld sampler_replay_status=%s sampler_replay_rows_expected=%zu sampler_replay_rows_captured=%zu sampler_replay_logits_rows_captured=%zu sampler_replay_state_ok=%d sampler_replay_state_size=%zu sampler_replay_state_hash=%016" PRIx64 " sampler_replay_scratch_copied=%d sampler_replay_scratch_removed_before=%d sampler_replay_scratch_removed_after=%d reason=target_rows_scratch_trace_only_transaction_not_committed target_replay_token_list=[",
                                                     slot.id,
                                                     target_status,
                                                     reject_depth,
@@ -7452,6 +8035,16 @@ private:
                                                     target_scratch_copied ? 1 : 0,
                                                     target_scratch_removed_before ? 1 : 0,
                                                     target_scratch_removed_after ? 1 : 0,
+                                                    target_probe_decode_ms,
+                                                    target_sampler_replay_decode_ms,
+                                                    target_sampler_replay_total_ms,
+                                                    target_sampler_replay_batched ? 1 : 0,
+                                                    target_sampler_replay_prefix_copied ? 1 : 0,
+                                                    target_sampler_replay_rm_ms,
+                                                    target_sampler_replay_cp_ms,
+                                                    target_sampler_replay_ckpt_load_ms,
+                                                    target_sampler_replay_sync_ms,
+                                                    target_sampler_replay_cleanup_ms,
                                                     (int) sibling_row_top1,
                                                     (int) sibling_row_top2,
                                                     (int) sibling_watch,
@@ -8245,6 +8838,37 @@ private:
 
                     const bool replay_accepted = replay_accepted_requested ||
                         (mtp_target_batch_verify_replay_partial_enabled() && n_rollback > 0);
+                    if (mtp_qblock_replay_oracle_trace_enabled()) {
+                        const auto & ckpt = slot.spec_ckpt;
+                        const size_t n_accepted = accepted.size() > 0 ? accepted.size() - 1 : 0;
+                        const llama_pos commit_pos_begin = (llama_pos) ckpt.n_tokens;
+                        const llama_pos commit_pos_end = commit_pos_begin + (llama_pos) accepted.size();
+                        fprintf(stderr,
+                                "MTP_QBLOCK_REPLAY_ORACLE: slot=%d backend=%s reason=%s draft=%zu accepted=%zu accepted_bundle=%zu rollback=%u ckpt_tokens=%lld ckpt_pos_min=%d ckpt_pos_max=%d commit_pos_begin=%d commit_pos_end=%d sampled=%d replay_requested=%d replay_active=%d replay_partial=%d accepted_row_only=%d accepted_row_only_done=%d prefix_commit_idx=%u tokens=[",
+                                slot.id,
+                                mtp_verify_backend_name(slot.spec_verify_backend),
+                                slot.spec_verify_backend_reason,
+                                n_draft,
+                                n_accepted,
+                                accepted.size(),
+                                n_rollback,
+                                (long long) ckpt.n_tokens,
+                                ckpt.pos_min,
+                                ckpt.pos_max,
+                                commit_pos_begin,
+                                commit_pos_end,
+                                (int) slot.sampled,
+                                replay_accepted_requested ? 1 : 0,
+                                replay_accepted ? 1 : 0,
+                                mtp_target_batch_verify_replay_partial_enabled() ? 1 : 0,
+                                accepted_row_only_commit ? 1 : 0,
+                                prefix_accepted_row_commit_done ? 1 : 0,
+                                prefix_accepted_row_commit_idx);
+                        for (size_t j = 0; j < accepted.size(); ++j) {
+                            fprintf(stderr, "%s%d", j == 0 ? "" : ",", (int) accepted[j]);
+                        }
+                        fprintf(stderr, "]\n");
+                    }
                     if (replay_accepted) {
                         const auto & ckpt = slot.spec_ckpt;
                         if (ckpt.data_tgt.empty()) {
@@ -8413,6 +9037,39 @@ private:
                         }
                         if (!replay_ok) {
                             continue;
+                        }
+
+                        if (mtp_qblock_replay_oracle_trace_enabled()) {
+                            const llama_pos tgt_pos_max = llama_memory_seq_pos_max(llama_get_memory(slot.ctx_tgt), slot.id);
+                            const llama_pos dft_pos_max = slot.ctx_dft ? llama_memory_seq_pos_max(llama_get_memory(slot.ctx_dft), slot.id) : (llama_pos) -999;
+                            std::vector<uint8_t> replay_state_data;
+                            mtp_rs_state_digest replay_state_digest;
+                            bool replay_state_ok = false;
+                            if (llama_n_rs_seq(slot.ctx_tgt) > 0) {
+                                replay_state_data = mtp_get_partial_seq_state_data(slot.ctx_tgt, slot.id);
+                                replay_state_digest = mtp_digest_bytes(replay_state_data);
+                                replay_state_ok = !replay_state_data.empty();
+                            }
+                            fprintf(stderr,
+                                    "MTP_QBLOCK_REPLAY_ORACLE_DONE: slot=%d backend=%s reason=%s draft=%zu accepted=%zu rollback=%u replay_tokens=%zu replay_pos_begin=%d replay_pos_end=%d tgt_pos_max=%d dft_pos_max=%d from_prefix=%d prefix_tokens=%zu skip_dft=%d outputs=%d replay_state_ok=%d replay_state_size=%zu replay_state_hash=%016" PRIx64 "\n",
+                                    slot.id,
+                                    mtp_verify_backend_name(slot.spec_verify_backend),
+                                    slot.spec_verify_backend_reason,
+                                    n_draft,
+                                    n_accepted,
+                                    n_rollback,
+                                    n_replayed,
+                                    (int) ((llama_pos) ckpt.n_tokens + (llama_pos) replay_prefix_tokens),
+                                    (int) pos,
+                                    (int) tgt_pos_max,
+                                    (int) dft_pos_max,
+                                    replay_from_prefix ? 1 : 0,
+                                    replay_prefix_tokens,
+                                    replay_skip_dft ? 1 : 0,
+                                    replay_outputs ? 1 : 0,
+                                    replay_state_ok ? 1 : 0,
+                                    replay_state_digest.size,
+                                    replay_state_digest.hash);
                         }
 
                         if (mtp_cycle_trace) {
@@ -8713,6 +9370,8 @@ private:
                         mtp_qblock_branch_txn_sampler_commit_status = "final_invariant_mismatch";
                         mtp_qblock_branch_txn_sampler_commit_reason = "prepared_sampler_clone_no_longer_matches_final_output_bundle";
                     }
+                    mtp_qblock_txn_runtime_sampler_ok = sampler_commit_final_ok;
+                    mtp_qblock_txn_runtime_sampler_touched = sampler_commit_touched;
 
                     fprintf(stderr,
                             "MTP_QBLOCK_BRANCH_TXN_SAMPLER_COMMIT: slot=%d status=%s reject_depth=%zu depth1=%zu selected=%d sampled=%d candidate_rank=%d ordinary_accepted=%zu rollback=%zu output_tokens=%zu output_contains_sampled=%d output_sampled_index=%lld output_sampled_expected_index=%zu output_sampled_expected_match=%d final_sampled=%d output_tail_after_sampled=%zu clone_ok=%d accepted_on_clone=%zu final_invariant_ok=%d production_mutation=%d production_seq_touched=0 output_touched=0 prompt_touched=0 sampler_touched=%d target_touched=0 target_context_touched=0 draft_touched=0 same_cycle_replayable=0 safe_commit=0 source=pre_final_sampler_commit reason=%s output_token_list=[",
@@ -8814,6 +9473,12 @@ private:
                     if (scratch_ready && !cleanup_ok) {
                         cleanup_ok = llama_memory_seq_rm(mem_tgt, scratch_seq, -1, -1);
                     }
+                    mtp_qblock_txn_runtime_kv_attempted = true;
+                    mtp_qblock_txn_runtime_kv_ok = import_ok && cleanup_ok && strcmp(phy_status, "candidate_committed") == 0;
+                    mtp_qblock_txn_runtime_kv_touched = import_ok;
+                    mtp_qblock_txn_runtime_kv_kind = "physical_import";
+                    mtp_qblock_txn_runtime_kv_status = phy_status;
+                    mtp_qblock_txn_runtime_kv_reason = phy_reason;
                     slot.mtp_qblock_branch_replay_target_sampler_replay_physical_scratch_pending = false;
                     slot.mtp_qblock_branch_replay_target_sampler_replay_physical_scratch_seq = -1;
 
@@ -9150,6 +9815,12 @@ private:
                     const bool target_context_touched = branch_full_import_ok || partial_restore_ok || full_restore_ok;
                     const bool production_mutation = leave_split_active ||
                         (full_restore_required && branch_full_import_ok && (!restore_full_match_pre || !restore_partial_match_pre));
+                    mtp_qblock_txn_runtime_kv_attempted = true;
+                    mtp_qblock_txn_runtime_kv_ok = kv_split_commit && leave_split_active && strcmp(kv_status, "candidate_committed") == 0;
+                    mtp_qblock_txn_runtime_kv_touched = branch_full_import_ok;
+                    mtp_qblock_txn_runtime_kv_kind = kv_split_commit ? "split_commit" : "split_proof";
+                    mtp_qblock_txn_runtime_kv_status = kv_status;
+                    mtp_qblock_txn_runtime_kv_reason = kv_reason;
                     fprintf(stderr,
                             "MTP_QBLOCK_BRANCH_TXN_KV_SPLIT: slot=%d status=%s mode=%s reject_depth=%zu depth1=%zu selected=%d sampled=%d candidate_rank=%d ordinary_accepted=%zu rollback=%zu output_tokens=%zu replay_tokens=%zu replay_output_match=%d prefix_full_state_ok=%d prefix_full_state_size=%zu prefix_full_state_hash=%016" PRIx64 " prefix_partial_state_ok=%d prefix_partial_state_size=%zu prefix_partial_state_hash=%016" PRIx64 " prefix_partial_state_canonical_hash=%016" PRIx64 " prefix_state_tokens=%zu prefix_token_count_match=%d pre_full_ok=%d pre_full_size=%zu pre_full_hash=%016" PRIx64 " pre_partial_ok=%d pre_partial_size=%zu pre_partial_hash=%016" PRIx64 " pre_partial_canonical_hash=%016" PRIx64 " branch_full_bytes_written=%zu branch_full_import_ok=%d branch_import_full_ok=%d branch_import_full_size=%zu branch_import_full_hash=%016" PRIx64 " branch_import_partial_ok=%d branch_import_partial_size=%zu branch_import_partial_hash=%016" PRIx64 " branch_import_partial_canonical_hash=%016" PRIx64 " branch_import_partial_matches_prefix=%d partial_restore_bytes_written=%zu partial_restore_ok=%d split_full_ok=%d split_full_size=%zu split_full_hash=%016" PRIx64 " split_partial_ok=%d split_partial_size=%zu split_partial_hash=%016" PRIx64 " split_partial_canonical_hash=%016" PRIx64 " split_partial_match_pre=%d split_full_changed_vs_pre=%d split_full_changed_vs_branch_import=%d full_restore_required=%d full_restore_bytes_written=%zu full_restore_ok=%d restore_full_ok=%d restore_full_size=%zu restore_full_hash=%016" PRIx64 " restore_partial_ok=%d restore_partial_size=%zu restore_partial_hash=%016" PRIx64 " restore_partial_canonical_hash=%016" PRIx64 " restore_full_match_pre=%d restore_partial_match_pre=%d production_mutation=%d production_seq_touched=%d output_touched=0 prompt_touched=0 sampler_touched=0 target_touched=0 target_context_touched=%d kv_touched=%d recurrent_touched=%d recurrent_restored=%d draft_touched=0 same_cycle_replayable=0 safe_commit=0 source=post_final_kv_split_txn reason=%s output_token_list=[",
                             slot.id,
@@ -9345,6 +10016,13 @@ private:
                         }
                     }
 
+                    mtp_qblock_txn_runtime_recurrent_attempted = true;
+                    mtp_qblock_txn_runtime_recurrent_ok = recurrent_post_match && recurrent_restore_match;
+                    mtp_qblock_txn_runtime_recurrent_touched = recurrent_touched;
+                    mtp_qblock_txn_runtime_recurrent_restored = recurrent_restore_touched;
+                    mtp_qblock_txn_runtime_recurrent_status = recurrent_status;
+                    mtp_qblock_txn_runtime_recurrent_reason = recurrent_reason;
+
                     fprintf(stderr,
                             "MTP_QBLOCK_BRANCH_TXN_RECURRENT_COMMIT: slot=%d status=%s reject_depth=%zu depth1=%zu selected=%d sampled=%d candidate_rank=%d ordinary_accepted=%zu rollback=%zu output_tokens=%zu replay_tokens=%zu replay_output_match=%d prefix_state_ok=%d prefix_state_tokens=%zu prefix_token_count_match=%d prefix_state_size=%zu prefix_state_hash=%016" PRIx64 " prefix_state_canonical_hash=%016" PRIx64 " pre_state_ok=%d pre_state_size=%zu pre_state_hash=%016" PRIx64 " pre_state_canonical_hash=%016" PRIx64 " pre_prefix_state_match=%d pre_prefix_state_first_diff=%lld state_bytes_written=%zu post_state_ok=%d post_state_size=%zu post_state_hash=%016" PRIx64 " post_state_canonical_hash=%016" PRIx64 " post_state_match=%d restore_bytes_written=%zu restore_state_ok=%d restore_state_size=%zu restore_state_hash=%016" PRIx64 " restore_state_canonical_hash=%016" PRIx64 " restore_state_match=%d production_mutation=0 production_seq_touched=0 output_touched=0 prompt_touched=0 sampler_touched=0 target_touched=0 target_context_touched=%d recurrent_touched=%d recurrent_restored=%d draft_touched=0 same_cycle_replayable=0 safe_commit=0 source=post_final_recurrent_txn reason=%s output_token_list=[",
                             slot.id,
@@ -9472,6 +10150,29 @@ private:
                 }
                 SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
+                bool tail_producer_snapshot_available = false;
+                const char * tail_producer_snapshot_reason = "not_requested";
+                ggml_cuda_mtp_qblock_tail_page_map_v1 tail_producer_snapshot_map = {};
+                if (slot.mtp_qblock_branch_replay_staged && mtp_qblock_txn_tail_page_consumer_requested() &&
+                        mtp_qblock_txn_tail_page_producer_state_import_requested() &&
+                        (mtp_qblock_txn_tail_page_requested() || mtp_qblock_txn_tail_page_proof_enabled())) {
+                    const mtp_qblock_txn_tail_page_runtime_contract_result tail_snapshot_runtime =
+                        mtp_qblock_txn_tail_page_runtime_contract(slot.spec_ckpt.n_tokens, ids.size());
+                    const bool tail_snapshot_contract_ok = tail_snapshot_runtime.tail_status == MTP_V4_144_TAIL_PAGE_OK &&
+                        tail_snapshot_runtime.lineage_status == MTP_QBLOCK_TXN_LINEAGE_OK &&
+                        tail_snapshot_runtime.state_status == MTP_V4_144_TAIL_STATE_OK;
+                    if (tail_snapshot_contract_ok) {
+                        tail_producer_snapshot_available = mtp_attention_memory_snapshot_tail_page_map_from_active_producer(
+                                llama_get_memory(slot.ctx_tgt),
+                                slot.spec_ckpt.n_tokens,
+                                tail_snapshot_runtime.accepted_len,
+                                &tail_producer_snapshot_map,
+                                &tail_producer_snapshot_reason);
+                    } else {
+                        tail_producer_snapshot_reason = "tail_page_contract_rejected";
+                    }
+                }
+
                 const llama_pos mtp_cleanup_from = slot.prompt.tokens.pos_next();
                 if (mtp_qblock_sibling_rows_in_batch == 0 || llama_memory_seq_pos_max(llama_get_memory(slot.ctx_tgt), slot.id) >= mtp_cleanup_from) {
                     common_context_seq_rm(slot.ctx_tgt, slot.id, mtp_cleanup_from, -1);
@@ -9512,6 +10213,10 @@ private:
                                 (long long) post_prefix_first_diff);
                     }
                 }
+                ggml_cuda_mtp_qblock_tail_page_dispatch_bind_v1 mtp_qblock_tail_pre_cleanup_dispatch = {};
+                const bool mtp_qblock_tail_pre_cleanup_dispatch_ok =
+                    llama_kv_cache_get_mtp_qblock_tail_page_last_dispatch_bind(&mtp_qblock_tail_pre_cleanup_dispatch);
+
                 if (slot.ctx_dft) {
                     if (mtp_qblock_sibling_rows_in_batch == 0 || llama_memory_seq_pos_max(llama_get_memory(slot.ctx_dft), slot.id) >= mtp_cleanup_from) {
                         common_context_seq_rm(slot.ctx_dft, slot.id, mtp_cleanup_from, -1);
@@ -9522,6 +10227,380 @@ private:
                 mtp_qblock_kv_attention_import_txn_emit();
                 mtp_qblock_kv_split_txn_emit();
                 mtp_qblock_recurrent_txn_emit();
+                if (slot.mtp_qblock_branch_replay_staged &&
+                        (mtp_qblock_txn_tail_page_requested() || mtp_qblock_txn_tail_page_proof_enabled())) {
+                    const mtp_qblock_txn_tail_page_runtime_contract_result tail_runtime =
+                        mtp_qblock_txn_tail_page_runtime_contract(slot.spec_ckpt.n_tokens, ids.size());
+                    const bool tail_contract_ok = tail_runtime.tail_status == MTP_V4_144_TAIL_PAGE_OK &&
+                        tail_runtime.lineage_status == MTP_QBLOCK_TXN_LINEAGE_OK &&
+                        tail_runtime.state_status == MTP_V4_144_TAIL_STATE_OK;
+                    const bool tail_metadata_active = mtp_qblock_txn_tail_page_requested() && tail_contract_ok &&
+                        mtp_qblock_txn_runtime_sampler_ok &&
+                        mtp_qblock_txn_runtime_kv_ok &&
+                        mtp_qblock_txn_runtime_recurrent_ok;
+                    const bool tail_consumer_requested = mtp_qblock_txn_tail_page_consumer_requested();
+                    bool tail_map_attempted = false;
+                    bool tail_map_registered = false;
+                    const char * tail_map_reason = tail_consumer_requested ? "metadata_not_active" : "consumer_not_requested";
+                    ggml_cuda_mtp_qblock_tail_page_map_v1 tail_map = {};
+                    auto tail_page_map_covers_commit = [](const ggml_cuda_mtp_qblock_tail_page_map_v1 & map,
+                            llama_pos logical_base_token,
+                            uint32_t accepted_tokens) {
+                        if (logical_base_token < 0 || accepted_tokens == 0 || !map.active ||
+                                map.version != GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_VERSION ||
+                                map.abi_bytes != sizeof(ggml_cuda_mtp_qblock_tail_page_map_v1) ||
+                                map.valid_tail_tokens == 0) {
+                            return false;
+                        }
+                        const uint64_t req_begin = (uint64_t) logical_base_token;
+                        const uint64_t req_end = req_begin + (uint64_t) accepted_tokens;
+                        const uint64_t map_begin = (uint64_t) map.logical_base_token;
+                        const uint64_t map_end = map_begin + (uint64_t) map.valid_tail_tokens;
+                        return req_end > req_begin && map_end > map_begin && map_begin <= req_begin && map_end >= req_end;
+                    };
+                    const bool tail_commit_range_valid = slot.spec_ckpt.n_tokens >= 0 && tail_runtime.accepted_len > 0;
+                    const uint64_t tail_commit_req_begin = tail_commit_range_valid ? (uint64_t) slot.spec_ckpt.n_tokens : 0ull;
+                    const uint64_t tail_commit_req_end = tail_commit_range_valid ? tail_commit_req_begin + (uint64_t) tail_runtime.accepted_len : 0ull;
+                    const bool tail_pre_cleanup_dispatch_covers_commit = mtp_qblock_tail_pre_cleanup_dispatch_ok &&
+                        tail_page_map_covers_commit(
+                            mtp_qblock_tail_pre_cleanup_dispatch.map,
+                            slot.spec_ckpt.n_tokens,
+                            tail_runtime.accepted_len);
+                    const bool tail_producer_snapshot_covers_commit = tail_producer_snapshot_available &&
+                        tail_page_map_covers_commit(
+                            tail_producer_snapshot_map,
+                            slot.spec_ckpt.n_tokens,
+                            tail_runtime.accepted_len);
+                    const uint64_t tail_producer_snapshot_begin = tail_producer_snapshot_available ? (uint64_t) tail_producer_snapshot_map.logical_base_token : 0ull;
+                    const uint64_t tail_producer_snapshot_end = tail_producer_snapshot_available ?
+                        tail_producer_snapshot_begin + (uint64_t) tail_producer_snapshot_map.valid_tail_tokens : 0ull;
+                    if (tail_consumer_requested) {
+                        auto * mem_tgt = llama_get_memory(slot.ctx_tgt);
+                        if (tail_metadata_active) {
+                            tail_map_attempted = true;
+                            const uint64_t tail_map_generation = (uint64_t) ggml_time_us() ^ ((uint64_t) (uint32_t) slot.id << 48);
+                            if (mtp_qblock_txn_tail_page_producer_state_import_requested()) {
+                                if (tail_producer_snapshot_available) {
+                                    tail_map_registered = mtp_attention_memory_register_tail_page_map_from_producer_snapshot(
+                                            mem_tgt,
+                                            slot.spec_ckpt.n_tokens,
+                                            tail_runtime.accepted_len,
+                                            tail_map_generation,
+                                            tail_producer_snapshot_map,
+                                            &tail_map,
+                                            &tail_map_reason);
+                                } else if (tail_pre_cleanup_dispatch_covers_commit) {
+                                    tail_map_registered = mtp_attention_memory_register_tail_page_map_from_producer_snapshot(
+                                            mem_tgt,
+                                            slot.spec_ckpt.n_tokens,
+                                            tail_runtime.accepted_len,
+                                            tail_map_generation,
+                                            mtp_qblock_tail_pre_cleanup_dispatch.map,
+                                            &tail_map,
+                                            &tail_map_reason);
+                                    if (!tail_map_registered && strcmp(tail_map_reason, "snapshot_not_covering_commit") == 0) {
+                                        tail_map_reason = "dispatch_bind_snapshot_not_covering_commit";
+                                    }
+                                } else {
+                                    tail_map_registered = mtp_attention_memory_register_tail_page_map_from_active_producer(
+                                            mem_tgt,
+                                            slot.spec_ckpt.n_tokens,
+                                            tail_runtime.accepted_len,
+                                            tail_map_generation,
+                                            &tail_map,
+                                            &tail_map_reason);
+                                    if (!tail_map_registered && strcmp(tail_map_reason, "no_covering_producer_map") == 0 &&
+                                            mtp_qblock_txn_runtime_kv_ok &&
+                                            mtp_qblock_txn_runtime_kv_touched &&
+                                            strcmp(mtp_qblock_txn_runtime_kv_kind, "split_commit") == 0 &&
+                                            slot.spec_ckpt.n_tokens >= 0 &&
+                                            tail_runtime.accepted_len > 0) {
+                                        const llama_pos tail_commit_last = slot.spec_ckpt.n_tokens + (llama_pos) tail_runtime.accepted_len - 1;
+                                        if (llama_memory_seq_pos_max(mem_tgt, slot.id) >= tail_commit_last) {
+                                            tail_map_registered = mtp_attention_memory_register_tail_page_map_from_commit(
+                                                    mem_tgt,
+                                                    slot.spec_ckpt.n_tokens,
+                                                    tail_runtime.accepted_len,
+                                                    tail_map_generation,
+                                                    &tail_map,
+                                                    &tail_map_reason);
+                                            if (tail_map_registered) {
+                                                tail_map_reason = "ok_committed_physical_import";
+                                            }
+                                        } else {
+                                            tail_map_reason = "committed_seq_not_visible";
+                                        }
+                                    }
+                                    if (!tail_map_registered && strcmp(tail_map_reason, "no_covering_producer_map") == 0) {
+                                        if (mtp_qblock_tail_pre_cleanup_dispatch_ok && !tail_pre_cleanup_dispatch_covers_commit) {
+                                            tail_map_reason = "dispatch_bind_snapshot_not_covering_commit";
+                                        } else if (strcmp(tail_producer_snapshot_reason, "not_requested") != 0) {
+                                            tail_map_reason = tail_producer_snapshot_reason;
+                                        }
+                                    }
+                                }
+                            } else {
+                                tail_map_registered = mtp_attention_memory_register_tail_page_map_from_commit(
+                                        mem_tgt,
+                                        slot.spec_ckpt.n_tokens,
+                                        tail_runtime.accepted_len,
+                                        tail_map_generation,
+                                        &tail_map,
+                                        &tail_map_reason);
+                            }
+                        } else {
+                            mtp_attention_memory_clear_tail_page_maps(mem_tgt);
+                        }
+                    }
+
+                    const char * tail_runtime_reason = "runtime_proof_only";
+                    if (mtp_qblock_txn_tail_page_requested()) {
+                        if (!tail_contract_ok) {
+                            tail_runtime_reason = "tail_page_contract_rejected";
+                        } else if (!mtp_qblock_txn_runtime_sampler_ok) {
+                            tail_runtime_reason = "sampler_commit_not_ready";
+                        } else if (!mtp_qblock_txn_runtime_kv_attempted) {
+                            tail_runtime_reason = "kv_commit_not_attempted";
+                        } else if (!mtp_qblock_txn_runtime_kv_ok) {
+                            tail_runtime_reason = "kv_commit_not_ready";
+                        } else if (!mtp_qblock_txn_runtime_recurrent_attempted) {
+                            tail_runtime_reason = "recurrent_commit_not_attempted";
+                        } else if (!mtp_qblock_txn_runtime_recurrent_ok) {
+                            tail_runtime_reason = "recurrent_commit_not_ready";
+                        } else if (tail_consumer_requested && !tail_map_registered) {
+                            tail_runtime_reason = "consumer_map_not_registered";
+                        } else if (tail_consumer_requested && tail_map_registered) {
+                            tail_runtime_reason = "runtime_metadata_ready_consumer_map_registered_dispatch_pending";
+                        } else {
+                            tail_runtime_reason = "runtime_metadata_ready_dispatch_not_wired";
+                        }
+                    }
+                    auto tail_page_maps_equal = [](const ggml_cuda_mtp_qblock_tail_page_map_v1 & a, const ggml_cuda_mtp_qblock_tail_page_map_v1 & b) {
+                        if (a.version != b.version || a.abi_bytes != b.abi_bytes || a.active != b.active || a.flags != b.flags ||
+                                a.logical_base_token != b.logical_base_token || a.valid_tail_tokens != b.valid_tail_tokens ||
+                                a.page_tokens != b.page_tokens || a.physical_pages != b.physical_pages ||
+                                a.block_table_pages != b.block_table_pages || a.generation != b.generation) {
+                            return false;
+                        }
+                        for (uint32_t i = 0; i < GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES; ++i) {
+                            if (a.block_table[i] != b.block_table[i]) {
+                                return false;
+                            }
+                        }
+                        return true;
+                    };
+                    ggml_cuda_mtp_qblock_tail_page_dispatch_bind_v1 tail_last_dispatch = mtp_qblock_tail_pre_cleanup_dispatch;
+                    bool tail_last_dispatch_ok = mtp_qblock_tail_pre_cleanup_dispatch_ok;
+                    if (!tail_last_dispatch_ok) {
+                        tail_last_dispatch_ok = llama_kv_cache_get_mtp_qblock_tail_page_last_dispatch_bind(&tail_last_dispatch);
+                    }
+                    const bool tail_last_dispatch_matches_map = tail_map_registered && tail_last_dispatch_ok &&
+                        tail_page_maps_equal(tail_last_dispatch.map, tail_map);
+
+                    uint32_t tail_bytes_authority_page_begin = 0;
+                    uint32_t tail_bytes_authority_page_end = 0;
+                    uint32_t tail_bytes_authority_page_count = 0;
+                    uint64_t tail_bytes_authority_k_byte_base0 = 0;
+                    uint64_t tail_bytes_authority_v_byte_base0 = 0;
+                    uint64_t tail_bytes_authority_kv_byte_base0 = 0;
+                    const char * tail_bytes_authority_reason = "not_requested";
+                    bool tail_dispatch_bytes_authoritative = false;
+                    if (mtp_qblock_txn_tail_page_requested()) {
+                        const uint32_t supported_flags = GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_SCRATCH_OVERLAY;
+                        if (!tail_metadata_active) {
+                            tail_bytes_authority_reason = "metadata_not_active";
+                        } else if (!tail_consumer_requested) {
+                            tail_bytes_authority_reason = "consumer_not_requested";
+                        } else if (!tail_map_registered) {
+                            tail_bytes_authority_reason = "consumer_map_not_registered";
+                        } else if (!tail_map.active || tail_map.version != GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_VERSION ||
+                                tail_map.abi_bytes != sizeof(ggml_cuda_mtp_qblock_tail_page_map_v1)) {
+                            tail_bytes_authority_reason = "bad_map_abi";
+                        } else if ((tail_map.flags & ~supported_flags) != 0) {
+                            tail_bytes_authority_reason = "unknown_map_flags";
+                        } else if (tail_map.page_tokens != MTP_V4_144_PAGE_TOKENS) {
+                            tail_bytes_authority_reason = "bad_page_tokens";
+                        } else if (tail_map.valid_tail_tokens == 0) {
+                            tail_bytes_authority_reason = "empty_visible_tail";
+                        } else if (tail_map.physical_pages == 0 || tail_map.block_table_pages == 0 ||
+                                tail_map.block_table_pages > GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES) {
+                            tail_bytes_authority_reason = "bad_page_counts";
+                        } else if (slot.spec_ckpt.n_tokens < 0 || tail_runtime.accepted_len == 0) {
+                            tail_bytes_authority_reason = "bad_commit_range";
+                        } else {
+                            const uint64_t req_begin = (uint64_t) slot.spec_ckpt.n_tokens;
+                            const uint64_t req_end = req_begin + (uint64_t) tail_runtime.accepted_len;
+                            const uint64_t map_begin = (uint64_t) tail_map.logical_base_token;
+                            const uint64_t map_end = map_begin + (uint64_t) tail_map.valid_tail_tokens;
+                            if (req_end <= req_begin || map_end <= map_begin || map_begin > req_begin || map_end < req_end) {
+                                tail_bytes_authority_reason = "map_not_covering_commit";
+                            } else {
+                                const uint64_t rel_begin = req_begin - map_begin;
+                                const uint64_t rel_end = req_end - map_begin;
+                                tail_bytes_authority_page_begin = (uint32_t) (rel_begin / tail_map.page_tokens);
+                                tail_bytes_authority_page_end = (uint32_t) ((rel_end + tail_map.page_tokens - 1u) / tail_map.page_tokens);
+                                tail_bytes_authority_page_count = tail_bytes_authority_page_end - tail_bytes_authority_page_begin;
+                                if (tail_bytes_authority_page_count == 0 || tail_bytes_authority_page_end > tail_map.block_table_pages) {
+                                    tail_bytes_authority_reason = "block_table_not_covering_commit";
+                                } else {
+                                    bool pages_valid = true;
+                                    for (uint32_t lp = tail_bytes_authority_page_begin; lp < tail_bytes_authority_page_end; ++lp) {
+                                        if (tail_map.block_table[lp] < 0 || (uint32_t) tail_map.block_table[lp] >= tail_map.physical_pages) {
+                                            pages_valid = false;
+                                            break;
+                                        }
+                                    }
+                                    if (!pages_valid) {
+                                        tail_bytes_authority_reason = "bad_physical_page";
+                                    } else {
+                                        const uint64_t physical_page0 = (uint64_t) tail_map.block_table[tail_bytes_authority_page_begin];
+                                        tail_bytes_authority_k_byte_base0 = physical_page0 * (uint64_t) MTP_PACKED16_K_PAGE_BYTES;
+                                        tail_bytes_authority_v_byte_base0 = physical_page0 * (uint64_t) MTP_V4_144_PAGE_BYTES;
+                                        tail_bytes_authority_kv_byte_base0 = physical_page0 * (uint64_t) MTP_V4_144_KV_PAGE_BYTES;
+                                        if ((tail_map.flags & GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_SCRATCH_OVERLAY) != 0) {
+                                            tail_bytes_authority_reason = "scratch_overlay_not_authoritative";
+                                        } else {
+                                            tail_bytes_authority_reason = "ok";
+                                            tail_dispatch_bytes_authoritative = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    const char * tail_dispatch_blocker = "not_requested";
+                    if (mtp_qblock_txn_tail_page_requested()) {
+                        if (!tail_metadata_active) {
+                            tail_dispatch_blocker = "metadata_not_active";
+                        } else if (tail_consumer_requested && !tail_map_registered) {
+                            tail_dispatch_blocker = "consumer_map_not_registered";
+                        } else if (!tail_last_dispatch_ok) {
+                            tail_dispatch_blocker = "no_dispatch_bind";
+                        } else if (!tail_last_dispatch_matches_map) {
+                            if (tail_dispatch_bytes_authoritative && strcmp(tail_map_reason, "ok_committed_physical_import") == 0) {
+                                const uint64_t tail_map_end = (uint64_t) tail_map.logical_base_token + (uint64_t) tail_map.valid_tail_tokens;
+                                const bool tail_commit_completes_full_page = tail_commit_range_valid &&
+                                    tail_map.page_tokens != 0 &&
+                                    tail_map.valid_tail_tokens != 0 &&
+                                    tail_map.valid_tail_tokens % tail_map.page_tokens == 0 &&
+                                    tail_commit_req_end == tail_map_end;
+                                tail_dispatch_blocker = tail_commit_completes_full_page ?
+                                    "dispatch_not_required_full_committed_physical_page" :
+                                    "dispatch_pending_after_committed_physical_import";
+                            } else {
+                                tail_dispatch_blocker = "no_matching_bind";
+                            }
+                        } else if (!tail_dispatch_bytes_authoritative) {
+                            tail_dispatch_blocker = "bytes_not_authoritative";
+                        } else {
+                            tail_dispatch_blocker = "dispatch_disabled";
+                        }
+                    }
+                    if (strcmp(tail_dispatch_blocker, "dispatch_pending_after_committed_physical_import") == 0 &&
+                            tail_commit_range_valid && tail_dispatch_bytes_authoritative) {
+                        llama_kv_cache_note_mtp_qblock_tail_page_pending_dispatch_bind(
+                                &tail_map,
+                                tail_commit_req_begin,
+                                tail_commit_req_end,
+                                slot.id);
+                    }
+                    fprintf(stderr,
+                            "MTP_QBLOCK_TXN_TAIL_PAGE_RUNTIME: slot=%d requested=%d proof=%d metadata_active=%d dispatch_active=0 reason=%s reject_depth=%zu depth1=%zu selected=%d sampled=%d candidate_rank=%d ordinary_accepted=%zu rollback=%zu output_tokens=%zu contract_tail_status=%u contract_lineage_status=%u contract_state_status=%u accepted_len=%u new_valid_tail=%u final_state_slot=%u state_valid_tail=%u state_page_valid=%u state_free=%u boundary_slot=%u logical_tokens=%u physical_page=%u consumer_requested=%d map_attempted=%d map_registered=%d map_reason=%s map_logical_base=%u map_valid_tail=%u map_page_tokens=%u map_physical_pages=%u map_table_pages=%u map_table0=%d map_flags=0x%x map_generation=%llu sampler_ok=%d sampler_touched=%d kv_attempted=%d kv_ok=%d kv_touched=%d kv_kind=%s kv_status=%s kv_reason=%s recurrent_attempted=%d recurrent_ok=%d recurrent_touched=%d recurrent_restored=%d recurrent_status=%s recurrent_reason=%s dispatch_query_active=%d dispatch_query_match=%d dispatch_blocker=%s bytes_authoritative=%d bytes_authoritative_reason=%s proof_page_count=%u proof_page_begin=%u proof_page_end=%u proof_k_page_bytes=%u proof_v_page_bytes=%u proof_kv_page_bytes=%u proof_table0=%d proof_table1=%d proof_table2=%d proof_table3=%d proof_k_byte_base0=%llu proof_v_byte_base0=%llu proof_kv_byte_base0=%llu last_dispatch_bind_count=%llu last_dispatch_node=%s last_dispatch_layer=%d last_dispatch_graph_inst=%d last_dispatch_nk=%d last_dispatch_logical_base=%u last_dispatch_valid_tail=%u last_dispatch_table0=%d last_dispatch_flags=0x%x last_dispatch_generation=%llu dispatch_req_begin=%llu dispatch_req_end=%llu dispatch_bind_begin=%llu dispatch_bind_end=%llu producer_snapshot_available=%d producer_snapshot_covers_commit=%d producer_snapshot_reason=%s producer_snapshot_begin=%llu producer_snapshot_end=%llu pre_dispatch_covers_commit=%d safe_commit=0 source=post_final_tail_page_runtime_contract output_token_list=[",
+                            slot.id,
+                            mtp_qblock_txn_tail_page_requested() ? 1 : 0,
+                            mtp_qblock_txn_tail_page_proof_enabled() ? 1 : 0,
+                            tail_metadata_active ? 1 : 0,
+                            tail_runtime_reason,
+                            slot.mtp_qblock_branch_replay_reject_depth,
+                            slot.mtp_qblock_branch_replay_reject_depth + 1,
+                            (int) slot.mtp_qblock_branch_replay_selected,
+                            (int) slot.mtp_qblock_branch_replay_sampled,
+                            slot.mtp_qblock_branch_replay_candidate_rank,
+                            slot.mtp_qblock_branch_replay_ordinary_accepted,
+                            slot.mtp_qblock_branch_replay_rollback,
+                            ids.size(),
+                            (unsigned) tail_runtime.tail_status,
+                            (unsigned) tail_runtime.lineage_status,
+                            (unsigned) tail_runtime.state_status,
+                            tail_runtime.accepted_len,
+                            tail_runtime.new_valid_tail,
+                            tail_runtime.final_state_slot,
+                            tail_runtime.state_valid_tail,
+                            tail_runtime.state_page_valid,
+                            tail_runtime.state_free,
+                            tail_runtime.boundary_slot,
+                            tail_runtime.logical_tokens,
+                            tail_runtime.physical_page,
+                            tail_consumer_requested ? 1 : 0,
+                            tail_map_attempted ? 1 : 0,
+                            tail_map_registered ? 1 : 0,
+                            tail_map_reason,
+                            tail_map.logical_base_token,
+                            tail_map.valid_tail_tokens,
+                            tail_map.page_tokens,
+                            tail_map.physical_pages,
+                            tail_map.block_table_pages,
+                            tail_map.block_table[0],
+                            tail_map.flags,
+                            (unsigned long long) tail_map.generation,
+                            mtp_qblock_txn_runtime_sampler_ok ? 1 : 0,
+                            mtp_qblock_txn_runtime_sampler_touched ? 1 : 0,
+                            mtp_qblock_txn_runtime_kv_attempted ? 1 : 0,
+                            mtp_qblock_txn_runtime_kv_ok ? 1 : 0,
+                            mtp_qblock_txn_runtime_kv_touched ? 1 : 0,
+                            mtp_qblock_txn_runtime_kv_kind,
+                            mtp_qblock_txn_runtime_kv_status,
+                            mtp_qblock_txn_runtime_kv_reason,
+                            mtp_qblock_txn_runtime_recurrent_attempted ? 1 : 0,
+                            mtp_qblock_txn_runtime_recurrent_ok ? 1 : 0,
+                            mtp_qblock_txn_runtime_recurrent_touched ? 1 : 0,
+                            mtp_qblock_txn_runtime_recurrent_restored ? 1 : 0,
+                            mtp_qblock_txn_runtime_recurrent_status,
+                            mtp_qblock_txn_runtime_recurrent_reason,
+                            tail_last_dispatch_ok ? 1 : 0,
+                            tail_last_dispatch_matches_map ? 1 : 0,
+                            tail_dispatch_blocker,
+                            tail_dispatch_bytes_authoritative ? 1 : 0,
+                            tail_bytes_authority_reason,
+                            tail_bytes_authority_page_count,
+                            tail_bytes_authority_page_begin,
+                            tail_bytes_authority_page_end,
+                            (unsigned) MTP_PACKED16_K_PAGE_BYTES,
+                            (unsigned) MTP_V4_144_PAGE_BYTES,
+                            (unsigned) MTP_V4_144_KV_PAGE_BYTES,
+                            tail_map.block_table[0],
+                            tail_map.block_table[1],
+                            tail_map.block_table[2],
+                            tail_map.block_table[3],
+                            (unsigned long long) tail_bytes_authority_k_byte_base0,
+                            (unsigned long long) tail_bytes_authority_v_byte_base0,
+                            (unsigned long long) tail_bytes_authority_kv_byte_base0,
+                            (unsigned long long) tail_last_dispatch.bind_count,
+                            tail_last_dispatch_ok ? tail_last_dispatch.node_name : "(none)",
+                            tail_last_dispatch_ok ? tail_last_dispatch.layer : -1,
+                            tail_last_dispatch_ok ? tail_last_dispatch.graph_inst : -1,
+                            tail_last_dispatch_ok ? tail_last_dispatch.nk : 0,
+                            tail_last_dispatch_ok ? tail_last_dispatch.map.logical_base_token : 0u,
+                            tail_last_dispatch_ok ? tail_last_dispatch.map.valid_tail_tokens : 0u,
+                            tail_last_dispatch_ok ? tail_last_dispatch.map.block_table[0] : 0,
+                            tail_last_dispatch_ok ? tail_last_dispatch.map.flags : 0u,
+                            (unsigned long long) (tail_last_dispatch_ok ? tail_last_dispatch.map.generation : 0ull),
+                            (unsigned long long) tail_commit_req_begin,
+                            (unsigned long long) tail_commit_req_end,
+                            (unsigned long long) (tail_last_dispatch_ok ? (uint64_t) tail_last_dispatch.map.logical_base_token : 0ull),
+                            (unsigned long long) (tail_last_dispatch_ok ? (uint64_t) tail_last_dispatch.map.logical_base_token + (uint64_t) tail_last_dispatch.map.valid_tail_tokens : 0ull),
+                            tail_producer_snapshot_available ? 1 : 0,
+                            tail_producer_snapshot_covers_commit ? 1 : 0,
+                            tail_producer_snapshot_reason,
+                            (unsigned long long) tail_producer_snapshot_begin,
+                            (unsigned long long) tail_producer_snapshot_end,
+                            tail_pre_cleanup_dispatch_covers_commit ? 1 : 0);
+                    for (size_t j = 0; j < ids.size(); ++j) {
+                        fprintf(stderr, "%s%d", j == 0 ? "" : ",", (int) ids[j]);
+                    }
+                    fprintf(stderr, "]\n");
+                }
                 if (slot.mtp_qblock_branch_replay_staged) {
                     slot.mtp_qblock_branch_replay_staged = false;
                 }

@@ -48,6 +48,50 @@ static bool llama_mtp_qblock_txn_tail_page_proof_enabled() {
     return proof && atoi(proof) != 0;
 }
 
+static bool llama_mtp_qblock_tail_page_registry_trace_enabled() {
+    const char * trace = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_REGISTRY_TRACE");
+    return trace && atoi(trace) != 0;
+}
+
+static bool llama_mtp_qblock_tail_page_preserve_disjoint_seq_rm_enabled() {
+    const char * preserve = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_PRESERVE_SEQ_RM_DISJOINT");
+    return preserve && atoi(preserve) != 0;
+}
+
+static bool llama_mtp_qblock_tail_page_shrink_seq_rm_suffix_enabled() {
+    const char * shrink = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_SHRINK_SEQ_RM_SUFFIX");
+    return shrink && atoi(shrink) != 0;
+}
+
+static bool llama_mtp_qblock_tail_page_preserve_shared_seq_rm_enabled() {
+    const char * preserve = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_PRESERVE_SEQ_RM_SHARED");
+    return preserve && atoi(preserve) != 0;
+}
+
+static bool llama_mtp_qblock_tail_page_persist_metadata_clear_enabled() {
+    const char * persist = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_PERSIST_METADATA_CLEAR");
+    return persist && atoi(persist) != 0;
+}
+
+static bool llama_mtp_qblock_tail_page_persist_data_clear_unsafe_enabled() {
+    const char * persist = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_PERSIST_DATA_CLEAR_UNSAFE");
+    return persist && atoi(persist) != 0;
+}
+
+static bool llama_mtp_qblock_tail_page_producer_state_import_enabled() {
+    const char * import = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_PRODUCER_STATE_IMPORT");
+    return import && atoi(import) != 0;
+}
+
+static bool llama_mtp_qblock_tail_page_keep_producer_snapshot_on_clear(const char * reason) {
+    if (!llama_mtp_qblock_tail_page_producer_state_import_enabled() || reason == nullptr) {
+        return false;
+    }
+    return strncmp(reason, "seq_rm(", 7) == 0 ||
+        strcmp(reason, "state_read") == 0 ||
+        strcmp(reason, "seq_cp") == 0;
+}
+
 static void llama_mtp_qblock_txn_tail_write_log(
         const char * kind,
         const int32_t il,
@@ -734,7 +778,583 @@ llama_kv_cache::llama_kv_cache(
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
 
+static const char * llama_mtp_qblock_paged_state_status_reason(llama_mtp_qblock_paged_state_status status) {
+    switch (status) {
+        case LLAMA_MTP_QBLOCK_PAGED_STATE_OK: return "ok";
+        case LLAMA_MTP_QBLOCK_PAGED_STATE_BAD_VERSION: return "bad_version";
+        case LLAMA_MTP_QBLOCK_PAGED_STATE_BAD_ABI_BYTES: return "bad_abi_bytes";
+        case LLAMA_MTP_QBLOCK_PAGED_STATE_BAD_PAGE_TOKENS: return "bad_page_tokens";
+        case LLAMA_MTP_QBLOCK_PAGED_STATE_BAD_PHYSICAL_PAGES: return "bad_physical_pages";
+        case LLAMA_MTP_QBLOCK_PAGED_STATE_BAD_LOGICAL_BASE: return "bad_logical_base";
+        case LLAMA_MTP_QBLOCK_PAGED_STATE_BAD_LOGICAL_PAGES: return "bad_logical_pages";
+        case LLAMA_MTP_QBLOCK_PAGED_STATE_BAD_VALID_TOKENS: return "bad_valid_tokens";
+        case LLAMA_MTP_QBLOCK_PAGED_STATE_BAD_BLOCK_TABLE: return "bad_block_table";
+        case LLAMA_MTP_QBLOCK_PAGED_STATE_BAD_OWNER: return "bad_owner";
+        case LLAMA_MTP_QBLOCK_PAGED_STATE_BAD_REFCOUNT: return "bad_refcount";
+        case LLAMA_MTP_QBLOCK_PAGED_STATE_BAD_PAGE_VALID_TOKENS: return "bad_page_valid_tokens";
+        case LLAMA_MTP_QBLOCK_PAGED_STATE_BAD_FREE_COUNT: return "bad_free_count";
+        case LLAMA_MTP_QBLOCK_PAGED_STATE_BAD_FREE_PAGE: return "bad_free_page";
+        case LLAMA_MTP_QBLOCK_PAGED_STATE_DUP_FREE_PAGE: return "dup_free_page";
+        case LLAMA_MTP_QBLOCK_PAGED_STATE_BAD_MANAGED_PAGE: return "bad_managed_page";
+        case LLAMA_MTP_QBLOCK_PAGED_STATE_DUP_MANAGED_PAGE: return "dup_managed_page";
+        case LLAMA_MTP_QBLOCK_PAGED_STATE_NO_FREE_PAGE: return "no_free_page";
+        case LLAMA_MTP_QBLOCK_PAGED_STATE_BAD_PAGE: return "bad_page";
+        case LLAMA_MTP_QBLOCK_PAGED_STATE_PAGE_NOT_FREE: return "page_not_free";
+        case LLAMA_MTP_QBLOCK_PAGED_STATE_PAGE_NOT_TXN: return "page_not_txn";
+        case LLAMA_MTP_QBLOCK_PAGED_STATE_NO_VISIBLE_PAGES: return "no_visible_pages";
+        case LLAMA_MTP_QBLOCK_PAGED_STATE_MAP_TOO_LARGE: return "map_too_large";
+        case LLAMA_MTP_QBLOCK_PAGED_STATE_TOKEN_NOT_VISIBLE: return "token_not_visible";
+    }
+    return "unknown";
+}
+
+void llama_kv_cache::clear_mtp_qblock_paged_state() const {
+    llama_mtp_qblock_paged_state_clear(mtp_qblock_paged_state, mtp_qblock_paged_state.generation + 1);
+}
+
+bool llama_kv_cache::init_mtp_qblock_paged_state(llama_pos logical_base_token, uint32_t physical_pages, const char ** reason) const {
+    auto fail = [&](const char * why) {
+        if (reason) {
+            *reason = why;
+        }
+        clear_mtp_qblock_paged_state();
+        return false;
+    };
+
+    if (logical_base_token < 0) {
+        return fail("bad_logical_base");
+    }
+    const uint64_t base64 = (uint64_t) logical_base_token;
+    if (base64 > UINT32_MAX) {
+        return fail("bad_logical_base");
+    }
+
+    clear_mtp_qblock_tail_page_maps("init_paged_state");
+    const llama_mtp_qblock_paged_state_status status = llama_mtp_qblock_paged_state_init(
+        mtp_qblock_paged_state, (uint32_t) base64, physical_pages, mtp_qblock_paged_state.generation + 1);
+    if (status != LLAMA_MTP_QBLOCK_PAGED_STATE_OK) {
+        return fail(llama_mtp_qblock_paged_state_status_reason(status));
+    }
+    if (reason) {
+        *reason = "ok";
+    }
+    return true;
+}
+
+bool llama_kv_cache::get_mtp_qblock_paged_state(llama_mtp_qblock_paged_state_v1 * out_state) const {
+    if (!out_state) {
+        return false;
+    }
+    *out_state = mtp_qblock_paged_state;
+    return mtp_qblock_paged_state.active != 0;
+}
+
+bool llama_kv_cache::mtp_qblock_paged_state_alloc_txn_page(uint32_t * out_page, const char ** reason) const {
+    const llama_mtp_qblock_paged_state_status status = llama_mtp_qblock_paged_state_alloc_page(
+        mtp_qblock_paged_state, LLAMA_MTP_QBLOCK_PAGED_PAGE_OWNER_TXN, out_page);
+    if (reason) {
+        *reason = llama_mtp_qblock_paged_state_status_reason(status);
+    }
+    return status == LLAMA_MTP_QBLOCK_PAGED_STATE_OK;
+}
+
+bool llama_kv_cache::mtp_qblock_paged_state_claim_txn_page(uint32_t physical_page, uint32_t * out_slot, const char ** reason) const {
+    const llama_mtp_qblock_paged_state_status status = llama_mtp_qblock_paged_state_claim_txn_page(
+        mtp_qblock_paged_state, physical_page, out_slot);
+    if (reason) {
+        *reason = llama_mtp_qblock_paged_state_status_reason(status);
+    }
+    return status == LLAMA_MTP_QBLOCK_PAGED_STATE_OK;
+}
+
+bool llama_kv_cache::mtp_qblock_paged_state_commit_pages(
+        uint32_t valid_tail_tokens,
+        const int32_t * block_table,
+        uint32_t block_table_pages,
+        uint32_t final_state_slot,
+        const char ** reason) const {
+    const llama_mtp_qblock_paged_state_status status = llama_mtp_qblock_paged_state_commit_pages(
+        mtp_qblock_paged_state, valid_tail_tokens, block_table, block_table_pages, final_state_slot);
+    if (reason) {
+        *reason = llama_mtp_qblock_paged_state_status_reason(status);
+    }
+    if (status != LLAMA_MTP_QBLOCK_PAGED_STATE_OK) {
+        return false;
+    }
+    llama_kv_cache_reset_mtp_qblock_tail_page_lifecycle(false);
+    return true;
+}
+
+bool llama_kv_cache::mtp_qblock_paged_state_rollback_txn_pages(const char ** reason) const {
+    const llama_mtp_qblock_paged_state_status status = llama_mtp_qblock_paged_state_rollback_txn_pages(mtp_qblock_paged_state);
+    if (reason) {
+        *reason = llama_mtp_qblock_paged_state_status_reason(status);
+    }
+    return status == LLAMA_MTP_QBLOCK_PAGED_STATE_OK;
+}
+
+void llama_kv_cache::clear_mtp_qblock_tail_page_maps(const char * reason, bool data_invalidates) const {
+    auto maps_equal = [](const ggml_cuda_mtp_qblock_tail_page_map_v1 & a, const ggml_cuda_mtp_qblock_tail_page_map_v1 & b) {
+        if (a.version != b.version || a.abi_bytes != b.abi_bytes || a.active != b.active || a.flags != b.flags ||
+                a.logical_base_token != b.logical_base_token || a.valid_tail_tokens != b.valid_tail_tokens ||
+                a.page_tokens != b.page_tokens || a.physical_pages != b.physical_pages ||
+                a.block_table_pages != b.block_table_pages || a.generation != b.generation) {
+            return false;
+        }
+        for (uint32_t i = 0; i < GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES; ++i) {
+            if (a.block_table[i] != b.block_table[i]) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    if (data_invalidates) {
+        const bool keep_producer_snapshot = llama_mtp_qblock_tail_page_keep_producer_snapshot_on_clear(reason);
+        llama_kv_cache_reset_mtp_qblock_tail_page_lifecycle_preserve_snapshot(true, keep_producer_snapshot);
+        if (llama_mtp_qblock_tail_page_persist_data_clear_unsafe_enabled() && llama_mtp_qblock_tail_page_registry_trace_enabled()) {
+            fprintf(stderr,
+                    "MTP_QBLOCK_TXN_TAIL_PAGE_REGISTRY: op=host_preserve_data_clear_unsafe_rejected reason=%s policy=data_clear_invalidates\n",
+                    reason ? reason : "unspecified");
+        }
+    }
+
+    const bool allow_persist_clear = !data_invalidates && llama_mtp_qblock_tail_page_persist_metadata_clear_enabled();
+    if (allow_persist_clear && n_stream == 1) {
+        bool found_active_map = false;
+        bool saw_conflicting_map = false;
+        ggml_cuda_mtp_qblock_tail_page_map_v1 first_map = {};
+        auto check_tail_page_map = [&](ggml_tensor * key) {
+            if (!key || !key->data || saw_conflicting_map) {
+                return;
+            }
+            ggml_cuda_mtp_qblock_tail_page_map_v1 map = {};
+            llama_kv_cache_get_mtp_qblock_tail_page_map(key->data, &map);
+            if (!map.active) {
+                return;
+            }
+            if (!found_active_map) {
+                first_map = map;
+            } else if (!maps_equal(first_map, map)) {
+                saw_conflicting_map = true;
+                return;
+            }
+            found_active_map = true;
+        };
+        for (const auto & layer : layers) {
+            check_tail_page_map(layer.k_payload);
+            for (auto * k_payload_view : layer.k_payload_stream) {
+                check_tail_page_map(k_payload_view);
+            }
+            check_tail_page_map(layer.k);
+            for (auto * k_view : layer.k_stream) {
+                check_tail_page_map(k_view);
+            }
+        }
+        const bool scratch_overlay = (first_map.flags & GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_SCRATCH_OVERLAY) != 0;
+        if (found_active_map && !saw_conflicting_map && scratch_overlay) {
+            if (llama_mtp_qblock_tail_page_registry_trace_enabled()) {
+                fprintf(stderr,
+                        "MTP_QBLOCK_TXN_TAIL_PAGE_REGISTRY: op=%s reason=%s layers=%zu map_base=%u valid_tail=%u flags=0x%x generation=%llu table0=%d\n",
+                        "host_preserve_metadata_clear",
+                        reason ? reason : "unspecified",
+                        layers.size(),
+                        first_map.logical_base_token,
+                        first_map.valid_tail_tokens,
+                        first_map.flags,
+                        (unsigned long long) first_map.generation,
+                        first_map.block_table[0]);
+            }
+            return;
+        }
+        if (llama_mtp_qblock_tail_page_registry_trace_enabled()) {
+            fprintf(stderr,
+                    "MTP_QBLOCK_TXN_TAIL_PAGE_REGISTRY: op=%s reason=%s layers=%zu found=%d conflict=%d scratch_overlay=%d\n",
+                    "host_preserve_metadata_clear_rejected",
+                    reason ? reason : "unspecified",
+                    layers.size(),
+                    found_active_map ? 1 : 0,
+                    saw_conflicting_map ? 1 : 0,
+                    scratch_overlay ? 1 : 0);
+        }
+    }
+
+    if (llama_mtp_qblock_tail_page_registry_trace_enabled()) {
+        fprintf(stderr,
+                "MTP_QBLOCK_TXN_TAIL_PAGE_REGISTRY: op=host_clear reason=%s data_invalidates=%d layers=%zu\n",
+                reason ? reason : "unspecified",
+                data_invalidates ? 1 : 0,
+                layers.size());
+    }
+    clear_mtp_qblock_paged_state();
+    for (const auto & layer : layers) {
+        if (layer.k_payload) {
+            llama_kv_cache_clear_mtp_qblock_tail_page_map(layer.k_payload->data);
+        }
+        for (auto * k_payload_view : layer.k_payload_stream) {
+            if (k_payload_view) {
+                llama_kv_cache_clear_mtp_qblock_tail_page_map(k_payload_view->data);
+            }
+        }
+        if (layer.k) {
+            llama_kv_cache_clear_mtp_qblock_tail_page_map(layer.k->data);
+        }
+        for (auto * k_view : layer.k_stream) {
+            if (k_view) {
+                llama_kv_cache_clear_mtp_qblock_tail_page_map(k_view->data);
+            }
+        }
+    }
+}
+
+bool llama_kv_cache::register_mtp_qblock_tail_page_map(const ggml_cuda_mtp_qblock_tail_page_map_v1 & map) const {
+    if (!map.active || n_stream != 1) {
+        clear_mtp_qblock_tail_page_maps("register_tail_page_map_inactive_or_multistream");
+        return false;
+    }
+
+    bool registered_any = false;
+    auto register_one = [&](ggml_tensor * key) {
+        if (!key || !key->data) {
+            return;
+        }
+        llama_kv_cache_register_mtp_qblock_tail_page_map(key->data, &map);
+        ggml_cuda_mtp_qblock_tail_page_map_v1 check = {};
+        llama_kv_cache_get_mtp_qblock_tail_page_map(key->data, &check);
+        bool table_equal = check.block_table_pages == map.block_table_pages;
+        for (uint32_t i = 0; table_equal && i < map.block_table_pages && i < GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES; ++i) {
+            table_equal = check.block_table[i] == map.block_table[i];
+        }
+        registered_any = registered_any ||
+            (check.active &&
+             check.generation == map.generation &&
+             check.logical_base_token == map.logical_base_token &&
+             check.valid_tail_tokens == map.valid_tail_tokens &&
+             check.flags == map.flags &&
+             check.page_tokens == map.page_tokens &&
+             table_equal);
+    };
+
+    for (const auto & layer : layers) {
+        register_one(layer.k_payload);
+        for (auto * k_payload_view : layer.k_payload_stream) {
+            register_one(k_payload_view);
+        }
+        register_one(layer.k);
+        for (auto * k_view : layer.k_stream) {
+            register_one(k_view);
+        }
+    }
+
+    if (!registered_any) {
+        clear_mtp_qblock_tail_page_maps("register_tail_page_map_no_sidecar");
+    }
+    return registered_any;
+}
+
+static bool llama_mtp_qblock_tail_page_map_valid_for_paged_import(
+        const ggml_cuda_mtp_qblock_tail_page_map_v1 & map) {
+    if (!map.active || map.version != GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_VERSION ||
+            map.abi_bytes != sizeof(ggml_cuda_mtp_qblock_tail_page_map_v1) ||
+            map.page_tokens != LLAMA_MTP_QBLOCK_PAGED_STATE_PAGE_TOKENS ||
+            map.valid_tail_tokens == 0 || map.physical_pages == 0 ||
+            map.block_table_pages == 0 || map.block_table_pages > GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES) {
+        return false;
+    }
+    const uint32_t required_pages = (map.valid_tail_tokens + map.page_tokens - 1u) / map.page_tokens;
+    if (required_pages == 0 || required_pages > map.block_table_pages) {
+        return false;
+    }
+    for (uint32_t i = 0; i < required_pages; ++i) {
+        if (map.block_table[i] < 0 || uint32_t(map.block_table[i]) >= map.physical_pages) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool llama_mtp_qblock_tail_page_map_covers_commit(
+        const ggml_cuda_mtp_qblock_tail_page_map_v1 & map,
+        const llama_pos logical_base_token,
+        const uint32_t accepted_tokens) {
+    if (logical_base_token < 0 || accepted_tokens == 0 ||
+            !llama_mtp_qblock_tail_page_map_valid_for_paged_import(map)) {
+        return false;
+    }
+    const uint64_t req_begin = (uint64_t) logical_base_token;
+    const uint64_t req_end = req_begin + accepted_tokens;
+    if (req_begin > UINT32_MAX || req_end > uint64_t(UINT32_MAX) + 1u || req_end <= req_begin) {
+        return false;
+    }
+    const uint64_t map_begin = map.logical_base_token;
+    const uint64_t map_end = map_begin + map.valid_tail_tokens;
+    return map_end > map_begin && map_begin <= req_begin && map_end >= req_end;
+}
+
+static bool llama_mtp_qblock_tail_page_maps_equal_for_paged_import(
+        const ggml_cuda_mtp_qblock_tail_page_map_v1 & a,
+        const ggml_cuda_mtp_qblock_tail_page_map_v1 & b) {
+    if (a.version != b.version || a.abi_bytes != b.abi_bytes || a.active != b.active || a.flags != b.flags ||
+            a.logical_base_token != b.logical_base_token || a.valid_tail_tokens != b.valid_tail_tokens ||
+            a.page_tokens != b.page_tokens || a.physical_pages != b.physical_pages ||
+            a.block_table_pages != b.block_table_pages) {
+        return false;
+    }
+    for (uint32_t i = 0; i < GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES; ++i) {
+        if (a.block_table[i] != b.block_table[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool llama_kv_cache::register_mtp_qblock_tail_page_map_from_commit(
+        llama_pos logical_base_token,
+        uint32_t accepted_tokens,
+        uint64_t generation,
+        ggml_cuda_mtp_qblock_tail_page_map_v1 * out_map,
+        const char ** reason) const {
+    auto fail = [&](const char * why) {
+        if (reason) {
+            *reason = why;
+        }
+        if (out_map) {
+            *out_map = {};
+        }
+        llama_kv_cache_reset_mtp_qblock_tail_page_lifecycle(false);
+        return false;
+    };
+
+    if (logical_base_token < 0 || accepted_tokens == 0) {
+        return fail("invalid_commit");
+    }
+    if (n_stream != 1) {
+        return fail("multi_stream_unsupported");
+    }
+    const uint32_t page_tokens = MTP_V4_144_PAGE_TOKENS;
+    const uint64_t base64 = (uint64_t) logical_base_token;
+    if (base64 > UINT32_MAX) {
+        return fail("logical_base_overflow");
+    }
+    const uint32_t base = (uint32_t) base64;
+    const uint32_t boundary_slot = base & (page_tokens - 1u);
+    const uint32_t valid_tail_tokens = boundary_slot + accepted_tokens;
+    const uint32_t block_table_pages = (valid_tail_tokens + page_tokens - 1u) / page_tokens;
+    if (block_table_pages == 0 || block_table_pages > GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES) {
+        return fail("tail_page_table_capacity");
+    }
+    const uint32_t page_base = base & ~(page_tokens - 1u);
+    const uint32_t kv_size = get_size();
+    if (kv_size < page_tokens || page_base > kv_size || block_table_pages > (kv_size - page_base) / page_tokens) {
+        return fail("page_out_of_capacity");
+    }
+    const uint32_t physical_pages = kv_size / page_tokens;
+    const uint32_t physical_page = page_base / page_tokens;
+    if (physical_pages == 0 || physical_page >= physical_pages || physical_page + block_table_pages > physical_pages) {
+        return fail("bad_physical_page");
+    }
+
+    int32_t block_table[GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES] = {};
+    for (uint32_t i = 0; i < block_table_pages; ++i) {
+        block_table[i] = (int32_t) (physical_page + i);
+    }
+    const llama_mtp_qblock_paged_state_status status = llama_mtp_qblock_paged_state_import_committed_pages(
+        mtp_qblock_paged_state,
+        page_base,
+        physical_pages,
+        valid_tail_tokens,
+        block_table,
+        block_table_pages,
+        accepted_tokens,
+        generation);
+    if (status != LLAMA_MTP_QBLOCK_PAGED_STATE_OK) {
+        return fail(llama_mtp_qblock_paged_state_status_reason(status));
+    }
+    return register_mtp_qblock_tail_page_map_from_paged_state(out_map, reason);
+}
+
+bool llama_kv_cache::snapshot_mtp_qblock_tail_page_map_from_active_producer(
+        llama_pos logical_base_token,
+        uint32_t accepted_tokens,
+        ggml_cuda_mtp_qblock_tail_page_map_v1 * out_map,
+        const char ** reason) const {
+    auto fail = [&](const char * why) {
+        if (reason) {
+            *reason = why;
+        }
+        if (out_map) {
+            *out_map = {};
+        }
+        return false;
+    };
+
+    if (logical_base_token < 0 || accepted_tokens == 0) {
+        return fail("invalid_commit");
+    }
+    if (n_stream != 1) {
+        return fail("multi_stream_unsupported");
+    }
+    const uint64_t req_begin = (uint64_t) logical_base_token;
+    const uint64_t req_end = req_begin + accepted_tokens;
+    if (req_begin > UINT32_MAX || req_end > uint64_t(UINT32_MAX) + 1u || req_end <= req_begin) {
+        return fail("logical_range_overflow");
+    }
+
+    ggml_cuda_mtp_qblock_tail_page_map_v1 chosen = {};
+    bool found = false;
+    bool conflict = false;
+    auto consider_key = [&](ggml_tensor * key) {
+        if (key == nullptr || key->data == nullptr || conflict) {
+            return;
+        }
+        ggml_cuda_mtp_qblock_tail_page_map_v1 candidate = {};
+        llama_kv_cache_get_mtp_qblock_tail_page_map(key->data, &candidate);
+        if (!llama_mtp_qblock_tail_page_map_covers_commit(candidate, logical_base_token, accepted_tokens)) {
+            return;
+        }
+        if (!found) {
+            chosen = candidate;
+            found = true;
+        } else if (!llama_mtp_qblock_tail_page_maps_equal_for_paged_import(chosen, candidate)) {
+            conflict = true;
+        }
+    };
+
+    for (const auto & layer : layers) {
+        consider_key(layer.k_payload);
+        for (auto * k_payload_view : layer.k_payload_stream) {
+            consider_key(k_payload_view);
+        }
+        consider_key(layer.k);
+        for (auto * k_view : layer.k_stream) {
+            consider_key(k_view);
+        }
+    }
+    if (!found && !conflict) {
+        ggml_cuda_mtp_qblock_tail_page_map_v1 published = {};
+        if (llama_kv_cache_get_mtp_qblock_tail_page_published_map(&published) &&
+                llama_mtp_qblock_tail_page_map_covers_commit(published, logical_base_token, accepted_tokens)) {
+            chosen = published;
+            found = true;
+        }
+    }
+    if (conflict) {
+        return fail("conflicting_producer_map");
+    }
+    if (!found) {
+        return fail("no_covering_producer_map");
+    }
+    if (out_map) {
+        *out_map = chosen;
+    }
+    if (reason) {
+        *reason = "ok";
+    }
+    return true;
+}
+
+bool llama_kv_cache::register_mtp_qblock_tail_page_map_from_producer_snapshot(
+        llama_pos logical_base_token,
+        uint32_t accepted_tokens,
+        uint64_t generation,
+        const ggml_cuda_mtp_qblock_tail_page_map_v1 & producer_map,
+        ggml_cuda_mtp_qblock_tail_page_map_v1 * out_map,
+        const char ** reason) const {
+    auto fail = [&](const char * why) {
+        if (reason) {
+            *reason = why;
+        }
+        if (out_map) {
+            *out_map = {};
+        }
+        llama_kv_cache_reset_mtp_qblock_tail_page_lifecycle(false);
+        return false;
+    };
+
+    if (!llama_mtp_qblock_tail_page_map_covers_commit(producer_map, logical_base_token, accepted_tokens)) {
+        return fail("snapshot_not_covering_commit");
+    }
+
+    const uint64_t imported_generation = producer_map.generation != 0 ? producer_map.generation : generation;
+    const llama_mtp_qblock_paged_state_status status = llama_mtp_qblock_paged_state_import_committed_pages(
+        mtp_qblock_paged_state,
+        producer_map.logical_base_token,
+        producer_map.physical_pages,
+        producer_map.valid_tail_tokens,
+        producer_map.block_table,
+        producer_map.block_table_pages,
+        accepted_tokens,
+        imported_generation);
+    if (status != LLAMA_MTP_QBLOCK_PAGED_STATE_OK) {
+        return fail(llama_mtp_qblock_paged_state_status_reason(status));
+    }
+    return register_mtp_qblock_tail_page_map_from_paged_state(out_map, reason, producer_map.flags);
+}
+
+bool llama_kv_cache::register_mtp_qblock_tail_page_map_from_active_producer(
+        llama_pos logical_base_token,
+        uint32_t accepted_tokens,
+        uint64_t generation,
+        ggml_cuda_mtp_qblock_tail_page_map_v1 * out_map,
+        const char ** reason) const {
+    ggml_cuda_mtp_qblock_tail_page_map_v1 producer_map = {};
+    if (!snapshot_mtp_qblock_tail_page_map_from_active_producer(logical_base_token, accepted_tokens, &producer_map, reason)) {
+        if (out_map) {
+            *out_map = {};
+        }
+        llama_kv_cache_reset_mtp_qblock_tail_page_lifecycle(false);
+        return false;
+    }
+    return register_mtp_qblock_tail_page_map_from_producer_snapshot(
+            logical_base_token, accepted_tokens, generation, producer_map, out_map, reason);
+}
+
+bool llama_kv_cache::register_mtp_qblock_tail_page_map_from_paged_state(
+        ggml_cuda_mtp_qblock_tail_page_map_v1 * out_map,
+        const char ** reason,
+        uint32_t flags) const {
+    llama_mtp_qblock_paged_consumer_map_v1 paged_map = {};
+    const llama_mtp_qblock_paged_state_status status = llama_mtp_qblock_paged_state_export_consumer_map(
+        mtp_qblock_paged_state, &paged_map);
+    if (status != LLAMA_MTP_QBLOCK_PAGED_STATE_OK) {
+        if (out_map) {
+            *out_map = {};
+        }
+        if (reason) {
+            *reason = llama_mtp_qblock_paged_state_status_reason(status);
+        }
+        llama_kv_cache_reset_mtp_qblock_tail_page_lifecycle(false);
+        return false;
+    }
+
+    ggml_cuda_mtp_qblock_tail_page_map_v1 map = {};
+    map.version = GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_VERSION;
+    map.abi_bytes = sizeof(ggml_cuda_mtp_qblock_tail_page_map_v1);
+    map.active = 1;
+    map.flags = flags;
+    map.logical_base_token = paged_map.logical_base_token;
+    map.valid_tail_tokens = paged_map.valid_tail_tokens;
+    map.page_tokens = paged_map.page_tokens;
+    map.physical_pages = paged_map.physical_pages;
+    map.block_table_pages = paged_map.block_table_pages;
+    for (uint32_t i = 0; i < paged_map.block_table_pages && i < GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES; ++i) {
+        map.block_table[i] = paged_map.block_table[i];
+    }
+    map.generation = paged_map.generation;
+
+    if (out_map) {
+        *out_map = map;
+    }
+    const bool ok = register_mtp_qblock_tail_page_map(map);
+    if (reason) {
+        *reason = ok ? "ok" : "no_packed16_sidecar_registered";
+    }
+    return ok;
+}
+
 void llama_kv_cache::clear(bool data) {
+    clear_mtp_qblock_tail_page_maps(data ? "clear_data" : "clear_metadata", data);
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -749,6 +1369,161 @@ void llama_kv_cache::clear(bool data) {
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
+    char tail_page_clear_reason[96];
+    snprintf(tail_page_clear_reason, sizeof(tail_page_clear_reason),
+            "seq_rm(seq=%d,p0=%lld,p1=%lld)",
+            (int) seq_id,
+            (long long) p0,
+            (long long) p1);
+
+    bool preserve_disjoint_tail_page_maps = false;
+    bool shrink_suffix_tail_page_maps = false;
+    bool preserve_shared_seq_tail_page_maps = false;
+    ggml_cuda_mtp_qblock_tail_page_map_v1 shrink_map = {};
+    const bool preserve_disjoint_tail_page_maps_requested = llama_mtp_qblock_tail_page_preserve_disjoint_seq_rm_enabled();
+    const bool shrink_suffix_tail_page_maps_requested = llama_mtp_qblock_tail_page_shrink_seq_rm_suffix_enabled();
+    const bool preserve_shared_seq_tail_page_maps_requested = llama_mtp_qblock_tail_page_preserve_shared_seq_rm_enabled();
+    if (preserve_disjoint_tail_page_maps_requested ||
+            shrink_suffix_tail_page_maps_requested ||
+            preserve_shared_seq_tail_page_maps_requested ||
+            llama_mtp_qblock_tail_page_producer_state_import_enabled()) {
+        const uint64_t rm_begin = p0 < 0 ? 0u : (uint64_t) p0;
+        const uint64_t rm_end = p1 < 0 ? std::numeric_limits<uint64_t>::max() : (uint64_t) p1;
+        bool found_active_map = false;
+        bool overlaps_active_map = false;
+        bool saw_conflicting_map = false;
+        ggml_cuda_mtp_qblock_tail_page_map_v1 first_map = {};
+        auto maps_equal = [](const ggml_cuda_mtp_qblock_tail_page_map_v1 & a, const ggml_cuda_mtp_qblock_tail_page_map_v1 & b) {
+            if (a.version != b.version || a.abi_bytes != b.abi_bytes || a.active != b.active || a.flags != b.flags ||
+                    a.logical_base_token != b.logical_base_token || a.valid_tail_tokens != b.valid_tail_tokens ||
+                    a.page_tokens != b.page_tokens || a.physical_pages != b.physical_pages ||
+                    a.block_table_pages != b.block_table_pages || a.generation != b.generation) {
+                return false;
+            }
+            for (uint32_t i = 0; i < GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES; ++i) {
+                if (a.block_table[i] != b.block_table[i]) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        auto check_tail_page_map = [&](ggml_tensor * key) {
+            if (!key || !key->data || saw_conflicting_map) {
+                return;
+            }
+            ggml_cuda_mtp_qblock_tail_page_map_v1 map = {};
+            llama_kv_cache_get_mtp_qblock_tail_page_map(key->data, &map);
+            if (!map.active) {
+                return;
+            }
+            if (!found_active_map) {
+                first_map = map;
+            } else if (!maps_equal(first_map, map)) {
+                saw_conflicting_map = true;
+                return;
+            }
+            found_active_map = true;
+            const uint64_t map_begin = map.logical_base_token;
+            const uint64_t map_end = map_begin + map.valid_tail_tokens;
+            overlaps_active_map = overlaps_active_map || (rm_begin < map_end && rm_end > map_begin);
+        };
+        for (const auto & layer : layers) {
+            check_tail_page_map(layer.k_payload);
+            for (auto * k_payload_view : layer.k_payload_stream) {
+                check_tail_page_map(k_payload_view);
+            }
+            check_tail_page_map(layer.k);
+            for (auto * k_view : layer.k_stream) {
+                check_tail_page_map(k_view);
+            }
+        }
+        auto mapped_overlap_survives_seq_rm = [&]() {
+            if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+                return false;
+            }
+            if (rm_end != std::numeric_limits<uint64_t>::max() ||
+                    (first_map.flags & GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_SCRATCH_OVERLAY) == 0) {
+                return false;
+            }
+            const uint64_t map_begin = first_map.logical_base_token;
+            const uint64_t map_end = map_begin + first_map.valid_tail_tokens;
+            const uint64_t overlap_begin = rm_begin > map_begin ? rm_begin : map_begin;
+            const uint64_t overlap_end = rm_end < map_end ? rm_end : map_end;
+            if (overlap_begin >= overlap_end) {
+                return false;
+            }
+            const auto stream_id = seq_to_stream[seq_id];
+            if ((size_t) stream_id >= v_cells.size()) {
+                return false;
+            }
+            const auto & cells = v_cells[stream_id];
+            for (uint64_t pos64 = overlap_begin; pos64 < overlap_end; ++pos64) {
+                if (pos64 > (uint64_t) std::numeric_limits<llama_pos>::max()) {
+                    return false;
+                }
+                const llama_pos pos = (llama_pos) pos64;
+                bool has_surviving_owner = false;
+                for (uint32_t i = 0; i < cells.size(); ++i) {
+                    if (cells.is_empty(i) || cells.pos_get(i) != pos) {
+                        continue;
+                    }
+                    if (!cells.seq_has(i, seq_id)) {
+                        has_surviving_owner = true;
+                        continue;
+                    }
+                    if (cells.seq_count(i) <= 1) {
+                        return false;
+                    }
+                    has_surviving_owner = true;
+                }
+                if (!has_surviving_owner) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        const bool non_scratch_tail_page_map = found_active_map && !saw_conflicting_map &&
+            first_map.version == GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_VERSION &&
+            first_map.abi_bytes == sizeof(ggml_cuda_mtp_qblock_tail_page_map_v1) &&
+            (first_map.flags & GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_SCRATCH_OVERLAY) == 0 &&
+            first_map.page_tokens == MTP_V4_144_PAGE_TOKENS &&
+            first_map.valid_tail_tokens > 0 &&
+            first_map.physical_pages > 0 &&
+            first_map.block_table_pages > 0 &&
+            first_map.block_table_pages <= GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES;
+        preserve_disjoint_tail_page_maps = found_active_map && !saw_conflicting_map && !overlaps_active_map &&
+            (preserve_disjoint_tail_page_maps_requested || non_scratch_tail_page_map);
+        preserve_shared_seq_tail_page_maps = found_active_map && !saw_conflicting_map && overlaps_active_map &&
+            preserve_shared_seq_tail_page_maps_requested &&
+            mapped_overlap_survives_seq_rm();
+        if (found_active_map && !saw_conflicting_map && overlaps_active_map && !preserve_shared_seq_tail_page_maps &&
+                shrink_suffix_tail_page_maps_requested && rm_end == std::numeric_limits<uint64_t>::max()) {
+            const uint64_t map_begin = first_map.logical_base_token;
+            const uint64_t map_end = map_begin + first_map.valid_tail_tokens;
+            if (rm_begin > map_begin && rm_begin < map_end) {
+                shrink_map = first_map;
+                shrink_map.valid_tail_tokens = (uint32_t) (rm_begin - map_begin);
+                shrink_suffix_tail_page_maps = shrink_map.valid_tail_tokens > 0 &&
+                    register_mtp_qblock_tail_page_map(shrink_map);
+            }
+        }
+        if ((preserve_disjoint_tail_page_maps || shrink_suffix_tail_page_maps || preserve_shared_seq_tail_page_maps) && llama_mtp_qblock_tail_page_registry_trace_enabled()) {
+            const char * op = preserve_shared_seq_tail_page_maps ? "host_preserve_clear_owner_shared" :
+                (shrink_suffix_tail_page_maps ? "host_shrink_clear" : "host_preserve_clear");
+            fprintf(stderr,
+                    "MTP_QBLOCK_TXN_TAIL_PAGE_REGISTRY: op=%s reason=%s rm_begin=%llu rm_end=%llu map_base=%u old_valid=%u new_valid=%u\n",
+                    op,
+                    tail_page_clear_reason,
+                    (unsigned long long) rm_begin,
+                    (unsigned long long) rm_end,
+                    first_map.logical_base_token,
+                    first_map.valid_tail_tokens,
+                    shrink_suffix_tail_page_maps ? shrink_map.valid_tail_tokens : first_map.valid_tail_tokens);
+        }
+    }
+    if (!preserve_disjoint_tail_page_maps && !shrink_suffix_tail_page_maps && !preserve_shared_seq_tail_page_maps) {
+        clear_mtp_qblock_tail_page_maps(tail_page_clear_reason);
+    }
 
     if (p0 < 0) {
         p0 = 0;
@@ -813,6 +1588,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     GGML_ASSERT(seq_id_src >= 0 && (size_t) seq_id_src < seq_to_stream.size());
     GGML_ASSERT(seq_id_dst >= 0 && (size_t) seq_id_dst < seq_to_stream.size());
+    clear_mtp_qblock_tail_page_maps("seq_cp");
 
     const auto s0 = seq_to_stream[seq_id_src];
     const auto s1 = seq_to_stream[seq_id_dst];
@@ -917,6 +1693,7 @@ bool llama_kv_cache::seq_import_physical(llama_seq_id seq_id_src, llama_seq_id s
     if (cells_copied) {
         *cells_copied = 0;
     }
+    clear_mtp_qblock_tail_page_maps("seq_import_physical");
 
     if (seq_id_src < 0 || seq_id_dst < 0 ||
             (size_t) seq_id_src >= seq_to_stream.size() ||
@@ -1388,6 +2165,7 @@ bool llama_kv_cache::seq_import_physical(llama_seq_id seq_id_src, llama_seq_id s
 
 void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+    clear_mtp_qblock_tail_page_maps("seq_keep");
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
     auto & head  = v_heads[seq_to_stream[seq_id]];
@@ -1418,6 +2196,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     if (shift == 0) {
         return;
     }
+    clear_mtp_qblock_tail_page_maps("seq_add");
 
     uint32_t new_head = cells.size();
 
@@ -1462,6 +2241,7 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
     if (d == 1) {
         return;
     }
+    clear_mtp_qblock_tail_page_maps("seq_div");
 
     if (p0 < 0) {
         p0 = 0;
@@ -1637,6 +2417,9 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
 bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
     bool updated = false;
+    if (do_shift || !sc_info.empty()) {
+        clear_mtp_qblock_tail_page_maps("update_shift_or_copy");
+    }
 
     auto * sched = lctx->get_sched();
 
@@ -2045,6 +2828,7 @@ bool llama_kv_cache::direct_tx_apply_metadata(const llama_ubatch & ubatch, llama
         return false;
     }
 
+    clear_mtp_qblock_tail_page_maps("direct_tx_apply_metadata");
     apply_ubatch(tx.sinfo, ubatch);
     tx.applied_metadata = true;
     return true;
@@ -2072,6 +2856,7 @@ bool llama_kv_cache::direct_tx_validate_metadata(const llama_kv_cache_direct_tx 
 }
 
 void llama_kv_cache::direct_tx_rollback(llama_kv_cache_direct_tx & tx) {
+    clear_mtp_qblock_tail_page_maps("direct_tx_rollback");
     if (!tx.rollback_ready) {
         tx = llama_kv_cache_direct_tx{};
         return;
@@ -2090,6 +2875,7 @@ void llama_kv_cache::direct_tx_rollback(llama_kv_cache_direct_tx & tx) {
 }
 
 void llama_kv_cache::direct_tx_commit(llama_kv_cache_direct_tx & tx) {
+    clear_mtp_qblock_tail_page_maps("direct_tx_commit");
     if (!tx.begun || !tx.applied_metadata || !tx.rollback_ready) {
         return;
     }
@@ -2162,6 +2948,94 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     }
 
     return result;
+}
+
+bool llama_kv_cache::get_implicit_causal_mask_meta(const slot_info & sinfo, const llama_ubatch * ubatch, bool causal_attn, int32_t meta[4]) const {
+    meta[0] = 0;
+    meta[1] = 0;
+    meta[2] = 0;
+    meta[3] = 0;
+
+    if (!causal_attn || !ubatch || ubatch->n_tokens <= 1) {
+        return false;
+    }
+
+    if (hparams.use_alibi || n_swa != 0 || swa_type != LLAMA_SWA_TYPE_NONE) {
+        return false;
+    }
+
+    if (sinfo.n_stream() != 1 || sinfo.idxs.size() != 1 || sinfo.strm.empty()) {
+        return false;
+    }
+
+    if (ubatch->n_seq_id[0] != 1) {
+        return false;
+    }
+
+    const llama_seq_id seq_id = ubatch->seq_id[0][0];
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size() || seq_to_stream[seq_id] != sinfo.strm[0]) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        if (ubatch->n_seq_id[i] != 1 || ubatch->seq_id[i][0] != seq_id) {
+            return false;
+        }
+        if (i > 0 && ubatch->pos[i] != ubatch->pos[0] + (llama_pos) i) {
+            return false;
+        }
+    }
+
+    const auto & cells = v_cells[sinfo.strm[0]];
+    const uint32_t n_kv_valid = cells.used_max_p1();
+    const uint32_t n_kv_padded = get_n_kv(sinfo);
+    if (n_kv_valid == 0 || n_kv_valid > n_kv_padded || n_kv_valid > (uint32_t) std::numeric_limits<int32_t>::max()) {
+        return false;
+    }
+    if (n_kv_valid < ubatch->n_tokens) {
+        return false;
+    }
+
+    if (cells.used_min() != 0 || cells.get_has_shift()) {
+        return false;
+    }
+
+    const llama_pos p_base = cells.pos_get(0);
+    if (ubatch->pos[0] < p_base) {
+        return false;
+    }
+
+    const int64_t q_offset = (int64_t) ubatch->pos[0] - (int64_t) p_base;
+    if (q_offset < 0 || q_offset > std::numeric_limits<int32_t>::max()) {
+        return false;
+    }
+    if ((uint64_t) q_offset + ubatch->n_tokens != n_kv_valid) {
+        return false;
+    }
+
+    if (sinfo.idxs[0].size() != ubatch->n_tokens) {
+        return false;
+    }
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        if (sinfo.idxs[0][i] != (uint32_t) q_offset + i) {
+            return false;
+        }
+    }
+
+    for (uint32_t i = 0; i < n_kv_valid; ++i) {
+        if (cells.is_empty(i) || cells.seq_count(i) != 1 || !cells.seq_has(i, seq_id)) {
+            return false;
+        }
+        if (cells.pos_get(i) != p_base + (llama_pos) i) {
+            return false;
+        }
+    }
+
+    meta[0] = (int32_t) n_kv_valid;
+    meta[1] = (int32_t) q_offset;
+    meta[2] = 1; // pure causal contiguous single-sequence mask
+    meta[3] = 0;
+    return true;
 }
 
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -3145,6 +4019,7 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
     GGML_UNUSED(flags);
 
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
+    clear_mtp_qblock_tail_page_maps("state_read");
 
     uint32_t n_stream_cur;
     io.read(&n_stream_cur, sizeof(n_stream_cur));
@@ -3683,6 +4558,10 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
 }
 
+bool llama_kv_cache_context::get_implicit_causal_mask_meta(const llama_ubatch * ubatch, bool causal_attn, int32_t meta[4]) const {
+    return kv->get_implicit_causal_mask_meta(sinfos[i_cur], ubatch, causal_attn, meta);
+}
+
 llama_pos llama_kv_cache_context::seq_pos_max(llama_seq_id seq_id) const {
     return kv->seq_pos_max(seq_id);
 }
@@ -3745,6 +4624,20 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+void llama_kv_cache_context::set_input_kq_mask_meta(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->ne[0] >= 4);
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+
+    int32_t meta[4] = { 0, 0, 0, 0 };
+    GGML_ASSERT(get_implicit_causal_mask_meta(ubatch, causal_attn, meta));
+    int32_t * data = (int32_t *) dst->data;
+    data[0] = meta[0];
+    data[1] = meta[1];
+    data[2] = meta[2];
+    data[3] = meta[3];
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

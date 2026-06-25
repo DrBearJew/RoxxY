@@ -396,6 +396,265 @@ static bool llama_trace_tensor_logical_bytes(ggml_tensor * t, std::vector<uint8_
     return true;
 }
 
+struct llama_graph_trace_state {
+    int layer = -1;
+    int max_nodes = 64;
+    int max_print = 8;
+    size_t max_bytes = 1u << 20;
+    int64_t n_tokens = 0;
+    int64_t n_seq_tokens = 0;
+    int64_t n_seqs = 0;
+    int seen_nodes = 0;
+    bool all = false;
+    std::vector<std::string> filters;
+    std::vector<llama_token> tokens;
+    std::vector<llama_pos> pos;
+    std::string dump_dir;
+    std::string pending_name;
+};
+
+static bool llama_graph_trace_env_enabled() {
+    const char * env = getenv("LLAMA_GRAPH_TRACE");
+    return env != nullptr && *env != '\0' && atoi(env) != 0;
+}
+
+static int llama_graph_trace_env_i32(const char * name, int def) {
+    const char * env = getenv(name);
+    return env && *env ? atoi(env) : def;
+}
+
+static size_t llama_graph_trace_env_size(const char * name, size_t def) {
+    const char * env = getenv(name);
+    if (env == nullptr || *env == '\0') {
+        return def;
+    }
+    const long long v = atoll(env);
+    return v > 0 ? (size_t) v : def;
+}
+
+static std::vector<std::string> llama_graph_trace_parse_filters(const char * env) {
+    std::vector<std::string> out;
+    const char * src = (env && *env) ? env : "fattn,Qcur,Kcur,Vcur,kq,kq_soft_max,kqv";
+    const char * p = src;
+    while (*p) {
+        while (*p == ',' || *p == ';' || *p == ' ' || *p == '\t') {
+            ++p;
+        }
+        const char * begin = p;
+        while (*p && *p != ',' && *p != ';' && *p != ' ' && *p != '\t') {
+            ++p;
+        }
+        if (p > begin) {
+            out.emplace_back(begin, (size_t) (p - begin));
+        }
+    }
+    return out;
+}
+
+static bool llama_graph_trace_name_has_layer(const char * name, int layer) {
+    if (layer < 0) {
+        return true;
+    }
+    char suffix[32];
+    snprintf(suffix, sizeof(suffix), "-%d", layer);
+    const size_t name_len = strlen(name);
+    const size_t suffix_len = strlen(suffix);
+    return name_len >= suffix_len && strcmp(name + name_len - suffix_len, suffix) == 0;
+}
+
+static bool llama_graph_trace_filter_matches(const llama_graph_trace_state * st, const char * name) {
+    if (st->all) {
+        return true;
+    }
+    for (const std::string & f : st->filters) {
+        if (f == "1" || f == "all" || strstr(name, f.c_str()) != nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool llama_graph_trace_want(const llama_graph_trace_state * st, const char * name) {
+    if (st == nullptr || name == nullptr || st->seen_nodes >= st->max_nodes) {
+        return false;
+    }
+    return llama_graph_trace_name_has_layer(name, st->layer) && llama_graph_trace_filter_matches(st, name);
+}
+
+static std::string llama_graph_trace_sanitize_file_component(const std::string & s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
+        out.push_back(ok ? c : '_');
+    }
+    return out.empty() ? std::string("node") : out;
+}
+
+static bool llama_graph_trace_mkdir_p(const std::string & dir) {
+    if (dir.empty()) {
+        return false;
+    }
+    std::string cur;
+    size_t pos = 0;
+    if (dir[0] == '/') {
+        cur = "/";
+        pos = 1;
+    }
+    while (pos < dir.size()) {
+        const size_t slash = dir.find('/', pos);
+        const size_t end = slash == std::string::npos ? dir.size() : slash;
+        if (end > pos) {
+            if (!cur.empty() && cur.back() != '/') {
+                cur.push_back('/');
+            }
+            cur.append(dir, pos, end - pos);
+            if (mkdir(cur.c_str(), 0755) != 0 && errno != EEXIST) {
+                return false;
+            }
+        }
+        if (slash == std::string::npos) {
+            break;
+        }
+        pos = slash + 1;
+    }
+    return true;
+}
+
+static bool llama_graph_trace_tensor_bytes_limited(ggml_tensor * t, size_t max_bytes, std::vector<uint8_t> & out) {
+    if (t == nullptr || t->buffer == nullptr || max_bytes == 0) {
+        return false;
+    }
+    const size_t elem_size = ggml_element_size(t);
+    const size_t row_bytes = (size_t) t->ne[0] * elem_size;
+    const size_t logical_bytes = (size_t) ggml_nelements(t) * elem_size;
+    const size_t limit = std::min(max_bytes, logical_bytes);
+    out.resize(limit);
+    size_t dst = 0;
+    for (int64_t i3 = 0; i3 < t->ne[3] && dst < limit; ++i3) {
+        for (int64_t i2 = 0; i2 < t->ne[2] && dst < limit; ++i2) {
+            for (int64_t i1 = 0; i1 < t->ne[1] && dst < limit; ++i1) {
+                const size_t off = (size_t) i3 * t->nb[3] + (size_t) i2 * t->nb[2] + (size_t) i1 * t->nb[1];
+                const size_t n = std::min(row_bytes, limit - dst);
+                ggml_backend_tensor_get(t, out.data() + dst, off, n);
+                dst += n;
+            }
+        }
+    }
+    return true;
+}
+
+static void llama_graph_trace_dump_file(
+        const llama_graph_trace_state * st,
+        const std::string & node_name,
+        ggml_tensor * t,
+        const std::vector<uint8_t> & bytes,
+        uint64_t hash) {
+    if (st == nullptr || st->dump_dir.empty() || bytes.empty()) {
+        return;
+    }
+    if (!llama_graph_trace_mkdir_p(st->dump_dir)) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "LLAMA_GRAPH_TRACE: failed to create dump dir %s\n", st->dump_dir.c_str());
+        }
+        return;
+    }
+    const std::string base = st->dump_dir + "/" + std::to_string(st->seen_nodes) + "_" + llama_graph_trace_sanitize_file_component(node_name);
+    const std::string bin_path = base + ".bin";
+    const std::string meta_path = base + ".meta";
+    {
+        std::ofstream out(bin_path, std::ios::binary);
+        out.write(reinterpret_cast<const char *>(bytes.data()), (std::streamsize) bytes.size());
+    }
+    {
+        std::ofstream meta(meta_path);
+        meta << "node=" << node_name << "\n";
+        meta << "op=" << ggml_op_name(t->op) << "\n";
+        meta << "type=" << ggml_type_name(t->type) << "\n";
+        meta << "ne=" << t->ne[0] << "," << t->ne[1] << "," << t->ne[2] << "," << t->ne[3] << "\n";
+        meta << "nb=" << t->nb[0] << "," << t->nb[1] << "," << t->nb[2] << "," << t->nb[3] << "\n";
+        meta << "logical_bytes=" << (size_t) ggml_nelements(t) * ggml_element_size(t) << "\n";
+        meta << "captured_bytes=" << bytes.size() << "\n";
+        meta << "hash=" << std::hex << hash << std::dec << "\n";
+    }
+}
+
+static bool llama_graph_trace_cb(ggml_tensor * t, bool ask, void * user_data) {
+    auto * st = static_cast<llama_graph_trace_state *>(user_data);
+    if (st == nullptr || t == nullptr) {
+        return false;
+    }
+
+    const char * name = ggml_get_name(t);
+    if (name == nullptr) {
+        name = "";
+    }
+
+    if (ask) {
+        if (!llama_graph_trace_want(st, name)) {
+            return false;
+        }
+        st->pending_name = name;
+        return true;
+    }
+
+    const std::string node_name = st->pending_name.empty() ? std::string(name) : st->pending_name;
+    st->pending_name.clear();
+    ++st->seen_nodes;
+
+    fprintf(stderr,
+            "LLAMA_GRAPH_TRACE: node=%d n_tokens=%lld n_seq_tokens=%lld n_seqs=%lld name=%s op=%s type=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] contiguous=%d rows_contiguous=%d",
+            st->seen_nodes,
+            (long long) st->n_tokens, (long long) st->n_seq_tokens, (long long) st->n_seqs,
+            node_name.c_str(), ggml_op_name(t->op), ggml_type_name(t->type),
+            (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+            (size_t) t->nb[0], (size_t) t->nb[1], (size_t) t->nb[2], (size_t) t->nb[3],
+            ggml_is_contiguous(t) ? 1 : 0, ggml_is_contiguous_rows(t) ? 1 : 0);
+
+    if (t->buffer == nullptr) {
+        fprintf(stderr, " buffer=0\n");
+        return true;
+    }
+
+    std::vector<uint8_t> bytes;
+    if (!llama_graph_trace_tensor_bytes_limited(t, st->max_bytes, bytes)) {
+        fprintf(stderr, " capture_failed=1\n");
+        return true;
+    }
+    const size_t logical_bytes = (size_t) ggml_nelements(t) * ggml_element_size(t);
+    const uint64_t hash = llama_mtp_fnv1a64(bytes.data(), bytes.size());
+    fprintf(stderr, " logical_bytes=%zu captured_bytes=%zu hash=%016" PRIx64, logical_bytes, bytes.size(), hash);
+
+    if (t->type == GGML_TYPE_F32) {
+        const size_t nfloat = bytes.size() / sizeof(float);
+        const float * vals = reinterpret_cast<const float *>(bytes.data());
+        float mn = INFINITY;
+        float mx = -INFINITY;
+        int bad = 0;
+        for (size_t i = 0; i < nfloat; ++i) {
+            const float v = vals[i];
+            if (!std::isfinite(v)) {
+                ++bad;
+            } else {
+                mn = std::min(mn, v);
+                mx = std::max(mx, v);
+            }
+        }
+        fprintf(stderr, " finite_min=%g finite_max=%g bad=%d first=[", (double) mn, (double) mx, bad);
+        const size_t nprint = std::min((size_t) std::max(0, st->max_print), nfloat);
+        for (size_t i = 0; i < nprint; ++i) {
+            fprintf(stderr, "%s%.9g", i == 0 ? "" : ",", (double) vals[i]);
+        }
+        fprintf(stderr, "]");
+    }
+
+    fprintf(stderr, "\n");
+    llama_graph_trace_dump_file(st, node_name, t, bytes, hash);
+    return true;
+}
+
 static bool llama_prefix_snapshot_trace_want(const llama_prefix_snapshot_trace_state * st, const char * name) {
     char kind = 0;
     long long row = -1;
@@ -2708,6 +2967,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     llama_prefix_snapshot_trace_state prefix_snapshot_trace;
+    bool prefix_snapshot_trace_active = false;
     if (gtype == LLM_GRAPH_TYPE_DECODER_PREFIX_VERIFY) {
         const char * env = getenv("LLAMA_MTP_PREFIX_SNAPSHOT_TRACE");
         const char * hidden_env = getenv("LLAMA_MTP_PREFIX_HIDDEN_TRACE");
@@ -2739,6 +2999,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     prefix_snapshot_trace.tokens.push_back(ubatch.token ? ubatch.token[i] : LLAMA_TOKEN_NULL);
                     prefix_snapshot_trace.pos.push_back(ubatch.pos ? ubatch.pos[i] : -1);
                 }
+                prefix_snapshot_trace_active = true;
                 ggml_backend_sched_set_eval_callback(sched.get(), llama_prefix_snapshot_trace_cb, &prefix_snapshot_trace);
             }
         }
@@ -2780,8 +3041,51 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+    llama_graph_trace_state graph_trace;
+    bool graph_trace_active = false;
+    if (llama_graph_trace_env_enabled()) {
+        if (cparams.cb_eval != nullptr || mtp_node_profile_active || prefix_snapshot_trace_active || gdn_input_trace_active) {
+            static bool warned = false;
+            if (!warned) {
+                LLAMA_LOG_WARN("%s: LLAMA_GRAPH_TRACE disabled because another eval callback is already installed\n", __func__);
+                warned = true;
+            }
+        } else {
+            graph_trace.layer        = llama_graph_trace_env_i32("LLAMA_GRAPH_TRACE_LAYER", -1);
+            graph_trace.max_nodes    = std::max(1, llama_graph_trace_env_i32("LLAMA_GRAPH_TRACE_MAX_NODES", 64));
+            graph_trace.max_print    = std::max(0, llama_graph_trace_env_i32("LLAMA_GRAPH_TRACE_MAX_PRINT", 8));
+            graph_trace.max_bytes    = llama_graph_trace_env_size("LLAMA_GRAPH_TRACE_MAX_BYTES", 1u << 20);
+            graph_trace.n_tokens     = ubatch.n_tokens;
+            graph_trace.n_seq_tokens = ubatch.n_seq_tokens;
+            graph_trace.n_seqs       = ubatch.n_seqs;
+            graph_trace.filters      = llama_graph_trace_parse_filters(getenv("LLAMA_GRAPH_TRACE_FILTER"));
+            graph_trace.dump_dir     = getenv("LLAMA_GRAPH_TRACE_DUMP_DIR") ? getenv("LLAMA_GRAPH_TRACE_DUMP_DIR") : "";
+            graph_trace.all          = false;
+            for (const std::string & f : graph_trace.filters) {
+                if (f == "1" || f == "all") {
+                    graph_trace.all = true;
+                    break;
+                }
+            }
+            graph_trace.tokens.reserve(ubatch.n_tokens);
+            graph_trace.pos.reserve(ubatch.n_tokens);
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                graph_trace.tokens.push_back(ubatch.token ? ubatch.token[i] : LLAMA_TOKEN_NULL);
+                graph_trace.pos.push_back(ubatch.pos ? ubatch.pos[i] : -1);
+            }
+            graph_trace_active = true;
+            ggml_backend_sched_set_eval_callback(sched.get(), llama_graph_trace_cb, &graph_trace);
+        }
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
 
+    if (graph_trace_active) {
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+    }
+    if (prefix_snapshot_trace_active) {
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+    }
     if (mtp_node_profile_active) {
         llama_mtp_node_profile_print(mtp_node_profile);
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
@@ -3954,7 +4258,9 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    const llm_graph_type reserve_gtype = ctx_type_to_graph_type(cparams.ctx_type);
+    const bool reserve_synthetic_implicit_causal_fa_mask = reserve_gtype == LLM_GRAPH_TYPE_DECODER_MTP;
+    const auto gparams = graph_params(res, ubatch, mctx, reserve_gtype, reserve_synthetic_implicit_causal_fa_mask);
 
     res->reset();
 
@@ -3982,7 +4288,8 @@ llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const {
+                          llm_graph_type   gtype,
+                                   bool   reserve_synthetic_implicit_causal_fa_mask) const {
     int32_t mtp_prefix_accepted_commit_verify_slots = 0;
     if (gtype == LLM_GRAPH_TYPE_DECODER_PREFIX_VERIFY && llama_env_i32("LLAMA_MTP_PREFIX_ACCEPTED_ROW_ONLY_COMMIT", 0) != 0) {
         mtp_prefix_accepted_commit_verify_slots = llama_env_i32("LLAMA_MTP_PREFIX_ACCEPTED_ROW_COMMIT_VERIFY_SLOTS", 1);
@@ -4036,6 +4343,7 @@ llm_graph_params llama_context::graph_params(
         /*.mtp_prefix_batch_output_head =*/ mtp_prefix_batch_output_head,
         /*.mtp_prefix_exact_tail_batch =*/ mtp_prefix_exact_tail_batch,
         /*.mtp_prefix_roweq_layer_ffn_batch =*/ mtp_prefix_roweq_layer_ffn_batch,
+        /*.reserve_synthetic_implicit_causal_fa_mask =*/ reserve_synthetic_implicit_causal_fa_mask,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };

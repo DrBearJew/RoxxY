@@ -21,6 +21,7 @@
 #include "dot4-packed16/dp16-fa-qpack.cuh"
 #include "dot4-packed16/dp16-trace.cuh"
 #include "dot4-packed16/mtp-qblock-txn-lineage.cuh"
+#include "dot4-packed16/mtp-v4-144-tail-page-state.cuh"
 
 #include <atomic>
 #include <cfloat>
@@ -37,6 +38,8 @@ void llama_kv_cache_get_packed16_metadata(const void * k_view_data,
                                            unsigned long long * generation);
 void llama_kv_cache_get_packed16_sidecar_meta(const void * k_view_data,
                                               ggml_cuda_packed16_sidecar_meta * meta);
+void llama_kv_cache_get_mtp_qblock_tail_page_map(const void * k_view_data,
+                                                 ggml_cuda_mtp_qblock_tail_page_map_v1 * map);
 }
 
 #ifndef CEIL_DIV
@@ -1080,8 +1083,16 @@ static __device__ __forceinline__ bool pdmq_mask_keep_and_bias(
         const int q,
         const int k,
         const int b,
-        float * __restrict__ bias) {
+        float * __restrict__ bias,
+        const int implicit_n_kv,
+        const int implicit_q_offset,
+        const int implicit_flags) {
     *bias = 0.0f;
+    if ((implicit_flags & 1) != 0) {
+        if (k >= implicit_n_kv || k > q + implicit_q_offset) {
+            return false;
+        }
+    }
     if (!mask) return true;
     if (q < 0 || q >= mask_ne01 || k < 0 || k >= mask_ne00) return false;
     const int mb = mask_ne03 > 1 ? (b % mask_ne03) : 0;
@@ -1400,6 +1411,9 @@ static __device__ __forceinline__ void pdmq_input_probe_hashes(
         const int64_t mask_nb00,
         const int64_t mask_nb01,
         const int64_t mask_nb03,
+        const int implicit_n_kv,
+        const int implicit_q_offset,
+        const int implicit_flags,
         const int * __restrict__ k_payload,
         const half * __restrict__ k_scales,
         const int q,
@@ -1463,8 +1477,8 @@ static __device__ __forceinline__ void pdmq_input_probe_hashes(
             valid = valid && (k <= q_offset + q);
         }
         float bias = 0.0f;
-        if (valid && mask) {
-            valid = pdmq_mask_keep_and_bias(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q, k, b, &bias);
+        if (valid && (mask || (implicit_flags & 1))) {
+            valid = pdmq_mask_keep_and_bias(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q, k, b, &bias, implicit_n_kv, implicit_q_offset, implicit_flags);
         }
         mh = pdmq_fnv1a64_mix_u32(mh, valid ? 1u : 0u);
         mh = pdmq_fnv1a64_mix_u32(mh, pdmq_f32_bits(bias));
@@ -1497,8 +1511,8 @@ static __device__ __forceinline__ void pdmq_input_probe_hashes(
             valid = valid && (k <= q_offset + q);
         }
         float bias = 0.0f;
-        if (valid && mask) {
-            valid = pdmq_mask_keep_and_bias(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q, k, b, &bias);
+        if (valid && (mask || (implicit_flags & 1))) {
+            valid = pdmq_mask_keep_and_bias(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q, k, b, &bias, implicit_n_kv, implicit_q_offset, implicit_flags);
         }
         *keep = valid ? 1 : 0;
         *bias_out = bias;
@@ -1530,6 +1544,9 @@ static __device__ __forceinline__ void pdmq_scalar_ref_range(
         const int64_t mask_nb00,
         const int64_t mask_nb01,
         const int64_t mask_nb03,
+        const int implicit_n_kv,
+        const int implicit_q_offset,
+        const int implicit_flags,
         const int * __restrict__ k_payload,
         const half * __restrict__ k_scales,
         const int q,
@@ -1561,8 +1578,8 @@ static __device__ __forceinline__ void pdmq_scalar_ref_range(
             valid = valid && (k <= q_offset + q);
         }
         float mask_bias = 0.0f;
-        if (valid && mask) {
-            valid = pdmq_mask_keep_and_bias(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q, k, b, &mask_bias);
+        if (valid && (mask || (implicit_flags & 1))) {
+            valid = pdmq_mask_keep_and_bias(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q, k, b, &mask_bias, implicit_n_kv, implicit_q_offset, implicit_flags);
         }
         if (!valid) {
             continue;
@@ -1585,8 +1602,8 @@ static __device__ __forceinline__ void pdmq_scalar_ref_range(
                 valid = valid && (k <= q_offset + q);
             }
             float mask_bias = 0.0f;
-            if (valid && mask) {
-                valid = pdmq_mask_keep_and_bias(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q, k, b, &mask_bias);
+            if (valid && (mask || (implicit_flags & 1))) {
+                valid = pdmq_mask_keep_and_bias(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q, k, b, &mask_bias, implicit_n_kv, implicit_q_offset, implicit_flags);
             }
             if (!valid) {
                 continue;
@@ -1622,6 +1639,7 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqa2
         const char * __restrict__ mask,
         int64_t mask_ne00, int64_t mask_ne01, int64_t mask_ne03,
         int64_t mask_nb00, int64_t mask_nb01, int64_t mask_nb03,
+        int implicit_n_kv, int implicit_q_offset, int implicit_flags,
         const int  * __restrict__ k_payload,
         const half * __restrict__ k_scales,
         int nq, int nk, int n_heads_q, int n_heads_k, int gqa_ratio,
@@ -1691,6 +1709,9 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqa2
 
     for (int k0 = 0; k0 < nk; k0 += BN) {
         const int tile_n = pdmq_min_i(BN, nk - k0);
+        if ((implicit_flags & 1) != 0 && k0 >= implicit_n_kv) {
+            break;
+        }
 
         if constexpr (CAUSAL_MASK) {
             const int q_last = pdmq_min_i(q0 + BM - 1, nq - 1);
@@ -1782,8 +1803,8 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqa2
                 bool valid = q < nq && kk < tile_n && k < nk;
                 if constexpr (CAUSAL_MASK) valid = valid && (k <= q_offset + q);
                 float mask_bias = 0.0f;
-                if (valid && mask) {
-                    valid = pdmq_mask_keep_and_bias(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q, k, b, &mask_bias);
+                if (valid && (mask || (implicit_flags & 1))) {
+                    valid = pdmq_mask_keep_and_bias(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q, k, b, &mask_bias, implicit_n_kv, implicit_q_offset, implicit_flags);
                 }
                 if (valid) {
                     const int  * kp_row;
@@ -1917,6 +1938,7 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
         const char * __restrict__ mask,
         int64_t mask_ne00, int64_t mask_ne01, int64_t mask_ne03,
         int64_t mask_nb00, int64_t mask_nb01, int64_t mask_nb03,
+        int implicit_n_kv, int implicit_q_offset, int implicit_flags,
         const int  * __restrict__ k_payload,
         const half * __restrict__ k_scales,
         int nq, int nk, int n_heads_q, int n_heads_k, int gqa_ratio,
@@ -2143,6 +2165,9 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
 
     for (int k0 = k_begin; k0 < k_end; k0 += BN) {
         const int tile_n = pdmq_min_i(BN, nk - k0);
+        if ((implicit_flags & 1) != 0 && k0 >= implicit_n_kv) {
+            break;
+        }
 
         if constexpr (CAUSAL_MASK) {
             const int q_last = dp16_fa_qblock_program_q_last_live(qblock_program, q0, BM, nq);
@@ -2151,7 +2176,8 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
 
         static constexpr bool V4_144_PV4_WORD_CACHE = V4_144_PV4_COMPILED && (BN % 8 == 0);
         uint32_t v4_144_pv4_payload_words[V4_144_PV4_WORD_CACHE ? (BN / 8) : 1];
-        const bool v4_144_pv4_words_active = v4_144_pv4_active && ((k0 & 7) == 0);
+        const bool v4_144_pv4_words_active = v4_144_pv4_active && ((k0 & 7) == 0) &&
+            !dp16_fa_qblock_tail_page_consumer_active(qblock_program);
 
 
         if constexpr (STAGE_V) {
@@ -2159,8 +2185,9 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
                 const int kk = v_idx / D;
                 const int d  = v_idx - kk * D;
                 const int k  = k0 + kk;
-                v_tile[kk * (D + 1) + d] = kk < tile_n
-                    ? pdmq_decode_v<V_TYPE>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k, hk, b, d, V4_tail, v4_tail_nb10, v4_tail_nb11, v4_tail_nb12, v4_live_nk)
+                const int k_phys = dp16_fa_qblock_tail_page_physical_k(qblock_program, k);
+                v_tile[kk * (D + 1) + d] = kk < tile_n && k_phys >= 0
+                    ? pdmq_decode_v<V_TYPE>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k_phys, hk, b, d, V4_tail, v4_tail_nb10, v4_tail_nb11, v4_tail_nb12, v4_live_nk)
                     : 0.0f;
             }
             __syncthreads();
@@ -2171,8 +2198,10 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
                     for (int v_idx = tid; v_idx < tile_n * V_BLOCKS; v_idx += int(blockDim.x)) {
                         const int kk = v_idx / V_BLOCKS;
                         const int blk = v_idx - kk * V_BLOCKS;
-                        v_raw_tile[kk * V_BLOCKS + blk] = *pdmq_v_q4_0_block_ptr(
-                            V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k0 + kk, hk, b, blk);
+                        const int k = k0 + kk;
+                        const int k_phys = dp16_fa_qblock_tail_page_physical_k(qblock_program, k);
+                        v_raw_tile[kk * V_BLOCKS + blk] = k_phys >= 0 ? *pdmq_v_q4_0_block_ptr(
+                            V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k_phys, hk, b, blk) : block_q4_0{};
                     }
                     __syncthreads();
                     if constexpr (V4_K16D16_ORACLE) {
@@ -2185,10 +2214,11 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
                     const int kk = v_idx / V_SCALE_BLOCKS;
                     const int d32 = v_idx - kk * V_SCALE_BLOCKS;
                     const int k = k0 + kk;
-                    const int k16_base = k & ~(PDMQ_V4_K16D16_144_K - 1);
-                    const int slot = k & (PDMQ_V4_K16D16_144_K - 1);
-                    const char * block = pdmq_v_v4_k16d16_144_block_ptr(V, v_nb11, v_nb12, v_nb13, v_ne13, k16_base, hk, b);
-                    v4_144_scale_tile[kk * V_SCALE_BLOCKS + d32] = ((const half *) (block + PDMQ_V4_K16D16_144_PAYLOAD_BYTES))[d32 * PDMQ_V4_K16D16_144_K + slot];
+                    const int k_phys = dp16_fa_qblock_tail_page_physical_k(qblock_program, k);
+                    const int k16_base = k_phys >= 0 ? (k_phys & ~(PDMQ_V4_K16D16_144_K - 1)) : 0;
+                    const int slot = k_phys >= 0 ? (k_phys & (PDMQ_V4_K16D16_144_K - 1)) : 0;
+                    const char * block = k_phys >= 0 ? pdmq_v_v4_k16d16_144_block_ptr(V, v_nb11, v_nb12, v_nb13, v_ne13, k16_base, hk, b) : nullptr;
+                    v4_144_scale_tile[kk * V_SCALE_BLOCKS + d32] = block ? ((const half *) (block + PDMQ_V4_K16D16_144_PAYLOAD_BYTES))[d32 * PDMQ_V4_K16D16_144_K + slot] : __float2half(0.0f);
                 }
                 if constexpr (V4_144_PV4_WORD_CACHE) {
 #pragma unroll
@@ -2196,10 +2226,11 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
                         const int kk = kg * 8;
                         if (v4_144_pv4_words_active && kk < tile_n) {
                             const int k = k0 + kk;
-                            const int k16_base = k & ~(PDMQ_V4_K16D16_144_K - 1);
-                            const int slot = k & (PDMQ_V4_K16D16_144_K - 1);
-                            const char * block = pdmq_v_v4_k16d16_144_block_ptr(V, v_nb11, v_nb12, v_nb13, v_ne13, k16_base, hk, b);
-                            v4_144_pv4_payload_words[kg] = pdmq_v_v4_k16d16_144_payload_word(block, slot, tid);
+                            const int k_phys = dp16_fa_qblock_tail_page_physical_k(qblock_program, k);
+                            const int k16_base = k_phys >= 0 ? (k_phys & ~(PDMQ_V4_K16D16_144_K - 1)) : 0;
+                            const int slot = k_phys >= 0 ? (k_phys & (PDMQ_V4_K16D16_144_K - 1)) : 0;
+                            const char * block = k_phys >= 0 ? pdmq_v_v4_k16d16_144_block_ptr(V, v_nb11, v_nb12, v_nb13, v_ne13, k16_base, hk, b) : nullptr;
+                            v4_144_pv4_payload_words[kg] = block ? pdmq_v_v4_k16d16_144_payload_word(block, slot, tid) : 0;
                         } else {
                             v4_144_pv4_payload_words[kg] = 0;
                         }
@@ -2212,8 +2243,10 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
             for (int v_idx = tid; v_idx < tile_n * V_BLOCKS; v_idx += int(blockDim.x)) {
                 const int kk = v_idx / V_BLOCKS;
                 const int blk = v_idx - kk * V_BLOCKS;
-                v_raw_q8_tile[kk * V_BLOCKS + blk] = *pdmq_v_q8_0_block_ptr(
-                    V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k0 + kk, hk, b, blk);
+                const int k = k0 + kk;
+                const int k_phys = dp16_fa_qblock_tail_page_physical_k(qblock_program, k);
+                v_raw_q8_tile[kk * V_BLOCKS + blk] = k_phys >= 0 ? *pdmq_v_q8_0_block_ptr(
+                    V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k_phys, hk, b, blk) : block_q8_0{};
             }
             __syncthreads();
         } else if constexpr (RAW_F16_LDS) {
@@ -2226,15 +2259,18 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
                     const int vec = v_idx - kk * VECS_PER_ROW;
                     const int d   = vec * HALF_PER_VEC;
                     const int k   = k0 + kk;
-                    const half * src = pdmq_v_f16_ptr(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k, hk, b, d);
-                    ((int4 *) (v_raw_f16_tile + kk * D))[vec] = *((const int4 *) src);
+                    const int k_phys = dp16_fa_qblock_tail_page_physical_k(qblock_program, k);
+                    const half * src = k_phys >= 0 ? pdmq_v_f16_ptr(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k_phys, hk, b, d) : nullptr;
+                    ((int4 *) (v_raw_f16_tile + kk * D))[vec] = src ? *((const int4 *) src) : int4{};
                 }
             } else {
                 for (int v_idx = tid; v_idx < tile_n * D; v_idx += int(blockDim.x)) {
                     const int kk = v_idx / D;
                     const int d  = v_idx - kk * D;
-                    v_raw_f16_tile[kk * D + d] = *pdmq_v_f16_ptr(
-                        V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k0 + kk, hk, b, d);
+                    const int k = k0 + kk;
+                    const int k_phys = dp16_fa_qblock_tail_page_physical_k(qblock_program, k);
+                    v_raw_f16_tile[kk * D + d] = k_phys >= 0 ? *pdmq_v_f16_ptr(
+                        V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k_phys, hk, b, d) : __float2half(0.0f);
                 }
             }
             __syncthreads();
@@ -2249,20 +2285,23 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
             for (int v_idx = tid; v_idx < BN * D; v_idx += int(blockDim.x)) {
                 const int kk = v_idx / D;
                 const int d  = v_idx - kk * D;
+                float vv = 0.0f;
                 if (kk < tile_n) {
-                    const float vv = STAGE_V
-                        ? v_tile[kk * (D + 1) + d]
-                        : (RAW_Q4_LDS
-                            ? pdmq_decode_v_q4_0_raw_lds<D>(v_raw_tile, kk, d)
-                            : (RAW_Q8_LDS
-                                ? pdmq_decode_v_q8_0_raw_lds<D>(v_raw_q8_tile, kk, d)
-                                : (RAW_F16_LDS
-                                    ? pdmq_decode_v_f16_raw_lds<D>(v_raw_f16_tile, kk, d)
-                                    : pdmq_decode_v<V_TYPE>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k0 + kk, hk, b, d, V4_tail, v4_tail_nb10, v4_tail_nb11, v4_tail_nb12, v4_live_nk))));
-                    v_wmma_tile[v_idx] = __float2half(vv);
-                } else {
-                    v_wmma_tile[v_idx] = __float2half(0.0f);
+                    if constexpr (STAGE_V) {
+                        vv = v_tile[kk * (D + 1) + d];
+                    } else if constexpr (RAW_Q4_LDS) {
+                        vv = pdmq_decode_v_q4_0_raw_lds<D>(v_raw_tile, kk, d);
+                    } else if constexpr (RAW_Q8_LDS) {
+                        vv = pdmq_decode_v_q8_0_raw_lds<D>(v_raw_q8_tile, kk, d);
+                    } else if constexpr (RAW_F16_LDS) {
+                        vv = pdmq_decode_v_f16_raw_lds<D>(v_raw_f16_tile, kk, d);
+                    } else {
+                        const int k = k0 + kk;
+                        const int k_phys = dp16_fa_qblock_tail_page_physical_k(qblock_program, k);
+                        vv = k_phys >= 0 ? pdmq_decode_v<V_TYPE>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k_phys, hk, b, d, V4_tail, v4_tail_nb10, v4_tail_nb11, v4_tail_nb12, v4_live_nk) : 0.0f;
+                    }
                 }
+                v_wmma_tile[v_idx] = __float2half(vv);
             }
             __syncthreads();
         }
@@ -2273,11 +2312,15 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
             constexpr int KS_PER_ROW = PDMQ_D / QK8_0;
             for (int idx = tid; idx < tile_n * KP_PER_ROW; idx += int(blockDim.x)) {
                 const int kk = idx / KP_PER_ROW, w = idx - kk * KP_PER_ROW;
-                k_payload_s[kk * (KP_PER_ROW + 1) + w] = k_payload[ggml_cuda_packed16_k_payload_index_from_desc(k_desc, (uint32_t) hk, (uint32_t) (k0 + kk), (uint32_t) w)];
+                const int k = k0 + kk;
+                const int k_phys = dp16_fa_qblock_tail_page_physical_k(qblock_program, k);
+                k_payload_s[kk * (KP_PER_ROW + 1) + w] = k_phys >= 0 ? k_payload[ggml_cuda_packed16_k_payload_index_from_desc(k_desc, (uint32_t) hk, (uint32_t) k_phys, (uint32_t) w)] : 0;
             }
             for (int idx = tid; idx < tile_n * KS_PER_ROW; idx += int(blockDim.x)) {
                 const int kk = idx / KS_PER_ROW, s_val = idx - kk * KS_PER_ROW;
-                k_scales_s[kk * (KS_PER_ROW + 1) + s_val] = k_scales[ggml_cuda_packed16_k_scale_index_from_desc(k_desc, (uint32_t) hk, (uint32_t) (k0 + kk), (uint32_t) s_val)];
+                const int k = k0 + kk;
+                const int k_phys = dp16_fa_qblock_tail_page_physical_k(qblock_program, k);
+                k_scales_s[kk * (KS_PER_ROW + 1) + s_val] = k_phys >= 0 ? k_scales[ggml_cuda_packed16_k_scale_index_from_desc(k_desc, (uint32_t) hk, (uint32_t) k_phys, (uint32_t) s_val)] : __float2half(0.0f);
             }
             __syncthreads();
         }
@@ -2302,9 +2345,11 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
                 valid = dp16_fa_qblock_program_tree_allows_local_k(qblock_program, qr, k - (q_offset + q0));
             }
             float mask_bias = 0.0f;
-            if (valid && mask) {
-                valid = pdmq_mask_keep_and_bias(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q, k, b, &mask_bias);
+            if (valid && (mask || (implicit_flags & 1))) {
+                valid = pdmq_mask_keep_and_bias(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q, k, b, &mask_bias, implicit_n_kv, implicit_q_offset, implicit_flags);
             }
+            const int k_phys = valid ? dp16_fa_qblock_tail_page_physical_k(qblock_program, k) : k;
+            valid = valid && k_phys >= 0 && k_phys < (int) k_kv_capacity;
             if (valid) {
                 const int  * kp_row;
                 const half * ks_row;
@@ -2312,13 +2357,13 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
                     kp_row = &k_payload_s[kk * (PDMQ_D / 4 + 1)];
                     ks_row = &k_scales_s [kk * (PDMQ_D / QK8_0 + 1)];
                 } else {
-                    const size_t k_row = k_head_base + size_t(k);
+                    const size_t k_row = k_head_base + size_t(k_phys);
                     kp_row = k_payload + k_row * (D / 4);
                     ks_row = k_scales  + k_row * (D / QK8_0);
                 }
                 s_val = KSHARED
                     ? pdmq_qk_dot<BM, D>(q_tile_i32[slot], q_tile_scales[slot], qr, kp_row, ks_row) * attention_scale + mask_bias
-                    : pdmq_qk_dot_sidecar<BM, D>(q_tile_i32[slot], q_tile_scales[slot], qr, k_payload, k_scales, k_desc, k_format, k_kv_capacity, hk, k) * attention_scale + mask_bias;
+                    : pdmq_qk_dot_sidecar<BM, D>(q_tile_i32[slot], q_tile_scales[slot], qr, k_payload, k_scales, k_desc, k_format, k_kv_capacity, hk, k_phys) * attention_scale + mask_bias;
             }
             logits[slot][qr][kk] = s_val;
         }
@@ -2664,16 +2709,18 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
                 }
 #pragma unroll
                 for (int kk = 0; kk < BN; ++kk) {
-                    const float vv = kk < tile_n
+                    const int k = k0 + kk;
+                    const int k_phys = kk < tile_n ? dp16_fa_qblock_tail_page_physical_k(qblock_program, k) : -1;
+                    const float vv = kk < tile_n && k_phys >= 0
                         ? (v4_144_pv4_active
-                            ? (v4_144_pv4_words_active ? pdmq_decode_v_v4_k16d16_144_pv4_cached<D>(v4_144_pv4_payload_words, v4_144_scale_tile, kk, tid) : pdmq_decode_v_v4_k16d16_144_scale_lds<D>(V, v_nb11, v_nb12, v_nb13, v_ne13, k0 + kk, hk, b, tid, v4_144_scale_tile, kk))
+                            ? (v4_144_pv4_words_active ? pdmq_decode_v_v4_k16d16_144_pv4_cached<D>(v4_144_pv4_payload_words, v4_144_scale_tile, kk, tid) : pdmq_decode_v_v4_k16d16_144_scale_lds<D>(V, v_nb11, v_nb12, v_nb13, v_ne13, k_phys, hk, b, tid, v4_144_scale_tile, kk))
                             : (RAW_Q4_LDS
                                 ? pdmq_decode_v_q4_0_raw_or_k16d16<D, BN, V4_K16D16_ORACLE>(v_raw_tile, v4_k16d16_words, kk, tid)
                                 : (RAW_Q8_LDS
                                     ? pdmq_decode_v_q8_0_raw_lds<D>(v_raw_q8_tile, kk, tid)
                                     : (RAW_F16_LDS
                                         ? pdmq_decode_v_f16_raw_lds<D>(v_raw_f16_tile, kk, tid)
-                                        : pdmq_decode_v<V_TYPE>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k0 + kk, hk, b, tid, V4_tail, v4_tail_nb10, v4_tail_nb11, v4_tail_nb12, v4_live_nk)))))
+                                        : pdmq_decode_v<V_TYPE>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k_phys, hk, b, tid, V4_tail, v4_tail_nb10, v4_tail_nb11, v4_tail_nb12, v4_live_nk)))))
                         : 0.0f;
 #pragma unroll
                     for (int slot = 0; slot < GQA_GROUP; ++slot) {
@@ -2719,16 +2766,18 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
                         }
 #pragma unroll
                         for (int kk = 0; kk < BN; ++kk) {
-                            const float vv = kk < tile_n
+                            const int k = k0 + kk;
+                            const int k_phys = kk < tile_n ? dp16_fa_qblock_tail_page_physical_k(qblock_program, k) : -1;
+                            const float vv = kk < tile_n && k_phys >= 0
                                 ? (v4_144_pv4_active
-                                    ? (v4_144_pv4_words_active ? pdmq_decode_v_v4_k16d16_144_pv4_cached<D>(v4_144_pv4_payload_words, v4_144_scale_tile, kk, tid) : pdmq_decode_v_v4_k16d16_144_scale_lds<D>(V, v_nb11, v_nb12, v_nb13, v_ne13, k0 + kk, hk, b, tid, v4_144_scale_tile, kk))
+                                    ? (v4_144_pv4_words_active ? pdmq_decode_v_v4_k16d16_144_pv4_cached<D>(v4_144_pv4_payload_words, v4_144_scale_tile, kk, tid) : pdmq_decode_v_v4_k16d16_144_scale_lds<D>(V, v_nb11, v_nb12, v_nb13, v_ne13, k_phys, hk, b, tid, v4_144_scale_tile, kk))
                                     : (RAW_Q4_LDS
                                         ? pdmq_decode_v_q4_0_raw_or_k16d16<D, BN, V4_K16D16_ORACLE>(v_raw_tile, v4_k16d16_words, kk, tid)
                                         : (RAW_Q8_LDS
                                             ? pdmq_decode_v_q8_0_raw_lds<D>(v_raw_q8_tile, kk, tid)
                                             : (RAW_F16_LDS
                                                 ? pdmq_decode_v_f16_raw_lds<D>(v_raw_f16_tile, kk, tid)
-                                                : pdmq_decode_v<V_TYPE>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k0 + kk, hk, b, tid, V4_tail, v4_tail_nb10, v4_tail_nb11, v4_tail_nb12, v4_live_nk)))))
+                                                : pdmq_decode_v<V_TYPE>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k_phys, hk, b, tid, V4_tail, v4_tail_nb10, v4_tail_nb11, v4_tail_nb12, v4_live_nk)))))
                                 : 0.0f;
 #pragma unroll
                             for (int slot = 0; slot < GQA_GROUP; ++slot) {
@@ -2745,16 +2794,18 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
                     } else {
 #pragma unroll
                         for (int kk = 0; kk < BN; ++kk) {
-                            const float vv = kk < tile_n
+                            const int k = k0 + kk;
+                            const int k_phys = kk < tile_n ? dp16_fa_qblock_tail_page_physical_k(qblock_program, k) : -1;
+                            const float vv = kk < tile_n && k_phys >= 0
                                 ? (v4_144_pv4_active
-                                    ? (v4_144_pv4_words_active ? pdmq_decode_v_v4_k16d16_144_pv4_cached<D>(v4_144_pv4_payload_words, v4_144_scale_tile, kk, tid) : pdmq_decode_v_v4_k16d16_144_scale_lds<D>(V, v_nb11, v_nb12, v_nb13, v_ne13, k0 + kk, hk, b, tid, v4_144_scale_tile, kk))
+                                    ? (v4_144_pv4_words_active ? pdmq_decode_v_v4_k16d16_144_pv4_cached<D>(v4_144_pv4_payload_words, v4_144_scale_tile, kk, tid) : pdmq_decode_v_v4_k16d16_144_scale_lds<D>(V, v_nb11, v_nb12, v_nb13, v_ne13, k_phys, hk, b, tid, v4_144_scale_tile, kk))
                                     : (RAW_Q4_LDS
                                         ? pdmq_decode_v_q4_0_raw_or_k16d16<D, BN, V4_K16D16_ORACLE>(v_raw_tile, v4_k16d16_words, kk, tid)
                                         : (RAW_Q8_LDS
                                             ? pdmq_decode_v_q8_0_raw_lds<D>(v_raw_q8_tile, kk, tid)
                                             : (RAW_F16_LDS
                                                 ? pdmq_decode_v_f16_raw_lds<D>(v_raw_f16_tile, kk, tid)
-                                                : pdmq_decode_v<V_TYPE>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k0 + kk, hk, b, tid, V4_tail, v4_tail_nb10, v4_tail_nb11, v4_tail_nb12, v4_live_nk)))))
+                                                : pdmq_decode_v<V_TYPE>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, k_phys, hk, b, tid, V4_tail, v4_tail_nb10, v4_tail_nb11, v4_tail_nb12, v4_live_nk)))))
                                 : 0.0f;
 #pragma unroll
                             for (int slot = 0; slot < GQA_GROUP; ++slot) {
@@ -2856,6 +2907,7 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
                                 V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13,
                                 V4_tail, v4_tail_nb10, v4_tail_nb11, v4_tail_nb12, v4_live_nk,
                                 mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03,
+                                implicit_n_kv, implicit_q_offset, implicit_flags,
                                 k_payload, k_scales,
                                 q, hq, hk, b, qr, nk, q_offset, attention_scale, packed_rows, n_heads_k, tid,
                                 k_begin, k_end, &ref_m, &ref_l, &ref_acc, &ref_valid_count, &ref_last_valid);
@@ -2880,6 +2932,7 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
                                     V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13,
                                     V4_tail, v4_tail_nb10, v4_tail_nb11, v4_tail_nb12, v4_live_nk,
                                     mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03,
+                                    implicit_n_kv, implicit_q_offset, implicit_flags,
                                     k_payload, k_scales,
                                     q, hq, hk, b, qr, nk, q_offset, attention_scale, packed_rows, n_heads_k, tid,
                                     0, nk, &ref_m, &ref_l, &ref_acc, &ref_valid_count, &ref_last_valid);
@@ -2917,6 +2970,7 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
                                         V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13,
                                         V4_tail, v4_tail_nb10, v4_tail_nb11, v4_tail_nb12, v4_live_nk,
                                         mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03,
+                                        implicit_n_kv, implicit_q_offset, implicit_flags,
                                         k_payload, k_scales,
                                         q, hk, b, qr, nk, q_offset, packed_rows, n_heads_k, tid,
                                         &q_hash, &k_hash, &v_hash, &mask_hash,
@@ -2948,8 +3002,8 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
                             if constexpr (CAUSAL_MASK) {
                                 valid = valid && (kk <= q_offset + q);
                             }
-                            if (valid && mask) {
-                                valid = pdmq_mask_keep_and_bias(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q, kk, b, &bias_tmp);
+                            if (valid && (mask || (implicit_flags & 1))) {
+                                valid = pdmq_mask_keep_and_bias(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q, kk, b, &bias_tmp, implicit_n_kv, implicit_q_offset, implicit_flags);
                             }
                             if (valid) {
                                 ++valid_count;
@@ -2957,9 +3011,9 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
                             }
                         }
                         float b0 = 0.0f, blast = 0.0f, bnk = 0.0f;
-                        const bool keep0 = mask ? pdmq_mask_keep_and_bias(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q, 0, b, &b0) : true;
-                        const bool keeplast = last_valid >= 0 && mask ? pdmq_mask_keep_and_bias(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q, last_valid, b, &blast) : (last_valid >= 0);
-                        const bool keepnk = mask ? pdmq_mask_keep_and_bias(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q, nk - 1, b, &bnk) : true;
+                        const bool keep0 = (mask || (implicit_flags & 1)) ? pdmq_mask_keep_and_bias(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q, 0, b, &b0, implicit_n_kv, implicit_q_offset, implicit_flags) : true;
+                        const bool keeplast = last_valid >= 0 && (mask || (implicit_flags & 1)) ? pdmq_mask_keep_and_bias(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q, last_valid, b, &blast, implicit_n_kv, implicit_q_offset, implicit_flags) : (last_valid >= 0);
+                        const bool keepnk = (mask || (implicit_flags & 1)) ? pdmq_mask_keep_and_bias(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q, nk - 1, b, &bnk, implicit_n_kv, implicit_q_offset, implicit_flags) : true;
                         const unsigned int n = atomicAdd(&pdmq_mask_trace_counter, 1u);
                         if (n < 64u) {
                             printf("PDMQ_MASK_TRACE: kernel=gqax nq=%d nk=%d q=%d hq=%d hk=%d slot=%d qr=%d q_tile=%d valid_count=%d last_valid=%d q_offset=%d mask_ne00=%lld mask_ne01=%lld keep0=%d bias0=%g keeplast=%d biaslast=%g keepnk=%d biasnk=%g row=%llu\\n",
@@ -2992,6 +3046,7 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_v4_g
         const char * __restrict__ mask,
         int64_t mask_ne00, int64_t mask_ne01, int64_t mask_ne03,
         int64_t mask_nb00, int64_t mask_nb01, int64_t mask_nb03,
+        int implicit_n_kv, int implicit_q_offset, int implicit_flags,
         const int  * __restrict__ k_payload,
         const half * __restrict__ k_scales,
         int nq, int nk, int n_heads_q, int n_heads_k, int gqa_ratio,
@@ -3137,6 +3192,9 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_v4_g
 
     for (int k0 = k_begin; k0 < k_end; k0 += BN) {
         const int tile_n = pdmq_min_i(BN, nk - k0);
+        if ((implicit_flags & 1) != 0 && k0 >= implicit_n_kv) {
+            break;
+        }
         if constexpr (CAUSAL_MASK) {
             if (k0 > q_offset + q0) {
                 break;
@@ -3162,8 +3220,8 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_v4_g
                 valid = valid && (k <= q_offset + q0);
             }
             float mask_bias = 0.0f;
-            if (valid && mask) {
-                valid = pdmq_mask_keep_and_bias(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q0, k, b, &mask_bias);
+            if (valid && (mask || (implicit_flags & 1))) {
+                valid = pdmq_mask_keep_and_bias(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q0, k, b, &mask_bias, implicit_n_kv, implicit_q_offset, implicit_flags);
             }
             if (valid) {
                 s_val = pdmq_qk_dot_sidecar<1, D>(q_tile_i32[slot], q_tile_scales[slot], 0,
@@ -3312,6 +3370,9 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_kern
         int64_t mask_nb00,
         int64_t mask_nb01,
         int64_t mask_nb03,
+        int implicit_n_kv,
+        int implicit_q_offset,
+        int implicit_flags,
         const int  * __restrict__ k_payload,
         const half * __restrict__ k_scales,
         int nq,
@@ -3381,6 +3442,9 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_kern
 
     for (int k0 = 0; k0 < nk; k0 += BN) {
         const int tile_n = pdmq_min_i(BN, nk - k0);
+        if ((implicit_flags & 1) != 0 && k0 >= implicit_n_kv) {
+            break;
+        }
 
         if constexpr (CAUSAL_MASK) {
             const int q_last = pdmq_min_i(q0 + BM - 1, nq - 1);
@@ -3470,7 +3534,11 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_kern
 
         const bool full_q = q0 + BM <= nq;
         const bool full_k = tile_n == BN;
+        const bool implicit_causal = (implicit_flags & 1) != 0;
         bool exact_tile = full_q && full_k && mask == nullptr;
+        if (implicit_causal) {
+            exact_tile = exact_tile && (k0 + BN - 1 < implicit_n_kv) && (k0 + BN - 1 <= implicit_q_offset + q0);
+        }
         if constexpr (CAUSAL_MASK) {
             exact_tile = exact_tile && (k0 + BN - 1 <= q_offset + q0);
         }
@@ -3488,8 +3556,8 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_kern
                     valid = valid && (k <= q_offset + q);
                 }
                 float mask_bias = 0.0f;
-                if (!exact_tile && valid && mask) {
-                    valid = pdmq_mask_keep_and_bias(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q, k, b, &mask_bias);
+                if (!exact_tile && valid && (mask || implicit_causal)) {
+                    valid = pdmq_mask_keep_and_bias(mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, q, k, b, &mask_bias, implicit_n_kv, implicit_q_offset, implicit_flags);
                 }
 
                 if (valid) {
@@ -3708,6 +3776,7 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_kern
                         V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13,
                         V4_tail, v4_tail_nb10, v4_tail_nb11, v4_tail_nb12, v4_live_nk,
                         mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03,
+                        implicit_n_kv, implicit_q_offset, implicit_flags,
                         k_payload, k_scales,
                         q, hq, hk, b, qr, nk, q_offset, attention_scale, packed_rows, n_heads_k, tid,
                         0, nk, &ref_m, &ref_l, &ref_acc, &ref_valid_count, &ref_last_valid);
@@ -3749,6 +3818,7 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_kern
                             V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13,
                             V4_tail, v4_tail_nb10, v4_tail_nb11, v4_tail_nb12, v4_live_nk,
                             mask, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03,
+                            implicit_n_kv, implicit_q_offset, implicit_flags,
                             k_payload, k_scales,
                             q, hk, b, qr, nk, q_offset, packed_rows, n_heads_k, tid,
                             &q_hash, &k_hash, &v_hash, &mask_hash,
@@ -4279,6 +4349,9 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     const int64_t mask_nb00 = mask ? mask->nb[0] : 0;
     const int64_t mask_nb01 = mask ? mask->nb[1] : 0;
     const int64_t mask_nb03 = mask ? mask->nb[3] : 0;
+    const int implicit_n_kv = ggml_get_op_params_i32(dst, 5);
+    const int implicit_q_offset = ggml_get_op_params_i32(dst, 6);
+    const int implicit_flags = ggml_get_op_params_i32(dst, 7);
 
     const bool assume_causal = []() {
         const char * v = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_ASSUME_CAUSAL");
@@ -4771,6 +4844,93 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         }
     }
 
+    const bool qblock_txn_tail_page_consumer_req = []() {
+        const char * v = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_CONSUMER");
+        return v && atoi(v) != 0;
+    }();
+    ggml_cuda_mtp_qblock_tail_page_map_v1 qblock_tail_page_map = {};
+    llama_kv_cache_get_mtp_qblock_tail_page_map(K ? K->data : nullptr, &qblock_tail_page_map);
+    bool qblock_tail_page_consumer_bound = false;
+    const char * qblock_tail_page_consumer_reason = "not_requested";
+    if (qblock_txn_tail_page_consumer_req) {
+        qblock_tail_page_consumer_reason = "no_registered_map";
+        if (qblock_tail_page_map.active) {
+            qblock_tail_page_consumer_reason = "ok";
+            if (K->type != GGML_TYPE_I32 || !k_persistent_i32 || pdmq_k_format != GGML_CUDA_PDMQ_K_FORMAT_PACKED16_Q8_272) {
+                qblock_tail_page_consumer_reason = "not_packed16_q8_k";
+            } else if (V->type != GGML_TYPE_V4_K16D16_144 || !v4_k16d16_144_persistent || !directv || stage_v) {
+                qblock_tail_page_consumer_reason = "not_v4_144_direct_v";
+            } else if (qblock_tail_page_map.page_tokens != MTP_V4_144_PAGE_TOKENS) {
+                qblock_tail_page_consumer_reason = "bad_page_tokens";
+            } else if (qblock_tail_page_map.block_table_pages > (uint32_t) DP16_FA_QBLOCK_TAIL_PAGE_MAX_PAGES) {
+                qblock_tail_page_consumer_reason = "block_table_too_large";
+            } else if (qblock_tail_page_map.logical_base_token + qblock_tail_page_map.valid_tail_tokens > (uint32_t) nk) {
+                qblock_tail_page_consumer_reason = "tail_not_visible_in_current_fa";
+            } else if (qblock_tail_page_map.physical_pages == 0 || qblock_tail_page_map.physical_pages > pdmq_k_kv_capacity / MTP_V4_144_PAGE_TOKENS) {
+                qblock_tail_page_consumer_reason = "bad_physical_pages";
+            } else if ((qblock_tail_page_map.flags & GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_SCRATCH_OVERLAY) != 0 &&
+                    qblock_tail_page_map.block_table[0] >= 0 &&
+                    qblock_tail_page_map.block_table[0] * (int) qblock_tail_page_map.page_tokens < nk) {
+                qblock_tail_page_consumer_reason = "scratch_page_visible";
+            } else {
+                qblock_program.tail_page_mode = DP16_FA_QBLOCK_TAIL_PAGE_TABLE;
+                qblock_program.tail_page_logical_base_token = (int) qblock_tail_page_map.logical_base_token;
+                qblock_program.tail_page_valid_tail_tokens = (int) qblock_tail_page_map.valid_tail_tokens;
+                qblock_program.tail_page_page_tokens = (int) qblock_tail_page_map.page_tokens;
+                qblock_program.tail_page_physical_pages = (int) qblock_tail_page_map.physical_pages;
+                qblock_program.tail_page_block_table_pages = (int) qblock_tail_page_map.block_table_pages;
+                for (int i = 0; i < DP16_FA_QBLOCK_TAIL_PAGE_MAX_PAGES; ++i) {
+                    qblock_program.tail_page_block_table[i] = qblock_tail_page_map.block_table[i];
+                }
+                qblock_tail_page_consumer_bound = true;
+            }
+        }
+    }
+    const bool qblock_tail_page_dispatch_bound = qblock_inst && qblock_program.enabled &&
+        qblock_tail_page_consumer_bound && dp16_fa_qblock_tail_page_consumer_active(qblock_program);
+    if (qblock_tail_page_dispatch_bound) {
+        llama_kv_cache_record_mtp_qblock_tail_page_dispatch_bind(
+            K ? K->data : nullptr,
+            &qblock_tail_page_map,
+            pdmq_fattn_node_name(dst),
+            pdmq_layer_index,
+            fa_inst_i32,
+            nk);
+    }
+    if (qblock_txn_tail_page_consumer_req && strcmp(qblock_tail_page_consumer_reason, "no_registered_map") == 0 && nk > 0) {
+        llama_kv_cache_record_mtp_qblock_tail_page_consumer_miss((uint32_t) nk, qblock_tail_page_consumer_reason);
+    }
+
+    const bool qblock_tail_page_consumer_trace = []() {
+        const char * trace = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_CONSUMER_TRACE");
+        if (trace && atoi(trace) != 0) {
+            return true;
+        }
+        const char * proof = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_PROOF");
+        return proof && atoi(proof) != 0;
+    }();
+    if (qblock_tail_page_consumer_trace && (qblock_txn_tail_page_consumer_req || qblock_tail_page_map.active)) {
+        fprintf(stderr,
+            "MTP_QBLOCK_TXN_TAIL_PAGE_CONSUMER: node=%s layer=%d requested=%d registered=%d bound=%d active=%d tail_dispatch_bound=%d reason=%s logical_base=%u valid_tail=%u page_tokens=%u physical_pages=%u table_pages=%u table0=%d nk=%d capacity=%u k_format=%s vpath=%s\n",
+            pdmq_fattn_node_name(dst), pdmq_layer_index,
+            qblock_txn_tail_page_consumer_req ? 1 : 0,
+            qblock_tail_page_map.active ? 1 : 0,
+            qblock_tail_page_consumer_bound ? 1 : 0,
+            dp16_fa_qblock_tail_page_consumer_active(qblock_program) ? 1 : 0,
+            qblock_tail_page_dispatch_bound ? 1 : 0,
+            qblock_tail_page_consumer_reason,
+            qblock_tail_page_map.logical_base_token,
+            qblock_tail_page_map.valid_tail_tokens,
+            qblock_tail_page_map.page_tokens,
+            qblock_tail_page_map.physical_pages,
+            qblock_tail_page_map.block_table_pages,
+            qblock_tail_page_map.block_table[0],
+            nk,
+            pdmq_k_kv_capacity,
+            ggml_cuda_pdmq_k_format_name(pdmq_k_format),
+            pdmq_v_path_name(plan.v_path));
+    }
+
     const bool qblock_txn_tail_page_proof = []() {
         const char * v = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_PROOF");
         return v && atoi(v) != 0;
@@ -4785,6 +4945,11 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         mtp_qblock_txn_lineage_status txn_lineage_status = MTP_QBLOCK_TXN_LINEAGE_OK;
         bool txn_tail_desc_static_ok = false;
         bool txn_lineage_ok = false;
+        mtp_v4_144_tail_state_status txn_state_status = MTP_V4_144_TAIL_STATE_OK;
+        bool txn_state_ok = false;
+        uint32_t txn_state_valid_tail_tokens = 0;
+        uint32_t txn_state_free_count = 0;
+        uint32_t txn_state_first_page_valid_tokens = 0;
         uint32_t txn_lineage_rows = 0;
         uint32_t txn_lineage_accepted_len = 0;
         uint32_t txn_lineage_new_valid_tail_tokens = 0;
@@ -4876,12 +5041,38 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
                     txn_lineage_accepted_len = lineage.accepted_len;
                     txn_lineage_new_valid_tail_tokens = mtp_qblock_txn_lineage_new_valid_tail_tokens(tail_desc, lineage);
                     txn_lineage_final_state_slot = mtp_qblock_txn_lineage_final_state_slot(lineage);
+
+                    if (txn_lineage_ok) {
+                        // The runtime tail descriptor above uses cache-global physical page ids.
+                        // The tiny page-state contract is transaction-local, so remap the single
+                        // eligible tail page to local page slot 0 for metadata commit/free-list proof.
+                        int32_t state_block_table[1] = { 0 };
+                        mtp_v4_144_tail_page_desc_v1 state_tail_desc = tail_desc;
+                        state_tail_desc.block_table = state_block_table;
+                        state_tail_desc.physical_pages = 3;
+                        mtp_v4_144_tail_page_state_v1 state = {};
+                        txn_state_status = mtp_v4_144_tail_state_init(state, state_tail_desc.logical_base_token, state_tail_desc.physical_pages);
+                        uint32_t state_page = 0;
+                        if (txn_state_status == MTP_V4_144_TAIL_STATE_OK) {
+                            txn_state_status = mtp_v4_144_tail_state_alloc_page(state, MTP_V4_144_TAIL_PAGE_OWNER_TXN, &state_page);
+                        }
+                        if (txn_state_status == MTP_V4_144_TAIL_STATE_OK) {
+                            state_block_table[0] = (int32_t) state_page;
+                            txn_state_status = mtp_v4_144_tail_state_commit_lineage(state, state_tail_desc, lineage);
+                        }
+                        txn_state_ok = txn_state_status == MTP_V4_144_TAIL_STATE_OK;
+                        txn_state_valid_tail_tokens = state.valid_tail_tokens;
+                        txn_state_free_count = state.free_count;
+                        txn_state_first_page_valid_tokens = state_page < state.physical_pages ? state.page_valid_tokens[state_page] : 0u;
+                    }
                 }
 
                 if (!txn_tail_desc_static_ok) {
                     txn_tail_reason = "tail_desc_static_rejected";
                 } else if (!txn_lineage_ok) {
                     txn_tail_reason = "lineage_rejected";
+                } else if (!txn_state_ok) {
+                    txn_tail_reason = "page_state_rejected";
                 } else {
                     txn_tail_reason = qblock_txn_tail_page_enable ? "state_sampler_not_wired" : "lineage_proof_only";
                 }
@@ -4889,18 +5080,22 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         }
 
         fprintf(stderr,
-            "MTP_QBLOCK_TXN_TAIL_PAGE: node=%s layer=%d graph_inst=%d proof=%d requested=%d active=0 eligible=%d reason=%s desc_status=%u lineage_status=%u lineage_rows=%u accepted_len=%u new_valid_tail=%u final_state_slot=%u nq=%d nk=%d hq=%d hk=%d gqa_ratio=%d qprog=%d rows=%d rowmask=0x%x vpath=%s V=%s K=%s k_format=%s capacity=%u tail_phys_page=%u v4_page_stride=%lld k_page_stride=%llu\n",
+            "MTP_QBLOCK_TXN_TAIL_PAGE: node=%s layer=%d graph_inst=%d proof=%d requested=%d active=0 eligible=%d reason=%s desc_status=%u lineage_status=%u state_status=%u lineage_rows=%u accepted_len=%u new_valid_tail=%u final_state_slot=%u state_valid_tail=%u state_page_valid=%u state_free=%u nq=%d nk=%d hq=%d hk=%d gqa_ratio=%d qprog=%d rows=%d rowmask=0x%x vpath=%s V=%s K=%s k_format=%s capacity=%u tail_phys_page=%u v4_page_stride=%lld k_page_stride=%llu\n",
             pdmq_fattn_node_name(dst), pdmq_layer_index, fa_inst_i32,
             qblock_txn_tail_page_proof ? 1 : 0,
             qblock_txn_tail_page_enable ? 1 : 0,
-            (txn_tail_desc_static_ok && txn_lineage_ok) ? 1 : 0,
+            (txn_tail_desc_static_ok && txn_lineage_ok && txn_state_ok) ? 1 : 0,
             txn_tail_reason,
             (unsigned) txn_tail_status,
             (unsigned) txn_lineage_status,
+            (unsigned) txn_state_status,
             txn_lineage_rows,
             txn_lineage_accepted_len,
             txn_lineage_new_valid_tail_tokens,
             (unsigned) txn_lineage_final_state_slot,
+            txn_state_valid_tail_tokens,
+            txn_state_first_page_valid_tokens,
+            txn_state_free_count,
             nq, nk, n_heads_q, n_heads_k, gqa_ratio,
             qblock_program.enabled,
             qblock_program.rows_per_cta,
@@ -5179,6 +5374,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
                     V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
                     v4_tail ? v4_tail->nb[0] : 0, v4_tail ? v4_tail->nb[1] : 0, v4_tail ? v4_tail->nb[2] : 0, \
                     mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+                    implicit_n_kv, implicit_q_offset, implicit_flags, \
                     (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
                     nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, pdmq_pvblock_mode, packed16_desc, pdmq_k_format, pdmq_k_kv_capacity); \
             } else { \
@@ -5188,6 +5384,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
                     V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
                     v4_tail ? v4_tail->nb[0] : 0, v4_tail ? v4_tail->nb[1] : 0, v4_tail ? v4_tail->nb[2] : 0, \
                     mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+                    implicit_n_kv, implicit_q_offset, implicit_flags, \
                     (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
                     nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, pdmq_pvblock_mode, packed16_desc, pdmq_k_format, pdmq_k_kv_capacity); \
             } \
@@ -5199,6 +5396,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
                     V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
                     v4_tail ? v4_tail->nb[0] : 0, v4_tail ? v4_tail->nb[1] : 0, v4_tail ? v4_tail->nb[2] : 0, \
                     mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+                    implicit_n_kv, implicit_q_offset, implicit_flags, \
                     (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
                     nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, pdmq_pvblock_mode, packed16_desc, pdmq_k_format, pdmq_k_kv_capacity); \
             } else { \
@@ -5208,6 +5406,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
                     V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
                     v4_tail ? v4_tail->nb[0] : 0, v4_tail ? v4_tail->nb[1] : 0, v4_tail ? v4_tail->nb[2] : 0, \
                     mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+                    implicit_n_kv, implicit_q_offset, implicit_flags, \
                     (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
                     nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, pdmq_pvblock_mode, packed16_desc, pdmq_k_format, pdmq_k_kv_capacity); \
             } \
@@ -5220,6 +5419,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
                 V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
                 v4_tail ? v4_tail->nb[0] : 0, v4_tail ? v4_tail->nb[1] : 0, v4_tail ? v4_tail->nb[2] : 0, \
                 mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+                implicit_n_kv, implicit_q_offset, implicit_flags, \
                 (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
                 nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, pdmq_pvblock_mode, packed16_desc, pdmq_k_format, pdmq_k_kv_capacity); \
         } else { \
@@ -5229,6 +5429,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
                 V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
                 v4_tail ? v4_tail->nb[0] : 0, v4_tail ? v4_tail->nb[1] : 0, v4_tail ? v4_tail->nb[2] : 0, \
                 mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+                implicit_n_kv, implicit_q_offset, implicit_flags, \
                 (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
                 nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, pdmq_pvblock_mode, packed16_desc, pdmq_k_format, pdmq_k_kv_capacity); \
         } \
@@ -5243,6 +5444,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
             V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
             v4_tail ? v4_tail->nb[0] : 0, v4_tail ? v4_tail->nb[1] : 0, v4_tail ? v4_tail->nb[2] : 0, \
             mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+            implicit_n_kv, implicit_q_offset, implicit_flags, \
             (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
             nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, packed16_desc, pdmq_k_format, pdmq_k_kv_capacity); \
     } else { \
@@ -5252,6 +5454,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
             V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
             v4_tail ? v4_tail->nb[0] : 0, v4_tail ? v4_tail->nb[1] : 0, v4_tail ? v4_tail->nb[2] : 0, \
             mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+            implicit_n_kv, implicit_q_offset, implicit_flags, \
             (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
             nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, packed16_desc, pdmq_k_format, pdmq_k_kv_capacity); \
     } \
@@ -5272,6 +5475,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
                     V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
                     v4_tail ? v4_tail->nb[0] : 0, v4_tail ? v4_tail->nb[1] : 0, v4_tail ? v4_tail->nb[2] : 0, \
                     mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+                    implicit_n_kv, implicit_q_offset, implicit_flags, \
                     (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
                     nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, batch, 1, nullptr, nullptr, qblock_program, nullptr, nullptr, 0, packed16_desc, pdmq_k_format, pdmq_k_kv_capacity); \
             } else { \
@@ -5281,6 +5485,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
                     V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
                     v4_tail ? v4_tail->nb[0] : 0, v4_tail ? v4_tail->nb[1] : 0, v4_tail ? v4_tail->nb[2] : 0, \
                     mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+                    implicit_n_kv, implicit_q_offset, implicit_flags, \
                     (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
                     nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, batch, 1, nullptr, nullptr, qblock_program, nullptr, nullptr, 0, packed16_desc, pdmq_k_format, pdmq_k_kv_capacity); \
             } \
@@ -5292,6 +5497,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
                     V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
                     v4_tail ? v4_tail->nb[0] : 0, v4_tail ? v4_tail->nb[1] : 0, v4_tail ? v4_tail->nb[2] : 0, \
                     mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+                    implicit_n_kv, implicit_q_offset, implicit_flags, \
                     (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
                     nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, batch, 1, nullptr, nullptr, qblock_program, nullptr, nullptr, 0, packed16_desc, pdmq_k_format, pdmq_k_kv_capacity); \
             } else { \
@@ -5301,6 +5507,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
                     V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
                     v4_tail ? v4_tail->nb[0] : 0, v4_tail ? v4_tail->nb[1] : 0, v4_tail ? v4_tail->nb[2] : 0, \
                     mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+                    implicit_n_kv, implicit_q_offset, implicit_flags, \
                     (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
                     nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, batch, 1, nullptr, nullptr, qblock_program, nullptr, nullptr, 0, packed16_desc, pdmq_k_format, pdmq_k_kv_capacity); \
             } \
@@ -5315,6 +5522,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
                 V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
                 v4_tail ? v4_tail->nb[0] : 0, v4_tail ? v4_tail->nb[1] : 0, v4_tail ? v4_tail->nb[2] : 0, \
                 mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+                implicit_n_kv, implicit_q_offset, implicit_flags, \
                 (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
                 nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, batch, 1, nullptr, nullptr, qblock_program, nullptr, nullptr, 0, packed16_desc, pdmq_k_format, pdmq_k_kv_capacity); \
         } else { \
@@ -5324,6 +5532,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
                 V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
                 v4_tail ? v4_tail->nb[0] : 0, v4_tail ? v4_tail->nb[1] : 0, v4_tail ? v4_tail->nb[2] : 0, \
                 mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+                implicit_n_kv, implicit_q_offset, implicit_flags, \
                 (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
                 nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, batch, 1, nullptr, nullptr, qblock_program, nullptr, nullptr, 0, packed16_desc, pdmq_k_format, pdmq_k_kv_capacity); \
         } \
@@ -5342,6 +5551,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
                     V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
                     v4_tail ? v4_tail->nb[0] : 0, v4_tail ? v4_tail->nb[1] : 0, v4_tail ? v4_tail->nb[2] : 0, \
                     mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+                    implicit_n_kv, implicit_q_offset, implicit_flags, \
                     (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
                     nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, batch, gqax_splitk_active, q_view.qpack_payload, q_view.qpack_scales, qblock_program, v_i4_cache_words, v_i4_cache_scales, v_i4_cache_k_blocks, packed16_desc, pdmq_k_format, pdmq_k_kv_capacity); \
             } else { \
@@ -5351,6 +5561,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
                     V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
                     v4_tail ? v4_tail->nb[0] : 0, v4_tail ? v4_tail->nb[1] : 0, v4_tail ? v4_tail->nb[2] : 0, \
                     mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+                    implicit_n_kv, implicit_q_offset, implicit_flags, \
                     (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
                     nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, batch, gqax_splitk_active, q_view.qpack_payload, q_view.qpack_scales, qblock_program, v_i4_cache_words, v_i4_cache_scales, v_i4_cache_k_blocks, packed16_desc, pdmq_k_format, pdmq_k_kv_capacity); \
             } \
@@ -5362,6 +5573,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
                     V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
                     v4_tail ? v4_tail->nb[0] : 0, v4_tail ? v4_tail->nb[1] : 0, v4_tail ? v4_tail->nb[2] : 0, \
                     mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+                    implicit_n_kv, implicit_q_offset, implicit_flags, \
                     (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
                     nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, batch, gqax_splitk_active, q_view.qpack_payload, q_view.qpack_scales, qblock_program, v_i4_cache_words, v_i4_cache_scales, v_i4_cache_k_blocks, packed16_desc, pdmq_k_format, pdmq_k_kv_capacity); \
             } else { \
@@ -5371,6 +5583,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
                     V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
                     v4_tail ? v4_tail->nb[0] : 0, v4_tail ? v4_tail->nb[1] : 0, v4_tail ? v4_tail->nb[2] : 0, \
                     mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+                    implicit_n_kv, implicit_q_offset, implicit_flags, \
                     (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
                     nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, batch, gqax_splitk_active, q_view.qpack_payload, q_view.qpack_scales, qblock_program, v_i4_cache_words, v_i4_cache_scales, v_i4_cache_k_blocks, packed16_desc, pdmq_k_format, pdmq_k_kv_capacity); \
             } \
@@ -5405,6 +5618,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
                 V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
                 v4_tail ? v4_tail->nb[0] : 0, v4_tail ? v4_tail->nb[1] : 0, v4_tail ? v4_tail->nb[2] : 0, \
                 mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+                implicit_n_kv, implicit_q_offset, implicit_flags, \
                 (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
                 nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, batch, gqax_splitk_active, q_view.qpack_payload, q_view.qpack_scales, qblock_program, v_i4_cache_words, v_i4_cache_scales, v_i4_cache_k_blocks, packed16_desc, pdmq_k_format, pdmq_k_kv_capacity); \
         } else { \
@@ -5414,6 +5628,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
                 V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
                 v4_tail ? v4_tail->nb[0] : 0, v4_tail ? v4_tail->nb[1] : 0, v4_tail ? v4_tail->nb[2] : 0, \
                 mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+                implicit_n_kv, implicit_q_offset, implicit_flags, \
                 (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
                 nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, batch, gqax_splitk_active, q_view.qpack_payload, q_view.qpack_scales, qblock_program, v_i4_cache_words, v_i4_cache_scales, v_i4_cache_k_blocks, packed16_desc, pdmq_k_format, pdmq_k_kv_capacity); \
         } \
@@ -5447,6 +5662,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
                 V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
                 v4_tail ? v4_tail->nb[0] : 0, v4_tail ? v4_tail->nb[1] : 0, v4_tail ? v4_tail->nb[2] : 0, \
                 mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+                implicit_n_kv, implicit_q_offset, implicit_flags, \
                 (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
                 nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, batch, gqax_splitk_active, q_view.qpack_payload, q_view.qpack_scales, qblock_program, v_i4_cache_words, v_i4_cache_scales, v_i4_cache_k_blocks, packed16_desc, pdmq_k_format, pdmq_k_kv_capacity); \
         } else if (pdmq_pv_i4_wmma_active) { \
@@ -5456,6 +5672,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
                 V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
                 v4_tail ? v4_tail->nb[0] : 0, v4_tail ? v4_tail->nb[1] : 0, v4_tail ? v4_tail->nb[2] : 0, \
                 mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+                implicit_n_kv, implicit_q_offset, implicit_flags, \
                 (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
                 nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, batch, gqax_splitk_active, q_view.qpack_payload, q_view.qpack_scales, qblock_program, v_i4_cache_words, v_i4_cache_scales, v_i4_cache_k_blocks, packed16_desc, pdmq_k_format, pdmq_k_kv_capacity); \
         } else if (pdmq_pv_i8_wmma_active && pdmq_pv_i8_wmma_coherent) { \
@@ -5465,6 +5682,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
                 V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
                 v4_tail ? v4_tail->nb[0] : 0, v4_tail ? v4_tail->nb[1] : 0, v4_tail ? v4_tail->nb[2] : 0, \
                 mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+                implicit_n_kv, implicit_q_offset, implicit_flags, \
                 (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
                 nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, batch, gqax_splitk_active, q_view.qpack_payload, q_view.qpack_scales, qblock_program, v_i4_cache_words, v_i4_cache_scales, v_i4_cache_k_blocks, packed16_desc, pdmq_k_format, pdmq_k_kv_capacity); \
         } else if (pdmq_pv_i8_wmma_active) { \
@@ -5474,6 +5692,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
                 V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
                 v4_tail ? v4_tail->nb[0] : 0, v4_tail ? v4_tail->nb[1] : 0, v4_tail ? v4_tail->nb[2] : 0, \
                 mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+                implicit_n_kv, implicit_q_offset, implicit_flags, \
                 (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
                 nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, batch, gqax_splitk_active, q_view.qpack_payload, q_view.qpack_scales, qblock_program, v_i4_cache_words, v_i4_cache_scales, v_i4_cache_k_blocks, packed16_desc, pdmq_k_format, pdmq_k_kv_capacity); \
         } else { \
@@ -5483,6 +5702,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
                 V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
                 v4_tail ? v4_tail->nb[0] : 0, v4_tail ? v4_tail->nb[1] : 0, v4_tail ? v4_tail->nb[2] : 0, \
                 mask ? (const char *) mask->data : nullptr, mask_ne00, mask_ne01, mask_ne03, mask_nb00, mask_nb01, mask_nb03, \
+                implicit_n_kv, implicit_q_offset, implicit_flags, \
                 (const int *) packed16_payload->data, (const half *) packed16_scales->data, \
                 nq, nk, n_heads_q, n_heads_k, gqa_ratio, packed_rows, q_offset, attention_scale, batch, gqax_splitk_active, q_view.qpack_payload, q_view.qpack_scales, qblock_program, v_i4_cache_words, v_i4_cache_scales, v_i4_cache_k_blocks, packed16_desc, pdmq_k_format, pdmq_k_kv_capacity); \
         } \

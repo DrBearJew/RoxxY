@@ -3,6 +3,7 @@
 #include "ggml.h" // for ggml_log_level
 
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #ifdef __GNUC__
@@ -33,6 +34,19 @@ void llama_log_callback_default(ggml_log_level level, const char * text, void * 
 //
 // helpers
 //
+
+template <typename dst_t, typename src_t>
+static inline dst_t llama_cast(src_t v) {
+    if constexpr (std::is_same_v<dst_t, src_t>) {
+        return v;
+    } else if constexpr (std::is_same_v<dst_t, float> && std::is_same_v<src_t, ggml_fp16_t>) {
+        return ggml_fp16_to_fp32(v);
+    } else if constexpr (std::is_same_v<dst_t, ggml_fp16_t> && std::is_same_v<src_t, float>) {
+        return ggml_fp32_to_fp16(v);
+    } else {
+        static_assert(std::is_same_v<dst_t, src_t>, "unsupported llama_cast type combination");
+    }
+}
 
 template <typename T>
 struct no_init {
