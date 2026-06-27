@@ -310,10 +310,12 @@ static int llama_pdmq_k_format_from_env(int default_format) {
     if (strcmp(env, "packed16_q8") == 0 || strcmp(env, "packed16") == 0) {
         return LLAMA_PDMQ_K_FORMAT_PACKED16_Q8_272;
     }
-    if (strcmp(env, "packed8_q4") == 0 || strcmp(env, "packed8") == 0) {
+    if (strcmp(env, "packed8_q4") == 0 || strcmp(env, "packed8") == 0 ||
+            strcmp(env, "packed4_q4") == 0 || strcmp(env, "packed4_q4_144") == 0 ||
+            strcmp(env, "packed4") == 0) {
         return LLAMA_PDMQ_K_FORMAT_PACKED8_Q4_144;
     }
-    if (strcmp(env, "packed4_q2") == 0 || strcmp(env, "packed4") == 0) {
+    if (strcmp(env, "packed4_q2") == 0 || strcmp(env, "packed4_q2_80") == 0 || strcmp(env, "packed4_q2_80_v1") == 0) {
         return LLAMA_PDMQ_K_FORMAT_PACKED4_Q2_80_V1;
     }
     throw std::runtime_error(std::string("unknown GGML_CUDA_ROCM_PDMQ_K_FORMAT=") + env);

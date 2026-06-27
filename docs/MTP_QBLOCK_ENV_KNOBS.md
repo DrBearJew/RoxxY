@@ -8,7 +8,7 @@ Purpose: stop QBlock/PDMQ/WMMA env knob drift. If a new env variable affects QBl
 
 `GGML_CUDA_ROCM_PDMQ_K_CACHE=0|1` controls the compressed-K sidecar allocation. The legacy alias `GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE=0|1` is still honored.
 
-`GGML_CUDA_ROCM_PDMQ_K_FORMAT=default|packed16_q8|packed8_q4|packed4_q2|none`. Default remains `packed16_q8` for normal PDMQ/canonical runs. When the user explicitly/effectively requests `q8_0` K cache, the default PDMQ format becomes `packed8_q4` so q8 means the packed8 replacement path, not the legacy raw `GGML_TYPE_Q8_0` VEC FA path. Packed8/packed4 replace packed16 K storage when selected; they are not sidecars. Packed4 is reserved/unsupported in the current mainline because there is no native int2 compute path. Forced route mode must abort on missing or wrong metadata.
+`GGML_CUDA_ROCM_PDMQ_K_FORMAT=default|packed16_q8|packed8_q4|packed4_q4|packed4|packed4_q2|none`. Default remains `packed16_q8` for normal PDMQ/canonical runs. When the user explicitly/effectively requests `q8_0` K cache, the default PDMQ format becomes `packed8_q4` so q8 means the packed8 replacement path, not the legacy raw `GGML_TYPE_Q8_0` VEC FA path. `packed4`, `packed4_q4`, and `packed4_q4_144` are compatibility aliases for the same 144B q4 storage as `packed8_q4`; they do not select the reserved 80B q2 format. Explicit `packed4_q2` remains unsupported/fail-closed because there is no native int2 compute path. Forced route mode must abort on missing or wrong metadata.
 
 Packed8 q4 is a lossy KV format. It is a perf/VRAM route, not a canonical token-hash route. Daily-tree `q8_0` K controls also miss the current packed16 canonical hash, so do not spend promotion time chasing `accabc9a` with global q4 scale tweaks.
 
@@ -16,7 +16,7 @@ Packed8 q4 is a lossy KV format. It is a perf/VRAM route, not a canonical token-
 
 Packed16 K is the standard/canonical persistent q8-like PDMQ storage, not f16-class VRAM. Packed8 K is the replacement selected for q8_0 K requests.
 
-For the active QBlock head dim `D=256`, packed8 uses:
+For the active QBlock head dim `D=256`, packed8 q4 uses this layout. The `packed4`/`packed4_q4` aliases intentionally use the same bytes:
 
 ```text
 payload = (256 / 8) I32 = 32 * 4 = 128 bytes
