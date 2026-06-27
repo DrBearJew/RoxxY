@@ -6781,7 +6781,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         }
 #undef PDMQ_LAUNCH_DEBUG_GQA1
     } else if (is_gqa1_splitk) {
-        GGML_ASSERT(((V->type == GGML_TYPE_Q4_0 && raw_lds_q4) || debug_v4_144_cell) && !kshared);
+        GGML_ASSERT((debug_v4_144_cell || debug_raw_q4_cell || debug_raw_typed_v_cell) && !kshared);
         const size_t partial_rows = size_t(gqax_splitk_active) * size_t(batch) * size_t(nq) * size_t(n_heads_q);
         ggml_cuda_pool & pool = ctx.pool();
         dp16_fa_q_workspace q_workspace(pool);
@@ -6801,15 +6801,29 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
             }
         } else
 #endif
-#if PDMQ_COMPILE_LEGACY_Q4V
-        if (assume_causal) {
-            PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE(1, PACKED16_DOT4_MMQ_V_Q4_0, true, partial_m.get(), partial_l.get(), partial_out.get());
+        if (V->type == GGML_TYPE_Q8_0) {
+            if (assume_causal) {
+                PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE(1, PACKED16_DOT4_MMQ_V_Q8_0, true, partial_m.get(), partial_l.get(), partial_out.get());
+            } else {
+                PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE(1, PACKED16_DOT4_MMQ_V_Q8_0, false, partial_m.get(), partial_l.get(), partial_out.get());
+            }
+        } else if (V->type == GGML_TYPE_F16) {
+            if (assume_causal) {
+                PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE(1, PACKED16_DOT4_MMQ_V_F16, true, partial_m.get(), partial_l.get(), partial_out.get());
+            } else {
+                PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE(1, PACKED16_DOT4_MMQ_V_F16, false, partial_m.get(), partial_l.get(), partial_out.get());
+            }
         } else {
-            PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE(1, PACKED16_DOT4_MMQ_V_Q4_0, false, partial_m.get(), partial_l.get(), partial_out.get());
-        }
+#if PDMQ_COMPILE_LEGACY_Q4V
+            if (assume_causal) {
+                PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE(1, PACKED16_DOT4_MMQ_V_Q4_0, true, partial_m.get(), partial_l.get(), partial_out.get());
+            } else {
+                PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE(1, PACKED16_DOT4_MMQ_V_Q4_0, false, partial_m.get(), partial_l.get(), partial_out.get());
+            }
 #else
-        GGML_ABORT("PDMQ legacy V=q4_0 GQA1 split-K cells are not compiled; set -DGGML_HIP_PDMQ_COMPILE_LEGACY_Q4V=ON for debug builds");
+            GGML_ABORT("PDMQ legacy V=q4_0 GQA1 split-K cells are not compiled; set -DGGML_HIP_PDMQ_COMPILE_LEGACY_Q4V=ON for debug builds");
 #endif
+        }
         const size_t merge_elems = size_t(batch) * size_t(nq) * size_t(n_heads_q) * size_t(PDMQ_D);
         const int merge_blocks = (int) ((merge_elems + size_t(PDMQ_THREADS) - 1) / size_t(PDMQ_THREADS));
         packed16_dot4_mmq_gqax_splitk_merge_kernel<<<merge_blocks, PDMQ_THREADS, 0, stream>>>(
