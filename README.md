@@ -26,17 +26,23 @@ For normal MTP runs, use:
 | K cache | default packed16/I32 | fastest validated prefill path |
 | V cache | `q4_0` | best measured speed/VRAM tradeoff |
 | MTP | `--spec-type draft-mtp` | active-RS pure MTP path |
-| PV4 | `GGML_CUDA_ROCM_V4_K16D16_144_PV4=1` | enables the current fast V route |
+| PV4/V144 | automatic default | current fast V route, no env needed |
 
-Do **not** add `--cache-type-k` for the default path. K is selected by RoxxY's
-runtime layout. Pick V precision with `--cache-type-v`.
+K has three user-facing modes:
+
+| How to select K | Runtime layout | Use |
+|---|---|---|
+| omit `--cache-type-k` | packed16/I32 q8-style K | fastest validated default |
+| `--cache-type-k q8_0` | packed8/I32 q4 K | compact q4 K request, compatibility spelling |
+| `--cache-type-k q4_0` | packed8/I32 q4 K | compact q4 K request |
+
+Pick V precision separately with `--cache-type-v`.
 
 ## 🚀 Quick Start — Qwen3.6 27B MTP
 
 ```bash
 MODEL=/path/to/Qwen3.6-27B-Q4_K_M-mtp.gguf
 
-GGML_CUDA_ROCM_V4_K16D16_144_PV4=1 \
 ./build-rocm/bin/llama-server \
   --device ROCm0 \
   --model "$MODEL" \
@@ -50,19 +56,24 @@ GGML_CUDA_ROCM_V4_K16D16_144_PV4=1 \
   --spec-draft-prio 2 --spec-draft-prio-batch 2
 ```
 
-That command is the baseline. You do not need the old long ROCm/MTP env stack.
+That command is the baseline. You do not need the old long ROCm/MTP env stack,
+and you do not need to enable PV4 manually.
 
 ## 🧱 K-cache formats
 
 | Name / setting | Row size at D=256 | Status | Notes |
 |---|---:|---|---|
-| default / `packed16_q8` | 272B | production default | fastest validated prefill route |
-| `GGML_CUDA_ROCM_PDMQ_K_FORMAT=packed8_q4` | 144B | operational | smaller K, expands q4→i8 before WMMA |
+| default / omit `--cache-type-k` / `packed16_q8` | 272B | production default | fastest validated prefill route |
+| `--cache-type-k q8_0` | 144B | operational | maps to compact q4 PDMQ K storage |
+| `--cache-type-k q4_0` | 144B | operational | maps to compact q4 PDMQ K storage |
+| `GGML_CUDA_ROCM_PDMQ_K_FORMAT=packed8_q4` | 144B | operational | explicit env selector for same q4 layout |
 | `packed4`, `packed4_q4`, `packed4_q4_144` | 144B | alias | same bytes and route as `packed8_q4` |
 | `packed4_q2` | 80B | reserved | q2/int2 idea, unsupported/fail-closed |
 
-Important: `packed4` does **not** mean the 80B q2 format. It is a compatibility
-alias for the working 144B q4 layout so users do not crash when trying it.
+Important: `--cache-type-k q8_0` and `--cache-type-k q4_0` in RoxxY both select
+the compact packed q4 PDMQ K layout. They do not select a legacy raw K-cache
+tensor. `packed4` does **not** mean the 80B q2 format; it is a compatibility
+alias for the working 144B q4 layout.
 
 Current q4 K storage is denser, but not faster on long prefill yet because it
 expands q4 K into i8 before using the existing i8 WMMA path.
@@ -77,16 +88,18 @@ expands q4 K into i8 before using the existing i8 WMMA path.
 
 `q4_0` V is only for the `P @ V` side. QK uses the selected packed I32 K path.
 
-## 📊 Current smoke numbers
+## 📊 Route smoke snapshot
 
-Qwen3.6 27B Q4_K_M MTP, `llama-server`, `ctx=49152`, `tg128`, q4_0 V unless noted.
+Qwen3.6 27B Q4_K_M MTP, `llama-server`, pp32k-style prompt smoke
+(`tokens_evaluated=32768`), `ctx=49152`, `tg128`. These are route/hash sanity
+checks, not a full benchmark suite.
 
-| K / V path | Prompt tok/s | Decode tok/s | SHA | Notes |
-|---|---:|---:|---|---|
-| default packed16 K + q4_0 V | ~583–589 | ~33 | `33fc0c55` | headline prefill path |
-| packed8/packed4 q4 K + q4_0 V | ~560–566 | ~31 | `33fc0c55` | smaller K, not faster yet |
-| packed8/packed4 q4 K + q8_0 V | ~550 | ~39 | `33fc0c55` | faster decode, slower prefill |
-| packed8/packed4 q4 K + f16 V | ~551 | ~38 | `33fc0c55` | faster decode, slower prefill |
+| K selection | V selection | Prompt tok/s | Decode tok/s | SHA | Notes |
+|---|---|---:|---:|---|---|
+| omit `--cache-type-k` → packed16/I32 | `q4_0` | ~583–589 | ~33 | `33fc0c55` | headline prefill path |
+| `--cache-type-k q8_0` / `--cache-type-k q4_0` / `packed8_q4` / `packed4` → q4 K | `q4_0` | ~560–566 | ~31 | `33fc0c55` | smaller K, not faster yet |
+| q4 K | `q8_0` | ~550 | ~39 | `33fc0c55` | faster decode, slower prefill |
+| q4 K | `f16` | ~551 | ~38 | `33fc0c55` | faster decode, slower prefill |
 
 Older 8k clean auto-table smoke: prompt ~744 tok/s, decode ~51 tok/s, SHA `4219d799`.
 
@@ -131,8 +144,7 @@ quality benchmark.
 | q8_0 | `1.00101 ± 0.00336` ratio | `0.002825 ± 0.000334` | `0.000863` | `97.94%` |
 
 Takeaway: q4_0 is the default compression choice; q8_0 is the higher-precision
-choice and is measurably closer to f16 V on this smoke. Evidence:
-[`.harness/research/i32-vformat-wikitext-kld-ppl-20260531.md`](.harness/research/i32-vformat-wikitext-kld-ppl-20260531.md).
+choice and is measurably closer to f16 V on this smoke.
 
 ### 128k active MTP VRAM smoke
 
@@ -150,8 +162,7 @@ K plus q4 V.
 
 Measured saving: Vulkan uses `+1.420 GiB` more total VRAM (`+1.422 GiB` delta
 over idle). ROCm route evidence included the packed16 DOT4/MMQ route and `PDMQ QK
-probe PASSED`. Evidence:
-[`.harness/research/active-mtp-vram-128k-20260531.md`](.harness/research/active-mtp-vram-128k-20260531.md).
+probe PASSED`.
 
 ---
 
@@ -298,17 +309,6 @@ Requirements:
 - ROCm HIP toolchain
 - rocWMMA headers/libraries available to CMake for the PWMMA path
 - gfx1100-class RDNA3 GPU; RX 7900 XTX is the primary target
-
-Optional ROCm + Vulkan build:
-
-```bash
-cmake -S . -B build-rocm-vulkan \
-  -DGGML_HIP=ON \
-  -DGGML_VULKAN=ON \
-  -DCMAKE_HIP_FLAGS="-DRDNA2_MATMUL_OPT_V1=1" \
-  -DCMAKE_BUILD_TYPE=Release
-cmake --build build-rocm-vulkan --target llama-server llama-bench -j
-```
 
 ---
 

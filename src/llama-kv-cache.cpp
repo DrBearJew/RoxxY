@@ -607,8 +607,10 @@ llama_kv_cache::llama_kv_cache(
             atoi(getenv("GGML_CUDA_ROCM_PACKED16_DISABLE")) != 0;
         int pdmq_k_format = LLAMA_PDMQ_K_FORMAT_NONE;
         if (has_k && !packed16_disabled && (mtp_packed16_only || mtp_packed16_hotcold_k || (!is_mtp_draft && pdmq_k_cache_enabled))) {
-            const bool q8_k_requested = type_k == GGML_TYPE_Q8_0;
-            const int default_pdmq_k_format = (mtp_packed16_hotcold_k || !q8_k_requested) ?
+            // CLI q8_0/q4_0 K requests select the compact q4 PDMQ storage path.
+            // The default/no-ctk path stays on packed16_q8 for the fastest validated prefill route.
+            const bool compact_q4_k_requested = type_k == GGML_TYPE_Q8_0 || type_k == GGML_TYPE_Q4_0;
+            const int default_pdmq_k_format = (mtp_packed16_hotcold_k || !compact_q4_k_requested) ?
                 LLAMA_PDMQ_K_FORMAT_PACKED16_Q8_272 : LLAMA_PDMQ_K_FORMAT_PACKED8_Q4_144;
             pdmq_k_format = llama_pdmq_k_format_from_env(default_pdmq_k_format);
         }
@@ -801,6 +803,10 @@ llama_kv_cache::llama_kv_cache(
     if (attn_rot_disable) {
         LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
     }
+    bool pdmq_only_k_active = false;
+    for (const auto & layer : layers) {
+        pdmq_only_k_active = pdmq_only_k_active || (layer.k_payload != nullptr && layer.k_scales != nullptr && layer.k == nullptr);
+    }
 
     const char * GGML_VK_TBQ4_D6_Q4K_ROT_K128 = getenv("GGML_VK_TBQ4_D6_Q4K_ROT_K128");
     d6_q4k_rot_k128 = GGML_VK_TBQ4_D6_Q4K_ROT_K128 ? atoi(GGML_VK_TBQ4_D6_Q4K_ROT_K128) : false;
@@ -822,6 +828,7 @@ llama_kv_cache::llama_kv_cache(
 
     attn_rot_k =
         !attn_rot_disable &&
+        !pdmq_only_k_active &&
         n_embd_head_k_all > 0 &&
         ggml_is_quantized(type_k) &&
         type_k != GGML_TYPE_TBQ4_0 &&
