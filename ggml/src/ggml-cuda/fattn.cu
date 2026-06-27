@@ -4387,9 +4387,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         // Keep compact PDMQ for small stamped prefill/verify chunks.  Bulk
         // prefill still reaches PWMMA/DBV once it satisfies the min-nq guard.
         const bool v4_144_pwmma_nq_ok = !v4_144_pwmma_prefill || Q->ne[1] >= v4_144_pwmma_min_nq;
+        const bool packed8_pwmma_disabled = ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_PACKED8_Q4_PWMMA_PREFILL_DISABLE");
         const bool packed8_pwmma_candidate_requested =
-            ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_PACKED8_Q4_144_PWMMA_PREFILL_CANDIDATE") ||
-            ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_PACKED8_Q4_PWMMA_PREFILL");
+            !packed8_pwmma_disabled &&
+            (packed8_q4_144_k_format ||
+             ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_PACKED8_Q4_144_PWMMA_PREFILL_CANDIDATE") ||
+             ggml_cuda_env_enabled_name("GGML_CUDA_ROCM_PACKED8_Q4_PWMMA_PREFILL"));
         const int packed8_pwmma_min_nq = getenv("GGML_CUDA_ROCM_PACKED8_Q4_PWMMA_PREFILL_MIN_NQ") ?
             std::max(1, atoi(getenv("GGML_CUDA_ROCM_PACKED8_Q4_PWMMA_PREFILL_MIN_NQ"))) : 16;
         const int packed8_pwmma_min_nk = getenv("GGML_CUDA_ROCM_PACKED8_Q4_PWMMA_PREFILL_MIN_NK") ?

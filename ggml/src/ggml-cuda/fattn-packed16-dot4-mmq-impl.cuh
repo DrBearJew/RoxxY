@@ -6708,9 +6708,17 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     const bool debug_v4_144_cell = false;
     const bool debug_v4_cell = false;
 #endif
-    if (!debug_v4_cell && (V->type != GGML_TYPE_Q4_0 || !raw_lds_q4 || kshared)) {
-        GGML_ABORT("PDMQ QWEN35_DEBUG_ONLY supports only V=q4_0 raw_lds_q4 kshared=0 or scalar persistent V4 K16D16 GQA1/GQA6; variant=%s V=%s raw_lds_q4=%d kshared=%d vpath=%s",
-                   pdmq_variant_name, ggml_type_name(V->type), raw_lds_q4 ? 1 : 0, kshared ? 1 : 0, pdmq_v_path_name(plan.v_path));
+    const bool debug_raw_typed_v_cell =
+        (V->type == GGML_TYPE_Q8_0 && raw_lds_q8) ||
+        (V->type == GGML_TYPE_F16  && raw_lds_f16);
+    const bool debug_raw_q4_cell = V->type == GGML_TYPE_Q4_0 && raw_lds_q4;
+    if (!debug_v4_cell && !debug_raw_q4_cell && !debug_raw_typed_v_cell) {
+        GGML_ABORT("PDMQ QWEN35_DEBUG_ONLY supports only V=q4_0 raw_lds_q4, V=q8_0 raw_lds_q8_0, V=f16 raw_lds_f16, or scalar persistent V4 K16D16 GQA1/GQA6; variant=%s V=%s raw_lds_q4=%d raw_lds_q8=%d raw_lds_f16=%d kshared=%d vpath=%s",
+                   pdmq_variant_name, ggml_type_name(V->type), raw_lds_q4 ? 1 : 0, raw_lds_q8 ? 1 : 0, raw_lds_f16 ? 1 : 0, kshared ? 1 : 0, pdmq_v_path_name(plan.v_path));
+    }
+    if (!debug_v4_cell && kshared) {
+        GGML_ABORT("PDMQ QWEN35_DEBUG_ONLY disables kshared cells; variant=%s V=%s vpath=%s",
+                   pdmq_variant_name, ggml_type_name(V->type), pdmq_v_path_name(plan.v_path));
     }
 #if !PDMQ_COMPILE_LEGACY_Q4V
     if (!debug_v4_cell && V->type == GGML_TYPE_Q4_0) {
@@ -6747,15 +6755,29 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         } else
 #endif
         {
-#if PDMQ_COMPILE_LEGACY_Q4V
-            if (assume_causal) {
-                PDMQ_LAUNCH_DEBUG_GQA1(PACKED16_DOT4_MMQ_V_Q4_0, true, true);
+            if (V->type == GGML_TYPE_Q8_0) {
+                if (assume_causal) {
+                    PDMQ_LAUNCH_DEBUG_GQA1(PACKED16_DOT4_MMQ_V_Q8_0, true, true);
+                } else {
+                    PDMQ_LAUNCH_DEBUG_GQA1(PACKED16_DOT4_MMQ_V_Q8_0, false, true);
+                }
+            } else if (V->type == GGML_TYPE_F16) {
+                if (assume_causal) {
+                    PDMQ_LAUNCH_DEBUG_GQA1(PACKED16_DOT4_MMQ_V_F16, true, true);
+                } else {
+                    PDMQ_LAUNCH_DEBUG_GQA1(PACKED16_DOT4_MMQ_V_F16, false, true);
+                }
             } else {
-                PDMQ_LAUNCH_DEBUG_GQA1(PACKED16_DOT4_MMQ_V_Q4_0, false, true);
-            }
+#if PDMQ_COMPILE_LEGACY_Q4V
+                if (assume_causal) {
+                    PDMQ_LAUNCH_DEBUG_GQA1(PACKED16_DOT4_MMQ_V_Q4_0, true, true);
+                } else {
+                    PDMQ_LAUNCH_DEBUG_GQA1(PACKED16_DOT4_MMQ_V_Q4_0, false, true);
+                }
 #else
-            GGML_ABORT("PDMQ legacy V=q4_0 GQA1 cells are not compiled; set -DGGML_HIP_PDMQ_COMPILE_LEGACY_Q4V=ON for debug builds");
+                GGML_ABORT("PDMQ legacy V=q4_0 GQA1 cells are not compiled; set -DGGML_HIP_PDMQ_COMPILE_LEGACY_Q4V=ON for debug builds");
 #endif
+            }
         }
 #undef PDMQ_LAUNCH_DEBUG_GQA1
     } else if (is_gqa1_splitk) {

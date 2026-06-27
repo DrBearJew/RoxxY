@@ -298,7 +298,7 @@ PDMQ phase profiling, WMMA oracle trace, WMMA QK parity, and low-level tail/stat
 
 ## PWMMA reference/probe knobs
 
-These are for packed16/PV4 PWMMA routes and opt-in packed8 prefill candidates, not QBlock route promotion.
+These are for packed16/PV4 PWMMA routes and packed8 prefill routing, not QBlock route promotion.
 
 | Env | Default | Status | Notes |
 | --- | --- | --- | --- |
@@ -329,10 +329,11 @@ These are for packed16/PV4 PWMMA routes and opt-in packed8 prefill candidates, n
 | `GGML_CUDA_ROCM_V4_K16D16_144_PV4_PWMMA_PREFILL_MIN_NQ` | `16` | diagnostic/candidate scope | Minimum `nq` for the PV4 PWMMA prefill candidate. Default avoids verifier-like n4 target batches. |
 | `GGML_CUDA_ROCM_V4_K16D16_144_PV4_PWMMA_PREFILL_MAX_NQ` | `0` | diagnostic/candidate scope | Optional maximum `nq`; `0` means unlimited. Used to isolate tail/small-batch drift. |
 | `GGML_CUDA_ROCM_V4_K16D16_144_PV4_PWMMA_PREFILL_MAX_NK` | `0` | diagnostic/candidate scope | Optional maximum `nk`; `0` means unlimited. Used to isolate prompt chunk drift. |
-| `GGML_CUDA_ROCM_PACKED8_Q4_144_PWMMA_PREFILL_CANDIDATE` | `0` | experimental opt-in | Enables packed8-q4 K prefill on the BM64 i8QK/PV-WMMA DBV route by expanding packed int4 K into int8 shared memory once per K tile. Packed8 K storage is standard, but this PWMMA prefill implementation stays opt-in; decode/verify stay on PDMQ. |
-| `GGML_CUDA_ROCM_PACKED8_Q4_PWMMA_PREFILL` | `0` | alias/experimental opt-in | Short alias for `GGML_CUDA_ROCM_PACKED8_Q4_144_PWMMA_PREFILL_CANDIDATE`. |
-| `GGML_CUDA_ROCM_PACKED8_Q4_PWMMA_PREFILL_MIN_NQ` | `16` | experimental scope | Minimum query rows for packed8 PWMMA prefill. Keeps verifier/small-Q batches off this route. |
-| `GGML_CUDA_ROCM_PACKED8_Q4_PWMMA_PREFILL_MIN_NK` | `512` | experimental scope | Minimum K rows for packed8 PWMMA prefill. Default matches 512-token prompt chunks. |
+| `GGML_CUDA_ROCM_PACKED8_Q4_144_PWMMA_PREFILL_CANDIDATE` | legacy alias | compatibility | Historical opt-in alias. Packed8-q4 K prefill now auto-selects BM64 i8QK/PV-WMMA DBV whenever the K metadata is `packed8_q4_144` and the min-nq/min-nk guards pass. |
+| `GGML_CUDA_ROCM_PACKED8_Q4_PWMMA_PREFILL` | legacy alias | compatibility | Short alias retained for old scripts; no longer required for normal packed8 prefill. |
+| `GGML_CUDA_ROCM_PACKED8_Q4_PWMMA_PREFILL_DISABLE` | `0` | fallback/diagnostic | Disables the packed8-q4 PWMMA prefill auto route and leaves packed8 decode/verify on PDMQ. Use only for A/B or emergency fallback. |
+| `GGML_CUDA_ROCM_PACKED8_Q4_PWMMA_PREFILL_MIN_NQ` | `16` | production guard | Minimum query rows for packed8 PWMMA prefill. Keeps verifier/small-Q batches on PDMQ. |
+| `GGML_CUDA_ROCM_PACKED8_Q4_PWMMA_PREFILL_MIN_NK` | `512` | production guard | Minimum K rows for packed8 PWMMA prefill. Default matches 512-token prompt chunks. |
 | `GGML_CUDA_ROCM_PACKED16_WMMA_DBV_KSHARED_PREFILL` | unset/`0` disables, `1` opts in for row packed16 K | default-off candidate / rollback | Routes pure packed16 PWMMA prefill to the BM64 i8QK/PV-WMMA DBV K-shared path. Stages each BN16 packed16-q8 K tile and scales in LDS before QK so the four Q waves reuse K payload/scales instead of reloading from global memory. Demoted back to explicit opt-in after the 2026-06-27 prefill marker regressed when noforce auto selected the kshared route; D16-planar/tile16 remains diagnostic and requires explicit `=1`. |
 | `GGML_CUDA_ROCM_PACKED16_DBV_LEAN` | `0` | experimental opt-in | Uses the BM64 i8QK/PV-WMMA DBV production specialization with stream-K, live-shadow proof, profile, and QK-dump branches compiled out. Exactness contract is unchanged; default-off until hash and speed gates pass. |
 | `GGML_CUDA_ROCM_PACKED16_DBV_SINGLE_VBUF` | `0` | experimental opt-in | Uses a BM64 i8QK/PV-WMMA DBV production specialization with the V tile staged in a single LDS buffer instead of the DBV double buffer, while also compiling out stream-K/proof/profile/QK-dump paths. Exactness contract is unchanged; default-off until hash and speed gates pass. |
