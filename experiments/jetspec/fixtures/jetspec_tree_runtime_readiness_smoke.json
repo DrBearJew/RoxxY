@@ -1,0 +1,76 @@
+{
+  "root_token": 10,
+  "budget": 5,
+  "topk_logprob_source": "full_vocab_softmax",
+  "renormalize_topk": false,
+  "topk_by_depth": [
+    [
+      {
+        "token": 11,
+        "rank": 0,
+        "p": 0.2,
+        "logprob": -1.6094379124341003
+      },
+      {
+        "token": 12,
+        "rank": 1,
+        "p": 0.15,
+        "logprob": -1.8971199848858813
+      }
+    ],
+    [
+      {
+        "token": 21,
+        "rank": 0,
+        "p": 0.1,
+        "logprob": -2.3025850929940455
+      },
+      {
+        "token": 22,
+        "rank": 1,
+        "p": 0.05,
+        "logprob": -2.995732273553991
+      }
+    ]
+  ],
+  "expected_tree": {
+    "token_ids": [10, 11, 12, 21, 22],
+    "parent_indices": [-1, 0, 0, 1, 1],
+    "depth": [0, 1, 1, 2, 2],
+    "rank": [-1, 0, 1, 0, 1],
+    "cum_logprob": [0.0, -1.6094379124341003, -1.8971199848858813, -3.9120230054281455, -4.605170185988091]
+  },
+  "past_len": 3,
+  "bucket_size": 8,
+  "other_sequence_tree_cols": 2,
+  "target_argmax_by_node": [11, 22, 77, 88, 99],
+  "expected_accept": {
+    "accepted_path": [0, 1, 4],
+    "acceptance_length": 2,
+    "correction_token": 99
+  },
+  "pre_committed_token_ids": [7, 8, 10],
+  "hidden_width": 3,
+  "pre_hidden_cache": [
+    [7.0, 7.1, 7.2],
+    [8.0, 8.1, 8.2]
+  ],
+  "node_hidden_rows": {
+    "0": [10.0, 10.1, 10.2],
+    "1": [11.0, 11.1, 11.2],
+    "2": [222.0, 222.1, 222.2],
+    "3": [333.0, 333.1, 333.2],
+    "4": [22.0, 22.1, 22.2]
+  },
+  "rejected_sentinels": [222.0, 333.0],
+  "kv_max_len": 100,
+  "expected_gather_positions": [100, 101, 104],
+  "readiness_boundary": {
+    "runtime_supported": false,
+    "draft_head_graph_executed": false,
+    "llama_context_runtime_instantiated": false,
+    "draft_tokens_emitted": false,
+    "kv_cache_mutated": false,
+    "server_route_added": false
+  }
+}

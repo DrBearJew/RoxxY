@@ -3011,7 +3011,7 @@ void ggml_cuda_q8k_dot4_decode_splitk_reduce_kernel(
 
 #define LAUNCH_DECODE_SPLITK(BN, BN_VSUB) { \
     int sm = (BN * 2 + 4 + DECODE_I32_PER_ROW + DECODE_N_BLOCKS) * (int)sizeof(float); \
-    int split_size = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_SPLITK_SIZE", 512); \
+    int split_size = decode_splitk_size; \
     int n_splits = (nk + split_size - 1) / split_size; \
     dim3 g1(n_splits, n_heads_q * nq, batch); \
     if (v4_144_decode_diag) { \

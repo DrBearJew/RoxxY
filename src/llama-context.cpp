@@ -1612,6 +1612,9 @@ llama_context::llama_context(
     cparams.yarn_beta_slow   = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
     cparams.embeddings       = params.embeddings;
     cparams.embeddings_pre_norm = false;
+    cparams.embeddings_pre_norm_masked = false;
+    cparams.jetspec_target_hidden_taps = false;
+    cparams.jetspec_target_hidden_taps_masked = false;
     cparams.offload_kqv      = params.offload_kqv;
     cparams.no_perf          = params.no_perf;
     cparams.pooling_type     = params.pooling_type;
@@ -2526,6 +2529,20 @@ float * llama_context::get_embeddings_pre_norm_ith(int32_t i) {
     }
 }
 
+int32_t llama_context::get_jetspec_target_hidden_tap_count() const {
+    return cparams.jetspec_target_hidden_taps ? 5 : 0;
+}
+
+int32_t llama_context::get_jetspec_target_hidden_tap_width() const {
+    return get_jetspec_target_hidden_tap_count() * (int32_t) model.hparams.n_embd;
+}
+
+float * llama_context::get_jetspec_target_hidden_taps() {
+    output_reorder();
+
+    return jetspec_target_hidden_taps.data;
+}
+
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     output_reorder();
 
@@ -2714,6 +2731,32 @@ void llama_context::set_embeddings_pre_norm(bool value, bool masked) {
 
     cparams.embeddings_pre_norm        = value;
     cparams.embeddings_pre_norm_masked = masked;
+
+    if (changed) {
+        sched_need_reserve = true;
+    }
+}
+
+void llama_context::set_jetspec_target_hidden_taps(bool value, bool masked) {
+    LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
+
+    bool enabled = value;
+    if (enabled && model.arch != LLM_ARCH_QWEN35 && model.arch != LLM_ARCH_QWEN35MOE) {
+        LLAMA_LOG_WARN("%s: JetSpec target hidden taps are only staged for qwen35/qwen35moe targets; disabling for arch %s\n",
+                __func__, llm_arch_name(model.arch));
+        enabled = false;
+    }
+    if (enabled && model.hparams.n_embd != 2048) {
+        LLAMA_LOG_WARN("%s: JetSpec target hidden taps require target hidden width 2048; got %u; disabling\n",
+                __func__, model.hparams.n_embd);
+        enabled = false;
+    }
+
+    const bool changed = cparams.jetspec_target_hidden_taps        != enabled ||
+                         cparams.jetspec_target_hidden_taps_masked != masked;
+
+    cparams.jetspec_target_hidden_taps        = enabled;
+    cparams.jetspec_target_hidden_taps_masked = enabled && masked;
 
     if (changed) {
         sched_need_reserve = true;
@@ -3237,6 +3280,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
     auto * t_logits        = res->get_logits();
     auto * t_embd          = res->get_embd_pooled() ? res->get_embd_pooled() : res->get_embd();
     auto * t_h_pre_norm    = cparams.embeddings_pre_norm ? (res->get_mtp_h_capture() ? res->get_mtp_h_capture() : res->get_h_pre_norm()) : nullptr;
+    auto * t_jetspec_taps  = cparams.jetspec_target_hidden_taps ? res->get_jetspec_target_hidden_taps() : nullptr;
 
     // extract logits
     if (logits.data && t_logits) {
@@ -3310,6 +3354,16 @@ int llama_context::encode(const llama_batch & batch_inp) {
         const uint32_t n_embd = hparams.n_embd_out();
         GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_pre_norm.size);
         ggml_backend_tensor_get_async(backend_h, t_h_pre_norm, embd_pre_norm.data, 0, n_tokens*n_embd*sizeof(float));
+    }
+
+    // extract P5B JetSpec target hidden taps, laid out [row][layer1|layer10|layer19|layer28|layer37]
+    if (jetspec_target_hidden_taps.data && t_jetspec_taps && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+        ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_jetspec_taps);
+        GGML_ASSERT(backend_h != nullptr);
+
+        const uint32_t tap_width = 5 * hparams.n_embd;
+        GGML_ASSERT(n_tokens*tap_width <= (int64_t) jetspec_target_hidden_taps.size);
+        ggml_backend_tensor_get_async(backend_h, t_jetspec_taps, jetspec_target_hidden_taps.data, 0, n_tokens*tap_width*sizeof(float));
     }
 
     // TODO: hacky solution
@@ -3775,6 +3829,7 @@ int llama_context::decode(const llama_batch & batch_inp, llm_graph_type gtype) {
         auto * t_logits        = res->get_logits();
         auto * t_embd          = cparams.embeddings          ? res->get_embd()        : nullptr;
         auto * t_h_pre_norm    = cparams.embeddings_pre_norm ? (res->get_mtp_h_capture() ? res->get_mtp_h_capture() : res->get_h_pre_norm()) : nullptr;
+        auto * t_jetspec_taps  = cparams.jetspec_target_hidden_taps ? res->get_jetspec_target_hidden_taps() : nullptr;
 
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
@@ -3878,6 +3933,24 @@ int llama_context::decode(const llama_batch & batch_inp, llm_graph_type gtype) {
             }
         }
 
+        // extract P5B JetSpec target hidden taps, laid out [row][layer1|layer10|layer19|layer28|layer37]
+        {
+            const bool masked    = cparams.jetspec_target_hidden_taps_masked;
+            const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
+            const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
+
+            if (jetspec_target_hidden_taps.data && t_jetspec_taps && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+                ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_jetspec_taps);
+                GGML_ASSERT(backend_h != nullptr);
+
+                const uint32_t tap_width = 5 * hparams.n_embd;
+                float * taps_out = jetspec_target_hidden_taps.data + offset*tap_width;
+
+                GGML_ASSERT((offset + n_rows)*tap_width <= (int64_t) jetspec_target_hidden_taps.size);
+                ggml_backend_tensor_get_async(backend_h, t_jetspec_taps, taps_out, 0, n_rows*tap_width*sizeof(float));
+            }
+        }
+
         // Copy direct fused target-top1 outputs, if present, into sampled-token rows.
         // This path is independent of backend sampler maps and supports multiple output rows per sequence.
         if (res->t_mtp_target_top1_fused_all != nullptr && sampling.sampled.has_data()) {
@@ -3978,9 +4051,10 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto n_vocab    = vocab.n_tokens();
     const auto n_embd_out = hparams.n_embd_out();
 
-    bool has_logits        = true;
-    bool has_embd          = cparams.embeddings;
-    bool has_embd_pre_norm = cparams.embeddings_pre_norm;
+    bool has_logits               = true;
+    bool has_embd                 = cparams.embeddings;
+    bool has_embd_pre_norm        = cparams.embeddings_pre_norm;
+    bool has_jetspec_hidden_taps  = cparams.jetspec_target_hidden_taps;
 
     // TODO: hacky enc-dec support
     if (model.arch == LLM_ARCH_T5) {
@@ -3992,12 +4066,18 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     size_t backend_float_count = 0;
     size_t backend_token_count = 0;
 
+    const size_t jetspec_tap_width = (size_t) 5 * hparams.n_embd;
+
     logits.size        = has_logits        ? n_vocab*n_outputs_max     : 0;
     embd.size          = has_embd          ? n_embd_out*n_outputs_max  : 0;
     embd_pre_norm.size = has_embd_pre_norm ? n_embd_out*n_outputs_max  : 0;
+    jetspec_target_hidden_taps.size = has_jetspec_hidden_taps ? jetspec_tap_width*n_outputs_max : 0;
 
     if (has_embd_pre_norm && !cparams.embeddings_pre_norm_masked) {
         embd_pre_norm.size = (size_t) n_embd_out * n_batch;
+    }
+    if (has_jetspec_hidden_taps && !cparams.jetspec_target_hidden_taps_masked) {
+        jetspec_target_hidden_taps.size = jetspec_tap_width * n_batch;
     }
 
     // Allocate backend sampling output buffers if there are backend samplers configured.
@@ -4023,8 +4103,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  =
-        (logits.size + embd.size + embd_pre_norm.size + backend_float_count) * sizeof(float) +
-        (                                               backend_token_count) * sizeof(llama_token);
+        (logits.size + embd.size + embd_pre_norm.size + jetspec_target_hidden_taps.size + backend_float_count) * sizeof(float) +
+        (                                                                           backend_token_count) * sizeof(llama_token);
 
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
@@ -4041,6 +4121,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             logits.data = nullptr;
             embd.data = nullptr;
             embd_pre_norm.data = nullptr;
+            jetspec_target_hidden_taps.data = nullptr;
         }
 
         auto * buft = ggml_backend_cpu_buffer_type();
@@ -4071,6 +4152,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     embd_pre_norm = has_embd_pre_norm ? buffer_view<float>{(float *) (base + offset), embd_pre_norm.size} : buffer_view<float>{nullptr, 0};
     offset += embd_pre_norm.size * sizeof(float);
+
+    jetspec_target_hidden_taps = has_jetspec_hidden_taps ? buffer_view<float>{(float *) (base + offset), jetspec_target_hidden_taps.size} : buffer_view<float>{nullptr, 0};
+    offset += jetspec_target_hidden_taps.size * sizeof(float);
 
     if (has_sampling) {
         sampling.logits = {(float *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
@@ -4151,6 +4235,13 @@ void llama_context::output_reorder() {
         if (embd_pre_norm.size > 0) {
             for (uint64_t k = 0; k < n_embd; k++) {
                 std::swap(embd_pre_norm.data[i0*n_embd + k], embd_pre_norm.data[i1*n_embd + k]);
+            }
+        }
+
+        if (jetspec_target_hidden_taps.size > 0) {
+            const uint64_t tap_width = 5 * n_embd;
+            for (uint64_t k = 0; k < tap_width; k++) {
+                std::swap(jetspec_target_hidden_taps.data[i0*tap_width + k], jetspec_target_hidden_taps.data[i1*tap_width + k]);
             }
         }
 
@@ -5764,6 +5855,10 @@ void llama_set_embeddings_pre_norm(llama_context * ctx, bool value, bool masked)
     ctx->set_embeddings_pre_norm(value, masked);
 }
 
+void llama_set_jetspec_target_hidden_taps(llama_context * ctx, bool value, bool masked) {
+    ctx->set_jetspec_target_hidden_taps(value, masked);
+}
+
 void llama_set_mtp_source(llama_context * ctx, llama_context * src) {
     ctx->set_mtp_source(src);
 }
@@ -5778,6 +5873,20 @@ float * llama_get_embeddings_pre_norm_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_embeddings_pre_norm_ith(i);
+}
+
+float * llama_get_jetspec_target_hidden_taps(llama_context * ctx) {
+    ctx->synchronize();
+
+    return ctx->get_jetspec_target_hidden_taps();
+}
+
+int32_t llama_get_jetspec_target_hidden_tap_count(llama_context * ctx) {
+    return ctx ? ctx->get_jetspec_target_hidden_tap_count() : 0;
+}
+
+int32_t llama_get_jetspec_target_hidden_tap_width(llama_context * ctx) {
+    return ctx ? ctx->get_jetspec_target_hidden_tap_width() : 0;
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {

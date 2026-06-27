@@ -1,0 +1,125 @@
+{
+  "status": "kv_ownership_primitive_design_verified_not_executed",
+  "scope": "experiments/jetspec only",
+  "production_paths_touched": [],
+  "source_files": [
+    "src/llama-kv-cache.h",
+    "src/llama-kv-cache.cpp"
+  ],
+  "runtime_boundary": {
+    "llama_context_created": false,
+    "draft_head_graph_executed": false,
+    "draft_tokens_emitted": false,
+    "real_kv_mutated": false,
+    "server_route_added": false,
+    "runtime_supported": false,
+    "performance_claimed": false,
+    "promotion_claimed": false
+  },
+  "audited_non_exact_helpers": [
+    {
+      "symbol": "seq_rm",
+      "verdict": "audited_non_exact_helper",
+      "reason": "not exact: range removal cannot prove accepted-path gather/compact or cross-sequence tree ownership by itself",
+      "exact_for_actions": []
+    },
+    {
+      "symbol": "seq_cp",
+      "verdict": "audited_non_exact_helper",
+      "reason": "not exact: sequence copy cannot be used as hidden/KV survivor commit without accepted-path physical gather semantics",
+      "exact_for_actions": []
+    },
+    {
+      "symbol": "seq_import_physical",
+      "verdict": "audited_non_exact_helper",
+      "reason": "not exact: physical import/rebind is not a JetSpec transient tree survivor gather primitive",
+      "exact_for_actions": []
+    },
+    {
+      "symbol": "seq_keep",
+      "verdict": "audited_non_exact_helper",
+      "reason": "not exact: sequence keep does not encode rejected branch discard from transient tree slots",
+      "exact_for_actions": []
+    },
+    {
+      "symbol": "find_slot",
+      "verdict": "audited_non_exact_helper",
+      "reason": "not exact: slot search is not a tree-node reservation and ownership primitive",
+      "exact_for_actions": []
+    },
+    {
+      "symbol": "apply_ubatch",
+      "verdict": "audited_non_exact_helper",
+      "reason": "not exact: ubatch application does not provide accepted-path gather/compact or rollback semantics",
+      "exact_for_actions": []
+    }
+  ],
+  "primitive_designs": [
+    {
+      "id": "hidden_kv_survivor_commit",
+      "proposed_primitive": "llama_kv_cache_jetspec_commit_survivor_path_candidate",
+      "status": "design_only_missing_implementation",
+      "implementation_approved": false,
+      "exact_existing_primitive_proven": false,
+      "touches_production_now": false,
+      "runtime_executed_now": false,
+      "claims_performance": false,
+      "claims_promotion": false,
+      "must_not_use_as_implicit_mapping": ["seq_cp", "seq_rm", "seq_import_physical"],
+      "invariants": [
+        "accepted_path physical gather/compact",
+        "[root | accepted] only",
+        "correction hidden deferred",
+        "committed tail compact"
+      ],
+      "source_backing": [
+        "P5J classifies hidden_kv_survivor_commit as exact_missing_primitive",
+        "P5H validates [root | accepted] survivor ownership and past_len+accepted_path gather"
+      ]
+    },
+    {
+      "id": "rejected_branch_discard",
+      "proposed_primitive": "llama_kv_cache_jetspec_discard_rejected_tree_candidate",
+      "status": "design_only_missing_implementation",
+      "implementation_approved": false,
+      "exact_existing_primitive_proven": false,
+      "touches_production_now": false,
+      "runtime_executed_now": false,
+      "claims_performance": false,
+      "claims_promotion": false,
+      "must_not_use_as_implicit_mapping": ["seq_cp", "seq_rm", "seq_import_physical"],
+      "invariants": [
+        "rejected transient tree slots unreachable",
+        "accepted path preserved",
+        "not range removal only",
+        "rollback restores pre-round state"
+      ],
+      "source_backing": [
+        "P5J classifies rejected_branch_discard as exact_missing_primitive",
+        "P5H validates rejected tree nodes unreachable after commit"
+      ]
+    },
+    {
+      "id": "cross_sequence_isolation",
+      "proposed_primitive": "llama_kv_cache_jetspec_assert_cross_sequence_isolation_candidate",
+      "status": "design_only_missing_implementation",
+      "implementation_approved": false,
+      "exact_existing_primitive_proven": false,
+      "touches_production_now": false,
+      "runtime_executed_now": false,
+      "claims_performance": false,
+      "claims_promotion": false,
+      "must_not_use_as_implicit_mapping": ["seq_cp", "seq_rm", "seq_import_physical"],
+      "invariants": [
+        "other-sequence slots unchanged",
+        "seq_to_stream isolation",
+        "no shared-slot corruption",
+        "rollback preserves other sequences"
+      ],
+      "source_backing": [
+        "P5J classifies cross_sequence_isolation as exact_missing_primitive",
+        "P5H validates cross-sequence slot isolation"
+      ]
+    }
+  ]
+}

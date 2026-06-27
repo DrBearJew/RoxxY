@@ -45,7 +45,19 @@ struct dp16_fa_problem {
     dp16_fa_inst inst;
 
     int nq;
+    // Compatibility planner bucket. Existing policy code uses this for shape,
+    // split-K, graph key, and trace bucketing. Phase-B keeps it but makes the
+    // source explicit under a default-off env.
     int nk_bucket;
+    int nk_active;
+    int nk_storage;
+    int kv_capacity;
+    int physical_page_count;
+    int logical_base;
+    int active_q_offset;
+    int active_flags;
+    bool has_active_k_meta;
+    bool active_k_contiguous;
     int d_head;
 
     int n_heads_q;

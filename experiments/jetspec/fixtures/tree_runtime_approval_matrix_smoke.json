@@ -1,0 +1,144 @@
+{
+  "status": "tree_runtime_approval_packet_verified_not_executed",
+  "production_tree_runtime_approved": false,
+  "scope": "experiments/jetspec only",
+  "runtime_claims": {
+    "llama_context_created": false,
+    "draft_head_graph_executed": false,
+    "draft_tokens_emitted": false,
+    "real_kv_mutated": false,
+    "server_route_added": false,
+    "performance_claimed": false,
+    "promotion_claimed": false,
+    "runtime_supported": false
+  },
+  "production_paths_touched": [],
+  "future_runtime_actions": [
+    {
+      "id": "tree_build",
+      "future_primitive": "jetspec_build_accum_logp_tree_candidate",
+      "mapping_status": "validated_by_p5g",
+      "approval_required": true,
+      "touches_production_now": false,
+      "runtime_executed_now": false,
+      "claims_performance": false,
+      "claims_promotion": false,
+      "evidence": ["P5G DraftTree parent-before-child ABI", "P5G full-vocab top-k logprob input"]
+    },
+    {
+      "id": "verify_mask",
+      "future_primitive": "jetspec_build_tree_verify_mask_candidate",
+      "mapping_status": "validated_by_p5g",
+      "approval_required": true,
+      "touches_production_now": false,
+      "runtime_executed_now": false,
+      "claims_performance": false,
+      "claims_promotion": false,
+      "evidence": ["P5G ancestor-only mask", "P5G other-sequence tree columns hidden"]
+    },
+    {
+      "id": "accept_path",
+      "future_primitive": "jetspec_tree_accept_candidate",
+      "mapping_status": "validated_by_p5g",
+      "approval_required": true,
+      "touches_production_now": false,
+      "runtime_executed_now": false,
+      "claims_performance": false,
+      "claims_promotion": false,
+      "evidence": ["P5G root-inclusive accepted_path", "P5G duplicate-child overwrite semantics"]
+    },
+    {
+      "id": "token_commit",
+      "future_primitive": "jetspec_commit_accepted_tokens_candidate",
+      "mapping_status": "validated_by_p5h",
+      "approval_required": true,
+      "touches_production_now": false,
+      "runtime_executed_now": false,
+      "claims_performance": false,
+      "claims_promotion": false,
+      "evidence": ["P5H committed tokens [accepted draft tokens | correction]"]
+    },
+    {
+      "id": "hidden_kv_survivor_commit",
+      "future_primitive": "missing primitive",
+      "mapping_status": "missing_primitive",
+      "approval_required": true,
+      "touches_production_now": false,
+      "runtime_executed_now": false,
+      "claims_performance": false,
+      "claims_promotion": false,
+      "evidence": ["P5H hidden/KV survivors [root | accepted] only", "P5H explicit missing primitive"]
+    },
+    {
+      "id": "rejected_branch_discard",
+      "future_primitive": "missing primitive",
+      "mapping_status": "missing_primitive",
+      "approval_required": true,
+      "touches_production_now": false,
+      "runtime_executed_now": false,
+      "claims_performance": false,
+      "claims_promotion": false,
+      "evidence": ["P5H rejected tree nodes unreachable after commit", "P5H explicit missing primitive"]
+    },
+    {
+      "id": "cross_sequence_isolation",
+      "future_primitive": "missing primitive",
+      "mapping_status": "missing_primitive",
+      "approval_required": true,
+      "touches_production_now": false,
+      "runtime_executed_now": false,
+      "claims_performance": false,
+      "claims_promotion": false,
+      "evidence": ["P5H cross-sequence slot isolation", "P5H explicit missing primitive"]
+    },
+    {
+      "id": "rollback_fail_closed_disable",
+      "future_primitive": "jetspec_rollback_and_disable_candidate",
+      "mapping_status": "blocked_pending_explicit_approval",
+      "blocked_reason": "requires explicit approval for production rollback/fail-closed runtime integration",
+      "approval_required": true,
+      "touches_production_now": false,
+      "runtime_executed_now": false,
+      "claims_performance": false,
+      "claims_promotion": false,
+      "evidence": ["P5D/P5E/P5F disable-before-draft behavior", "P5H no real KV mutation boundary"]
+    }
+  ],
+  "approval_gates": [
+    {
+      "id": "aggregate_contracts",
+      "command": "python3 experiments/jetspec/run_all_jetspec_contracts.py --json",
+      "pass_condition": "ok true and failed empty"
+    },
+    {
+      "id": "default_build",
+      "command": "cmake --build build-rocm-qwen35-dev -j2 --target llama-server",
+      "pass_condition": "build passes"
+    },
+    {
+      "id": "disabled_path",
+      "command": "future deterministic no-spec run",
+      "pass_condition": "output and routing unchanged"
+    },
+    {
+      "id": "existing_mtp_path",
+      "command": "future deterministic --spec-type draft-mtp run",
+      "pass_condition": "existing MTP output and routing not regressed"
+    },
+    {
+      "id": "jetspec_opt_in_fail_closed",
+      "command": "LLAMA_JETSPEC_EXPERIMENTAL=1 --spec-type draft-jetspec future run",
+      "pass_condition": "all gates pass or JetSpec disables before partial execution"
+    },
+    {
+      "id": "correctness_matrix",
+      "command": "future JetSpec correctness matrix",
+      "pass_condition": "greedy target parity and rollback invariants pass"
+    },
+    {
+      "id": "baseline_benchmark",
+      "command": "future agreed benchmark matrix",
+      "pass_condition": "candidate is compared against current proven speculative baseline before any promotion discussion"
+    }
+  ]
+}

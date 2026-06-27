@@ -93,6 +93,9 @@ struct llama_context {
     llama_context * get_mtp() const { return mtp.ctx_mtp; }
     float * get_embeddings_pre_norm();
     float * get_embeddings_pre_norm_ith(int32_t i);
+    float * get_jetspec_target_hidden_taps();
+    int32_t get_jetspec_target_hidden_tap_count() const;
+    int32_t get_jetspec_target_hidden_tap_width() const;
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
@@ -118,6 +121,7 @@ struct llama_context {
 
     void set_embeddings (bool value);
     void set_embeddings_pre_norm(bool value, bool masked);
+    void set_jetspec_target_hidden_taps(bool value, bool masked);
     void set_mtp_source(llama_context * src);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -310,6 +314,11 @@ private:
     // populated only when cparams.embeddings_pre_norm is enabled and the model graph
     // sets llm_graph_result::t_h_pre_norm
     buffer_view<float> embd_pre_norm = {nullptr, 0};
+
+    // P5B JetSpec target hidden taps (2-dimensional array: [n_rows][5*n_embd])
+    // populated only when cparams.jetspec_target_hidden_taps is enabled and the model graph
+    // sets llm_graph_result::t_jetspec_target_hidden_taps
+    buffer_view<float> jetspec_target_hidden_taps = {nullptr, 0};
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

@@ -1,0 +1,21 @@
+{
+  "spec": {
+    "target_layer_ids": [1, 10, 19, 28, 37],
+    "target_hidden_size": 3,
+    "num_target_layers": 40,
+    "block_size": 4,
+    "mask_token_id": 99,
+    "draft_fc_input_size": 15
+  },
+  "anchor_token_id": 7,
+  "fill_tokens": [8],
+  "layer_outputs": {
+    "0": [0, 0, 0],
+    "1": [101, 102, 103],
+    "10": [1001, 1002, 1003],
+    "19": [1901, 1902, 1903],
+    "28": [2801, 2802, 2803],
+    "37": [3701, 3702, 3703],
+    "39": [3901, 3902, 3903]
+  }
+}

@@ -1,0 +1,276 @@
+# JetSpec staging area
+
+This directory is intentionally **not compiled** by the default llama.cpp / `llama-server` build.
+
+Purpose:
+- Stage JetSpec draft-head and tree-spec design with explicit promotion gates.
+- Keep the original server behavior isolated while the GGUF converter, loader, and tree verifier contracts are worked out.
+- Track the approved P5A validation-only loader candidate, P5B private target-hidden tap side channel, P5C fail-closed speculative type route, P5D target-tap ingestion slice, P5E runtime-state bookkeeping slice, P5F binding-preflight slice, inert P5G tree-runtime readiness contract, inert P5H KV/hidden commit ownership readiness contract, inert P5I tree-runtime approval packet, inert P5J KV/runtime primitive audit, inert P5K KV ownership primitive design packet, inert P5L page-map ownership oracle, inert P5M transaction/failpoint plan oracle, approved P5N transaction-plan scaffold, approved P5O pre-round snapshot descriptor, approved P5P transient-reservation descriptor, and approved P5Q tree-build descriptor while executable JetSpec drafting still emits no draft tokens.
+- Provide source-map notes for the upstream JetSpec implementation pinned locally at `/home/mrtrent/.harness/tmp/jetspec-upstream-master`.
+
+Do not add this directory to CMake until all of these are true:
+1. A JetSpec draft-head GGUF schema is finalized.
+2. The HF `DFlashDraftModel`/causal JetSpec head has a converter and loader.
+3. Tree verify/accept semantics pass losslessness checks against the existing greedy target path.
+4. Rejected branch KV/state handling has an explicit rollback/commit contract.
+
+Safe locations for inert work:
+- `experiments/jetspec/*.md`
+- `experiments/jetspec/*.py`
+- standalone prototype headers here that are not included from `src/`, `common/`, `tools/`, `tests/`, `examples/`, or `pocs/`
+
+Avoid until explicit subphase approval:
+- non-P5A/P5B `src/models/*.cpp` and model registration edits, because `src/CMakeLists.txt` globs model sources.
+- non-P5C/P5D/P5E/P5F `common/`, `tools/server/`, `tests`, `examples`, `pocs`, because they are wired into normal CMake targets.
+- `ggml/src/`, unless a kernel is ready for a default-off gated implementation.
+
+Approved P5A validation-only production hook set:
+- `src/llama-arch.h`
+- `src/llama-arch.cpp`
+- `src/llama-model.cpp`
+- `src/models/models.h`
+- `src/models/jetspec_qwen3_draft_head.cpp`
+
+P5A remains fail-closed: metadata-only previews reject as `preview_not_allowed` by default; with `LLAMA_JETSPEC_ALLOW_PREVIEW_LOAD=1`, `runtime_supported=false` still rejects as `unsupported_runtime`; no graph executes.
+
+Approved P5B private side-channel hook set:
+- `src/llama-cparams.h`
+- `src/llama-graph.h`
+- `src/llama-graph.cpp`
+- `src/llama-context.h`
+- `src/llama-context.cpp`
+- `src/llama-ext.h`
+- `src/models/qwen35.cpp`
+- `src/models/qwen35moe.cpp`
+
+P5B remains default-off and private: it adds no public `include/llama.h`, no server route, and no CMake wiring. When explicitly enabled through `src/llama-ext.h`, it captures Qwen35/Qwen35MoE post-layer taps `[1, 10, 19, 28, 37]` into width `10240` as a side channel only.
+
+Approved P5C fail-closed speculative type hook set:
+- `common/common.h`
+- `common/speculative.cpp`
+- `docs/speculative.md`
+
+P5C remains default-off and non-executable: it accepts `--spec-type draft-jetspec` only as an explicit experimental route, requires `LLAMA_JETSPEC_EXPERIMENTAL=1`, prevents silent fallback to `draft-simple`, preserves `runtime_supported=false`, and emits no draft tokens before a separately approved tree runtime exists.
+
+Approved P5D target-tap ingestion hook set:
+- `common/speculative.cpp`
+- `docs/speculative.md`
+
+P5D remains non-drafting: when the explicit JetSpec route is active it keeps the private P5B tap side channel enabled, copies masked target tap rows after target decode, records a diagnostic FNV-1a hash, and disables ingestion on missing/wrong-width/null tap data. It still does not execute the draft head, build a tree, verify masks, rollback KV/hidden state, or add server behavior.
+
+Approved P5E runtime-state bookkeeping hook set:
+- `common/speculative.cpp`
+- `docs/speculative.md`
+
+P5E remains state-only and non-drafting: when the explicit JetSpec route is active it tracks private runtime phase, failure state, row metadata, cached row counts, and draft-call counters around the P5D tap-ingestion buffer. `LLAMA_JETSPEC_STATE_TRACE=1` logs the state without adding draft-head graph execution, tree verification, rollback, server behavior, public API, or CMake wiring.
+
+Approved P5F binding-preflight hook set:
+- `common/speculative.cpp`
+- `docs/speculative.md`
+
+P5F remains preflight-only and non-drafting: before the explicit JetSpec implementation is instantiated it validates target/draft contexts, model/vocab availability, draft metadata strings, Qwen3.6 target/draft shape constants, and target tap count/width. Any mismatch disables JetSpec before runtime execution without adding draft-head graph execution, tree verification, rollback, server behavior, public API, or CMake wiring. Offline P5F artifact binding is verified against the stored real JetSpec draft-head manifest/tensor map/conversion plan, and the live metadata-only loader gate is probed through `llama-cli`; P5F remains artifact/loader-gate verified, still not draft-runtime executed.
+
+P5G is inert readiness only under `experiments/jetspec/`: it validates DraftTree ABI, full-vocab top-k logprob input without top-k-only renormalization, accum-logp expected trees, ancestor-only verify masks, root-inclusive accept paths, duplicate-child overwrite semantics, `[accepted draft tokens | correction]` token commits, `[root | accepted] only` hidden/KV commits, `max_len + accepted_path` gather positions, and the boundary `tree_runtime_readiness_verified_not_executed`. It adds no production hook set.
+
+P5H is inert KV/hidden ownership readiness only under `experiments/jetspec/`: it validates abstract transient tree slots, `past_len + accepted_path` gather positions, committed tokens `[accepted draft tokens | correction]`, hidden/KV survivors `[root | accepted]`, correction-hidden deferral, rejected-branch discard, cross-sequence isolation, explicit `missing primitive` ownership mapping, and the boundary `kv_commit_readiness_verified_not_executed`. It adds no production hook set and performs no real KV cache mutation.
+
+P5I is an inert tree-runtime approval packet only under `experiments/jetspec/`: it maps future runtime actions to `validated_by_p5g`, `validated_by_p5h`, `missing_primitive`, or `blocked_pending_explicit_approval`; requires explicit primitives for tree build, verify mask, accept path, token commit, hidden/KV survivor commit, rejected branch discard, cross-sequence isolation, and rollback/fail-closed disable; rejects production path touches, runtime execution claims, implicit `seq_cp`/`seq_rm` primitives, performance claims, and promotion claims; and reports `tree_runtime_approval_packet_verified_not_executed`. It adds no production hook set.
+
+P5J is an inert KV/runtime primitive audit only under `experiments/jetspec/`: it scans `src/llama-kv-cache.{h,cpp}` as read-only source text, records locations for existing helpers (`seq_rm`, `seq_cp`, `seq_import_physical`, `seq_keep`, `find_slot`, `apply_ubatch`), classifies hidden/KV survivor commit, rejected-branch discard, and cross-sequence isolation as `exact_missing_primitive`, rejects implicit mapping to `seq_cp`/`seq_rm`/`seq_import_physical`, and reports `kv_primitive_audit_verified_not_executed`. It adds no production hook set.
+
+P5K is an inert KV ownership primitive design packet only under `experiments/jetspec/`: it keeps audited helpers as non-exact, names design-only candidate primitives `llama_kv_cache_jetspec_commit_survivor_path_candidate`, `llama_kv_cache_jetspec_discard_rejected_tree_candidate`, and `llama_kv_cache_jetspec_assert_cross_sequence_isolation_candidate`, requires accepted-path gather/compact, `[root | accepted]`, correction-hidden deferral, rejected-slot unreachability, cross-sequence preservation, and rejects implementation approval or implicit `seq_cp`/`seq_rm`/`seq_import_physical` mapping. It reports `kv_ownership_primitive_design_verified_not_executed` and adds no production hook set.
+
+P5L is an inert page-map ownership oracle only under `experiments/jetspec/`: it turns QBlock/PageAttention descriptor lessons into fixture validation for future JetSpec page ownership. It requires accepted path pages to map to `[root | accepted]` only, correction hidden deferral, explicit accepted path physical gather/compact, rejected transient pages unreachable after commit, accepted paths unable to read rejected siblings or descendants, rollback restoring the pre-round page snapshot, other-sequence pages unchanged, no duplicate mutable physical page ownership, and rollback preserving other sequences. It keeps `seq_cp`/`seq_rm`/`seq_import_physical` non-exact, names design-only candidates `llama_kv_cache_jetspec_validate_page_ownership_oracle_candidate`, `llama_kv_cache_jetspec_reserve_transient_tree_pages_candidate`, `llama_kv_cache_jetspec_commit_page_survivor_path_candidate`, and `llama_kv_cache_jetspec_discard_rejected_tree_pages_candidate`, preserves identity maps as oracle/parity cases only, and reports `page_map_ownership_oracle_verified_not_executed`. It adds no production hook set.
+
+P5M is an inert transaction/failpoint plan oracle only under `experiments/jetspec/`: it consolidates P5G/P5H/P5I/P5K/P5L into ordered transaction semantics before any tree-runtime approval. It requires `snapshot_pre_round`, `reserve_transient_tree_pages`, `build_tree`, `build_verify_mask`, `accept_path`, `commit_tokens`, `commit_hidden_kv_survivors`, `discard_rejected_branches`, and `publish_post_commit_state`; rollback points after reserve/tree/mask/accept/token/hidden-KV/discard phases; no committed token, hidden/KV, or page-map visibility before publish; rollback restoration of pre-round tokens/pages/other sequences; rejected branches unreachable; `seq_cp`/`seq_rm`/`seq_import_physical` non-exact; design-only `llama_kv_cache_jetspec_rollback_tree_transaction_candidate`; and reports `transaction_plan_oracle_verified_not_executed`. It adds no production hook set.
+
+P5N is an approved bounded transaction-plan scaffold in `common/speculative.cpp` and `docs/speculative.md`: after the explicit `draft-jetspec` route passes P5F preflight and captures P5B target taps, it records the P5M phase order and rollback failpoint strings, computes `transaction_plan_hash_last`, enters `transaction_plan_scaffold_ready`, and logs `no_kv_mutation=1`, `no_publish=1`, and `no_draft_tokens=1` under the existing trace envs. It still emits no draft tokens, executes no draft-head graph, mutates no KV, dispatches no CUDA, adds no server route, adds no public API, and adds no CMake wiring.
+
+P5O is an approved bounded pre-round snapshot descriptor in `common/speculative.cpp` and `docs/speculative.md`: `begin(seq_id, prompt)` validates the sequence id, records prompt token count/hash, computes `pre_round_snapshot_hash_last`, sets `pre_round_snapshot_ready`, and requires that snapshot before the P5N transaction scaffold can build. It logs `transaction_phase=snapshot_pre_round`, `no_reserve=1`, `no_tree_build=1`, `no_verify_mask=1`, `no_kv_mutation=1`, `no_publish=1`, and `no_draft_tokens=1`. It still performs no reserve, tree build, verify mask, accept, commit, KV mutation, CUDA, server, public API, or CMake work.
+
+P5P is an approved bounded transient-reservation descriptor in `common/speculative.cpp` and `docs/speculative.md`: after P5O snapshot readiness and P5N transaction scaffold readiness, it records descriptor-only intent for `reserve_transient_tree_pages`, hashes the pre-round/transaction/tap state, bounds `transient_tree_node_budget` by `JETSPEC_QWEN36_DRAFT_BLOCK_SIZE`, records `rollback_point=after_reserve`, and keeps `actual_pages_reserved=0`. It performs no real page reservation, no `llama_kv_cache` primitive, no tree build, no verify mask, no draft tokens, no CUDA, no server route, no public API, and no CMake wiring.
+
+P5Q is an approved bounded tree-build descriptor in `common/speculative.cpp` and `docs/speculative.md`: after P5P descriptor readiness, it records descriptor-only intent for `build_tree`, hashes the pre-round/transaction/reservation/tap state, records `rollback_point=after_build_tree`, planned tree node budget, root parent `-1`, root depth `0`, and keeps `actual_tree_nodes=0`. It performs no real tree build, no tree arrays, no verify mask, no accept path runtime, no draft tokens, no CUDA, no server route, no public API, and no CMake wiring.
+
+Current external model target:
+- HF repo: `JetSpec/jetspec-Qwen3.6-35B-A3B`
+- HF commit from model API: `ffb38cf9917e0f426ab1b21d745e859f7788e467`
+- Architecture in config: `DFlashDraftModel`
+- Important: name is legacy; config has `dflash_config.causal_head=true`, so this is the causal JetSpec draft head we care about.
+
+Inert inspection artifacts:
+- `inspect_hf_head.py`: stdlib-only HF config + safetensors-header inspector. Uses HTTP Range reads for tensor metadata; does not download the full weight file.
+- `manifests/JetSpec_jetspec-Qwen3.6-35B-A3B_main.manifest.json`: observed config/tensor manifest, 91 BF16 tensors, 473,995,264 params.
+- `tensor_map_qwen36_head.json`: provisional HF tensor name → draft-prefixed GGUF tensor name map.
+- `validate_p5f_artifact_binding.py`: offline P5F artifact-binding validator. It ties the real JetSpec draft-head manifest, tensor map, conversion plan, and `common/speculative.cpp` P5F constants together; verifies 91 BF16 tensors, `fc.weight` shape `[2048, 10240]`, tap layers `[1, 10, 19, 28, 37]`, shape/metadata constants, and `runtime_supported=false`; and explicitly reports `artifact_verified_not_runtime_executed`.
+- `test_p5f_artifact_binding.py`: unittest for the offline artifact-binding validator and its no-runtime-execution limitation.
+- `probe_p5f_loader_gate.py`: live fail-closed loader-gate probe. It writes the metadata-only JetSpec GGUF preview, invokes `build-rocm-qwen35-dev/bin/llama-cli`, requires default load failure as `preview_not_allowed`, requires `LLAMA_JETSPEC_ALLOW_PREVIEW_LOAD=1` failure as `unsupported_runtime`, and reports `loader_gate_verified_preflight_still_blocked` without creating a target/draft `llama_context` pair.
+- `test_p5f_loader_gate_probe.py`: unittest for the loader-gate probe contract mode and its explicit no-preflight/no-runtime limitation.
+- `jetspec_tree_runtime_readiness.py`: P5G stdlib readiness evaluator translating upstream tree/verify/gather semantics into a llama.cpp-facing fixture contract without runtime execution.
+- `fixtures/jetspec_tree_runtime_readiness_smoke.json` and `fixtures/jetspec_tree_runtime_readiness_smoke.out.json`: deterministic P5G fixture proving full-vocab top-k input, accum-logp tree ABI, ancestor-only mask, accept, commit, gather, and no-runtime boundary.
+- `validate_p5g_tree_runtime_readiness.py`: source/governance validator for the P5G readiness files, smoke output, CMake isolation, and forbidden production path boundary.
+- `test_p5g_tree_runtime_readiness.py`: unittest for P5G smoke output, top-k renormalization rejection, gather-position mismatch, duplicate-child deterministic overwrite, runtime-boundary failures, and validator success.
+- `jetspec_kv_commit_readiness.py`: P5H stdlib readiness evaluator for abstract KV/hidden ownership, transient tree slots, gather, commit, rejected-branch discard, cross-sequence isolation, explicit ownership primitive mapping, and no-runtime boundary.
+- `fixtures/jetspec_kv_commit_readiness_smoke.json` and `fixtures/jetspec_kv_commit_readiness_smoke.out.json`: deterministic P5H fixture proving `past_len + accepted_path`, `[accepted draft tokens | correction]`, `[root | accepted]`, correction-hidden deferral, and `kv_commit_readiness_verified_not_executed`.
+- `validate_p5h_kv_commit_readiness.py`: source/governance validator for the P5H files, smoke output, CMake isolation, and forbidden production path boundary.
+- `test_p5h_kv_commit_readiness.py`: unittest for P5H smoke output, duplicate/out-of-range path rejection, gather mismatch, cross-sequence isolation, silent ownership mapping rejection, runtime-boundary failures, and validator success.
+- `tree_runtime_approval_matrix.py`: P5I stdlib approval-packet evaluator mapping future runtime actions to P5G/P5H evidence, missing primitives, or explicit-approval blockers without runtime execution.
+- `fixtures/tree_runtime_approval_matrix_smoke.json` and `fixtures/tree_runtime_approval_matrix_smoke.out.json`: deterministic P5I approval matrix fixture proving required actions, gates, no production touches, no runtime claims, and `tree_runtime_approval_packet_verified_not_executed`.
+- `validate_p5i_tree_runtime_approval_packet.py`: source/governance validator for P5I files, smoke output, CMake isolation, and forbidden production path boundary.
+- `test_p5i_tree_runtime_approval_packet.py`: unittest for P5I smoke output, missing required action rejection, production path touch rejection, runtime claim rejection, implicit primitive rejection, promotion claim rejection, and validator success.
+- `kv_primitive_audit.py`: P5J stdlib read-only source scanner and primitive classifier for the P5I missing KV/hidden ownership actions.
+- `fixtures/kv_primitive_audit_smoke.json` and `fixtures/kv_primitive_audit_smoke.out.json`: deterministic P5J audit fixture proving all three P5I ownership gaps remain `exact_missing_primitive` and no runtime executes.
+- `validate_p5j_kv_primitive_audit.py`: source/governance validator for P5J files, smoke output, CMake isolation, and forbidden production path boundary.
+- `test_p5j_kv_primitive_audit.py`: unittest for P5J smoke output, missing action rejection, implicit `seq_cp` mapping rejection, missing source symbol rejection, runtime-boundary failure, production touch rejection, and validator success.
+- `kv_ownership_primitive_design.py`: P5K stdlib source-backed design validator for future KV ownership primitive contracts, still without implementation.
+- `fixtures/kv_ownership_primitive_design_smoke.json` and `fixtures/kv_ownership_primitive_design_smoke.out.json`: deterministic P5K design fixture naming three design-only missing implementation candidates and enforcing ownership invariants.
+- `validate_p5k_kv_ownership_primitive_design.py`: source/governance validator for P5K files, smoke output, CMake isolation, and forbidden production path boundary.
+- `test_p5k_kv_ownership_primitive_design.py`: unittest for P5K smoke output, audited helper coverage, missing design rejection, implicit mapping rejection, implementation-approval rejection, runtime-boundary failure, and validator success.
+- `page_map_ownership_oracle.py`: P5L stdlib page-map ownership oracle for future JetSpec transient tree page reservation, survivor commit, rejected-page discard, cross-sequence isolation, and QBlock/PageAttention safety lessons without runtime execution.
+- `fixtures/page_map_ownership_oracle_smoke.json` and `fixtures/page_map_ownership_oracle_smoke.out.json`: deterministic P5L fixture proving accepted survivor page ownership, rejected branch page unreachability, cross-sequence page isolation, non-exact helper mappings, and `page_map_ownership_oracle_verified_not_executed`.
+- `validate_p5l_page_map_ownership_oracle.py`: source/governance validator for P5L files, smoke output, CMake isolation, and forbidden production path boundary.
+- `test_p5l_page_map_ownership_oracle.py`: unittest for P5L smoke output, missing oracle rejection, duplicate page owner rejection, rejected-page reachability rejection, accepted path without root rejection, implicit helper mapping rejection, cross-sequence mutation rejection, runtime-boundary failure, production touch rejection, and validator success.
+- `transaction_plan_oracle.py`: P5M stdlib transaction/failpoint oracle for future JetSpec round ordering, rollback, pre-publish invisibility, survivor commit, rejected discard, and publish semantics without runtime execution.
+- `fixtures/transaction_plan_oracle_smoke.json` and `fixtures/transaction_plan_oracle_smoke.out.json`: deterministic P5M fixture proving ordered phases, complete rollback failpoints, `[accepted draft tokens | correction]`, `[root | accepted]`, no partial visibility, non-exact helper mappings, and `transaction_plan_oracle_verified_not_executed`.
+- `validate_p5m_transaction_plan_oracle.py`: source/governance validator for P5M files, smoke output, CMake isolation, and forbidden production path boundary.
+- `test_p5m_transaction_plan_oracle.py`: unittest for P5M smoke output, missing rollback rejection, bad publish ordering rejection, commit-before-accept rejection, hidden/KV prevalidation rejection, rejected-page reachability rejection, cross-sequence rollback mutation rejection, duplicate page owner rejection, runtime-boundary failure, production touch rejection, implementation/performance/promotion rejection, implicit helper mapping rejection, and validator success.
+- `jetspec_p5n_transaction_scaffold_candidate.md`: approved P5N evidence note for the default-off production transaction-plan scaffold while draft-token emission remains blocked.
+- `validate_p5n_transaction_scaffold.py`: source/governance validator for the P5N `common/speculative.cpp` and `docs/speculative.md` slice, no CMake references, and no graph/KV/draft-token execution.
+- `test_p5n_transaction_scaffold.py`: unittest for P5N phase/failpoint constants, transaction hash scaffolding, fail-closed invalid transaction plan, trace boundaries, docs boundaries, and validator success.
+- `jetspec_p5o_pre_round_snapshot_candidate.md`: approved P5O evidence note for the default-off pre-round snapshot descriptor while all next transaction phases remain blocked.
+- `validate_p5o_pre_round_snapshot.py`: source/governance validator for the P5O `common/speculative.cpp` and `docs/speculative.md` slice, no CMake references, and no reserve/tree/verify/KV/draft-token execution.
+- `test_p5o_pre_round_snapshot.py`: unittest for P5O snapshot fields, `begin()` descriptor build, transaction scaffold snapshot dependency, fail-closed invalid snapshot, trace boundaries, docs boundaries, and validator success.
+- `jetspec_p5p_transient_reservation_descriptor_candidate.md`: approved P5P evidence note for descriptor-only transient reservation intent while real page reservation and all later phases remain blocked.
+- `validate_p5p_transient_reservation_descriptor.py`: source/governance validator for the P5P `common/speculative.cpp` and `docs/speculative.md` slice, no CMake references, and no real reservation/KV/tree/verify/draft-token execution.
+- `test_p5p_transient_reservation_descriptor.py`: unittest for P5P descriptor fields, prerequisite gates, zero actual pages, fail-closed invalid descriptor, trace boundaries, docs boundaries, and validator success.
+- `jetspec_p5q_tree_build_descriptor_candidate.md`: approved P5Q evidence note for descriptor-only tree-build intent while real tree construction and all later phases remain blocked.
+- `validate_p5q_tree_build_descriptor.py`: source/governance validator for the P5Q `common/speculative.cpp` and `docs/speculative.md` slice, no CMake references, and no real tree/verify/accept/KV/draft-token execution.
+- `test_p5q_tree_build_descriptor.py`: unittest for P5Q descriptor fields, prerequisite gates, zero actual tree nodes, fail-closed invalid descriptor, trace boundaries, docs boundaries, and validator success.
+
+Inert tree-semantics artifacts:
+- `tree_semantics.py`: pure Python prototype for `accum_logp`, `build_ancestor_matrix`, and `tree_accept`.
+- `test_tree_semantics.py`: standalone unittest suite, no pytest dependency.
+- `fixtures/tree_topk_smoke.json` and `fixtures/tree_topk_smoke.out.json`: deterministic tree builder fixture.
+
+Inert conversion-planning artifacts:
+- `plan_gguf_conversion.py`: validates the manifest/tensor map against the expected Qwen3.6 JetSpec draft-head schema and emits a dry-run GGUF conversion plan.
+- `conversion_plans/JetSpec_jetspec-Qwen3.6-35B-A3B_gguf_plan.json`: pass-status plan, 25 provisional metadata entries, 91 tensor entries, 947,990,528 byte tensor payload floor.
+- `convert_jetspec_head_to_gguf.py`: stdlib-only experimental writer. Default mode is inspect-only; `--write-metadata-only` emits a zero-tensor GGUF preview; raw BF16 tensor payload writing requires `--write-tensor-payload --safetensors PATH --experimental-write-tensor-payload`.
+- `bf16_payload_parity.py`: P2 synthetic/local BF16 payload parity fixture. It validates all 91 tensor names, dtypes, shapes, source offsets, GGUF tensor-info offsets, and the `raw_bf16_no_transform` copy policy without downloading or copying the full payload.
+- `test_bf16_payload_parity.py`: unittest for the P2 parity fixture, expected smoke output, sparse converter-header validation, and fail-closed missing/wrong tensor metadata.
+- `fixtures/bf16_payload_parity_smoke.json` and `fixtures/bf16_payload_parity_smoke.out.json`: deterministic P2 payload-contract smoke fixture.
+
+Inert loader-contract artifacts:
+- `jetspec_loader_contract.md`: future loader acceptance/rejection contract for `jetspec_qwen3_draft_head`, target hidden taps, shared embeddings, shared lm_head, and tensor-info requirements.
+- `parse_gguf_preview.py`: stdlib-only GGUF v3 metadata/tensor-info parser plus JetSpec loader-contract validator.
+- `draft_head_loader_prototype.py`: P1 standalone loader/parser prototype. It consumes the metadata-only preview, maps GGUF keys into `draft_head_metadata`-shaped JSON, and fails closed for runtime preparation unless explicit preview-runtime inspection is requested; previews still keep `runtime_supported=false`.
+- `test_gguf_preview.py`: unittest that writes a temporary metadata-only GGUF preview, parses it, and verifies fail-closed loader metadata checks.
+- `test_draft_head_loader_prototype.py`: unittest for P1 metadata mapping, duplicate target-layer rejection, preview runtime gate failure, and `runtime_supported=false` preservation.
+
+Inert target-hidden tap artifacts:
+- `jetspec_target_hidden_taps.md`: future target-side hidden tap contract. Taps are post-layer outputs equivalent to HF `hidden_states[layer_id + 1]`, concatenated in `target_layer_ids` order, with normal greedy output kept unchanged.
+- `target_hidden_taps.py`: stdlib fixture helper for tap spec validation, block input IDs, immutable tap capture, HF `hidden_states[layer_id + 1]` extraction, and A/B parity checks proving capture is side-channel only.
+- `test_target_hidden_taps.py`: unittest for plan-derived Qwen3.6 dimensions, deterministic fixture output, fail-closed missing/wrong-width layers, immutable side-channel capture, HF hidden-state index mapping, target mismatch rejection, and greedy logits/output parity.
+- `fixtures/target_hidden_taps_smoke.json` and `fixtures/target_hidden_taps_smoke.out.json`: small deterministic tap-order fixture.
+- `fixtures/target_hidden_tap_parity_smoke.json` and `fixtures/target_hidden_tap_parity_smoke.out.json`: compact P3 A/B parity fixture for width `10240`, concat order `[1, 10, 19, 28, 37]`, side-channel-only capture, and unchanged greedy output.
+
+Inert committed-hidden-cache artifacts:
+- `jetspec_hidden_cache_contract.md`: future commit/rollback contract. Before verify, hidden/KV trail committed by one anchor; after verify, append hidden rows for `[root | accepted nodes]`, append committed tokens `[accepted draft tokens | correction]`, and discard rejected branch rows.
+- `committed_hidden_cache.py`: stdlib model of accepted hidden-row append, correction-token no-hidden rule, rejected-row discard, and length invariants.
+- `test_committed_hidden_cache.py`: unittest for smoke fixture, zero-accept rounds, `tree_accept` integration, fail-closed invariants, and immutable copies.
+- `fixtures/committed_hidden_cache_smoke.json` and `fixtures/committed_hidden_cache_smoke.out.json`: deterministic accepted path plus rejected sentinel rows.
+
+Inert tree-verify-mask artifacts:
+- `jetspec_tree_verify_mask.md`: future verify attention-mask contract. Prefix keys are visible to every tree query; tree keys are filtered by ancestor matrix; siblings, descendants, and rejected branch nodes are isolated.
+- `tree_verify_mask.py`: stdlib helper for dense verify masks, `qq_bias`, bucket padding, and sibling-isolation checks.
+- `test_tree_verify_mask.py`: unittest for prefix visibility, ancestor-only tree visibility, sibling/rejected-branch isolation, additive bias, and bucket pad semantics.
+- `fixtures/tree_verify_mask_smoke.json` and `fixtures/tree_verify_mask_smoke.out.json`: deterministic two-branch tree mask fixture.
+
+Inert round-contract artifacts:
+- `jetspec_round_contract.md`: composed single-round contract tying tree build, verify mask, greedy accept, hidden-cache commit, rollback, and baseline greedy-output parity.
+- `jetspec_round_contract.py`: stdlib helper that evaluates the composed round and fails if rejected sentinels leak into committed hidden cache, accepted-path queries can attend rejected nodes, or committed tokens diverge from the baseline greedy target path.
+- `test_jetspec_round_contract.py`: unittest for deterministic output, invariant wiring, expected-accept mismatch, sentinel leakage, pre-round trail invariant, accepted-path isolation, and baseline greedy mismatch.
+- `fixtures/jetspec_round_smoke.json` and `fixtures/jetspec_round_smoke.out.json`: deterministic end-to-end round fixture.
+- `fixtures/jetspec_round_parity_smoke.json` and `fixtures/jetspec_round_parity_smoke.out.json`: P4 composed tree verify + rollback parity fixture proving `[accepted draft tokens | correction]` equals the deterministic baseline greedy output and rejected branch hidden rows remain unreachable.
+
+Inert runtime-state artifacts:
+- `jetspec_runtime_contract.hpp`: declaration-only C++ planning header for future draft-head metadata, tensor info, target bindings, hidden cache state, verify plan, commit plan, and round state. It stays under `experiments/jetspec/` and must not be included by production sources.
+- `jetspec_runtime_state_contract.md`: companion spec for the future C++ data boundaries and fail-closed runtime phases/failures.
+- `validate_runtime_contract.py`: stdlib text validator for header constants, required enums/structs, local-only includes, and forbidden production references.
+- `test_runtime_contract.py`: unittest for the inert runtime header contract and constants.
+
+Promotion-governance artifacts:
+- `jetspec_promotion_checklist.md`: promotion checklist / ADR defining P0-P6 gates, the approved P5A/P5B/P5C/P5D/P5E/P5F hook sets, still-forbidden tree-runtime paths, evidence requirements, fail-closed blockers, and next allowed work.
+- `jetspec_p5_default_off_plan.md`: proposed P5 ADR/story pack for a default-off production-path candidate. It names P5A/P5B/P5C file boundaries, feature gates, preview rejection, no-default-behavior-change proof, verification matrix, rollback, and explicitly did not itself approve production edits.
+- `jetspec_p5a_loader_candidate.md`: approved P5A evidence note for the validation-only production hooks and preview-load fail-closed proof.
+- `jetspec_p5b_target_taps_candidate.md`: approved P5B evidence note for the private target-hidden tap hook set, fixed layout, source guard, and blocked P5C work.
+- `validate_promotion_checklist.py`: stdlib text validator for checklist sections, path policies, phase order, and required evidence tokens.
+- `validate_p5_plan.py`: stdlib text validator for the inert P5 default-off candidate plan and approval gate.
+- `validate_p5a_loader_candidate.py`: stdlib source validator for the approved P5A production hooks, fail-closed env gates, BF16/0-or-91 tensor inventory checks, no graph construction, no P5C speculative type, and no explicit CMake wiring.
+- `validate_p5b_target_taps.py`: stdlib source validator for the approved P5B private target-hidden tap hooks, fixed layer order, graph-reuse guard, no public API/server route, approved downstream connector only, and no explicit CMake wiring.
+- `jetspec_p5c_speculative_type_candidate.md`: approved P5C evidence note for the explicit `draft-jetspec` type, fail-closed gates, no-draft placeholder, and blocked runtime work.
+- `validate_p5c_speculative_type.py`: stdlib source validator for the approved P5C enum/parser/docs hooks, experimental gate, no silent fallback, no public/server/CMake route, and no executable runtime.
+- `test_p5c_speculative_type.py`: unittest for the P5C source validator.
+- `jetspec_p5d_target_tap_ingestion_candidate.md`: approved P5D evidence note for explicit-route target tap ingestion, trace hashing, no-draft behavior, and blocked tree-runtime work.
+- `validate_p5d_target_tap_ingestion.py`: stdlib source validator for the P5D tap ingestion buffer, masked row count, hash, fail-closed disable path, no public/server/CMake route, and no draft graph execution.
+- `test_p5d_target_tap_ingestion.py`: unittest for the P5D source validator.
+- `jetspec_p5e_runtime_state_candidate.md`: approved P5E evidence note for private runtime-state bookkeeping, failure state, row metadata, state trace, no-draft behavior, and blocked tree-runtime work.
+- `validate_p5e_runtime_state.py`: stdlib source validator for the P5E runtime-state fields, fail-closed disable path, no public/server/CMake route, and no draft graph execution.
+- `test_p5e_runtime_state.py`: unittest for the P5E source validator.
+- `jetspec_p5f_binding_preflight_candidate.md`: approved P5F evidence note for private draft-head/target binding preflight, shape/metadata checks, no-draft behavior, and blocked tree-runtime work.
+- `validate_p5f_binding_preflight.py`: stdlib source validator for the P5F preflight checks, fail-closed disable path, no public/server/CMake route, and no draft graph execution.
+- `test_p5f_binding_preflight.py`: unittest for the P5F source validator.
+- `validate_p5f_artifact_binding.py`: stdlib artifact validator for the stored real JetSpec draft-head manifest/tensor map/conversion plan versus P5F source constants. It upgrades P5F evidence from source-only to artifact-verified while still reporting no live `llama_context` execution.
+- `test_p5f_artifact_binding.py`: unittest for artifact/source constant agreement, `fc.weight` target-tap width evidence, and the explicit `runtime_executed=false` boundary.
+- `probe_p5f_loader_gate.py`: stdlib probe plus optional live `llama-cli` invocation for the metadata-only loader gate. It verifies `preview_not_allowed` by default and `unsupported_runtime` with `LLAMA_JETSPEC_ALLOW_PREVIEW_LOAD=1`, so P5F live preflight remains blocked by design.
+- `test_p5f_loader_gate_probe.py`: unittest for preview generation and the documented absence of `common_speculative_jetspec_preflight` execution.
+- `jetspec_p5g_tree_runtime_readiness.md`: inert P5G evidence note for tree-runtime readiness contracts while production tree runtime remains blocked.
+- `validate_p5g_tree_runtime_readiness.py`: stdlib validator for P5G readiness source, fixture, CMake isolation, and forbidden production path boundary.
+- `test_p5g_tree_runtime_readiness.py`: unittest for the P5G readiness evaluator and validator.
+- `jetspec_p5h_kv_commit_readiness.md`: inert P5H evidence note for KV/hidden commit ownership readiness while production tree runtime remains blocked.
+- `validate_p5h_kv_commit_readiness.py`: stdlib validator for P5H readiness source, fixture, CMake isolation, and forbidden production path boundary.
+- `test_p5h_kv_commit_readiness.py`: unittest for the P5H readiness evaluator and validator.
+- `jetspec_p5i_tree_runtime_approval_packet.md`: inert P5I evidence note for the tree-runtime approval packet while production tree runtime remains blocked.
+- `validate_p5i_tree_runtime_approval_packet.py`: stdlib validator for P5I approval-packet source, fixture, CMake isolation, and forbidden production path boundary.
+- `test_p5i_tree_runtime_approval_packet.py`: unittest for the P5I approval matrix evaluator and validator.
+- `jetspec_p5j_kv_primitive_audit.md`: inert P5J evidence note for the KV/runtime primitive audit while production tree runtime remains blocked.
+- `validate_p5j_kv_primitive_audit.py`: stdlib validator for P5J audit source, fixture, CMake isolation, and forbidden production path boundary.
+- `test_p5j_kv_primitive_audit.py`: unittest for the P5J audit evaluator and validator.
+- `jetspec_p5k_kv_ownership_primitive_design.md`: inert P5K evidence note for KV ownership primitive design while production tree runtime remains blocked.
+- `validate_p5k_kv_ownership_primitive_design.py`: stdlib validator for P5K design source, fixture, CMake isolation, and forbidden production path boundary.
+- `test_p5k_kv_ownership_primitive_design.py`: unittest for the P5K design evaluator and validator.
+- `jetspec_p5l_page_map_ownership_oracle.md`: inert P5L evidence note for the page-map ownership oracle while production tree runtime remains blocked.
+- `validate_p5l_page_map_ownership_oracle.py`: stdlib validator for P5L oracle source, fixture, CMake isolation, and forbidden production path boundary.
+- `test_p5l_page_map_ownership_oracle.py`: unittest for the P5L oracle evaluator and validator.
+- `jetspec_p5m_transaction_plan_oracle.md`: inert P5M evidence note for the transaction/failpoint plan oracle while production tree runtime remains blocked.
+- `validate_p5m_transaction_plan_oracle.py`: stdlib validator for P5M transaction source, fixture, CMake isolation, and forbidden production path boundary.
+- `test_p5m_transaction_plan_oracle.py`: unittest for the P5M transaction evaluator and validator.
+- `jetspec_p5n_transaction_scaffold_candidate.md`: approved P5N evidence note for the production transaction-plan scaffold while draft-token emission remains blocked.
+- `validate_p5n_transaction_scaffold.py`: stdlib validator for the P5N source slice and no-runtime boundary.
+- `test_p5n_transaction_scaffold.py`: unittest for the P5N source validator.
+- `jetspec_p5o_pre_round_snapshot_candidate.md`: approved P5O evidence note for the production pre-round snapshot descriptor while reserve/tree/verify/KV/publish/draft work remains blocked.
+- `validate_p5o_pre_round_snapshot.py`: stdlib validator for the P5O source slice and no-next-phase boundary.
+- `test_p5o_pre_round_snapshot.py`: unittest for the P5O source validator.
+- `jetspec_p5p_transient_reservation_descriptor_candidate.md`: approved P5P evidence note for the production transient-reservation descriptor while real reservation/KV/tree/verify/publish/draft work remains blocked.
+- `validate_p5p_transient_reservation_descriptor.py`: stdlib validator for the P5P source slice and no-real-reservation boundary.
+- `test_p5p_transient_reservation_descriptor.py`: unittest for the P5P source validator.
+- `jetspec_p5q_tree_build_descriptor_candidate.md`: approved P5Q evidence note for the production tree-build descriptor while real tree/verify/accept/KV/publish/draft work remains blocked.
+- `validate_p5q_tree_build_descriptor.py`: stdlib validator for the P5Q source slice and no-real-tree-build boundary.
+- `test_p5q_tree_build_descriptor.py`: unittest for the P5Q source validator.
+- `test_promotion_checklist.py`: unittest for the promotion checklist and hard boundary.
+- `test_p5_plan.py`: unittest for P5 default-off gates, preview rejection, candidate file boundaries, verification matrix, and non-approval status.
+- `test_p5a_loader_candidate.py`: unittest for the P5A production-source validator.
+- `test_p5b_target_taps.py`: unittest for the P5B production-source validator.
+
+Aggregate-verification artifact:
+- `run_all_jetspec_contracts.py`: one-command local gate for every staged unit test, fixture validator, GGUF planner/writer/parser self-test, standalone loader prototype self-test, BF16 payload parity fixture/self-test, target-hidden tap parity fixture, tree verify/rollback parity fixture, runtime header validator, P5 plan validator, P5A loader candidate validator, P5B target hidden taps validator, P5C speculative type validator, P5D target tap ingestion validator, P5E runtime state validator, P5F binding preflight validator, P5F artifact binding validator, P5F loader gate probe, P5G tree-runtime readiness fixture/validator, P5H KV commit readiness fixture/validator, P5I tree-runtime approval matrix/validator, P5J KV primitive audit fixture/validator, P5K KV ownership primitive design fixture/validator, P5L page-map ownership oracle fixture/validator, P5M transaction plan oracle fixture/validator, P5N transaction scaffold validator, P5O pre-round snapshot validator, P5P transient-reservation descriptor validator, P5Q tree-build descriptor validator, promotion checklist validator, py_compile, and CMake isolation scan.
+
+Upstream source references:
+- `jetspec/inference_engine/engine.py:592` `generate_tree()`
+- `jetspec/tree/_core/base.py:18` `DraftTree`
+- `jetspec/tree/_core/ancestor.py:34` `build_ancestor_matrix()`
+- `jetspec/tree/_core/accept.py:73` `gpu_tree_accept()`, `:144` `tree_accept()`
+- `jetspec/tree/baselines/accum_logp.py:43` `AccumLogP`
+- `jetspec/inference_engine/paged_kv_cache.py:363` `reserve_tree_slots()`, `:514` `gather()`
+- `jetspec/inference_engine/paged_tree_attn.py:275` `paged_tree_attn()`
+- `jetspec/draft_head_adapter.py:164` `DraftHeadTreeDrafter`

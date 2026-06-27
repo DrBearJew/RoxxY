@@ -282,6 +282,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_qwen35_mtp(params);
         case LLM_ARCH_QWEN35MOE_MTP:
             return new llama_model_qwen35moe_mtp(params);
+        case LLM_ARCH_JETSPEC_QWEN3_DRAFT_HEAD:
+            return new llama_model_jetspec_qwen3_draft_head(params);
         case LLM_ARCH_MISTRAL3:
             return new llama_model_mistral3(params);
         case LLM_ARCH_MIMO2:
@@ -2304,6 +2306,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_ERNIE4_5_MOE:
         case LLM_ARCH_MISTRAL3:
         case LLM_ARCH_MISTRAL4:
+        case LLM_ARCH_JETSPEC_QWEN3_DRAFT_HEAD:
         case LLM_ARCH_LLAMA_EMBED:
         case LLM_ARCH_MAINCODER:
         case LLM_ARCH_GLM_DSA:

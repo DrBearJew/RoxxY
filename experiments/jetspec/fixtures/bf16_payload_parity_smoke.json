@@ -1,0 +1,19 @@
+{
+  "mode": "synthetic_header_from_plan",
+  "plan": "conversion_plans/JetSpec_jetspec-Qwen3.6-35B-A3B_gguf_plan.json",
+  "expected": {
+    "ok": true,
+    "payload_contract.tensor_count": 91,
+    "payload_contract.expected_tensor_count": 91,
+    "payload_contract.payload_bytes": 947990528,
+    "payload_contract.expected_payload_bytes": 947990528,
+    "payload_contract.dtype": "BF16",
+    "payload_contract.ggml_type": 30,
+    "payload_contract.copy_policy": "raw_bf16_no_transform",
+    "payload_contract.quantization": "none",
+    "payload_contract.packing": "none",
+    "payload_contract.dtype_conversion": "none",
+    "payload_contract.offsets_match_safetensors_header": true,
+    "payload_contract.gguf_offsets_monotonic": true
+  }
+}

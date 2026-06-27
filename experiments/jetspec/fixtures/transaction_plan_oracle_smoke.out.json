@@ -1,0 +1,630 @@
+{
+  "approval_status": "blocked_pending_explicit_approval",
+  "candidate_primitives": [
+    {
+      "claims_performance": false,
+      "claims_promotion": false,
+      "implementation_approved": false,
+      "name": "llama_kv_cache_jetspec_validate_page_ownership_oracle_candidate",
+      "runtime_executed_now": false,
+      "source_backing": [
+        "P5L page-map ownership oracle"
+      ],
+      "status": "design_only_missing_implementation",
+      "touches_production_now": false
+    },
+    {
+      "claims_performance": false,
+      "claims_promotion": false,
+      "implementation_approved": false,
+      "name": "llama_kv_cache_jetspec_reserve_transient_tree_pages_candidate",
+      "runtime_executed_now": false,
+      "source_backing": [
+        "P5L page-map ownership oracle",
+        "P5K KV ownership primitive design"
+      ],
+      "status": "design_only_missing_implementation",
+      "touches_production_now": false
+    },
+    {
+      "claims_performance": false,
+      "claims_promotion": false,
+      "implementation_approved": false,
+      "name": "llama_kv_cache_jetspec_commit_page_survivor_path_candidate",
+      "runtime_executed_now": false,
+      "source_backing": [
+        "P5H KV/hidden commit readiness",
+        "P5L page-map ownership oracle"
+      ],
+      "status": "design_only_missing_implementation",
+      "touches_production_now": false
+    },
+    {
+      "claims_performance": false,
+      "claims_promotion": false,
+      "implementation_approved": false,
+      "name": "llama_kv_cache_jetspec_discard_rejected_tree_pages_candidate",
+      "runtime_executed_now": false,
+      "source_backing": [
+        "P5H KV/hidden commit readiness",
+        "P5L page-map ownership oracle"
+      ],
+      "status": "design_only_missing_implementation",
+      "touches_production_now": false
+    },
+    {
+      "claims_performance": false,
+      "claims_promotion": false,
+      "implementation_approved": false,
+      "name": "llama_kv_cache_jetspec_rollback_tree_transaction_candidate",
+      "runtime_executed_now": false,
+      "source_backing": [
+        "P5I tree-runtime approval packet",
+        "P5M transaction failpoint oracle"
+      ],
+      "status": "design_only_missing_implementation",
+      "touches_production_now": false
+    }
+  ],
+  "coverage": {
+    "duplicate_mutable_physical_page_ownership": false,
+    "forbidden_implicit_helpers": [
+      "seq_cp",
+      "seq_rm",
+      "seq_import_physical"
+    ],
+    "forbidden_implicit_helpers_remain_non_exact": true,
+    "hidden_kv_survivors_are_root_plus_accepted": true,
+    "no_performance_or_promotion_claim": true,
+    "no_runtime_or_production_touch": true,
+    "other_sequence_pages_unchanged": true,
+    "post_publish_tokens_are_accepted_plus_correction": true,
+    "pre_publish_state_unmodified": true,
+    "rejected_branches_unreachable": true,
+    "required_candidate_primitives": [
+      "llama_kv_cache_jetspec_validate_page_ownership_oracle_candidate",
+      "llama_kv_cache_jetspec_reserve_transient_tree_pages_candidate",
+      "llama_kv_cache_jetspec_commit_page_survivor_path_candidate",
+      "llama_kv_cache_jetspec_discard_rejected_tree_pages_candidate",
+      "llama_kv_cache_jetspec_rollback_tree_transaction_candidate"
+    ],
+    "required_candidate_primitives_present": true,
+    "required_phases": [
+      "snapshot_pre_round",
+      "reserve_transient_tree_pages",
+      "build_tree",
+      "build_verify_mask",
+      "accept_path",
+      "commit_tokens",
+      "commit_hidden_kv_survivors",
+      "discard_rejected_branches",
+      "publish_post_commit_state"
+    ],
+    "required_phases_ordered": true,
+    "required_rollback_points": [
+      "after_reserve",
+      "after_build_tree",
+      "after_verify_mask",
+      "after_accept",
+      "after_token_commit",
+      "after_hidden_kv_commit",
+      "after_rejected_discard"
+    ],
+    "required_rollback_points_present": true,
+    "rollback_restores_pre_round_snapshot": true
+  },
+  "helper_mappings": [
+    {
+      "exact_existing_primitive_proven": false,
+      "helper": "seq_cp",
+      "implicit_mapping_allowed": false,
+      "reason": "seq_cp cannot silently become an ordered transaction commit",
+      "verdict": "audited_non_exact_helper"
+    },
+    {
+      "exact_existing_primitive_proven": false,
+      "helper": "seq_rm",
+      "implicit_mapping_allowed": false,
+      "reason": "seq_rm range removal cannot prove failpoint rollback or rejected branch discard",
+      "verdict": "audited_non_exact_helper"
+    },
+    {
+      "exact_existing_primitive_proven": false,
+      "helper": "seq_import_physical",
+      "implicit_mapping_allowed": false,
+      "reason": "seq_import_physical is not a JetSpec transaction publish/rollback primitive",
+      "verdict": "audited_non_exact_helper"
+    }
+  ],
+  "ok": true,
+  "page_ownership": {
+    "duplicate_mutable_physical_page_ownership": false,
+    "other_sequence_pages_after": [
+      50,
+      51
+    ],
+    "other_sequence_pages_before": [
+      50,
+      51
+    ],
+    "other_sequence_pages_unchanged": true,
+    "page_owners": [
+      {
+        "immutable_prefix_shared": false,
+        "physical_page": 10,
+        "role": "transient_root",
+        "seq_id": 0
+      },
+      {
+        "immutable_prefix_shared": false,
+        "physical_page": 11,
+        "role": "accepted_survivor",
+        "seq_id": 0
+      },
+      {
+        "immutable_prefix_shared": false,
+        "physical_page": 12,
+        "role": "accepted_survivor",
+        "seq_id": 0
+      },
+      {
+        "immutable_prefix_shared": false,
+        "physical_page": 13,
+        "role": "rejected_branch",
+        "seq_id": 0
+      },
+      {
+        "immutable_prefix_shared": false,
+        "physical_page": 14,
+        "role": "rejected_branch",
+        "seq_id": 0
+      },
+      {
+        "immutable_prefix_shared": false,
+        "physical_page": 50,
+        "role": "other_sequence",
+        "seq_id": 9
+      },
+      {
+        "immutable_prefix_shared": false,
+        "physical_page": 51,
+        "role": "other_sequence",
+        "seq_id": 9
+      }
+    ]
+  },
+  "post_publish_state": {
+    "committed_tokens": [
+      101,
+      102,
+      11,
+      22,
+      99
+    ],
+    "correction_hidden_deferred": true,
+    "hidden_kv_survivor_pages": [
+      10,
+      11,
+      12
+    ],
+    "other_sequence_pages": [
+      50,
+      51
+    ],
+    "rejected_pages_reachable": false
+  },
+  "pre_round_snapshot": {
+    "committed_tokens": [
+      101,
+      102
+    ],
+    "hidden_kv_pages": [
+      0,
+      1,
+      2
+    ],
+    "other_sequence_pages": [
+      50,
+      51
+    ]
+  },
+  "production_paths_touched": [],
+  "rollback_points": [
+    {
+      "after_phase": "reserve_transient_tree_pages",
+      "committed_tokens_after_rollback": [
+        101,
+        102
+      ],
+      "hidden_kv_pages_after_rollback": [
+        0,
+        1,
+        2
+      ],
+      "id": "after_reserve",
+      "other_sequence_pages_after_rollback": [
+        50,
+        51
+      ],
+      "partial_publish_visible": false,
+      "rejected_pages_reachable": false,
+      "restores_pre_round_snapshot": true
+    },
+    {
+      "after_phase": "build_tree",
+      "committed_tokens_after_rollback": [
+        101,
+        102
+      ],
+      "hidden_kv_pages_after_rollback": [
+        0,
+        1,
+        2
+      ],
+      "id": "after_build_tree",
+      "other_sequence_pages_after_rollback": [
+        50,
+        51
+      ],
+      "partial_publish_visible": false,
+      "rejected_pages_reachable": false,
+      "restores_pre_round_snapshot": true
+    },
+    {
+      "after_phase": "build_verify_mask",
+      "committed_tokens_after_rollback": [
+        101,
+        102
+      ],
+      "hidden_kv_pages_after_rollback": [
+        0,
+        1,
+        2
+      ],
+      "id": "after_verify_mask",
+      "other_sequence_pages_after_rollback": [
+        50,
+        51
+      ],
+      "partial_publish_visible": false,
+      "rejected_pages_reachable": false,
+      "restores_pre_round_snapshot": true
+    },
+    {
+      "after_phase": "accept_path",
+      "committed_tokens_after_rollback": [
+        101,
+        102
+      ],
+      "hidden_kv_pages_after_rollback": [
+        0,
+        1,
+        2
+      ],
+      "id": "after_accept",
+      "other_sequence_pages_after_rollback": [
+        50,
+        51
+      ],
+      "partial_publish_visible": false,
+      "rejected_pages_reachable": false,
+      "restores_pre_round_snapshot": true
+    },
+    {
+      "after_phase": "commit_tokens",
+      "committed_tokens_after_rollback": [
+        101,
+        102
+      ],
+      "hidden_kv_pages_after_rollback": [
+        0,
+        1,
+        2
+      ],
+      "id": "after_token_commit",
+      "other_sequence_pages_after_rollback": [
+        50,
+        51
+      ],
+      "partial_publish_visible": false,
+      "rejected_pages_reachable": false,
+      "restores_pre_round_snapshot": true
+    },
+    {
+      "after_phase": "commit_hidden_kv_survivors",
+      "committed_tokens_after_rollback": [
+        101,
+        102
+      ],
+      "hidden_kv_pages_after_rollback": [
+        0,
+        1,
+        2
+      ],
+      "id": "after_hidden_kv_commit",
+      "other_sequence_pages_after_rollback": [
+        50,
+        51
+      ],
+      "partial_publish_visible": false,
+      "rejected_pages_reachable": false,
+      "restores_pre_round_snapshot": true
+    },
+    {
+      "after_phase": "discard_rejected_branches",
+      "committed_tokens_after_rollback": [
+        101,
+        102
+      ],
+      "hidden_kv_pages_after_rollback": [
+        0,
+        1,
+        2
+      ],
+      "id": "after_rejected_discard",
+      "other_sequence_pages_after_rollback": [
+        50,
+        51
+      ],
+      "partial_publish_visible": false,
+      "rejected_pages_reachable": false,
+      "restores_pre_round_snapshot": true
+    }
+  ],
+  "round_inputs": {
+    "accepted_path": [
+      0,
+      1,
+      4
+    ],
+    "accepted_survivor_pages": [
+      10,
+      11,
+      12
+    ],
+    "accepted_tokens_excluding_root": [
+      11,
+      22
+    ],
+    "committed_token_suffix": [
+      11,
+      22,
+      99
+    ],
+    "correction_token": 99,
+    "past_len": 80,
+    "rejected_node_ids": [
+      2,
+      3
+    ],
+    "rejected_pages": [
+      13,
+      14
+    ],
+    "root_node_id": 0,
+    "tree_nodes": [
+      {
+        "id": 0,
+        "parent": null,
+        "physical_page": 10,
+        "role": "root",
+        "seq_id": 0,
+        "token": 10
+      },
+      {
+        "id": 1,
+        "parent": 0,
+        "physical_page": 11,
+        "role": "accepted_survivor",
+        "seq_id": 0,
+        "token": 11
+      },
+      {
+        "id": 2,
+        "parent": 0,
+        "physical_page": 13,
+        "role": "rejected_branch",
+        "seq_id": 0,
+        "token": 12
+      },
+      {
+        "id": 3,
+        "parent": 2,
+        "physical_page": 14,
+        "role": "rejected_branch",
+        "seq_id": 0,
+        "token": 13
+      },
+      {
+        "id": 4,
+        "parent": 1,
+        "physical_page": 12,
+        "role": "accepted_survivor",
+        "seq_id": 0,
+        "token": 22
+      }
+    ]
+  },
+  "runtime_boundary": {
+    "draft_head_graph_executed": false,
+    "draft_tokens_emitted": false,
+    "llama_context_created": false,
+    "no_runtime_execution": true,
+    "performance_claimed": false,
+    "promotion_claimed": false,
+    "real_kv_mutated": false,
+    "runtime_supported": false,
+    "server_route_added": false,
+    "transaction_plan_oracle_only": true
+  },
+  "scope": "experiments/jetspec only",
+  "source_backing": [
+    "P5G tree-runtime readiness",
+    "P5H KV/hidden commit readiness",
+    "P5I tree-runtime approval packet",
+    "P5K KV ownership primitive design",
+    "P5L page-map ownership oracle"
+  ],
+  "status": "transaction_plan_oracle_verified_not_executed",
+  "transaction_phases": [
+    {
+      "claims_performance": false,
+      "claims_promotion": false,
+      "id": "snapshot_pre_round",
+      "implementation_approved": false,
+      "order": 0,
+      "pre_publish_visible_state_unmodified": true,
+      "publishes_visible_state": false,
+      "requires_after": [],
+      "runtime_executed_now": false,
+      "status": "planned_not_executed",
+      "touches_production_now": false
+    },
+    {
+      "claims_performance": false,
+      "claims_promotion": false,
+      "id": "reserve_transient_tree_pages",
+      "implementation_approved": false,
+      "order": 1,
+      "pre_publish_visible_state_unmodified": true,
+      "publishes_visible_state": false,
+      "requires_after": [
+        "snapshot_pre_round"
+      ],
+      "runtime_executed_now": false,
+      "status": "planned_not_executed",
+      "touches_production_now": false
+    },
+    {
+      "claims_performance": false,
+      "claims_promotion": false,
+      "id": "build_tree",
+      "implementation_approved": false,
+      "order": 2,
+      "pre_publish_visible_state_unmodified": true,
+      "publishes_visible_state": false,
+      "requires_after": [
+        "reserve_transient_tree_pages"
+      ],
+      "runtime_executed_now": false,
+      "status": "planned_not_executed",
+      "touches_production_now": false
+    },
+    {
+      "claims_performance": false,
+      "claims_promotion": false,
+      "id": "build_verify_mask",
+      "implementation_approved": false,
+      "order": 3,
+      "pre_publish_visible_state_unmodified": true,
+      "publishes_visible_state": false,
+      "requires_after": [
+        "build_tree"
+      ],
+      "runtime_executed_now": false,
+      "status": "planned_not_executed",
+      "touches_production_now": false
+    },
+    {
+      "claims_performance": false,
+      "claims_promotion": false,
+      "id": "accept_path",
+      "implementation_approved": false,
+      "order": 4,
+      "pre_publish_visible_state_unmodified": true,
+      "publishes_visible_state": false,
+      "requires_after": [
+        "build_verify_mask"
+      ],
+      "runtime_executed_now": false,
+      "status": "planned_not_executed",
+      "touches_production_now": false
+    },
+    {
+      "claims_performance": false,
+      "claims_promotion": false,
+      "committed_token_suffix": [
+        11,
+        22,
+        99
+      ],
+      "id": "commit_tokens",
+      "implementation_approved": false,
+      "order": 5,
+      "pre_publish_visible_state_unmodified": true,
+      "publishes_visible_state": false,
+      "requires_after": [
+        "accept_path"
+      ],
+      "runtime_executed_now": false,
+      "status": "planned_not_executed",
+      "touches_production_now": false
+    },
+    {
+      "claims_performance": false,
+      "claims_promotion": false,
+      "correction_hidden_deferred": true,
+      "id": "commit_hidden_kv_survivors",
+      "implementation_approved": false,
+      "order": 6,
+      "pre_publish_visible_state_unmodified": true,
+      "publishes_visible_state": false,
+      "requires_after": [
+        "reserve_transient_tree_pages",
+        "accept_path"
+      ],
+      "runtime_executed_now": false,
+      "status": "planned_not_executed",
+      "survivor_pages": [
+        10,
+        11,
+        12
+      ],
+      "touches_production_now": false
+    },
+    {
+      "claims_performance": false,
+      "claims_promotion": false,
+      "discarded_pages": [
+        13,
+        14
+      ],
+      "id": "discard_rejected_branches",
+      "implementation_approved": false,
+      "order": 7,
+      "pre_publish_visible_state_unmodified": true,
+      "publishes_visible_state": false,
+      "rejected_pages_reachable_after_discard": false,
+      "requires_after": [
+        "commit_hidden_kv_survivors"
+      ],
+      "runtime_executed_now": false,
+      "status": "planned_not_executed",
+      "touches_production_now": false
+    },
+    {
+      "claims_performance": false,
+      "claims_promotion": false,
+      "id": "publish_post_commit_state",
+      "implementation_approved": false,
+      "order": 8,
+      "pre_publish_visible_state_unmodified": false,
+      "publishes_visible_state": true,
+      "requires_after": [
+        "commit_tokens",
+        "commit_hidden_kv_survivors",
+        "discard_rejected_branches"
+      ],
+      "runtime_executed_now": false,
+      "status": "planned_not_executed",
+      "touches_production_now": false
+    }
+  ],
+  "visibility_rules": {
+    "no_committed_token_visibility_before_publish": true,
+    "no_hidden_kv_visibility_before_publish": true,
+    "no_page_map_visibility_before_publish": true,
+    "publish_after_commit_and_discard_only": true,
+    "rollback_clears_transient_state": true
+  }
+}

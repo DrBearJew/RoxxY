@@ -13,15 +13,17 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, struct ggml_t
 void ggml_cuda_op_pack_v4_k16d16(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst);
 void ggml_cuda_op_pack_v4_k16d16_144(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst);
 
-static constexpr int GGML_CUDA_PACKED16_K_LAYOUT_UNKNOWN    = -1;
-static constexpr int GGML_CUDA_PACKED16_K_LAYOUT_ROW        = 0;
-static constexpr int GGML_CUDA_PACKED16_K_LAYOUT_D16_PLANAR = 1;
+static constexpr int GGML_CUDA_PACKED16_K_LAYOUT_UNKNOWN      = -1;
+static constexpr int GGML_CUDA_PACKED16_K_LAYOUT_ROW          = 0;
+static constexpr int GGML_CUDA_PACKED16_K_LAYOUT_D16_PLANAR   = 1;
+static constexpr int GGML_CUDA_PACKED16_K_LAYOUT_PAGE16_D16   = 2;
 
 static constexpr uint32_t GGML_CUDA_PACKED16_K_FORMAT_VERSION = 1;
 static constexpr uint32_t GGML_CUDA_PDMQ_K_FORMAT_VERSION = 2;
-static constexpr int GGML_CUDA_PACKED16_K_SCALE_LAYOUT_UNKNOWN       = -1;
-static constexpr int GGML_CUDA_PACKED16_K_SCALE_LAYOUT_ROW           = 0;
-static constexpr int GGML_CUDA_PACKED16_K_SCALE_LAYOUT_QBLOCK_PLANAR = 1;
+static constexpr int GGML_CUDA_PACKED16_K_SCALE_LAYOUT_UNKNOWN         = -1;
+static constexpr int GGML_CUDA_PACKED16_K_SCALE_LAYOUT_ROW             = 0;
+static constexpr int GGML_CUDA_PACKED16_K_SCALE_LAYOUT_QBLOCK_PLANAR   = 1;
+static constexpr int GGML_CUDA_PACKED16_K_SCALE_LAYOUT_PAGE16_QBLOCK   = 2;
 
 enum ggml_cuda_pdmq_k_format : uint8_t {
     GGML_CUDA_PDMQ_K_FORMAT_NONE             = 0,
@@ -68,6 +70,7 @@ static inline uint32_t ggml_cuda_pdmq_k_payload_words_per_token(const int format
 static constexpr uint32_t GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_VERSION = 1;
 static constexpr uint32_t GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES = 4;
 static constexpr uint32_t GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_SCRATCH_OVERLAY = 1u << 0;
+static constexpr uint32_t GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_OWNED_TAIL_WRITE = 1u << 1;
 
 struct ggml_cuda_mtp_qblock_tail_page_map_v1 {
     uint32_t version = 0;
@@ -80,6 +83,28 @@ struct ggml_cuda_mtp_qblock_tail_page_map_v1 {
     uint32_t physical_pages = 0;
     uint32_t block_table_pages = 0;
     int32_t block_table[GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES] = {};
+    uint64_t generation = 0;
+};
+#endif
+#ifndef GGML_CUDA_MTP_QBLOCK_FULL_PAGE_MAP_V1_DEFINED
+#define GGML_CUDA_MTP_QBLOCK_FULL_PAGE_MAP_V1_DEFINED
+static constexpr uint32_t GGML_CUDA_MTP_QBLOCK_FULL_PAGE_MAP_VERSION = 1;
+static constexpr uint32_t GGML_CUDA_MTP_QBLOCK_FULL_PAGE_MAP_FLAG_IDENTITY = 1u << 0;
+static constexpr uint32_t GGML_CUDA_MTP_QBLOCK_FULL_PAGE_MAP_FLAG_OWNED_TAIL_OVERLAY = 1u << 1;
+struct ggml_cuda_mtp_qblock_full_page_map_v1 {
+    uint32_t version = 0;
+    uint32_t abi_bytes = 0;
+    uint32_t active = 0;
+    uint32_t flags = 0;
+    uint32_t logical_base_token = 0;
+    uint32_t valid_tokens = 0;
+    uint32_t page_tokens = 0;
+    uint32_t physical_pages = 0;
+    uint32_t block_table_pages = 0;
+    uint32_t non_identity_page_begin = 0;
+    uint32_t non_identity_page_end = 0;
+    const int32_t * block_table = nullptr;
+    int32_t debug_first_pages[4] = {};
     uint64_t generation = 0;
 };
 #endif
@@ -139,14 +164,19 @@ void llama_kv_cache_register_mtp_qblock_tail_page_map(const void * k_view_data, 
 void llama_kv_cache_clear_mtp_qblock_tail_page_map(const void * k_view_data);
 void llama_kv_cache_get_mtp_qblock_tail_page_map(const void * k_view_data, struct ggml_cuda_mtp_qblock_tail_page_map_v1 * map);
 bool llama_kv_cache_get_mtp_qblock_tail_page_published_map(struct ggml_cuda_mtp_qblock_tail_page_map_v1 * map);
+void llama_kv_cache_register_mtp_qblock_full_page_map_host(const void * k_view_data, const struct ggml_cuda_mtp_qblock_full_page_map_v1 * map, const int32_t * host_block_table);
+void llama_kv_cache_clear_mtp_qblock_full_page_map(const void * k_view_data);
+void llama_kv_cache_get_mtp_qblock_full_page_map(const void * k_view_data, struct ggml_cuda_mtp_qblock_full_page_map_v1 * map);
 void llama_kv_cache_record_mtp_qblock_tail_page_dispatch_bind(const void * k_view_data, const struct ggml_cuda_mtp_qblock_tail_page_map_v1 * map, const char * node_name, int layer, int graph_inst, int nk);
 void llama_kv_cache_note_mtp_qblock_tail_page_pending_dispatch_bind(const struct ggml_cuda_mtp_qblock_tail_page_map_v1 * map, uint64_t req_begin, uint64_t req_end, int slot);
+void llama_kv_cache_note_mtp_qblock_tail_page_route_expected(const struct ggml_cuda_mtp_qblock_tail_page_map_v1 * map, uint32_t expected_layer_count);
 bool llama_kv_cache_get_mtp_qblock_tail_page_last_dispatch_bind(struct ggml_cuda_mtp_qblock_tail_page_dispatch_bind_v1 * out);
 void llama_kv_cache_record_mtp_qblock_tail_page_consumer_miss(uint32_t nk, const char * reason);
 uint32_t llama_kv_cache_get_mtp_qblock_tail_page_consumer_no_map_nk_max(void);
 void llama_kv_cache_reset_mtp_qblock_tail_page_lifecycle(bool data_invalidates);
 void llama_kv_cache_reset_mtp_qblock_tail_page_lifecycle_preserve_snapshot(bool data_invalidates, bool keep_producer_snapshot);
 bool llama_kv_cache_mtp_qblock_tail_page_published_scratch_map_covers(uint32_t logical_base, uint32_t n_tokens);
+bool llama_kv_cache_mtp_qblock_tail_page_published_owned_map_covers(uint32_t logical_base, uint32_t n_tokens, uint32_t * physical_page, struct ggml_cuda_mtp_qblock_tail_page_map_v1 * out_map);
 }
 
 static constexpr int GGML_CUDA_PACKED16_K_TILE_D = 256;
@@ -154,10 +184,16 @@ static constexpr int GGML_CUDA_PACKED16_K_WORDS = GGML_CUDA_PACKED16_K_TILE_D / 
 static constexpr int GGML_CUDA_PACKED16_K_QBLOCKS = GGML_CUDA_PACKED16_K_TILE_D / QK8_0;
 static constexpr int GGML_CUDA_PACKED16_K_D16 = 16;
 static constexpr int GGML_CUDA_PACKED16_K_WORDS_PER_D16 = GGML_CUDA_PACKED16_K_D16 / 4;
+static constexpr int GGML_CUDA_PACKED16_K_PAGE16_TOKENS = 16;
+static constexpr int GGML_CUDA_PACKED16_K_WORDS_PER_PAGE16 = GGML_CUDA_PACKED16_K_PAGE16_TOKENS * GGML_CUDA_PACKED16_K_WORDS;
+static constexpr int GGML_CUDA_PACKED16_K_SCALE_PER_PAGE16 = GGML_CUDA_PACKED16_K_PAGE16_TOKENS * GGML_CUDA_PACKED16_K_QBLOCKS;
 
 static inline int ggml_cuda_packed16_k_layout_kind_from_env() {
     const char * layout = getenv("GGML_CUDA_ROCM_PACKED16_K_LAYOUT");
-    if (layout && (strcmp(layout, "tile16") == 0 || strcmp(layout, "native") == 0 || strcmp(layout, "v2") == 0 || strcmp(layout, "d16_planar") == 0)) {
+    if (layout && (strcmp(layout, "page16_d16") == 0 || strcmp(layout, "paged16") == 0 || strcmp(layout, "qblock_page16") == 0 || strcmp(layout, "v2_page16") == 0 || strcmp(layout, "v2") == 0)) {
+        return GGML_CUDA_PACKED16_K_LAYOUT_PAGE16_D16;
+    }
+    if (layout && (strcmp(layout, "tile16") == 0 || strcmp(layout, "native") == 0 || strcmp(layout, "d16_planar") == 0)) {
         return GGML_CUDA_PACKED16_K_LAYOUT_D16_PLANAR;
     }
     const char * native = getenv("GGML_CUDA_ROCM_PACKED16_NATIVE_K");
@@ -168,10 +204,15 @@ static inline bool ggml_cuda_packed16_k_layout_kind_tile16(const int layout_kind
     return layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_D16_PLANAR;
 }
 
+static inline bool ggml_cuda_packed16_k_layout_kind_page16_d16(const int layout_kind) {
+    return layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_PAGE16_D16;
+}
+
 static inline const char * ggml_cuda_packed16_k_layout_kind_name(const int layout_kind) {
     switch (layout_kind) {
         case GGML_CUDA_PACKED16_K_LAYOUT_ROW:        return "row";
         case GGML_CUDA_PACKED16_K_LAYOUT_D16_PLANAR: return "d16_planar";
+        case GGML_CUDA_PACKED16_K_LAYOUT_PAGE16_D16: return "page16_d16";
         default:                                     return "unknown";
     }
 }
@@ -181,7 +222,7 @@ static inline bool ggml_cuda_packed16_k_layout_tile16() {
 }
 
 static inline const char * ggml_cuda_packed16_k_layout_name() {
-    return ggml_cuda_packed16_k_layout_tile16() ? "tile16" : "row";
+    return ggml_cuda_packed16_k_layout_kind_name(ggml_cuda_packed16_k_layout_kind_from_env());
 }
 
 static __host__ __device__ __forceinline__ size_t ggml_cuda_packed16_k_payload_index(
@@ -189,15 +230,24 @@ static __host__ __device__ __forceinline__ size_t ggml_cuda_packed16_k_payload_i
         const int head_stride_rows,
         const int k,
         const int d_word,
-        const bool tile16) {
-    if (!tile16) {
+        const int layout_kind) {
+    if (layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_ROW) {
         return (head_base_rows + size_t(k)) * size_t(GGML_CUDA_PACKED16_K_WORDS) + size_t(d_word);
+    }
+    const int d16 = d_word / GGML_CUDA_PACKED16_K_WORDS_PER_D16;
+    const int w4  = d_word - d16 * GGML_CUDA_PACKED16_K_WORDS_PER_D16;
+    if (layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_PAGE16_D16) {
+        const int page = k / GGML_CUDA_PACKED16_K_PAGE16_TOKENS;
+        const int slot = k - page * GGML_CUDA_PACKED16_K_PAGE16_TOKENS;
+        return head_base_rows * size_t(GGML_CUDA_PACKED16_K_WORDS)
+            + size_t(page) * size_t(GGML_CUDA_PACKED16_K_WORDS_PER_PAGE16)
+            + size_t(d16) * size_t(GGML_CUDA_PACKED16_K_PAGE16_TOKENS) * size_t(GGML_CUDA_PACKED16_K_WORDS_PER_D16)
+            + size_t(slot) * size_t(GGML_CUDA_PACKED16_K_WORDS_PER_D16)
+            + size_t(w4);
     }
     // In-place native layout, no row padding: [head][D16 plane][K row][4xi32 word].
     // This preserves exactly 272 B/token/KV-head while making each D16 plane a
     // contiguous 16B packed-vector scratch plane over K rows.
-    const int d16 = d_word / GGML_CUDA_PACKED16_K_WORDS_PER_D16;
-    const int w4  = d_word - d16 * GGML_CUDA_PACKED16_K_WORDS_PER_D16;
     return head_base_rows * size_t(GGML_CUDA_PACKED16_K_WORDS)
         + size_t(d16) * size_t(head_stride_rows) * size_t(GGML_CUDA_PACKED16_K_WORDS_PER_D16)
         + size_t(k) * size_t(GGML_CUDA_PACKED16_K_WORDS_PER_D16)
@@ -209,9 +259,17 @@ static __host__ __device__ __forceinline__ size_t ggml_cuda_packed16_k_scale_ind
         const int head_stride_rows,
         const int k,
         const int qblock,
-        const bool tile16) {
-    if (!tile16) {
+        const int layout_kind) {
+    if (layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_ROW) {
         return (head_base_rows + size_t(k)) * size_t(GGML_CUDA_PACKED16_K_QBLOCKS) + size_t(qblock);
+    }
+    if (layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_PAGE16_D16) {
+        const int page = k / GGML_CUDA_PACKED16_K_PAGE16_TOKENS;
+        const int slot = k - page * GGML_CUDA_PACKED16_K_PAGE16_TOKENS;
+        return head_base_rows * size_t(GGML_CUDA_PACKED16_K_QBLOCKS)
+            + size_t(page) * size_t(GGML_CUDA_PACKED16_K_SCALE_PER_PAGE16)
+            + size_t(qblock) * size_t(GGML_CUDA_PACKED16_K_PAGE16_TOKENS)
+            + size_t(slot);
     }
     return head_base_rows * size_t(GGML_CUDA_PACKED16_K_QBLOCKS)
         + size_t(qblock) * size_t(head_stride_rows)

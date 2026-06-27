@@ -1,0 +1,1501 @@
+{
+  "generated_at": "2026-06-27T13:03:19+00:00",
+  "inputs": {
+    "manifest": "/home/mrtrent/.harness/tmp/roxxY-push-20260624-002659/experiments/jetspec/manifests/JetSpec_jetspec-Qwen3.6-35B-A3B_main.manifest.json",
+    "tensor_map": "/home/mrtrent/.harness/tmp/roxxY-push-20260624-002659/experiments/jetspec/tensor_map_qwen36_head.json"
+  },
+  "metadata": [
+    {
+      "key": "general.architecture",
+      "type": "string",
+      "value": "jetspec_qwen3_draft_head"
+    },
+    {
+      "key": "general.name",
+      "type": "string",
+      "value": "JetSpec/jetspec-Qwen3.6-35B-A3B"
+    },
+    {
+      "key": "general.source.huggingface.repository",
+      "type": "string",
+      "value": "JetSpec/jetspec-Qwen3.6-35B-A3B"
+    },
+    {
+      "key": "general.source.huggingface.sha",
+      "type": "string",
+      "value": "ffb38cf9917e0f426ab1b21d745e859f7788e467"
+    },
+    {
+      "key": "jetspec.architecture",
+      "type": "string",
+      "value": "qwen3_draft_head"
+    },
+    {
+      "key": "jetspec.source_architecture",
+      "type": "string",
+      "value": "DFlashDraftModel"
+    },
+    {
+      "key": "jetspec.block_size",
+      "type": "uint32",
+      "value": 16
+    },
+    {
+      "key": "jetspec.draft_depth",
+      "type": "uint32",
+      "value": 15
+    },
+    {
+      "key": "jetspec.causal_head",
+      "type": "bool",
+      "value": true
+    },
+    {
+      "key": "jetspec.mask_token_id",
+      "type": "uint32",
+      "value": 248070
+    },
+    {
+      "key": "jetspec.target_layer_ids",
+      "type": "array:uint32",
+      "value": [
+        1,
+        10,
+        19,
+        28,
+        37
+      ]
+    },
+    {
+      "key": "jetspec.num_target_layers",
+      "type": "uint32",
+      "value": 40
+    },
+    {
+      "key": "jetspec.requires_target_embeddings",
+      "type": "bool",
+      "value": true
+    },
+    {
+      "key": "jetspec.requires_target_lm_head",
+      "type": "bool",
+      "value": true
+    },
+    {
+      "key": "jetspec.embedding_length",
+      "type": "uint32",
+      "value": 2048
+    },
+    {
+      "key": "jetspec.feed_forward_length",
+      "type": "uint32",
+      "value": 6144
+    },
+    {
+      "key": "jetspec.block_count",
+      "type": "uint32",
+      "value": 8
+    },
+    {
+      "key": "jetspec.attention.head_count",
+      "type": "uint32",
+      "value": 32
+    },
+    {
+      "key": "jetspec.attention.head_count_kv",
+      "type": "uint32",
+      "value": 4
+    },
+    {
+      "key": "jetspec.attention.key_length",
+      "type": "uint32",
+      "value": 128
+    },
+    {
+      "key": "jetspec.attention.value_length",
+      "type": "uint32",
+      "value": 128
+    },
+    {
+      "key": "jetspec.rope.freq_base",
+      "type": "float32",
+      "value": 10000000
+    },
+    {
+      "key": "jetspec.attention.layer_norm_rms_epsilon",
+      "type": "float32",
+      "value": 1e-06
+    },
+    {
+      "key": "jetspec.vocab_size",
+      "type": "uint32",
+      "value": 248320
+    },
+    {
+      "key": "jetspec.tensor_data_dtype",
+      "type": "string",
+      "value": "bfloat16"
+    }
+  ],
+  "promotion_blockers": [
+    "Production GGUF metadata key names are not accepted or loaded yet.",
+    "No llama.cpp DFlashDraftModel/JetSpec draft-head graph loader exists yet.",
+    "Target hidden tap extraction for layers [1,10,19,28,37] is not wired to this head.",
+    "Target embed_tokens and lm_head sharing contract is not implemented for this GGUF."
+  ],
+  "proposed_output": {
+    "file_size_floor_bytes": 947990528,
+    "gguf_arch": "jetspec_qwen3_draft_head",
+    "param_count": 473995264,
+    "reason": "planned metadata/tensor schema only; no llama.cpp loader is wired",
+    "runtime_supported": false,
+    "tensor_count": 91,
+    "tensor_payload_bytes": 947990528
+  },
+  "schema": "llama.cpp.experiments.jetspec.gguf_conversion_plan.v1",
+  "source": {
+    "model_sha": "ffb38cf9917e0f426ab1b21d745e859f7788e467",
+    "repo": "JetSpec/jetspec-Qwen3.6-35B-A3B",
+    "revision": "main"
+  },
+  "status": "pass",
+  "tensors": [
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.fc.weight",
+      "hf_name": "fc.weight",
+      "nbytes": 41943040,
+      "numel": 20971520,
+      "shape": [
+        2048,
+        10240
+      ],
+      "source_data_offsets": [
+        0,
+        41943040
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.hidden_norm.weight",
+      "hf_name": "hidden_norm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ],
+      "source_data_offsets": [
+        41943040,
+        41947136
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.0.input_layernorm.weight",
+      "hf_name": "layers.0.input_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ],
+      "source_data_offsets": [
+        41947136,
+        41951232
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.0.mlp.down_proj.weight",
+      "hf_name": "layers.0.mlp.down_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        2048,
+        6144
+      ],
+      "source_data_offsets": [
+        41951232,
+        67117056
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.0.mlp.gate_proj.weight",
+      "hf_name": "layers.0.mlp.gate_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ],
+      "source_data_offsets": [
+        67117056,
+        92282880
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.0.mlp.up_proj.weight",
+      "hf_name": "layers.0.mlp.up_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ],
+      "source_data_offsets": [
+        92282880,
+        117448704
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.0.post_attention_layernorm.weight",
+      "hf_name": "layers.0.post_attention_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ],
+      "source_data_offsets": [
+        117448704,
+        117452800
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.0.self_attn.k_norm.weight",
+      "hf_name": "layers.0.self_attn.k_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ],
+      "source_data_offsets": [
+        117452800,
+        117453056
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.0.self_attn.k_proj.weight",
+      "hf_name": "layers.0.self_attn.k_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ],
+      "source_data_offsets": [
+        117453056,
+        119550208
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.0.self_attn.o_proj.weight",
+      "hf_name": "layers.0.self_attn.o_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        2048,
+        4096
+      ],
+      "source_data_offsets": [
+        119550208,
+        136327424
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.0.self_attn.q_norm.weight",
+      "hf_name": "layers.0.self_attn.q_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ],
+      "source_data_offsets": [
+        136327424,
+        136327680
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.0.self_attn.q_proj.weight",
+      "hf_name": "layers.0.self_attn.q_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        4096,
+        2048
+      ],
+      "source_data_offsets": [
+        136327680,
+        153104896
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.0.self_attn.v_proj.weight",
+      "hf_name": "layers.0.self_attn.v_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ],
+      "source_data_offsets": [
+        153104896,
+        155202048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.1.input_layernorm.weight",
+      "hf_name": "layers.1.input_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ],
+      "source_data_offsets": [
+        155202048,
+        155206144
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.1.mlp.down_proj.weight",
+      "hf_name": "layers.1.mlp.down_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        2048,
+        6144
+      ],
+      "source_data_offsets": [
+        155206144,
+        180371968
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.1.mlp.gate_proj.weight",
+      "hf_name": "layers.1.mlp.gate_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ],
+      "source_data_offsets": [
+        180371968,
+        205537792
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.1.mlp.up_proj.weight",
+      "hf_name": "layers.1.mlp.up_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ],
+      "source_data_offsets": [
+        205537792,
+        230703616
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.1.post_attention_layernorm.weight",
+      "hf_name": "layers.1.post_attention_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ],
+      "source_data_offsets": [
+        230703616,
+        230707712
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.1.self_attn.k_norm.weight",
+      "hf_name": "layers.1.self_attn.k_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ],
+      "source_data_offsets": [
+        230707712,
+        230707968
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.1.self_attn.k_proj.weight",
+      "hf_name": "layers.1.self_attn.k_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ],
+      "source_data_offsets": [
+        230707968,
+        232805120
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.1.self_attn.o_proj.weight",
+      "hf_name": "layers.1.self_attn.o_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        2048,
+        4096
+      ],
+      "source_data_offsets": [
+        232805120,
+        249582336
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.1.self_attn.q_norm.weight",
+      "hf_name": "layers.1.self_attn.q_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ],
+      "source_data_offsets": [
+        249582336,
+        249582592
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.1.self_attn.q_proj.weight",
+      "hf_name": "layers.1.self_attn.q_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        4096,
+        2048
+      ],
+      "source_data_offsets": [
+        249582592,
+        266359808
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.1.self_attn.v_proj.weight",
+      "hf_name": "layers.1.self_attn.v_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ],
+      "source_data_offsets": [
+        266359808,
+        268456960
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.2.input_layernorm.weight",
+      "hf_name": "layers.2.input_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ],
+      "source_data_offsets": [
+        268456960,
+        268461056
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.2.mlp.down_proj.weight",
+      "hf_name": "layers.2.mlp.down_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        2048,
+        6144
+      ],
+      "source_data_offsets": [
+        268461056,
+        293626880
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.2.mlp.gate_proj.weight",
+      "hf_name": "layers.2.mlp.gate_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ],
+      "source_data_offsets": [
+        293626880,
+        318792704
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.2.mlp.up_proj.weight",
+      "hf_name": "layers.2.mlp.up_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ],
+      "source_data_offsets": [
+        318792704,
+        343958528
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.2.post_attention_layernorm.weight",
+      "hf_name": "layers.2.post_attention_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ],
+      "source_data_offsets": [
+        343958528,
+        343962624
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.2.self_attn.k_norm.weight",
+      "hf_name": "layers.2.self_attn.k_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ],
+      "source_data_offsets": [
+        343962624,
+        343962880
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.2.self_attn.k_proj.weight",
+      "hf_name": "layers.2.self_attn.k_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ],
+      "source_data_offsets": [
+        343962880,
+        346060032
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.2.self_attn.o_proj.weight",
+      "hf_name": "layers.2.self_attn.o_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        2048,
+        4096
+      ],
+      "source_data_offsets": [
+        346060032,
+        362837248
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.2.self_attn.q_norm.weight",
+      "hf_name": "layers.2.self_attn.q_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ],
+      "source_data_offsets": [
+        362837248,
+        362837504
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.2.self_attn.q_proj.weight",
+      "hf_name": "layers.2.self_attn.q_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        4096,
+        2048
+      ],
+      "source_data_offsets": [
+        362837504,
+        379614720
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.2.self_attn.v_proj.weight",
+      "hf_name": "layers.2.self_attn.v_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ],
+      "source_data_offsets": [
+        379614720,
+        381711872
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.3.input_layernorm.weight",
+      "hf_name": "layers.3.input_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ],
+      "source_data_offsets": [
+        381711872,
+        381715968
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.3.mlp.down_proj.weight",
+      "hf_name": "layers.3.mlp.down_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        2048,
+        6144
+      ],
+      "source_data_offsets": [
+        381715968,
+        406881792
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.3.mlp.gate_proj.weight",
+      "hf_name": "layers.3.mlp.gate_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ],
+      "source_data_offsets": [
+        406881792,
+        432047616
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.3.mlp.up_proj.weight",
+      "hf_name": "layers.3.mlp.up_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ],
+      "source_data_offsets": [
+        432047616,
+        457213440
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.3.post_attention_layernorm.weight",
+      "hf_name": "layers.3.post_attention_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ],
+      "source_data_offsets": [
+        457213440,
+        457217536
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.3.self_attn.k_norm.weight",
+      "hf_name": "layers.3.self_attn.k_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ],
+      "source_data_offsets": [
+        457217536,
+        457217792
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.3.self_attn.k_proj.weight",
+      "hf_name": "layers.3.self_attn.k_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ],
+      "source_data_offsets": [
+        457217792,
+        459314944
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.3.self_attn.o_proj.weight",
+      "hf_name": "layers.3.self_attn.o_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        2048,
+        4096
+      ],
+      "source_data_offsets": [
+        459314944,
+        476092160
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.3.self_attn.q_norm.weight",
+      "hf_name": "layers.3.self_attn.q_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ],
+      "source_data_offsets": [
+        476092160,
+        476092416
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.3.self_attn.q_proj.weight",
+      "hf_name": "layers.3.self_attn.q_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        4096,
+        2048
+      ],
+      "source_data_offsets": [
+        476092416,
+        492869632
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.3.self_attn.v_proj.weight",
+      "hf_name": "layers.3.self_attn.v_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ],
+      "source_data_offsets": [
+        492869632,
+        494966784
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.4.input_layernorm.weight",
+      "hf_name": "layers.4.input_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ],
+      "source_data_offsets": [
+        494966784,
+        494970880
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.4.mlp.down_proj.weight",
+      "hf_name": "layers.4.mlp.down_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        2048,
+        6144
+      ],
+      "source_data_offsets": [
+        494970880,
+        520136704
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.4.mlp.gate_proj.weight",
+      "hf_name": "layers.4.mlp.gate_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ],
+      "source_data_offsets": [
+        520136704,
+        545302528
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.4.mlp.up_proj.weight",
+      "hf_name": "layers.4.mlp.up_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ],
+      "source_data_offsets": [
+        545302528,
+        570468352
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.4.post_attention_layernorm.weight",
+      "hf_name": "layers.4.post_attention_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ],
+      "source_data_offsets": [
+        570468352,
+        570472448
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.4.self_attn.k_norm.weight",
+      "hf_name": "layers.4.self_attn.k_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ],
+      "source_data_offsets": [
+        570472448,
+        570472704
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.4.self_attn.k_proj.weight",
+      "hf_name": "layers.4.self_attn.k_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ],
+      "source_data_offsets": [
+        570472704,
+        572569856
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.4.self_attn.o_proj.weight",
+      "hf_name": "layers.4.self_attn.o_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        2048,
+        4096
+      ],
+      "source_data_offsets": [
+        572569856,
+        589347072
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.4.self_attn.q_norm.weight",
+      "hf_name": "layers.4.self_attn.q_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ],
+      "source_data_offsets": [
+        589347072,
+        589347328
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.4.self_attn.q_proj.weight",
+      "hf_name": "layers.4.self_attn.q_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        4096,
+        2048
+      ],
+      "source_data_offsets": [
+        589347328,
+        606124544
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.4.self_attn.v_proj.weight",
+      "hf_name": "layers.4.self_attn.v_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ],
+      "source_data_offsets": [
+        606124544,
+        608221696
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.5.input_layernorm.weight",
+      "hf_name": "layers.5.input_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ],
+      "source_data_offsets": [
+        608221696,
+        608225792
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.5.mlp.down_proj.weight",
+      "hf_name": "layers.5.mlp.down_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        2048,
+        6144
+      ],
+      "source_data_offsets": [
+        608225792,
+        633391616
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.5.mlp.gate_proj.weight",
+      "hf_name": "layers.5.mlp.gate_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ],
+      "source_data_offsets": [
+        633391616,
+        658557440
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.5.mlp.up_proj.weight",
+      "hf_name": "layers.5.mlp.up_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ],
+      "source_data_offsets": [
+        658557440,
+        683723264
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.5.post_attention_layernorm.weight",
+      "hf_name": "layers.5.post_attention_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ],
+      "source_data_offsets": [
+        683723264,
+        683727360
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.5.self_attn.k_norm.weight",
+      "hf_name": "layers.5.self_attn.k_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ],
+      "source_data_offsets": [
+        683727360,
+        683727616
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.5.self_attn.k_proj.weight",
+      "hf_name": "layers.5.self_attn.k_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ],
+      "source_data_offsets": [
+        683727616,
+        685824768
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.5.self_attn.o_proj.weight",
+      "hf_name": "layers.5.self_attn.o_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        2048,
+        4096
+      ],
+      "source_data_offsets": [
+        685824768,
+        702601984
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.5.self_attn.q_norm.weight",
+      "hf_name": "layers.5.self_attn.q_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ],
+      "source_data_offsets": [
+        702601984,
+        702602240
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.5.self_attn.q_proj.weight",
+      "hf_name": "layers.5.self_attn.q_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        4096,
+        2048
+      ],
+      "source_data_offsets": [
+        702602240,
+        719379456
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.5.self_attn.v_proj.weight",
+      "hf_name": "layers.5.self_attn.v_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ],
+      "source_data_offsets": [
+        719379456,
+        721476608
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.6.input_layernorm.weight",
+      "hf_name": "layers.6.input_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ],
+      "source_data_offsets": [
+        721476608,
+        721480704
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.6.mlp.down_proj.weight",
+      "hf_name": "layers.6.mlp.down_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        2048,
+        6144
+      ],
+      "source_data_offsets": [
+        721480704,
+        746646528
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.6.mlp.gate_proj.weight",
+      "hf_name": "layers.6.mlp.gate_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ],
+      "source_data_offsets": [
+        746646528,
+        771812352
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.6.mlp.up_proj.weight",
+      "hf_name": "layers.6.mlp.up_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ],
+      "source_data_offsets": [
+        771812352,
+        796978176
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.6.post_attention_layernorm.weight",
+      "hf_name": "layers.6.post_attention_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ],
+      "source_data_offsets": [
+        796978176,
+        796982272
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.6.self_attn.k_norm.weight",
+      "hf_name": "layers.6.self_attn.k_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ],
+      "source_data_offsets": [
+        796982272,
+        796982528
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.6.self_attn.k_proj.weight",
+      "hf_name": "layers.6.self_attn.k_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ],
+      "source_data_offsets": [
+        796982528,
+        799079680
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.6.self_attn.o_proj.weight",
+      "hf_name": "layers.6.self_attn.o_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        2048,
+        4096
+      ],
+      "source_data_offsets": [
+        799079680,
+        815856896
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.6.self_attn.q_norm.weight",
+      "hf_name": "layers.6.self_attn.q_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ],
+      "source_data_offsets": [
+        815856896,
+        815857152
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.6.self_attn.q_proj.weight",
+      "hf_name": "layers.6.self_attn.q_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        4096,
+        2048
+      ],
+      "source_data_offsets": [
+        815857152,
+        832634368
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.6.self_attn.v_proj.weight",
+      "hf_name": "layers.6.self_attn.v_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ],
+      "source_data_offsets": [
+        832634368,
+        834731520
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.7.input_layernorm.weight",
+      "hf_name": "layers.7.input_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ],
+      "source_data_offsets": [
+        834731520,
+        834735616
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.7.mlp.down_proj.weight",
+      "hf_name": "layers.7.mlp.down_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        2048,
+        6144
+      ],
+      "source_data_offsets": [
+        834735616,
+        859901440
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.7.mlp.gate_proj.weight",
+      "hf_name": "layers.7.mlp.gate_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ],
+      "source_data_offsets": [
+        859901440,
+        885067264
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.7.mlp.up_proj.weight",
+      "hf_name": "layers.7.mlp.up_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ],
+      "source_data_offsets": [
+        885067264,
+        910233088
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.7.post_attention_layernorm.weight",
+      "hf_name": "layers.7.post_attention_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ],
+      "source_data_offsets": [
+        910233088,
+        910237184
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.7.self_attn.k_norm.weight",
+      "hf_name": "layers.7.self_attn.k_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ],
+      "source_data_offsets": [
+        910237184,
+        910237440
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.7.self_attn.k_proj.weight",
+      "hf_name": "layers.7.self_attn.k_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ],
+      "source_data_offsets": [
+        910237440,
+        912334592
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.7.self_attn.o_proj.weight",
+      "hf_name": "layers.7.self_attn.o_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        2048,
+        4096
+      ],
+      "source_data_offsets": [
+        912334592,
+        929111808
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.7.self_attn.q_norm.weight",
+      "hf_name": "layers.7.self_attn.q_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ],
+      "source_data_offsets": [
+        929111808,
+        929112064
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.7.self_attn.q_proj.weight",
+      "hf_name": "layers.7.self_attn.q_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        4096,
+        2048
+      ],
+      "source_data_offsets": [
+        929112064,
+        945889280
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.7.self_attn.v_proj.weight",
+      "hf_name": "layers.7.self_attn.v_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ],
+      "source_data_offsets": [
+        945889280,
+        947986432
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.norm.weight",
+      "hf_name": "norm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ],
+      "source_data_offsets": [
+        947986432,
+        947990528
+      ]
+    }
+  ],
+  "validation": {
+    "errors": [],
+    "expected_tensor_count": 91,
+    "observed_tensor_count": 91,
+    "ok": true
+  }
+}

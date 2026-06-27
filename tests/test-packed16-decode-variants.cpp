@@ -30,6 +30,36 @@ extern "C" void llama_kv_cache_register_packed16_with_layout_info(
 
 static constexpr int TEST_PACKED16_LAYOUT_ROW = 0;
 static constexpr int TEST_PACKED16_LAYOUT_D16_PLANAR = 1;
+static constexpr int TEST_PACKED16_LAYOUT_PAGE16_D16 = 2;
+
+static constexpr int TEST_V_KIND_V4_144 = 0;
+static constexpr int TEST_V_KIND_Q4_0 = 1;
+static constexpr int TEST_V4_144_D = 256;
+static constexpr int TEST_V4_144_K = 16;
+static constexpr int TEST_V4_144_D32 = 32;
+static constexpr int TEST_V4_144_D32_BLOCKS = TEST_V4_144_D / TEST_V4_144_D32;
+static constexpr int TEST_V4_144_ROW_BYTES = 144;
+static constexpr int TEST_V4_144_PAYLOAD_BYTES = TEST_V4_144_D * 2 * (int) sizeof(uint32_t);
+static constexpr int TEST_V4_144_SCALE_BYTES = TEST_V4_144_D32_BLOCKS * TEST_V4_144_K * (int) sizeof(uint16_t);
+static_assert(TEST_V4_144_PAYLOAD_BYTES == 2048, "bad V4_144 payload bytes");
+static_assert(TEST_V4_144_SCALE_BYTES == 256, "bad V4_144 scale bytes");
+static_assert(TEST_V4_144_ROW_BYTES * TEST_V4_144_K == TEST_V4_144_PAYLOAD_BYTES + TEST_V4_144_SCALE_BYTES, "bad V4_144 block bytes");
+
+static int packed16_test_v_kind_from_env() {
+    const char * v = getenv("PACKED16_DECODE_TEST_V");
+    if (!v || !v[0] || strcmp(v, "v4_144") == 0 || strcmp(v, "v4_k16d16_144") == 0 || strcmp(v, "pv4") == 0) {
+        return TEST_V_KIND_V4_144;
+    }
+    if (strcmp(v, "q4") == 0 || strcmp(v, "q4_0") == 0 || strcmp(v, "legacy_q4") == 0) {
+        return TEST_V_KIND_Q4_0;
+    }
+    std::fprintf(stderr, "unknown PACKED16_DECODE_TEST_V=%s; expected v4_144 or q4_0\n", v);
+    std::abort();
+}
+
+static const char * packed16_test_v_kind_name(int v_kind) {
+    return v_kind == TEST_V_KIND_Q4_0 ? "q4_0" : "v4_k16d16_144";
+}
 
 static int packed16_test_layout_from_env() {
     const char * layout = getenv("PACKED16_DECODE_TEST_LAYOUT");
@@ -39,12 +69,16 @@ static int packed16_test_layout_from_env() {
     if (strcmp(layout, "tile16") == 0 || strcmp(layout, "d16_planar") == 0 || strcmp(layout, "native") == 0) {
         return TEST_PACKED16_LAYOUT_D16_PLANAR;
     }
-    std::fprintf(stderr, "unknown PACKED16_DECODE_TEST_LAYOUT=%s; expected row or d16_planar\n", layout);
+    if (strcmp(layout, "page16_d16") == 0 || strcmp(layout, "paged16") == 0 || strcmp(layout, "v2") == 0 || strcmp(layout, "v2_page16") == 0) {
+        return TEST_PACKED16_LAYOUT_PAGE16_D16;
+    }
+    std::fprintf(stderr, "unknown PACKED16_DECODE_TEST_LAYOUT=%s; expected row, d16_planar, or page16_d16\n", layout);
     std::abort();
 }
 
 static const char * packed16_test_layout_name(int layout_kind) {
-    return layout_kind == TEST_PACKED16_LAYOUT_D16_PLANAR ? "d16_planar" : "row";
+    return layout_kind == TEST_PACKED16_LAYOUT_PAGE16_D16 ? "page16_d16" :
+        (layout_kind == TEST_PACKED16_LAYOUT_D16_PLANAR ? "d16_planar" : "row");
 }
 
 static void expect_u64(const char * what, uint64_t got, uint64_t expected) {
@@ -65,7 +99,8 @@ static dp16_packed_i8_desc_v1 make_test_packed_i8_desc(int layout_kind, uint32_t
     desc.words_per_vector = DP16_PACKED_I8X16_WORDS;
     desc.bytes_per_vector = DP16_PACKED_I8X16_BYTES;
     desc.bytes_per_word = DP16_PACKED_I8_WORD_BYTES;
-    desc.layout_kind = layout_kind == TEST_PACKED16_LAYOUT_D16_PLANAR ? DP16_PACKED_I8_LAYOUT_D16_PLANAR : DP16_PACKED_I8_LAYOUT_ROW;
+    desc.layout_kind = layout_kind == TEST_PACKED16_LAYOUT_PAGE16_D16 ? DP16_PACKED_I8_LAYOUT_PAGE16_D16 :
+        (layout_kind == TEST_PACKED16_LAYOUT_D16_PLANAR ? DP16_PACKED_I8_LAYOUT_D16_PLANAR : DP16_PACKED_I8_LAYOUT_ROW);
     desc.axis_x = DP16_PACKED_I8_AXIS_D16;
     desc.axis_y = DP16_PACKED_I8_AXIS_TOKEN;
     desc.axis_z = DP16_PACKED_I8_AXIS_HEAD;
@@ -77,13 +112,21 @@ static dp16_packed_i8_desc_v1 make_test_packed_i8_desc(int layout_kind, uint32_t
     desc.physical_z = desc.logical_z;
     desc.base_offset_bytes = 128;
     desc.z_stride_bytes = (uint64_t) kv_capacity * WORDS * DP16_PACKED_I8_WORD_BYTES;
-    desc.scale_layout = layout_kind == TEST_PACKED16_LAYOUT_D16_PLANAR ? DP16_PACKED_I8_SCALE_LAYOUT_QBLOCK_PLANAR : DP16_PACKED_I8_SCALE_LAYOUT_ROW;
+    desc.scale_layout = layout_kind == TEST_PACKED16_LAYOUT_PAGE16_D16 ? DP16_PACKED_I8_SCALE_LAYOUT_PAGE16_QBLOCK :
+        (layout_kind == TEST_PACKED16_LAYOUT_D16_PLANAR ? DP16_PACKED_I8_SCALE_LAYOUT_QBLOCK_PLANAR : DP16_PACKED_I8_SCALE_LAYOUT_ROW);
     desc.scale_axis_x = DP16_PACKED_I8_AXIS_QBLOCK;
     desc.scale_axis_y = DP16_PACKED_I8_AXIS_TOKEN;
     desc.scale_axis_z = DP16_PACKED_I8_AXIS_HEAD;
     desc.scale_base_offset_bytes = 64;
     desc.scale_z_stride_bytes = (uint64_t) kv_capacity * QBLOCKS * sizeof(uint16_t);
-    if (layout_kind == TEST_PACKED16_LAYOUT_D16_PLANAR) {
+    if (layout_kind == TEST_PACKED16_LAYOUT_PAGE16_D16) {
+        desc.x_stride_bytes = DP16_PACKED_I8_PAGE16_TOKENS * DP16_PACKED_I8X16_BYTES;
+        desc.y_stride_bytes = DP16_PACKED_I8X16_BYTES;
+        desc.plane_stride_bytes = DP16_PACKED_I8_PAGE16_TOKENS * WORDS * DP16_PACKED_I8_WORD_BYTES;
+        desc.scale_x_stride_bytes = DP16_PACKED_I8_PAGE16_TOKENS * sizeof(uint16_t);
+        desc.scale_y_stride_bytes = sizeof(uint16_t);
+        desc.scale_plane_stride_bytes = DP16_PACKED_I8_PAGE16_TOKENS * QBLOCKS * sizeof(uint16_t);
+    } else if (layout_kind == TEST_PACKED16_LAYOUT_D16_PLANAR) {
         desc.x_stride_bytes = (uint64_t) kv_capacity * DP16_PACKED_I8X16_BYTES;
         desc.y_stride_bytes = DP16_PACKED_I8X16_BYTES;
         desc.plane_stride_bytes = desc.x_stride_bytes;
@@ -105,10 +148,10 @@ static void verify_packed16_descriptor_formulas() {
     constexpr uint32_t D = 256;
     constexpr uint32_t WORDS = D / 4;
     constexpr uint32_t QBLOCKS = D / 32;
-    const uint32_t kv_capacity = 19;
+    const uint32_t kv_capacity = 32;
     const uint32_t n_heads_k = 3;
     const uint32_t head = 1;
-    const uint32_t token = 7;
+    const uint32_t token = 23;
     const uint32_t d16 = 5;
     const uint32_t word = 2;
     const uint32_t qblock = 6;
@@ -156,6 +199,28 @@ static void verify_packed16_descriptor_formulas() {
     expect_u64("D16-planar payload byte offset", dp16_packed_i8_payload_byte_offset(d16_planar, head, token, d16, word), d16_payload);
     expect_u64("D16-planar payload word index", dp16_packed_i8_payload_word_index(d16_planar, head, token, d16, word), d16_payload / DP16_PACKED_I8_WORD_BYTES);
     expect_u64("D16-planar scale byte offset", dp16_packed_i8_scale_byte_offset(d16_planar, head, token, qblock), d16_scale);
+
+    const dp16_packed_i8_desc_v1 page16 = make_test_packed_i8_desc(TEST_PACKED16_LAYOUT_PAGE16_D16, kv_capacity, n_heads_k);
+    if (!dp16_i8x16_desc_has_vector_abi(page16)) {
+        std::fprintf(stderr, "page16-D16 descriptor vector ABI check failed\n");
+        std::abort();
+    }
+    const uint32_t page = token / DP16_PACKED_I8_PAGE16_TOKENS;
+    const uint32_t slot = token - page * DP16_PACKED_I8_PAGE16_TOKENS;
+    const uint64_t page_payload = page16.base_offset_bytes +
+        (uint64_t) head * kv_capacity * WORDS * DP16_PACKED_I8_WORD_BYTES +
+        (uint64_t) page * DP16_PACKED_I8_PAGE16_TOKENS * WORDS * DP16_PACKED_I8_WORD_BYTES +
+        (uint64_t) d16 * DP16_PACKED_I8_PAGE16_TOKENS * DP16_PACKED_I8X16_BYTES +
+        (uint64_t) slot * DP16_PACKED_I8X16_BYTES +
+        (uint64_t) word * DP16_PACKED_I8_WORD_BYTES;
+    const uint64_t page_scale = page16.scale_base_offset_bytes +
+        (uint64_t) head * kv_capacity * QBLOCKS * sizeof(uint16_t) +
+        (uint64_t) page * DP16_PACKED_I8_PAGE16_TOKENS * QBLOCKS * sizeof(uint16_t) +
+        (uint64_t) qblock * DP16_PACKED_I8_PAGE16_TOKENS * sizeof(uint16_t) +
+        (uint64_t) slot * sizeof(uint16_t);
+    expect_u64("page16-D16 payload byte offset", dp16_packed_i8_payload_byte_offset(page16, head, token, d16, word), page_payload);
+    expect_u64("page16-D16 payload word index", dp16_packed_i8_payload_word_index(page16, head, token, d16, word), page_payload / DP16_PACKED_I8_WORD_BYTES);
+    expect_u64("page16-D16 scale byte offset", dp16_packed_i8_scale_byte_offset(page16, head, token, qblock), page_scale);
 }
 
 static void fill_f32(std::vector<float> & data, float scale, int seed) {
@@ -181,6 +246,62 @@ static std::vector<uint8_t> quantize_q4_0_rows(const std::vector<float> & data, 
     return q;
 }
 
+static void store_f16_bits(uint8_t * dst, float value) {
+    uint16_t h = 0;
+    ggml_fp32_to_fp16_row(&value, (ggml_fp16_t *) &h, 1);
+    memcpy(dst, &h, sizeof(h));
+}
+
+static std::vector<uint8_t> quantize_v4_k16d16_144_rows(const std::vector<float> & data, int nk, int n_heads_k) {
+    constexpr int D = TEST_V4_144_D;
+    if ((nk % TEST_V4_144_K) != 0) {
+        std::fprintf(stderr, "v4_k16d16_144 test V layout requires nk multiple of %d, got %d\n", TEST_V4_144_K, nk);
+        std::abort();
+    }
+    std::vector<uint8_t> out((size_t) n_heads_k * nk * TEST_V4_144_ROW_BYTES, 0);
+    for (int hk = 0; hk < n_heads_k; ++hk) {
+        for (int k16_base = 0; k16_base < nk; k16_base += TEST_V4_144_K) {
+            uint8_t * block = out.data() + ((size_t) hk * nk + k16_base) * TEST_V4_144_ROW_BYTES;
+            uint32_t * payload = (uint32_t *) block;
+            uint8_t * scales = block + TEST_V4_144_PAYLOAD_BYTES;
+            for (int slot = 0; slot < TEST_V4_144_K; ++slot) {
+                const int k = k16_base + slot;
+                const size_t src_row = ((size_t) hk * nk + k) * D;
+                for (int d32 = 0; d32 < TEST_V4_144_D32_BLOCKS; ++d32) {
+                    const int d0 = d32 * TEST_V4_144_D32;
+                    float amax = 0.0f;
+                    float maxv = 0.0f;
+                    for (int dd = 0; dd < TEST_V4_144_D32; ++dd) {
+                        const float v = data[src_row + d0 + dd];
+                        const float av = fabsf(v);
+                        if (av > amax) {
+                            amax = av;
+                            maxv = v;
+                        }
+                    }
+                    const float scale = maxv / -8.0f;
+                    const float inv_scale = scale ? 1.0f / scale : 0.0f;
+                    store_f16_bits(scales + ((d32 * TEST_V4_144_K + slot) * (int) sizeof(uint16_t)), scale);
+                    for (int dd = 0; dd < TEST_V4_144_D32; ++dd) {
+                        const int d = d0 + dd;
+                        const float x = data[src_row + d];
+                        int q = (int) (x * inv_scale + 8.5f);
+                        if (q > 15) {
+                            q = 15;
+                        }
+                        const uint32_t shift = (uint32_t) (4 * (slot & 7));
+                        const uint32_t mask = uint32_t(0x0fu) << shift;
+                        const uint32_t bits = (uint32_t(q) & 0x0fu) << shift;
+                        uint32_t & word = payload[d * 2 + (slot >> 3)];
+                        word = (word & ~mask) | bits;
+                    }
+                }
+            }
+        }
+    }
+    return out;
+}
+
 static void make_packed16_from_f16(
         const std::vector<uint16_t> & K_f16,
         int nk, int n_heads_k,
@@ -191,6 +312,10 @@ static void make_packed16_from_f16(
     constexpr int QK = 32;
     constexpr int I32_PER_ROW = D / 4;
     constexpr int NB = D / QK;
+    if (layout_kind == TEST_PACKED16_LAYOUT_PAGE16_D16 && (nk % (int) DP16_PACKED_I8_PAGE16_TOKENS) != 0) {
+        std::fprintf(stderr, "page16_d16 test layout requires nk multiple of %u, got %d\n", DP16_PACKED_I8_PAGE16_TOKENS, nk);
+        std::abort();
+    }
     std::vector<float> K_f32(K_f16.size());
     ggml_fp16_to_fp32_row((const ggml_fp16_t *) K_f16.data(), K_f32.data(), (int64_t) K_f16.size());
     payload.assign((size_t) n_heads_k * nk * I32_PER_ROW, 0);
@@ -205,9 +330,16 @@ static void make_packed16_from_f16(
                 for (int i = 0; i < QK; ++i) amax = fmaxf(amax, fabsf(K_f32[src_base + b * QK + i]));
                 const float s = amax > 0.0f ? amax / 127.0f : 1.0f;
                 float hs = s;
-                const size_t scale_index = layout_kind == TEST_PACKED16_LAYOUT_D16_PLANAR ?
-                    head_base * NB + (size_t) b * nk + k :
-                    row * NB + b;
+                size_t scale_index = 0;
+                if (layout_kind == TEST_PACKED16_LAYOUT_PAGE16_D16) {
+                    const int page = k / (int) DP16_PACKED_I8_PAGE16_TOKENS;
+                    const int slot = k - page * (int) DP16_PACKED_I8_PAGE16_TOKENS;
+                    scale_index = head_base * NB + (size_t) page * DP16_PACKED_I8_PAGE16_TOKENS * NB + (size_t) b * DP16_PACKED_I8_PAGE16_TOKENS + slot;
+                } else if (layout_kind == TEST_PACKED16_LAYOUT_D16_PLANAR) {
+                    scale_index = head_base * NB + (size_t) b * nk + k;
+                } else {
+                    scale_index = row * NB + b;
+                }
                 ggml_fp32_to_fp16_row(&hs, (ggml_fp16_t *) &scales[scale_index], 1);
                 for (int g = 0; g < QK / 4; ++g) {
                     int word = 0;
@@ -219,9 +351,17 @@ static void make_packed16_from_f16(
                     const int d_word = b * (QK / 4) + g;
                     const int d16 = d_word / 4;
                     const int w4 = d_word - d16 * 4;
-                    const size_t payload_index = layout_kind == TEST_PACKED16_LAYOUT_D16_PLANAR ?
-                        head_base * I32_PER_ROW + (size_t) d16 * nk * 4 + (size_t) k * 4 + w4 :
-                        row * I32_PER_ROW + d_word;
+                    size_t payload_index = 0;
+                    if (layout_kind == TEST_PACKED16_LAYOUT_PAGE16_D16) {
+                        const int page = k / (int) DP16_PACKED_I8_PAGE16_TOKENS;
+                        const int slot = k - page * (int) DP16_PACKED_I8_PAGE16_TOKENS;
+                        payload_index = head_base * I32_PER_ROW + (size_t) page * DP16_PACKED_I8_PAGE16_TOKENS * I32_PER_ROW +
+                            (size_t) d16 * DP16_PACKED_I8_PAGE16_TOKENS * 4 + (size_t) slot * 4 + w4;
+                    } else if (layout_kind == TEST_PACKED16_LAYOUT_D16_PLANAR) {
+                        payload_index = head_base * I32_PER_ROW + (size_t) d16 * nk * 4 + (size_t) k * 4 + w4;
+                    } else {
+                        payload_index = row * I32_PER_ROW + d_word;
+                    }
                     payload[payload_index] = word;
                 }
             }
@@ -315,7 +455,8 @@ static run_result run_variant(
         const std::vector<float> & Q_data,
         const std::vector<int> & K_payload,
         const std::vector<uint16_t> & K_scales,
-        const std::vector<uint8_t> & V_q4,
+        const std::vector<uint8_t> & V_data,
+        int v_kind,
         int layout_kind) {
 
     constexpr int D = 256;
@@ -338,6 +479,11 @@ static run_result run_variant(
         "GGML_CUDA_ROCM_MTP_QBLOCK_SHAPE",
         "GGML_CUDA_DP16_FA_QBLOCK_ROWMAP_MODE",
         "GGML_CUDA_DP16_FA_QBLOCK_Q_PRECISION",
+        "GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_VPATH",
+        "GGML_CUDA_ROCM_V4_K16D16_144_PV4",
+        "GGML_CUDA_ROCM_V4_K16D16_144_PV4_DISABLE",
+        "GGML_CUDA_ROCM_V4_K16D16_144_PV_IMPL",
+        "GGML_CUDA_ROCM_V4_K16D16_144_PACKED16_DECODE_EXPERIMENT",
         "COMPRESSED_KV_FATTN_LOG",
     });
 
@@ -347,7 +493,17 @@ static run_result run_variant(
     setenv("GGML_CUDA_ROCM_MTP_DRAFT_DOT4_DECODE", "1", 1);
     setenv("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_BN", "64", 1);
     setenv("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_SPLITK_THRESHOLD", "100000000", 1);
-    if (nq > 1 && strcmp(variant, "scalar") == 0) {
+    if (v_kind == TEST_V_KIND_V4_144) {
+        setenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_VPATH", "v4_k16d16_144", 1);
+        setenv("GGML_CUDA_ROCM_V4_K16D16_144_PV4", "1", 1);
+        setenv("GGML_CUDA_ROCM_V4_K16D16_144_PV_IMPL", "scalar", 1);
+        setenv("GGML_CUDA_ROCM_V4_K16D16_144_PACKED16_DECODE_EXPERIMENT", "1", 1);
+        unsetenv("GGML_CUDA_ROCM_V4_K16D16_144_PV4_DISABLE");
+    }
+    if (v_kind == TEST_V_KIND_V4_144 && strcmp(variant, "scalar") == 0) {
+        setenv("GGML_CUDA_FA_ROUTE_REQUIRE", "rocm_packed16_dot4_mmq", 1);
+        unsetenv("GGML_CUDA_ROCM_PACKED16_DECODE_IMPL");
+    } else if (nq > 1 && strcmp(variant, "scalar") == 0) {
         unsetenv("GGML_CUDA_FA_ROUTE_REQUIRE");
         unsetenv("GGML_CUDA_ROCM_PACKED16_DECODE_IMPL");
     } else if (strcmp(variant, "splitk") == 0) {
@@ -516,13 +672,14 @@ static run_result run_variant(
 
     ggml_tensor * Q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,  D, nq, n_heads_q, batch);
     ggml_tensor * K = ggml_new_tensor_4d(ctx, GGML_TYPE_I32,  D/4, nk, n_heads_k, batch);
-    ggml_tensor * V = ggml_new_tensor_4d(ctx, GGML_TYPE_Q4_0, D, nk, n_heads_k, batch);
+    const ggml_type v_type = v_kind == TEST_V_KIND_V4_144 ? GGML_TYPE_V4_K16D16_144 : GGML_TYPE_Q4_0;
+    ggml_tensor * V = ggml_new_tensor_4d(ctx, v_type, D, nk, n_heads_k, batch);
     ggml_tensor * M = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, nk, nq);
     ggml_tensor * P = ggml_new_tensor_4d(ctx, GGML_TYPE_I32,  D/4, nk * n_heads_k, 1, 1);
     ggml_tensor * S = ggml_new_tensor_4d(ctx, GGML_TYPE_F16,  D/32, nk * n_heads_k, 1, 1);
     ggml_set_name(Q, "decode_Q");
     ggml_set_name(K, "decode_K_i32_view");
-    ggml_set_name(V, "decode_V_q4_0");
+    ggml_set_name(V, v_kind == TEST_V_KIND_V4_144 ? "decode_V_v4_k16d16_144" : "decode_V_q4_0");
     ggml_set_name(M, "decode_mask");
     ggml_set_name(P, "decode_K_payload");
     ggml_set_name(S, "decode_K_scales");
@@ -557,7 +714,12 @@ static run_result run_variant(
     ggml_backend_tensor_set(K, K_view.data(), 0, ggml_nbytes(K));
     ggml_backend_tensor_set(P, K_payload.data(), 0, ggml_nbytes(P));
     ggml_backend_tensor_set(S, K_scales.data(), 0, ggml_nbytes(S));
-    ggml_backend_tensor_set(V, V_q4.data(), 0, ggml_nbytes(V));
+    if (V_data.size() != ggml_nbytes(V)) {
+        rr.err = "V fixture size mismatch got=" + std::to_string(V_data.size()) + " expected=" + std::to_string(ggml_nbytes(V));
+        ggml_backend_buffer_free(buf); ggml_free(ctx);
+        return rr;
+    }
+    ggml_backend_tensor_set(V, V_data.data(), 0, ggml_nbytes(V));
     ggml_backend_tensor_set(M, mask_f16.data(), 0, ggml_nbytes(M));
 
     const int warmup = getenv("PACKED16_DECODE_TEST_WARMUP") ? std::max(0, atoi(getenv("PACKED16_DECODE_TEST_WARMUP"))) : 0;
@@ -669,7 +831,7 @@ static bool write_fixture_meta(
         "    \"q_f32\": \"[batch,hq,nq,d]\",\n"
         "    \"k_payload_i32\": \"[batch,hk,nk,d/4] int32 packed i8x4\",\n"
         "    \"k_scales_f16\": \"[batch,hk,nk,d/32]\",\n"
-        "    \"v_q4_0\": \"[batch,hk,nk,d/32] block_q4_0 raw: f16 delta + 16 qs bytes\",\n"
+        "    \"v_payload\": \"[batch,hk,nk,d] selected test V fixture; q4_0 rows or v4_k16d16_144 K16/D32 blocks\",\n"
         "    \"mask_f16\": \"[nk,nq] additive mask\",\n"
         "    \"outputs\": \"[batch,nq,hq,d] float32\"\n"
         "  },\n"
@@ -677,7 +839,7 @@ static bool write_fixture_meta(
         "    \"q_f32\": \"q_f32.bin\",\n"
         "    \"k_payload_i32\": \"k_payload_i32.bin\",\n"
         "    \"k_scales_f16\": \"k_scales_f16.bin\",\n"
-        "    \"v_q4_0\": \"v_q4_0.bin\",\n"
+        "    \"v_payload\": \"v_payload.bin\",\n"
         "    \"mask_f16\": \"mask_f16.bin\"\n"
         "  },\n"
         "  \"outputs\": {\n",
@@ -696,6 +858,11 @@ static bool write_fixture_meta(
 
 int main() {
     verify_packed16_descriptor_formulas();
+    const char * formulas_only = getenv("PACKED16_DECODE_TEST_FORMULAS_ONLY");
+    if (formulas_only && atoi(formulas_only) != 0) {
+        std::printf("packed16 decode variant harness: descriptor formula checks PASS\n");
+        return 0;
+    }
 
     constexpr int D = 256;
     const int nq = getenv("PACKED16_DECODE_TEST_NQ") ? atoi(getenv("PACKED16_DECODE_TEST_NQ")) : 1;
@@ -707,7 +874,8 @@ int main() {
     const int warmup = getenv("PACKED16_DECODE_TEST_WARMUP") ? std::max(0, atoi(getenv("PACKED16_DECODE_TEST_WARMUP"))) : 0;
     const int repeats = getenv("PACKED16_DECODE_TEST_REPEAT") ? std::max(1, atoi(getenv("PACKED16_DECODE_TEST_REPEAT"))) : 1;
     const int layout_kind = packed16_test_layout_from_env();
-    std::printf("packed16 decode variant harness: nq=%d nk=%d hq=%d hk=%d gqa=%d warmup=%d repeat=%d layout=%s\n", nq, nk, n_heads_q, n_heads_k, gqa, warmup, repeats, packed16_test_layout_name(layout_kind));
+    const int v_kind = packed16_test_v_kind_from_env();
+    std::printf("packed16 decode variant harness: nq=%d nk=%d hq=%d hk=%d gqa=%d warmup=%d repeat=%d layout=%s V=%s\n", nq, nk, n_heads_q, n_heads_k, gqa, warmup, repeats, packed16_test_layout_name(layout_kind), packed16_test_v_kind_name(v_kind));
 
     const float q_scale = getenv("PACKED16_DECODE_TEST_Q_SCALE") ? atof(getenv("PACKED16_DECODE_TEST_Q_SCALE")) : 0.75f;
     const float k_scale = getenv("PACKED16_DECODE_TEST_K_SCALE") ? atof(getenv("PACKED16_DECODE_TEST_K_SCALE")) : 0.75f;
@@ -721,7 +889,9 @@ int main() {
     std::vector<int> K_payload;
     std::vector<uint16_t> K_scales;
     make_packed16_from_f16(K, nk, n_heads_k, layout_kind, K_payload, K_scales);
-    std::vector<uint8_t> V_q4 = quantize_q4_0_rows(V_f32, nk * n_heads_k, D);
+    std::vector<uint8_t> V_data = v_kind == TEST_V_KIND_V4_144 ?
+        quantize_v4_k16d16_144_rows(V_f32, nk, n_heads_k) :
+        quantize_q4_0_rows(V_f32, nk * n_heads_k, D);
 
     std::vector<std::string> variants;
     const char * variants_env = getenv("PACKED16_DECODE_TEST_VARIANTS");
@@ -731,11 +901,13 @@ int main() {
         while (std::getline(ss, item, ',')) {
             if (!item.empty()) variants.push_back(item);
         }
+    } else if (v_kind == TEST_V_KIND_V4_144) {
+        variants = {"scalar"};
     } else {
         variants = {"scalar", "gqa_scalar", "waveqk", "waveqk_q4pair", "pvwmma", "wmma_full", "dsplit", "splitk", "small_verify", "small_verify_splitk", "small_verify_batched_splitk", "small_verify_fa2", "packed16_fa2", "packed16_fa2_vec", "small_verify_fa2_tune", "small_verify_fa2_hybrid_tune", "small_verify_fa2_sparsev_tune", "small_verify_fa2_pv_dot4_onthefly_tune", "small_verify_fa2_pv_dot4_lds_a_tune", "small_verify_fa2_fusedpv_tune", "small_verify_fa2_pvwmma_tune", "small_verify_fa3_tune", "small_verify_fa4", "small_verify_fa4_pvwmma", "bm_dot4_pages", "bm_dot4_pages_pvwmma", "bm_dot4_pages_pint8pv", "bm_dot4_pages_pint8pv_dot4", "bm_dot4_pages_intflash_vfrag_dot4", "bm_dot4_pages_intflash_vfrag_wmma", "logits_debug"};
     }
 
-    run_result scalar = run_variant("scalar", nq, nk, n_heads_q, n_heads_k, Q, K_payload, K_scales, V_q4, layout_kind);
+    run_result scalar = run_variant("scalar", nq, nk, n_heads_q, n_heads_k, Q, K_payload, K_scales, V_data, v_kind, layout_kind);
     if (!scalar.ok || !finite_all(scalar.out)) {
         std::fprintf(stderr, "scalar baseline failed: %s finite=%d\n", scalar.err.c_str(), scalar.ok ? (int) finite_all(scalar.out) : 0);
         return 2;
@@ -756,7 +928,7 @@ int main() {
         dump_ok &= write_binary_file(dump_dir + "/q_f32.bin", Q.data(), Q.size() * sizeof(Q[0]));
         dump_ok &= write_binary_file(dump_dir + "/k_payload_i32.bin", K_payload.data(), K_payload.size() * sizeof(K_payload[0]));
         dump_ok &= write_binary_file(dump_dir + "/k_scales_f16.bin", K_scales.data(), K_scales.size() * sizeof(K_scales[0]));
-        dump_ok &= write_binary_file(dump_dir + "/v_q4_0.bin", V_q4.data(), V_q4.size() * sizeof(V_q4[0]));
+        dump_ok &= write_binary_file(dump_dir + "/v_payload.bin", V_data.data(), V_data.size() * sizeof(V_data[0]));
         dump_ok &= write_binary_file(dump_dir + "/mask_f16.bin", mask_f16.data(), mask_f16.size() * sizeof(mask_f16[0]));
         dump_ok &= write_binary_file(dump_dir + "/out_scalar.f32", scalar.out.data(), scalar.out.size() * sizeof(scalar.out[0]));
         push_unique(dumped_outputs, "scalar");
@@ -768,7 +940,7 @@ int main() {
     bool all_ok = true;
     for (const std::string & variant_name : variants) {
         const char * v = variant_name.c_str();
-        run_result r = strcmp(v, "scalar") == 0 ? scalar : run_variant(v, nq, nk, n_heads_q, n_heads_k, Q, K_payload, K_scales, V_q4, layout_kind);
+        run_result r = strcmp(v, "scalar") == 0 ? scalar : run_variant(v, nq, nk, n_heads_q, n_heads_k, Q, K_payload, K_scales, V_data, v_kind, layout_kind);
         if (!r.ok) {
             std::printf("variant=%s RESULT=FAIL err=%s\n", v, r.err.c_str());
             all_ok = false;

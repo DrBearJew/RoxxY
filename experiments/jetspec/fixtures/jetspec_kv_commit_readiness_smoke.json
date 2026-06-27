@@ -1,0 +1,60 @@
+{
+  "target_seq_id": 0,
+  "past_len": 2,
+  "pre_committed_token_ids": [7, 8, 10],
+  "tree": {
+    "token_ids": [10, 11, 12, 21, 22],
+    "parent_indices": [-1, 0, 0, 1, 1],
+    "depth": [0, 1, 1, 2, 2],
+    "rank": [-1, 0, 1, 0, 1],
+    "cum_logprob": [0.0, -1.6094379124341003, -1.8971199848858813, -3.9120230054281455, -4.605170185988091]
+  },
+  "accepted_path": [0, 1, 4],
+  "correction_token": 99,
+  "expected_gather_positions": [2, 3, 6],
+  "expected_post_committed_token_ids": [7, 8, 10, 11, 22, 99],
+  "expected_post_kv_tokens": [7, 8, 10, 11, 22],
+  "pre_kv_slots": [
+    {"logical_slot": 0, "seq_id": 0, "token": 7, "refcount": 1},
+    {"logical_slot": 1, "seq_id": 0, "token": 8, "refcount": 1}
+  ],
+  "tree_kv_slots": [
+    {"node_index": 0, "temp_slot": 2, "seq_id": 0, "token": 10, "refcount": 1, "sentinel": "root"},
+    {"node_index": 1, "temp_slot": 3, "seq_id": 0, "token": 11, "refcount": 1, "sentinel": "accepted-11"},
+    {"node_index": 2, "temp_slot": 4, "seq_id": 0, "token": 12, "refcount": 1, "sentinel": "rejected-12"},
+    {"node_index": 3, "temp_slot": 5, "seq_id": 0, "token": 21, "refcount": 1, "sentinel": "rejected-21"},
+    {"node_index": 4, "temp_slot": 6, "seq_id": 0, "token": 22, "refcount": 1, "sentinel": "accepted-22"}
+  ],
+  "other_sequence_slots": [
+    {"logical_slot": 50, "seq_id": 9, "token": 900, "refcount": 1},
+    {"logical_slot": 51, "seq_id": 9, "token": 901, "refcount": 1}
+  ],
+  "rejected_sentinels": ["rejected-12", "rejected-21"],
+  "hidden_width": 3,
+  "pre_hidden_cache": [
+    [7.0, 7.1, 7.2],
+    [8.0, 8.1, 8.2]
+  ],
+  "node_hidden_rows": {
+    "0": [10.0, 10.1, 10.2],
+    "1": [11.0, 11.1, 11.2],
+    "2": [222.0, 222.1, 222.2],
+    "3": [333.0, 333.1, 333.2],
+    "4": [22.0, 22.1, 22.2]
+  },
+  "llama_cpp_ownership_mapping": {
+    "reserve_transient_tree_slots": "missing primitive",
+    "gather_accepted_path": "missing primitive",
+    "discard_rejected_tree_slots": "missing primitive",
+    "compact_survivors_to_committed_tail": "missing primitive",
+    "preserve_cross_sequence_slots": "missing primitive"
+  },
+  "readiness_boundary": {
+    "llama_context_instantiated": false,
+    "draft_head_graph_executed": false,
+    "draft_tokens_emitted": false,
+    "real_kv_cache_mutated": false,
+    "server_route_added": false,
+    "runtime_supported": false
+  }
+}

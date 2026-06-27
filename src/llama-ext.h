@@ -125,6 +125,14 @@ LLAMA_API void llama_set_mtp_source(struct llama_context * ctx, struct llama_con
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_pre_norm    (struct llama_context * ctx);
 
+// P5B JetSpec target hidden taps, private staging API.
+// Disabled by default. When enabled for supported Qwen35 targets, returns rows
+// laid out as [layer1 | layer10 | layer19 | layer28 | layer37], width 5*n_embd.
+LLAMA_API void    llama_set_jetspec_target_hidden_taps(struct llama_context * ctx, bool value, bool masked);
+LLAMA_API float * llama_get_jetspec_target_hidden_taps(struct llama_context * ctx);
+LLAMA_API int32_t llama_get_jetspec_target_hidden_tap_count(struct llama_context * ctx);
+LLAMA_API int32_t llama_get_jetspec_target_hidden_tap_width(struct llama_context * ctx);
+
 // Return the raw model logits row, bypassing backend-sampler sampled-logit fallback in llama_get_logits_ith().
 // Intended for exactness/debug verification paths that need the full result_output row.
 LLAMA_API float * llama_get_logits_raw_ith(struct llama_context * ctx, int32_t i);

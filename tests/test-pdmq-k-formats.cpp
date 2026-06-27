@@ -562,6 +562,7 @@ static void test_llama_mtp_qblock_paged_state_contract() {
 
     uint32_t physical_page = 0;
     uint32_t slot = 0;
+    uint64_t physical_slot = 0;
     CHECK(llama_mtp_qblock_paged_state_logical_to_physical(state, 1024, &physical_page, &slot) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
     CHECK(physical_page == p2 && slot == 0);
     CHECK(llama_mtp_qblock_paged_state_logical_to_physical(state, 1039, &physical_page, &slot) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
@@ -582,6 +583,17 @@ static void test_llama_mtp_qblock_paged_state_contract() {
     CHECK(map.block_table[0] != int32_t(p1) && map.block_table[1] != int32_t(p1));
     CHECK(map.block_table[0] != int32_t(p3) && map.block_table[1] != int32_t(p3));
     CHECK(map.generation == state.generation);
+    CHECK(llama_mtp_qblock_paged_consumer_map_logical_to_physical(map, 1024, &physical_page, &slot, &physical_slot) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(physical_page == p2 && slot == 0 && physical_slot == uint64_t(p2) * LLAMA_MTP_QBLOCK_PAGED_STATE_PAGE_TOKENS);
+    CHECK(llama_mtp_qblock_paged_consumer_map_logical_to_physical(map, 1041, &physical_page, &slot, &physical_slot) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(physical_page == p0 && slot == 1 && physical_slot == uint64_t(p0) * LLAMA_MTP_QBLOCK_PAGED_STATE_PAGE_TOKENS + 1);
+    CHECK(llama_mtp_qblock_paged_consumer_map_logical_to_physical(map, 1042, &physical_page, &slot, &physical_slot) == LLAMA_MTP_QBLOCK_PAGED_STATE_TOKEN_NOT_VISIBLE);
+    CHECK(llama_mtp_qblock_paged_consumer_map_validate_range(map, 1024, 18) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(llama_mtp_qblock_paged_consumer_map_validate_range(map, 1039, 2) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(llama_mtp_qblock_paged_consumer_map_validate_range(map, 1041, 1) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(llama_mtp_qblock_paged_consumer_map_validate_range(map, 1041, 2) == LLAMA_MTP_QBLOCK_PAGED_STATE_TOKEN_NOT_VISIBLE);
+    CHECK(llama_mtp_qblock_paged_consumer_map_validate_range(map, 1024, 0) == LLAMA_MTP_QBLOCK_PAGED_STATE_TOKEN_NOT_VISIBLE);
+    CHECK(llama_mtp_qblock_paged_consumer_map_validate_range(map, 1023, 1) == LLAMA_MTP_QBLOCK_PAGED_STATE_TOKEN_NOT_VISIBLE);
 
     llama_mtp_qblock_paged_state_v1 imported = {};
     int32_t absolute_pages[2] = { 486, 488 };
@@ -625,6 +637,29 @@ static void test_llama_mtp_qblock_paged_state_contract() {
     CHECK(imported.managed_pages == 3);
     CHECK(llama_mtp_qblock_paged_state_find_managed_slot(imported, 490) == LLAMA_MTP_QBLOCK_PAGED_STATE_INVALID_SLOT);
 
+    llama_mtp_qblock_paged_state_v1 four_page_import = {};
+    int32_t four_page_table[4] = { 1200, 1203, 1201, 1202 };
+    CHECK(llama_mtp_qblock_paged_state_import_committed_pages(four_page_import, 12000, 2560, 64, four_page_table, 4, 9, 777) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(four_page_import.valid_tail_tokens == 64);
+    CHECK(four_page_import.logical_pages == 4);
+    CHECK(llama_mtp_qblock_paged_state_export_consumer_map(four_page_import, &map) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(map.logical_base_token == 12000);
+    CHECK(map.valid_tail_tokens == 64);
+    CHECK(map.block_table_pages == 4);
+    CHECK(map.block_table[0] == 1200 && map.block_table[1] == 1203 && map.block_table[2] == 1201 && map.block_table[3] == 1202);
+    const uint32_t four_page_expected_pages = (map.valid_tail_tokens + map.page_tokens - 1u) / map.page_tokens;
+    CHECK(four_page_expected_pages == 4);
+    CHECK(uint64_t(64) * uint64_t(four_page_expected_pages) == 256u);
+    CHECK(llama_mtp_qblock_paged_consumer_map_logical_to_physical(map, 12000, &physical_page, &slot, &physical_slot) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(physical_page == 1200 && slot == 0 && physical_slot == uint64_t(1200) * LLAMA_MTP_QBLOCK_PAGED_STATE_PAGE_TOKENS);
+    CHECK(llama_mtp_qblock_paged_consumer_map_logical_to_physical(map, 12031, &physical_page, &slot, &physical_slot) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(physical_page == 1203 && slot == 15 && physical_slot == uint64_t(1203) * LLAMA_MTP_QBLOCK_PAGED_STATE_PAGE_TOKENS + 15);
+    CHECK(llama_mtp_qblock_paged_consumer_map_logical_to_physical(map, 12032, &physical_page, &slot, &physical_slot) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(physical_page == 1201 && slot == 0 && physical_slot == uint64_t(1201) * LLAMA_MTP_QBLOCK_PAGED_STATE_PAGE_TOKENS);
+    CHECK(llama_mtp_qblock_paged_consumer_map_logical_to_physical(map, 12063, &physical_page, &slot, &physical_slot) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(physical_page == 1202 && slot == 15 && physical_slot == uint64_t(1202) * LLAMA_MTP_QBLOCK_PAGED_STATE_PAGE_TOKENS + 15);
+    CHECK(llama_mtp_qblock_paged_consumer_map_logical_to_physical(map, 12064, &physical_page, &slot, &physical_slot) == LLAMA_MTP_QBLOCK_PAGED_STATE_TOKEN_NOT_VISIBLE);
+
     llama_mtp_qblock_paged_state_v1 imported_with_reject = {};
     int32_t one_absolute_page[1] = { 700 };
     CHECK(llama_mtp_qblock_paged_state_import_committed_pages(imported_with_reject, 8192, 2560, 16, one_absolute_page, 1, 1, 200) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
@@ -653,6 +688,43 @@ static void test_llama_mtp_qblock_paged_state_contract() {
     CHECK(map.logical_base_token == 7783);
     CHECK(map.valid_tail_tokens == 5);
     CHECK(map.block_table[0] == 2499);
+    CHECK(llama_mtp_qblock_paged_consumer_map_logical_to_physical(map, 7783, &physical_page, &slot, &physical_slot) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(physical_page == 2499 && slot == 0 && physical_slot == uint64_t(2499) * LLAMA_MTP_QBLOCK_PAGED_STATE_PAGE_TOKENS);
+    CHECK(llama_mtp_qblock_paged_consumer_map_logical_to_physical(map, 7787, &physical_page, &slot, &physical_slot) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(physical_page == 2499 && slot == 4 && physical_slot == uint64_t(2499) * LLAMA_MTP_QBLOCK_PAGED_STATE_PAGE_TOKENS + 4);
+    CHECK(llama_mtp_qblock_paged_consumer_map_logical_to_physical(map, 7788, &physical_page, &slot, &physical_slot) == LLAMA_MTP_QBLOCK_PAGED_STATE_TOKEN_NOT_VISIBLE);
+
+    llama_mtp_qblock_paged_state_v1 owned_empty = {};
+    CHECK(llama_mtp_qblock_paged_state_init_absolute_empty(owned_empty, 9001, 2560, 400) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(owned_empty.active == 1);
+    CHECK(owned_empty.logical_base_token == 9001);
+    CHECK(owned_empty.physical_pages == 2560);
+    CHECK(owned_empty.managed_pages == 0);
+    CHECK(llama_mtp_qblock_paged_state_export_consumer_map(owned_empty, &map) == LLAMA_MTP_QBLOCK_PAGED_STATE_NO_VISIBLE_PAGES);
+    CHECK(llama_mtp_qblock_paged_state_claim_txn_page(owned_empty, 2559, &claimed_slot) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(claimed_slot == 0);
+    CHECK(owned_empty.managed_pages == 1);
+    CHECK(owned_empty.managed_physical_page[0] == 2559);
+    CHECK(owned_empty.owner[0] == uint8_t(LLAMA_MTP_QBLOCK_PAGED_PAGE_OWNER_TXN));
+    CHECK(llama_mtp_qblock_paged_state_claim_txn_page(owned_empty, 2559, nullptr) == LLAMA_MTP_QBLOCK_PAGED_STATE_DUP_MANAGED_PAGE);
+    int32_t owned_commit_page[1] = { 2559 };
+    CHECK(llama_mtp_qblock_paged_state_commit_pages(owned_empty, 7, owned_commit_page, 1, 7) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(owned_empty.valid_tail_tokens == 7);
+    CHECK(owned_empty.logical_pages == 1);
+    CHECK(owned_empty.owner[0] == uint8_t(LLAMA_MTP_QBLOCK_PAGED_PAGE_OWNER_CANONICAL));
+    CHECK(owned_empty.page_valid_tokens[0] == 7);
+    CHECK(llama_mtp_qblock_paged_state_logical_to_physical(owned_empty, 9007, &physical_page, &slot) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(physical_page == 2559 && slot == 6);
+    CHECK(llama_mtp_qblock_paged_state_logical_to_physical(owned_empty, 9008, &physical_page, &slot) == LLAMA_MTP_QBLOCK_PAGED_STATE_TOKEN_NOT_VISIBLE);
+
+    llama_mtp_qblock_paged_state_v1 owned_fail = {};
+    CHECK(llama_mtp_qblock_paged_state_init_absolute_empty(owned_fail, 9017, 2560, 401) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(llama_mtp_qblock_paged_state_claim_txn_page(owned_fail, 2401, nullptr) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    int32_t unclaimed_commit_page[1] = { 2402 };
+    CHECK(llama_mtp_qblock_paged_state_commit_pages(owned_fail, 4, unclaimed_commit_page, 1, 4) == LLAMA_MTP_QBLOCK_PAGED_STATE_BAD_MANAGED_PAGE);
+    CHECK(llama_mtp_qblock_paged_state_rollback_txn_pages(owned_fail) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(owned_fail.managed_pages == 0);
+    CHECK(llama_mtp_qblock_paged_state_export_consumer_map(owned_fail, &map) == LLAMA_MTP_QBLOCK_PAGED_STATE_NO_VISIBLE_PAGES);
 
     int32_t duplicate_absolute_pages[2] = { 486, 486 };
     CHECK(llama_mtp_qblock_paged_state_import_committed_pages(imported, 7776, 2560, 18, duplicate_absolute_pages, 2, 5, 124) == LLAMA_MTP_QBLOCK_PAGED_STATE_BAD_BLOCK_TABLE);
@@ -671,7 +743,15 @@ static void test_llama_mtp_qblock_paged_state_contract() {
     }
     CHECK(llama_mtp_qblock_paged_state_commit_pages(too_large, 65, too_large_table, 5, 0) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
     CHECK(too_large.logical_pages == 5);
+    CHECK(LLAMA_MTP_QBLOCK_PAGED_CONSUMER_MAP_MAX_PAGES == 4);
     CHECK(llama_mtp_qblock_paged_state_export_consumer_map(too_large, &map) == LLAMA_MTP_QBLOCK_PAGED_STATE_MAP_TOO_LARGE);
+    llama_mtp_qblock_paged_consumer_map_v1 oversized_map = {};
+    oversized_map.page_tokens = LLAMA_MTP_QBLOCK_PAGED_STATE_PAGE_TOKENS;
+    oversized_map.valid_tail_tokens = 65;
+    oversized_map.physical_pages = 2560;
+    oversized_map.block_table_pages = LLAMA_MTP_QBLOCK_PAGED_CONSUMER_MAP_MAX_PAGES + 1;
+    CHECK(llama_mtp_qblock_paged_consumer_map_logical_to_physical(oversized_map, 3072, &physical_page, &slot, &physical_slot) == LLAMA_MTP_QBLOCK_PAGED_STATE_MAP_TOO_LARGE);
+    CHECK(llama_mtp_qblock_paged_consumer_map_validate_range(oversized_map, 3072, 16) == LLAMA_MTP_QBLOCK_PAGED_STATE_MAP_TOO_LARGE);
 
     llama_mtp_qblock_paged_state_v1 rollback = {};
     CHECK(llama_mtp_qblock_paged_state_init(rollback, 4096, 3, 1) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
@@ -681,6 +761,556 @@ static void test_llama_mtp_qblock_paged_state_contract() {
     CHECK(llama_mtp_qblock_paged_state_rollback_txn_pages(rollback) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
     CHECK(rollback.free_count == 3);
     CHECK(llama_mtp_qblock_paged_state_export_consumer_map(rollback, &map) == LLAMA_MTP_QBLOCK_PAGED_STATE_NO_VISIBLE_PAGES);
+}
+
+static llama_mtp_qblock_tail_txn_commit_v1 make_tail_txn_commit_desc(
+        const uint32_t logical_base,
+        const uint32_t accepted_tokens,
+        const uint32_t physical_pages,
+        const int32_t * block_table,
+        const uint32_t block_table_pages,
+        const uint32_t final_state_slot,
+        const uint32_t recurrent_slot_count,
+        const uint32_t sampler_commit_tokens,
+        const uint64_t generation) {
+    llama_mtp_qblock_tail_txn_commit_v1 desc = {};
+    desc.logical_base_token = logical_base;
+    desc.accepted_tokens = accepted_tokens;
+    desc.physical_pages = physical_pages;
+    desc.block_table_pages = block_table_pages;
+    desc.final_state_slot = final_state_slot;
+    desc.recurrent_slot_count = recurrent_slot_count;
+    desc.sampler_commit_tokens = sampler_commit_tokens;
+    desc.generation = generation;
+    for (uint32_t i = 0; i < LLAMA_MTP_QBLOCK_PAGED_STATE_MAX_PAGES; ++i) {
+        desc.block_table[i] = LLAMA_MTP_QBLOCK_PAGED_STATE_INVALID_PAGE;
+    }
+    for (uint32_t i = 0; i < block_table_pages && i < LLAMA_MTP_QBLOCK_PAGED_STATE_MAX_PAGES; ++i) {
+        desc.block_table[i] = block_table != nullptr ? block_table[i] : LLAMA_MTP_QBLOCK_PAGED_STATE_INVALID_PAGE;
+    }
+    return desc;
+}
+
+static void test_tail_txn_commit_descriptor_contract() {
+    llama_mtp_qblock_paged_consumer_map_v1 map = {};
+
+    // Accepting zero tokens is a rollback-only transaction: no sampler or recurrent commit is visible.
+    llama_mtp_qblock_paged_state_v1 accept_zero = {};
+    CHECK(llama_mtp_qblock_paged_state_init_absolute_empty(accept_zero, 50000, 4096, 700) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(llama_mtp_qblock_paged_state_claim_txn_page(accept_zero, 2100, nullptr) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(llama_mtp_qblock_paged_state_claim_txn_page(accept_zero, 2101, nullptr) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    llama_mtp_qblock_tail_txn_commit_v1 zero_desc = make_tail_txn_commit_desc(
+        50000, 0, 4096, nullptr, 0, LLAMA_MTP_QBLOCK_PAGED_STATE_INVALID_SLOT, 8, 0, 701);
+    CHECK(llama_mtp_qblock_tail_txn_commit_validate_static(zero_desc) == LLAMA_MTP_QBLOCK_TAIL_TXN_COMMIT_OK);
+    CHECK(llama_mtp_qblock_tail_txn_commit_export_consumer_map(zero_desc, &map) == LLAMA_MTP_QBLOCK_TAIL_TXN_COMMIT_NO_VISIBLE_PAGES);
+    CHECK(llama_mtp_qblock_tail_txn_commit_apply(accept_zero, zero_desc) == LLAMA_MTP_QBLOCK_TAIL_TXN_COMMIT_OK);
+    CHECK(accept_zero.managed_pages == 0);
+    CHECK(llama_mtp_qblock_paged_state_export_consumer_map(accept_zero, &map) == LLAMA_MTP_QBLOCK_PAGED_STATE_NO_VISIBLE_PAGES);
+
+    // Partial final pages expose only accepted slots and carry the final recurrent state slot.
+    llama_mtp_qblock_paged_state_v1 partial = {};
+    CHECK(llama_mtp_qblock_paged_state_init_absolute_empty(partial, 51000, 4096, 800) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(llama_mtp_qblock_paged_state_claim_txn_page(partial, 2110, nullptr) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(llama_mtp_qblock_paged_state_claim_txn_page(partial, 2111, nullptr) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    const int32_t partial_pages[2] = {2110, 2111};
+    llama_mtp_qblock_tail_txn_commit_v1 partial_desc = make_tail_txn_commit_desc(
+        51000, 18, 4096, partial_pages, 2, 2, 8, 18, 801);
+    CHECK(llama_mtp_qblock_tail_txn_commit_validate_static(partial_desc) == LLAMA_MTP_QBLOCK_TAIL_TXN_COMMIT_OK);
+    CHECK(llama_mtp_qblock_tail_txn_commit_export_consumer_map(partial_desc, &map) == LLAMA_MTP_QBLOCK_TAIL_TXN_COMMIT_OK);
+    CHECK(map.logical_base_token == 51000 && map.valid_tail_tokens == 18 && map.block_table_pages == 2);
+    CHECK(llama_mtp_qblock_paged_consumer_map_validate_range(map, 51000, 18) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(llama_mtp_qblock_paged_consumer_map_validate_range(map, 51017, 1) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(llama_mtp_qblock_paged_consumer_map_validate_range(map, 51017, 2) == LLAMA_MTP_QBLOCK_PAGED_STATE_TOKEN_NOT_VISIBLE);
+    CHECK(llama_mtp_qblock_tail_txn_commit_apply(partial, partial_desc) == LLAMA_MTP_QBLOCK_TAIL_TXN_COMMIT_OK);
+    CHECK(partial.valid_tail_tokens == 18);
+    CHECK(partial.final_state_slot == 2);
+    CHECK(partial.page_valid_tokens[0] == 16);
+    CHECK(partial.page_valid_tokens[1] == 2);
+
+    // More than four committed pages may exist in the internal state, but cannot be exported to the current FA map ABI.
+    llama_mtp_qblock_paged_state_v1 five_page = {};
+    CHECK(llama_mtp_qblock_paged_state_init_absolute_empty(five_page, 52000, 4096, 900) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    const int32_t five_pages[5] = {2200, 2201, 2202, 2203, 2204};
+    for (int32_t page : five_pages) {
+        CHECK(llama_mtp_qblock_paged_state_claim_txn_page(five_page, uint32_t(page), nullptr) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    }
+    llama_mtp_qblock_tail_txn_commit_v1 five_desc = make_tail_txn_commit_desc(
+        52000, 80, 4096, five_pages, 5, 5, 8, 80, 901);
+    CHECK(llama_mtp_qblock_tail_txn_commit_validate_static(five_desc) == LLAMA_MTP_QBLOCK_TAIL_TXN_COMMIT_OK);
+    CHECK(llama_mtp_qblock_tail_txn_commit_export_consumer_map(five_desc, &map) == LLAMA_MTP_QBLOCK_TAIL_TXN_COMMIT_MAP_TOO_LARGE);
+    CHECK(llama_mtp_qblock_tail_txn_commit_apply(five_page, five_desc) == LLAMA_MTP_QBLOCK_TAIL_TXN_COMMIT_OK);
+    CHECK(five_page.logical_pages == 5);
+    CHECK(llama_mtp_qblock_paged_state_export_consumer_map(five_page, &map) == LLAMA_MTP_QBLOCK_PAGED_STATE_MAP_TOO_LARGE);
+
+    // Rejected sibling pages are released and never exported as accepted lineage.
+    llama_mtp_qblock_paged_state_v1 sibling = {};
+    CHECK(llama_mtp_qblock_paged_state_init_absolute_empty(sibling, 53000, 4096, 1000) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(llama_mtp_qblock_paged_state_claim_txn_page(sibling, 2300, nullptr) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(llama_mtp_qblock_paged_state_claim_txn_page(sibling, 2301, nullptr) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    const int32_t accepted_only[1] = {2300};
+    llama_mtp_qblock_tail_txn_commit_v1 sibling_desc = make_tail_txn_commit_desc(
+        53000, 16, 4096, accepted_only, 1, 1, 8, 16, 1001);
+    CHECK(llama_mtp_qblock_tail_txn_commit_apply(sibling, sibling_desc) == LLAMA_MTP_QBLOCK_TAIL_TXN_COMMIT_OK);
+    CHECK(llama_mtp_qblock_paged_state_find_managed_slot(sibling, 2300) < sibling.managed_pages);
+    CHECK(llama_mtp_qblock_paged_state_find_managed_slot(sibling, 2301) == LLAMA_MTP_QBLOCK_PAGED_STATE_INVALID_SLOT);
+    CHECK(llama_mtp_qblock_paged_state_export_consumer_map(sibling, &map) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(map.block_table_pages == 1 && map.block_table[0] == 2300);
+
+    const int32_t one_page[1] = {2400};
+    llama_mtp_qblock_tail_txn_commit_v1 bad_state_slot = make_tail_txn_commit_desc(
+        54000, 16, 4096, one_page, 1, 9, 4, 16, 1100);
+    CHECK(llama_mtp_qblock_tail_txn_commit_validate_static(bad_state_slot) == LLAMA_MTP_QBLOCK_TAIL_TXN_COMMIT_BAD_FINAL_STATE_SLOT);
+    llama_mtp_qblock_tail_txn_commit_v1 bad_sampler = make_tail_txn_commit_desc(
+        54000, 16, 4096, one_page, 1, 1, 4, 15, 1101);
+    CHECK(llama_mtp_qblock_tail_txn_commit_validate_static(bad_sampler) == LLAMA_MTP_QBLOCK_TAIL_TXN_COMMIT_BAD_SAMPLER_COMMIT);
+    const int32_t duplicate_pages[2] = {2400, 2400};
+    llama_mtp_qblock_tail_txn_commit_v1 duplicate = make_tail_txn_commit_desc(
+        54000, 32, 4096, duplicate_pages, 2, 2, 4, 32, 1102);
+    CHECK(llama_mtp_qblock_tail_txn_commit_validate_static(duplicate) == LLAMA_MTP_QBLOCK_TAIL_TXN_COMMIT_BAD_BLOCK_TABLE);
+}
+
+enum class owned_exclusive_host_reason {
+    ok,
+    not_owned_map,
+    physical_page_mismatch,
+    range_not_covered,
+    kv_pair_not_ready,
+    route_incomplete,
+    all_bound_unsafe_gate_disabled,
+    no_route_highwater,
+    before_route_highwater,
+    k_exclusive_not_seen,
+};
+
+struct owned_exclusive_host_state {
+    llama_mtp_qblock_paged_consumer_map_v1 map = {};
+    bool owned = true;
+    bool scratch = false;
+    bool k_ready = false;
+    bool v_ready = false;
+    bool route_complete = false;
+    bool all_bound_requested = false;
+    bool all_bound_unsafe = false;
+    bool k_exclusive_seen = false;
+    uint32_t physical_page = 0;
+    uint32_t no_map_highwater = 0;
+};
+
+static owned_exclusive_host_reason owned_exclusive_host_reason_for(
+        const owned_exclusive_host_state & state,
+        const bool is_v,
+        const uint32_t logical_base,
+        const uint32_t n_tokens,
+        const uint32_t physical_page) {
+    if (!state.owned || state.scratch) {
+        return owned_exclusive_host_reason::not_owned_map;
+    }
+    uint32_t mapped_physical_page = 0;
+    uint32_t slot = 0;
+    uint64_t physical_slot = 0;
+    if (llama_mtp_qblock_paged_consumer_map_logical_to_physical(
+            state.map, logical_base, &mapped_physical_page, &slot, &physical_slot) != LLAMA_MTP_QBLOCK_PAGED_STATE_OK ||
+            mapped_physical_page != physical_page || physical_page != state.physical_page) {
+        return owned_exclusive_host_reason::physical_page_mismatch;
+    }
+    const uint64_t req_begin = logical_base;
+    const uint64_t req_end = req_begin + n_tokens;
+    const uint64_t map_begin = state.map.logical_base_token;
+    const uint64_t map_end = map_begin + state.map.valid_tail_tokens;
+    if (n_tokens == 0 || req_end <= req_begin || req_begin < map_begin || req_end > map_end) {
+        return owned_exclusive_host_reason::range_not_covered;
+    }
+    if (!state.k_ready || !state.v_ready) {
+        return owned_exclusive_host_reason::kv_pair_not_ready;
+    }
+    if (!state.route_complete) {
+        return owned_exclusive_host_reason::route_incomplete;
+    }
+    const bool all_bound_no_miss = state.all_bound_requested && state.all_bound_unsafe && state.no_map_highwater == 0;
+    if (state.all_bound_requested && !state.all_bound_unsafe && state.no_map_highwater == 0) {
+        return owned_exclusive_host_reason::all_bound_unsafe_gate_disabled;
+    }
+    if (!all_bound_no_miss && state.no_map_highwater == 0) {
+        return owned_exclusive_host_reason::no_route_highwater;
+    }
+    if (!all_bound_no_miss && logical_base < state.no_map_highwater) {
+        return owned_exclusive_host_reason::before_route_highwater;
+    }
+    if (is_v && !state.k_exclusive_seen) {
+        return owned_exclusive_host_reason::k_exclusive_not_seen;
+    }
+    return owned_exclusive_host_reason::ok;
+}
+
+static void test_owned_exclusive_proof_contract() {
+    llama_mtp_qblock_paged_state_v1 import = {};
+    const int32_t pages[4] = {710, 711, 712, 713};
+    CHECK(llama_mtp_qblock_paged_state_import_committed_pages(import, 12000, 2560, 64, pages, 4, 9, 777) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    llama_mtp_qblock_paged_consumer_map_v1 map = {};
+    CHECK(llama_mtp_qblock_paged_state_export_consumer_map(import, &map) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(map.block_table_pages == 4);
+    CHECK(map.valid_tail_tokens == 64);
+
+    owned_exclusive_host_state state = {};
+    state.map = map;
+    state.physical_page = pages[0];
+    CHECK(owned_exclusive_host_reason_for(state, false, 12000, 16, pages[0]) == owned_exclusive_host_reason::kv_pair_not_ready);
+    state.k_ready = true;
+    CHECK(owned_exclusive_host_reason_for(state, false, 12000, 16, pages[0]) == owned_exclusive_host_reason::kv_pair_not_ready);
+    state.v_ready = true;
+    CHECK(owned_exclusive_host_reason_for(state, false, 12000, 16, pages[0]) == owned_exclusive_host_reason::route_incomplete);
+    state.route_complete = true;
+    CHECK(owned_exclusive_host_reason_for(state, false, 12000, 16, pages[0]) == owned_exclusive_host_reason::no_route_highwater);
+    state.all_bound_requested = true;
+    CHECK(owned_exclusive_host_reason_for(state, false, 12000, 16, pages[0]) == owned_exclusive_host_reason::all_bound_unsafe_gate_disabled);
+    state.all_bound_unsafe = true;
+    CHECK(owned_exclusive_host_reason_for(state, false, 12000, 16, pages[0]) == owned_exclusive_host_reason::ok);
+    CHECK(owned_exclusive_host_reason_for(state, true, 12000, 16, pages[0]) == owned_exclusive_host_reason::k_exclusive_not_seen);
+    state.all_bound_requested = false;
+    state.all_bound_unsafe = false;
+    state.no_map_highwater = 12001;
+    CHECK(owned_exclusive_host_reason_for(state, false, 12000, 16, pages[0]) == owned_exclusive_host_reason::before_route_highwater);
+    state.no_map_highwater = 12000;
+    CHECK(owned_exclusive_host_reason_for(state, false, 12000, 16, pages[0]) == owned_exclusive_host_reason::ok);
+    CHECK(owned_exclusive_host_reason_for(state, true, 12000, 16, pages[0]) == owned_exclusive_host_reason::k_exclusive_not_seen);
+    state.k_exclusive_seen = true;
+    CHECK(owned_exclusive_host_reason_for(state, true, 12000, 16, pages[0]) == owned_exclusive_host_reason::ok);
+    state.scratch = true;
+    CHECK(owned_exclusive_host_reason_for(state, false, 12000, 16, pages[0]) == owned_exclusive_host_reason::not_owned_map);
+    state.scratch = false;
+    CHECK(owned_exclusive_host_reason_for(state, false, 12000, 80, pages[0]) == owned_exclusive_host_reason::range_not_covered);
+    CHECK(owned_exclusive_host_reason_for(state, false, 12016, 16, pages[0]) == owned_exclusive_host_reason::physical_page_mismatch);
+}
+
+enum class owned_plan_bound_host_reason {
+    ok,
+    not_owned_map,
+    physical_page_mismatch,
+    range_not_covered,
+    plan_not_ready,
+    plan_after_record,
+    missing_bound_layer_pages,
+    route_incomplete_or_map_replaced,
+    no_map_consumer_seen,
+    k_plan_skip_not_seen,
+};
+
+struct owned_plan_bound_host_state {
+    llama_mtp_qblock_paged_consumer_map_v1 map = {};
+    bool owned = true;
+    bool scratch = false;
+    bool plan_ready = false;
+    bool plan_before_record = false;
+    bool route_complete_same_map = false;
+    bool k_plan_skip_seen = false;
+    uint64_t expected_layer_pages = 0;
+    uint64_t bound_layer_pages_at_record = 0;
+    uint32_t physical_page = 0;
+    uint32_t no_map_highwater = 0;
+};
+
+static owned_plan_bound_host_reason owned_plan_bound_host_reason_for(
+        const owned_plan_bound_host_state & state,
+        const bool is_v,
+        const uint32_t logical_base,
+        const uint32_t n_tokens,
+        const uint32_t physical_page) {
+    if (!state.owned || state.scratch) {
+        return owned_plan_bound_host_reason::not_owned_map;
+    }
+    uint32_t mapped_physical_page = 0;
+    uint32_t slot = 0;
+    uint64_t physical_slot = 0;
+    if (llama_mtp_qblock_paged_consumer_map_logical_to_physical(
+            state.map, logical_base, &mapped_physical_page, &slot, &physical_slot) != LLAMA_MTP_QBLOCK_PAGED_STATE_OK ||
+            mapped_physical_page != physical_page || physical_page != state.physical_page) {
+        return owned_plan_bound_host_reason::physical_page_mismatch;
+    }
+    const uint64_t req_begin = logical_base;
+    const uint64_t req_end = req_begin + n_tokens;
+    const uint64_t map_begin = state.map.logical_base_token;
+    const uint64_t map_end = map_begin + state.map.valid_tail_tokens;
+    if (n_tokens == 0 || req_end <= req_begin || req_begin < map_begin || req_end > map_end) {
+        return owned_plan_bound_host_reason::range_not_covered;
+    }
+    if (!state.plan_ready || state.expected_layer_pages == 0) {
+        return owned_plan_bound_host_reason::plan_not_ready;
+    }
+    if (!state.plan_before_record) {
+        return owned_plan_bound_host_reason::plan_after_record;
+    }
+    if (state.bound_layer_pages_at_record < state.expected_layer_pages) {
+        return owned_plan_bound_host_reason::missing_bound_layer_pages;
+    }
+    if (!state.route_complete_same_map) {
+        return owned_plan_bound_host_reason::route_incomplete_or_map_replaced;
+    }
+    if (state.no_map_highwater != 0) {
+        return owned_plan_bound_host_reason::no_map_consumer_seen;
+    }
+    if (is_v && !state.k_plan_skip_seen) {
+        return owned_plan_bound_host_reason::k_plan_skip_not_seen;
+    }
+    return owned_plan_bound_host_reason::ok;
+}
+
+static void test_owned_plan_first_contract() {
+    llama_mtp_qblock_paged_state_v1 import = {};
+    const int32_t pages[4] = {810, 811, 812, 813};
+    CHECK(llama_mtp_qblock_paged_state_import_committed_pages(import, 16000, 2560, 64, pages, 4, 7, 991) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    llama_mtp_qblock_paged_consumer_map_v1 map = {};
+    CHECK(llama_mtp_qblock_paged_state_export_consumer_map(import, &map) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+
+    owned_plan_bound_host_state state = {};
+    state.map = map;
+    state.physical_page = pages[0];
+    state.expected_layer_pages = 8;
+    CHECK(owned_plan_bound_host_reason_for(state, false, 16000, 16, pages[0]) == owned_plan_bound_host_reason::plan_not_ready);
+    state.plan_ready = true;
+    CHECK(owned_plan_bound_host_reason_for(state, false, 16000, 16, pages[0]) == owned_plan_bound_host_reason::plan_after_record);
+    state.plan_before_record = true;
+    CHECK(owned_plan_bound_host_reason_for(state, false, 16000, 16, pages[0]) == owned_plan_bound_host_reason::missing_bound_layer_pages);
+    state.bound_layer_pages_at_record = 7;
+    CHECK(owned_plan_bound_host_reason_for(state, false, 16000, 16, pages[0]) == owned_plan_bound_host_reason::missing_bound_layer_pages);
+    state.bound_layer_pages_at_record = 8;
+    CHECK(owned_plan_bound_host_reason_for(state, false, 16000, 16, pages[0]) == owned_plan_bound_host_reason::route_incomplete_or_map_replaced);
+    state.route_complete_same_map = true;
+    CHECK(owned_plan_bound_host_reason_for(state, false, 16000, 16, pages[0]) == owned_plan_bound_host_reason::ok);
+    CHECK(owned_plan_bound_host_reason_for(state, true, 16000, 16, pages[0]) == owned_plan_bound_host_reason::k_plan_skip_not_seen);
+    state.k_plan_skip_seen = true;
+    CHECK(owned_plan_bound_host_reason_for(state, true, 16000, 16, pages[0]) == owned_plan_bound_host_reason::ok);
+    state.no_map_highwater = 16001;
+    CHECK(owned_plan_bound_host_reason_for(state, false, 16000, 16, pages[0]) == owned_plan_bound_host_reason::no_map_consumer_seen);
+    state.no_map_highwater = 0;
+    state.scratch = true;
+    CHECK(owned_plan_bound_host_reason_for(state, false, 16000, 16, pages[0]) == owned_plan_bound_host_reason::not_owned_map);
+    state.scratch = false;
+    CHECK(owned_plan_bound_host_reason_for(state, false, 16064, 16, pages[0]) == owned_plan_bound_host_reason::physical_page_mismatch);
+    CHECK(owned_plan_bound_host_reason_for(state, false, 16000, 80, pages[0]) == owned_plan_bound_host_reason::range_not_covered);
+}
+
+static bool owned_page_authority_writer_from_map(
+        const bool map_registered,
+        const llama_mtp_qblock_paged_consumer_map_v1 & map,
+        const uint32_t logical_base,
+        const uint32_t n_tokens,
+        const uint32_t writer_physical_page,
+        uint64_t * map_generation) {
+    if (map_generation != nullptr) {
+        *map_generation = 0;
+    }
+    if (!map_registered || n_tokens == 0) {
+        return false;
+    }
+    uint32_t mapped_physical_page = 0;
+    uint32_t slot = 0;
+    uint64_t physical_slot = 0;
+    if (llama_mtp_qblock_paged_consumer_map_logical_to_physical(
+            map, logical_base, &mapped_physical_page, &slot, &physical_slot) != LLAMA_MTP_QBLOCK_PAGED_STATE_OK) {
+        return false;
+    }
+    const uint64_t req_begin = logical_base;
+    const uint64_t req_end = req_begin + n_tokens;
+    const uint64_t map_begin = map.logical_base_token;
+    const uint64_t map_end = map_begin + map.valid_tail_tokens;
+    if (req_end <= req_begin || req_begin < map_begin || req_end > map_end || mapped_physical_page != writer_physical_page) {
+        return false;
+    }
+    if (map_generation != nullptr) {
+        *map_generation = map.generation;
+    }
+    return true;
+}
+
+static bool owned_page_authority_legacy_fallback_owned(
+        const bool owned_requested,
+        const bool page_merge_active,
+        const bool writer_from_map,
+        const bool require_prepublished_map,
+        const int scratch_page_base,
+        const uint32_t canonical_page_end) {
+    return owned_requested && page_merge_active && !writer_from_map && !require_prepublished_map &&
+        scratch_page_base >= 0 && (uint32_t) scratch_page_base >= canonical_page_end;
+}
+
+static void test_owned_page_authority_map_first_contract() {
+    llama_mtp_qblock_paged_state_v1 state = {};
+    CHECK(llama_mtp_qblock_paged_state_init_absolute_empty(state, 32000, 4096, 123) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    uint32_t claim_slot = LLAMA_MTP_QBLOCK_PAGED_STATE_INVALID_SLOT;
+    CHECK(llama_mtp_qblock_paged_state_claim_txn_page(state, 2047, &claim_slot) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(claim_slot == 0);
+    const int32_t block_table[1] = {2047};
+    CHECK(llama_mtp_qblock_paged_state_commit_pages(state, 16, block_table, 1, 5) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+
+    llama_mtp_qblock_paged_consumer_map_v1 map = {};
+    CHECK(llama_mtp_qblock_paged_state_export_consumer_map(state, &map) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(map.logical_base_token == 32000);
+    CHECK(map.valid_tail_tokens == 16);
+    CHECK(map.block_table_pages == 1);
+    CHECK(map.block_table[0] == 2047);
+
+    uint64_t generation = 0;
+    const bool writer_from_map = owned_page_authority_writer_from_map(true, map, 32000, 5, 2047, &generation);
+    CHECK(writer_from_map);
+    CHECK(generation == map.generation);
+    CHECK(!owned_page_authority_legacy_fallback_owned(true, true, writer_from_map, false, 4095 * 16, 32016));
+    CHECK(!owned_page_authority_legacy_fallback_owned(true, true, writer_from_map, true, 4095 * 16, 32016));
+
+    CHECK(!owned_page_authority_writer_from_map(false, map, 32000, 5, 2047, &generation));
+    CHECK(generation == 0);
+    CHECK(owned_page_authority_legacy_fallback_owned(true, true, false, false, 4095 * 16, 32016));
+    CHECK(!owned_page_authority_legacy_fallback_owned(true, true, false, true, 4095 * 16, 32016));
+    CHECK(!owned_page_authority_writer_from_map(true, map, 32000, 17, 2047, &generation));
+    CHECK(!owned_page_authority_writer_from_map(true, map, 32000, 5, 2046, &generation));
+    CHECK(!owned_page_authority_writer_from_map(true, map, 32016, 1, 2047, &generation));
+}
+
+static bool owned_ageout_future_read_safe(
+        const llama_mtp_qblock_paged_consumer_map_v1 & current_map,
+        const uint32_t logical_base,
+        const uint32_t n_tokens,
+        const uint32_t owned_physical_page,
+        const bool canonical_write_through) {
+    uint64_t generation = 0;
+    if (owned_page_authority_writer_from_map(true, current_map, logical_base, n_tokens, owned_physical_page, &generation)) {
+        return true;
+    }
+    return canonical_write_through;
+}
+
+static void test_owned_ageout_requires_canonical_write_through_contract() {
+    llama_mtp_qblock_paged_state_v1 initial = {};
+    const int32_t initial_pages[4] = {1500, 1501, 1502, 1503};
+    CHECK(llama_mtp_qblock_paged_state_import_committed_pages(initial, 40000, 4096, 64, initial_pages, 4, 4, 1001) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    llama_mtp_qblock_paged_consumer_map_v1 initial_map = {};
+    CHECK(llama_mtp_qblock_paged_state_export_consumer_map(initial, &initial_map) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(llama_mtp_qblock_paged_consumer_map_validate_range(initial_map, 40000, 64) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(owned_ageout_future_read_safe(initial_map, 40000, 16, 1500, false));
+
+    llama_mtp_qblock_paged_state_v1 later = {};
+    const int32_t later_pages[4] = {1504, 1505, 1506, 1507};
+    CHECK(llama_mtp_qblock_paged_state_import_committed_pages(later, 40064, 4096, 64, later_pages, 4, 4, 1002) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    llama_mtp_qblock_paged_consumer_map_v1 later_map = {};
+    CHECK(llama_mtp_qblock_paged_state_export_consumer_map(later, &later_map) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+
+    uint64_t generation = 0;
+    CHECK(!owned_page_authority_writer_from_map(true, later_map, 40000, 16, 1500, &generation));
+    CHECK(llama_mtp_qblock_paged_consumer_map_validate_range(later_map, 40000, 16) == LLAMA_MTP_QBLOCK_PAGED_STATE_TOKEN_NOT_VISIBLE);
+    CHECK(generation == 0);
+    CHECK(!owned_ageout_future_read_safe(later_map, 40000, 16, 1500, false));
+    CHECK(owned_ageout_future_read_safe(later_map, 40000, 16, 1500, true));
+
+    llama_mtp_qblock_paged_state_v1 five_pages = {};
+    CHECK(llama_mtp_qblock_paged_state_init_absolute_empty(five_pages, 40000, 4096, 2001) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    const int32_t five_page_table[5] = {1500, 1501, 1502, 1503, 1504};
+    for (int32_t page : five_page_table) {
+        CHECK(llama_mtp_qblock_paged_state_claim_txn_page(five_pages, uint32_t(page), nullptr) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    }
+    CHECK(llama_mtp_qblock_paged_state_commit_pages(five_pages, 80, five_page_table, 5, 5) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    uint32_t physical_page = 0;
+    uint32_t slot = 0;
+    CHECK(llama_mtp_qblock_paged_state_logical_to_physical(five_pages, 40000, &physical_page, &slot) == LLAMA_MTP_QBLOCK_PAGED_STATE_OK);
+    CHECK(physical_page == 1500 && slot == 0);
+    llama_mtp_qblock_paged_consumer_map_v1 oversized_consumer_map = {};
+    CHECK(llama_mtp_qblock_paged_state_export_consumer_map(five_pages, &oversized_consumer_map) == LLAMA_MTP_QBLOCK_PAGED_STATE_MAP_TOO_LARGE);
+}
+
+struct logical_slot_audit_host_result {
+    uint32_t samples = 0;
+    uint32_t canonical_tokens = 0;
+    uint32_t remap_tokens = 0;
+    uint32_t visible_noncanonical_tokens = 0;
+    uint32_t bad_slots = 0;
+    uint64_t first_physical_slot = 0;
+    uint64_t last_physical_slot = 0;
+    uint64_t min_physical_slot = 0;
+    uint64_t max_physical_slot = 0;
+};
+
+static logical_slot_audit_host_result logical_slot_audit_host(
+        const llama_mtp_qblock_paged_consumer_map_v1 & map,
+        const uint32_t nk) {
+    logical_slot_audit_host_result out = {};
+    for (uint32_t rel = 0; rel < map.valid_tail_tokens; ++rel) {
+        const uint32_t logical_token = map.logical_base_token + rel;
+        uint32_t physical_page = 0;
+        uint32_t slot = 0;
+        uint64_t physical_slot = 0;
+        const llama_mtp_qblock_paged_state_status status = llama_mtp_qblock_paged_consumer_map_logical_to_physical(
+                map, logical_token, &physical_page, &slot, &physical_slot);
+        if (status != LLAMA_MTP_QBLOCK_PAGED_STATE_OK) {
+            ++out.bad_slots;
+            continue;
+        }
+        if (out.samples == 0) {
+            out.first_physical_slot = physical_slot;
+            out.min_physical_slot = physical_slot;
+            out.max_physical_slot = physical_slot;
+        } else {
+            out.min_physical_slot = std::min(out.min_physical_slot, physical_slot);
+            out.max_physical_slot = std::max(out.max_physical_slot, physical_slot);
+        }
+        out.last_physical_slot = physical_slot;
+        ++out.samples;
+        if (physical_slot == uint64_t(logical_token)) {
+            ++out.canonical_tokens;
+        } else {
+            ++out.remap_tokens;
+            if (physical_slot < nk) {
+                ++out.visible_noncanonical_tokens;
+            }
+        }
+    }
+    return out;
+}
+
+static void test_logical_slot_audit_contract() {
+    llama_mtp_qblock_paged_consumer_map_v1 map = {};
+    map.logical_base_token = 64;
+    map.valid_tail_tokens = 40;
+    map.page_tokens = LLAMA_MTP_QBLOCK_PAGED_STATE_PAGE_TOKENS;
+    map.physical_pages = 2560;
+    map.block_table_pages = 3;
+    map.block_table[0] = 4;
+    map.block_table[1] = 5;
+    map.block_table[2] = 2559;
+    map.generation = 77;
+
+    logical_slot_audit_host_result audit = logical_slot_audit_host(map, 96);
+    CHECK(audit.samples == 40);
+    CHECK(audit.bad_slots == 0);
+    CHECK(audit.canonical_tokens == 32);
+    CHECK(audit.remap_tokens == 8);
+    CHECK(audit.visible_noncanonical_tokens == 0);
+    CHECK(audit.first_physical_slot == 64);
+    CHECK(audit.last_physical_slot == uint64_t(2559) * LLAMA_MTP_QBLOCK_PAGED_STATE_PAGE_TOKENS + 7);
+    CHECK(audit.min_physical_slot == 64);
+    CHECK(audit.max_physical_slot == uint64_t(2559) * LLAMA_MTP_QBLOCK_PAGED_STATE_PAGE_TOKENS + 7);
+
+    llama_mtp_qblock_paged_consumer_map_v1 visible_noncanonical = {};
+    visible_noncanonical.logical_base_token = 64;
+    visible_noncanonical.valid_tail_tokens = 34;
+    visible_noncanonical.page_tokens = LLAMA_MTP_QBLOCK_PAGED_STATE_PAGE_TOKENS;
+    visible_noncanonical.physical_pages = 4;
+    visible_noncanonical.block_table_pages = 3;
+    visible_noncanonical.block_table[0] = 2;
+    visible_noncanonical.block_table[1] = 0;
+    visible_noncanonical.block_table[2] = 3;
+    audit = logical_slot_audit_host(visible_noncanonical, 50);
+    CHECK(audit.samples == 34);
+    CHECK(audit.bad_slots == 0);
+    CHECK(audit.canonical_tokens == 0);
+    CHECK(audit.remap_tokens == 34);
+    CHECK(audit.visible_noncanonical_tokens == 34);
+    CHECK(audit.first_physical_slot == 32);
+    CHECK(audit.last_physical_slot == 49);
+    CHECK(audit.min_physical_slot == 0);
+    CHECK(audit.max_physical_slot == 49);
+
+    visible_noncanonical.block_table[2] = 99;
+    audit = logical_slot_audit_host(visible_noncanonical, 50);
+    CHECK(audit.samples == 32);
+    CHECK(audit.bad_slots == 2);
 }
 
 static void test_txn_tail_page_stage_contract() {
@@ -800,6 +1430,12 @@ int main() {
     test_txn_tail_page_state_contract();
     test_txn_tail_page_state_multipage_contract();
     test_llama_mtp_qblock_paged_state_contract();
+    test_tail_txn_commit_descriptor_contract();
+    test_owned_exclusive_proof_contract();
+    test_owned_plan_first_contract();
+    test_owned_page_authority_map_first_contract();
+    test_owned_ageout_requires_canonical_write_through_contract();
+    test_logical_slot_audit_contract();
     test_txn_tail_page_stage_contract();
     test_randomized_qk_and_attention();
     std::puts("test-pdmq-k-formats: PASS");

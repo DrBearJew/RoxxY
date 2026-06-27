@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "dot4-packed16/dp16-packed-i8-desc.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
 #include "fattn-packed16-common.cuh"
@@ -1087,6 +1088,12 @@ static const char * ggml_cuda_fattn_rocm_quant_prefill_f16_env() {
     if (!env) {
         env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_MMA");
     }
+    if (!env) {
+        env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_WMMA");
+    }
+    if (!env) {
+        env = getenv("TBQ4_PREFILL_WMMA");
+    }
     return env;
 #else
     return nullptr;
@@ -1120,6 +1127,159 @@ static int64_t ggml_cuda_round_up_i64(const int64_t x, const int64_t multiple) {
         return x;
     }
     return ((x + multiple - 1) / multiple) * multiple;
+}
+
+extern "C" {
+void llama_kv_cache_get_packed16_tensors(const void * k_view_data, struct ggml_tensor ** payload, struct ggml_tensor ** scales);
+void llama_kv_cache_get_packed16_packed_i8_desc(const void * k_view_data, struct dp16_packed_i8_desc_v1 * desc);
+}
+
+static __global__ void ggml_cuda_fattn_materialize_packed16_k_f16_kernel(
+        const int32_t * __restrict__ payload,
+        const half * __restrict__ scales,
+        half * __restrict__ dst,
+        const dp16_packed_i8_desc_v1 desc,
+        const int64_t payload_batch_stride_words,
+        const int64_t scales_batch_stride_half,
+        const int d,
+        const int nkv,
+        const int n_heads_k,
+        const int batch) {
+    const int d_words = d >> 2;
+    const int64_t n_words = (int64_t) d_words * nkv * n_heads_k * batch;
+    int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_words) {
+        return;
+    }
+
+    const int d_word = idx % d_words;
+    idx /= d_words;
+    const int token = idx % nkv;
+    idx /= nkv;
+    const int head = idx % n_heads_k;
+    const int b = idx / n_heads_k;
+
+    const uint32_t d16 = (uint32_t) d_word / DP16_PACKED_I8X16_WORDS;
+    const uint32_t word_in_d16 = (uint32_t) d_word - d16 * DP16_PACKED_I8X16_WORDS;
+    const size_t payload_idx = (size_t) b * (size_t) payload_batch_stride_words +
+        dp16_packed_i8_payload_word_index(desc, (uint32_t) head, (uint32_t) token, d16, word_in_d16);
+    const uint32_t word = (uint32_t) payload[payload_idx];
+
+    const uint32_t qblock = (uint32_t) d_word / (QK8_0 / 4u);
+    const size_t scale_idx = (size_t) b * (size_t) scales_batch_stride_half +
+        (size_t) (dp16_packed_i8_scale_byte_offset(desc, (uint32_t) head, (uint32_t) token, qblock) / sizeof(uint16_t));
+    const float scale = __half2float(scales[scale_idx]);
+
+    half * out = dst + ((((int64_t) b * n_heads_k + head) * nkv + token) * d + d_word * 4);
+#pragma unroll
+    for (int lane = 0; lane < 4; ++lane) {
+        const int q = (int) (int8_t) ((word >> (lane * 8u)) & 0xffu);
+        out[lane] = __float2half((float) q * scale);
+    }
+}
+
+static void ggml_cuda_fattn_materialize_packed16_k_f16(
+        const ggml_tensor * K,
+        const int d,
+        half * dst,
+        cudaStream_t stream) {
+    ggml_tensor * payload = nullptr;
+    ggml_tensor * scales = nullptr;
+    const void * lookup = K->data;
+    llama_kv_cache_get_packed16_tensors(lookup, &payload, &scales);
+    if ((!payload || !scales) && K->view_src) {
+        lookup = K->view_src->data;
+        llama_kv_cache_get_packed16_tensors(lookup, &payload, &scales);
+    }
+    GGML_ASSERT(payload && scales && payload->data && scales->data);
+
+    dp16_packed_i8_desc_v1 desc = {};
+    llama_kv_cache_get_packed16_packed_i8_desc(lookup, &desc);
+    GGML_ASSERT(dp16_i8x16_desc_has_vector_abi(desc));
+    GGML_ASSERT(desc.scale_layout != DP16_PACKED_I8_SCALE_LAYOUT_UNKNOWN);
+    GGML_ASSERT(K->type == GGML_TYPE_I32 && K->ne[0] * 4 == d);
+    GGML_ASSERT(scales->ne[0] >= d / QK8_0);
+
+    GGML_ASSERT((d % 4) == 0);
+    const int64_t n = (int64_t) (d / 4) * K->ne[1] * K->ne[2] * K->ne[3];
+    const int threads = 256;
+    const int blocks = (int) ((n + threads - 1) / threads);
+    const int64_t payload_batch_stride_words = payload->nb[3] > 0 ? payload->nb[3] / (int64_t) sizeof(int32_t) : 0;
+    const int64_t scales_batch_stride_half = scales->nb[3] > 0 ? scales->nb[3] / (int64_t) sizeof(half) : 0;
+    ggml_cuda_fattn_materialize_packed16_k_f16_kernel<<<blocks, threads, 0, stream>>>(
+        (const int32_t *) payload->data, (const half *) scales->data, dst, desc,
+        payload_batch_stride_words, scales_batch_stride_half,
+        (int) d, (int) K->ne[1], (int) K->ne[2], (int) K->ne[3]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static constexpr int GGML_CUDA_FATTN_V4_144_D = 256;
+static constexpr int GGML_CUDA_FATTN_V4_144_K = 16;
+static constexpr int GGML_CUDA_FATTN_V4_144_D32 = 32;
+static constexpr int GGML_CUDA_FATTN_V4_144_PAYLOAD_BYTES = 2048;
+static constexpr int GGML_CUDA_FATTN_V4_144_WORDS_PER_D = 2;
+
+static __global__ void ggml_cuda_fattn_materialize_v4_144_f16_kernel(
+        const char * __restrict__ V,
+        half * __restrict__ dst,
+        const int64_t nb11,
+        const int64_t nb12,
+        const int64_t nb13,
+        const int64_t v_ne13,
+        const int nkv,
+        const int n_heads_v,
+        const int batch) {
+    constexpr int d = GGML_CUDA_FATTN_V4_144_D;
+    constexpr int slots_per_word = 8;
+    const int n_k16 = (nkv + GGML_CUDA_FATTN_V4_144_K - 1) / GGML_CUDA_FATTN_V4_144_K;
+    const int64_t n_words = (int64_t) d * GGML_CUDA_FATTN_V4_144_WORDS_PER_D * n_k16 * n_heads_v * batch;
+    int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_words) {
+        return;
+    }
+
+    const int dim = idx % d;
+    idx /= d;
+    const int word_in_k16 = idx % GGML_CUDA_FATTN_V4_144_WORDS_PER_D;
+    idx /= GGML_CUDA_FATTN_V4_144_WORDS_PER_D;
+    const int k16_block = idx % n_k16;
+    idx /= n_k16;
+    const int head = idx % n_heads_v;
+    const int b = idx / n_heads_v;
+
+    const int vb = v_ne13 > 1 ? (b % (int) v_ne13) : 0;
+    const int k16_base = k16_block * GGML_CUDA_FATTN_V4_144_K;
+    const char * block = V + (int64_t) vb * nb13 + (int64_t) head * nb12 + (int64_t) k16_base * nb11;
+    const uint32_t word = ((const uint32_t *) block)[dim * GGML_CUDA_FATTN_V4_144_WORDS_PER_D + word_in_k16];
+    const half * scale = (const half *) (block + GGML_CUDA_FATTN_V4_144_PAYLOAD_BYTES);
+    const int slot_base = word_in_k16 * slots_per_word;
+
+#pragma unroll
+    for (int s = 0; s < slots_per_word; ++s) {
+        const int token = k16_base + slot_base + s;
+        if (token >= nkv) {
+            continue;
+        }
+        const int slot = slot_base + s;
+        const int q = (int) ((word >> (4 * s)) & 0x0fu) - 8;
+        dst[(((int64_t) b * n_heads_v + head) * nkv + token) * d + dim] =
+            __float2half((float) q * __half2float(scale[(dim / GGML_CUDA_FATTN_V4_144_D32) * GGML_CUDA_FATTN_V4_144_K + slot]));
+    }
+}
+
+static void ggml_cuda_fattn_materialize_v4_144_f16(
+        const ggml_tensor * V,
+        half * dst,
+        cudaStream_t stream) {
+    GGML_ASSERT(V->type == GGML_TYPE_V4_K16D16_144 && V->ne[0] == GGML_CUDA_FATTN_V4_144_D);
+    const int64_t n_k16 = (V->ne[1] + GGML_CUDA_FATTN_V4_144_K - 1) / GGML_CUDA_FATTN_V4_144_K;
+    const int64_t n = (int64_t) V->ne[0] * GGML_CUDA_FATTN_V4_144_WORDS_PER_D * n_k16 * V->ne[2] * V->ne[3];
+    const int threads = 256;
+    const int blocks = (int) ((n + threads - 1) / threads);
+    ggml_cuda_fattn_materialize_v4_144_f16_kernel<<<blocks, threads, 0, stream>>>(
+        (const char *) V->data, dst, V->nb[1], V->nb[2], V->nb[3], V->ne[3],
+        (int) V->ne[1], (int) V->ne[2], (int) V->ne[3]);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 static int64_t ggml_cuda_fattn_f16_tmp_stable_bucket_nkv() {
@@ -1156,7 +1316,7 @@ static int64_t ggml_cuda_fattn_f16_tmp_stable_nkv(const ggml_tensor * t) {
 }
 
 static int64_t ggml_cuda_fattn_f16_tmp_alloc_nelements(const ggml_tensor * t) {
-    int64_t ne = ggml_nelements(t);
+    int64_t ne = t->type == GGML_TYPE_I32 ? t->ne[0] * 4 * t->ne[1] * t->ne[2] * t->ne[3] : ggml_nelements(t);
 
 #ifdef GGML_USE_HIP
     // HIP legacy-pool allocations are cached by size. During MTP prefill, nkv
@@ -1169,13 +1329,15 @@ static int64_t ggml_cuda_fattn_f16_tmp_alloc_nelements(const ggml_tensor * t) {
     const char * stable_alloc_env = getenv("GGML_CUDA_ROCM_QUANT_PREFILL_F16_STABLE_ALLOC");
     const bool stable_alloc = stable_alloc_env ? atoi(stable_alloc_env) != 0 :
         (ggml_cuda_fattn_rocm_quant_prefill_f16_enabled() || ggml_cuda_fattn_rocm_quant_prefill_f16_auto_enabled());
-    if (!stable_alloc || !ggml_is_quantized(t->type)) {
+    const bool packed16_i32_k = t->type == GGML_TYPE_I32;
+    if (!stable_alloc || (!ggml_is_quantized(t->type) && !packed16_i32_k)) {
         return ne;
     }
 
     const int64_t stable_nkv = ggml_cuda_fattn_f16_tmp_stable_nkv(t);
     if (stable_nkv > t->ne[1]) {
-        const int64_t stable_ne = t->ne[0] * stable_nkv * t->ne[2] * t->ne[3];
+        const int64_t d_f16 = packed16_i32_k ? t->ne[0] * 4 : t->ne[0];
+        const int64_t stable_ne = d_f16 * stable_nkv * t->ne[2] * t->ne[3];
         ne = std::max(ne, stable_ne);
     }
 #endif // GGML_USE_HIP
@@ -1293,28 +1455,37 @@ void launch_fattn(
     size_t nb23 = V->nb[3];
 
     if (!K_data_override && need_f16_K && K->type != GGML_TYPE_F16) {
-        const size_t bs = ggml_blck_size(K->type);
-        const size_t ts = ggml_type_size(K->type);
-
         K_f16.alloc(ggml_cuda_fattn_f16_tmp_alloc_nelements(K));
-        if (ggml_is_contiguously_allocated(K)) {
-            to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
-            to_fp16(K_data, K_f16.ptr, ggml_nelements(K), main_stream);
-
-            nb11 = nb11*bs*sizeof(half)/ts;
-            nb12 = nb12*bs*sizeof(half)/ts;
-            nb13 = nb13*bs*sizeof(half)/ts;
-        } else {
-            GGML_ASSERT(K->nb[0] == ts);
-            to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
-            const int64_t s01 = nb11 / ts;
-            const int64_t s02 = nb12 / ts;
-            const int64_t s03 = nb13 / ts;
-            to_fp16(K_data, K_f16.ptr, K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
-
-            nb11 = K->ne[0] * sizeof(half);
+        if (K->type == GGML_TYPE_I32 && K->ne[0] * 4 == Q->ne[0]) {
+            ggml_cuda_fattn_materialize_packed16_k_f16(K, (int) Q->ne[0], K_f16.ptr, main_stream);
+            nb11 = Q->ne[0] * sizeof(half);
             nb12 = K->ne[1] * nb11;
             nb13 = K->ne[2] * nb12;
+        } else {
+            const size_t bs = ggml_blck_size(K->type);
+            const size_t ts = ggml_type_size(K->type);
+
+            if (ggml_is_contiguously_allocated(K)) {
+                to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
+                GGML_ASSERT(to_fp16 != nullptr);
+                to_fp16(K_data, K_f16.ptr, ggml_nelements(K), main_stream);
+
+                nb11 = nb11*bs*sizeof(half)/ts;
+                nb12 = nb12*bs*sizeof(half)/ts;
+                nb13 = nb13*bs*sizeof(half)/ts;
+            } else {
+                GGML_ASSERT(K->nb[0] == ts);
+                to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
+                GGML_ASSERT(to_fp16 != nullptr);
+                const int64_t s01 = nb11 / ts;
+                const int64_t s02 = nb12 / ts;
+                const int64_t s03 = nb13 / ts;
+                to_fp16(K_data, K_f16.ptr, K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
+
+                nb11 = K->ne[0] * sizeof(half);
+                nb12 = K->ne[1] * nb11;
+                nb13 = K->ne[2] * nb12;
+            }
         }
         K_data = (char *) K_f16.ptr;
     }
@@ -1326,29 +1497,37 @@ void launch_fattn(
             nb22   = nb12;
             nb23   = nb13;
         } else {
-            const size_t bs = ggml_blck_size(V->type);
-            const size_t ts = ggml_type_size(V->type);
-
             V_f16.alloc(ggml_cuda_fattn_f16_tmp_alloc_nelements(V));
-            if (ggml_is_contiguously_allocated(V)) {
-                to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
-                to_fp16(V_data, V_f16.ptr, ggml_nelements(V), main_stream);
-                V_data = (char *) V_f16.ptr;
-
-                nb21 = nb21*bs*sizeof(half)/ts;
-                nb22 = nb22*bs*sizeof(half)/ts;
-                nb23 = nb23*bs*sizeof(half)/ts;
-            } else {
-                GGML_ASSERT(V->nb[0] == ts);
-                to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V->type);
-                const int64_t s01 = nb21 / ts;
-                const int64_t s02 = nb22 / ts;
-                const int64_t s03 = nb23 / ts;
-                to_fp16(V_data, V_f16.ptr, V->ne[0], V->ne[1], V->ne[2], V->ne[3], s01, s02, s03, main_stream);
-
+            if (V->type == GGML_TYPE_V4_K16D16_144) {
+                ggml_cuda_fattn_materialize_v4_144_f16(V, V_f16.ptr, main_stream);
                 nb21 = V->ne[0] * sizeof(half);
                 nb22 = V->ne[1] * nb21;
                 nb23 = V->ne[2] * nb22;
+            } else {
+                const size_t bs = ggml_blck_size(V->type);
+                const size_t ts = ggml_type_size(V->type);
+
+                if (ggml_is_contiguously_allocated(V)) {
+                    to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
+                    GGML_ASSERT(to_fp16 != nullptr);
+                    to_fp16(V_data, V_f16.ptr, ggml_nelements(V), main_stream);
+
+                    nb21 = nb21*bs*sizeof(half)/ts;
+                    nb22 = nb22*bs*sizeof(half)/ts;
+                    nb23 = nb23*bs*sizeof(half)/ts;
+                } else {
+                    GGML_ASSERT(V->nb[0] == ts);
+                    to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V->type);
+                    GGML_ASSERT(to_fp16 != nullptr);
+                    const int64_t s01 = nb21 / ts;
+                    const int64_t s02 = nb22 / ts;
+                    const int64_t s03 = nb23 / ts;
+                    to_fp16(V_data, V_f16.ptr, V->ne[0], V->ne[1], V->ne[2], V->ne[3], s01, s02, s03, main_stream);
+
+                    nb21 = V->ne[0] * sizeof(half);
+                    nb22 = V->ne[1] * nb21;
+                    nb23 = V->ne[2] * nb22;
+                }
             }
             V_data = (char *) V_f16.ptr;
         }

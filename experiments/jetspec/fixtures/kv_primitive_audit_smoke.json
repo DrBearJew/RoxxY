@@ -1,0 +1,101 @@
+{
+  "status": "kv_primitive_audit_verified_not_executed",
+  "scope": "experiments/jetspec only",
+  "production_paths_touched": [],
+  "source_files": [
+    "src/llama-kv-cache.h",
+    "src/llama-kv-cache.cpp"
+  ],
+  "runtime_boundary": {
+    "llama_context_created": false,
+    "draft_head_graph_executed": false,
+    "draft_tokens_emitted": false,
+    "real_kv_mutated": false,
+    "server_route_added": false,
+    "runtime_supported": false,
+    "performance_claimed": false,
+    "promotion_claimed": false
+  },
+  "existing_symbols_to_audit": [
+    {
+      "symbol": "seq_rm",
+      "purpose": "existing sequence range removal; not an exact accepted-path tree gather primitive"
+    },
+    {
+      "symbol": "seq_cp",
+      "purpose": "existing sequence copy; forbidden as an implicit tree survivor commit mapping"
+    },
+    {
+      "symbol": "seq_import_physical",
+      "purpose": "existing physical import/rebind helper; forbidden as an implicit tree survivor commit mapping"
+    },
+    {
+      "symbol": "seq_keep",
+      "purpose": "existing sequence keep helper; not an exact rejected-branch discard primitive"
+    },
+    {
+      "symbol": "find_slot",
+      "purpose": "existing slot search helper; not an exact transient tree slot reservation primitive"
+    },
+    {
+      "symbol": "apply_ubatch",
+      "purpose": "existing ubatch slot application; not an exact JetSpec gather/compact primitive"
+    }
+  ],
+  "actions": [
+    {
+      "id": "hidden_kv_survivor_commit",
+      "classification": "exact_missing_primitive",
+      "primitive": "missing primitive",
+      "blockers": [
+        "needs accepted-path physical gather/compact from transient tree slots to committed tail",
+        "must preserve [root | accepted] only and defer correction hidden",
+        "must not silently use seq_cp, seq_rm, or seq_import_physical"
+      ],
+      "touches_production_now": false,
+      "runtime_executed_now": false,
+      "claims_performance": false,
+      "claims_promotion": false,
+      "evidence": [
+        "P5H hidden/KV survivors [root | accepted] only",
+        "P5I hidden_kv_survivor_commit is missing_primitive"
+      ]
+    },
+    {
+      "id": "rejected_branch_discard",
+      "classification": "exact_missing_primitive",
+      "primitive": "missing primitive",
+      "blockers": [
+        "needs tree-node ownership discard that makes rejected transient slots unreachable",
+        "range seq_rm is not sufficient without accepted-path ownership proof",
+        "must preserve cross-sequence slots"
+      ],
+      "touches_production_now": false,
+      "runtime_executed_now": false,
+      "claims_performance": false,
+      "claims_promotion": false,
+      "evidence": [
+        "P5H rejected tree nodes unreachable after commit",
+        "P5I rejected_branch_discard is missing_primitive"
+      ]
+    },
+    {
+      "id": "cross_sequence_isolation",
+      "classification": "exact_missing_primitive",
+      "primitive": "missing primitive",
+      "blockers": [
+        "needs explicit tree-gather isolation contract across seq_to_stream mappings",
+        "must prove other-sequence slots unchanged after gather/discard",
+        "must not infer safety from existing seq_id assertions alone"
+      ],
+      "touches_production_now": false,
+      "runtime_executed_now": false,
+      "claims_performance": false,
+      "claims_promotion": false,
+      "evidence": [
+        "P5H cross-sequence slot isolation",
+        "P5I cross_sequence_isolation is missing_primitive"
+      ]
+    }
+  ]
+}

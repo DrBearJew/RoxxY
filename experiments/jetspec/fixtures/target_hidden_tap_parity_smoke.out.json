@@ -1,0 +1,97 @@
+{
+  "baseline_greedy_token_ids": [
+    3,
+    2
+  ],
+  "capture_greedy_token_ids": [
+    3,
+    2
+  ],
+  "capture_is_side_channel_only": true,
+  "capture_layer_ids": [
+    1,
+    10,
+    19,
+    28,
+    37
+  ],
+  "concat_order": [
+    1,
+    10,
+    19,
+    28,
+    37
+  ],
+  "errors": [],
+  "fallback_matches_hook_capture": true,
+  "greedy_output_match": true,
+  "hf_hidden_state_indices": [
+    {
+      "hidden_states_index": 2,
+      "layer_id": 1
+    },
+    {
+      "hidden_states_index": 11,
+      "layer_id": 10
+    },
+    {
+      "hidden_states_index": 20,
+      "layer_id": 19
+    },
+    {
+      "hidden_states_index": 29,
+      "layer_id": 28
+    },
+    {
+      "hidden_states_index": 38,
+      "layer_id": 37
+    }
+  ],
+  "logits_match": true,
+  "ok": true,
+  "spec": {
+    "block_size": 16,
+    "concat_order": "target_layer_ids order",
+    "concatenated_width": 10240,
+    "draft_depth": 15,
+    "draft_fc_input_size": 10240,
+    "mask_token_id": 248070,
+    "num_target_layers": 40,
+    "tap_semantics": "post-layer output, equivalent to HF hidden_states[layer_id + 1]",
+    "target_hidden_size": 2048,
+    "target_layer_ids": [
+      1,
+      10,
+      19,
+      28,
+      37
+    ]
+  },
+  "target_binding": {
+    "has_lm_head": true,
+    "has_token_embeddings": true,
+    "hidden_size": 2048,
+    "layer_count": 40
+  },
+  "target_hidden_shape": [
+    1,
+    1,
+    10240
+  ],
+  "target_hidden_summary": {
+    "first": 200000.0,
+    "head": [
+      200000.0,
+      200001.0,
+      200002.0
+    ],
+    "last": 3802047.0,
+    "sum": 20490480640.0,
+    "tail": [
+      3802045.0,
+      3802046.0,
+      3802047.0
+    ],
+    "width": 10240
+  }
+}

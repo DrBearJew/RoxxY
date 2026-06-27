@@ -26,6 +26,7 @@
 #define SERVER_MTP_TAIL_DEFINED_FORCEINLINE
 #endif
 #include "../../ggml/src/ggml-cuda/dot4-packed16/mtp-v4-144-tail-page-state.cuh"
+#include "../../src/llama-mtp-qblock-paged-state.h"
 #undef DP16_PACKED_I8_DESC_HOST_ONLY
 #ifdef SERVER_MTP_TAIL_DEFINED_HOST
 #undef __host__
@@ -549,6 +550,11 @@ static bool mtp_qblock_txn_tail_page_consumer_requested() {
     return env && atoi(env) != 0;
 }
 
+static bool mtp_qblock_txn_tail_page_dispatch_enable_requested() {
+    const char * env = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_DISPATCH_ENABLE");
+    return env && atoi(env) != 0;
+}
+
 static bool mtp_qblock_txn_tail_page_producer_state_import_requested() {
     const char * env = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_PRODUCER_STATE_IMPORT");
     return env && atoi(env) != 0;
@@ -597,6 +603,14 @@ struct mtp_qblock_txn_tail_page_runtime_contract_result {
     uint32_t boundary_slot = 0;
     uint32_t logical_tokens = 0;
     uint32_t physical_page = 0;
+    llama_mtp_qblock_tail_txn_commit_status commit_desc_status = LLAMA_MTP_QBLOCK_TAIL_TXN_COMMIT_BAD_ACCEPTED_TOKENS;
+    llama_mtp_qblock_tail_txn_commit_status commit_export_status = LLAMA_MTP_QBLOCK_TAIL_TXN_COMMIT_BAD_ACCEPTED_TOKENS;
+    llama_mtp_qblock_tail_txn_commit_status commit_apply_status = LLAMA_MTP_QBLOCK_TAIL_TXN_COMMIT_BAD_ACCEPTED_TOKENS;
+    llama_mtp_qblock_paged_state_status commit_map_range_status = LLAMA_MTP_QBLOCK_PAGED_STATE_TOKEN_NOT_VISIBLE;
+    uint32_t commit_page_count = 0;
+    uint32_t commit_map_valid_tail = 0;
+    uint32_t commit_map_table_pages = 0;
+    int32_t commit_table0 = LLAMA_MTP_QBLOCK_PAGED_STATE_INVALID_PAGE;
 };
 
 static mtp_qblock_txn_tail_page_runtime_contract_result mtp_qblock_txn_tail_page_runtime_contract(
@@ -672,6 +686,44 @@ static mtp_qblock_txn_tail_page_runtime_contract_result mtp_qblock_txn_tail_page
     result.lineage_status = mtp_qblock_txn_lineage_validate_commit(lineage, tail);
     result.new_valid_tail = mtp_qblock_txn_lineage_new_valid_tail_tokens(tail, lineage);
     result.final_state_slot = mtp_qblock_txn_lineage_final_state_slot(lineage);
+
+    llama_mtp_qblock_tail_txn_commit_v1 commit_desc = {};
+    commit_desc.logical_base_token = base;
+    commit_desc.accepted_tokens = result.accepted_len;
+    commit_desc.page_tokens = LLAMA_MTP_QBLOCK_PAGED_STATE_PAGE_TOKENS;
+    commit_desc.physical_pages = tail.physical_pages;
+    commit_desc.block_table_pages = llama_mtp_qblock_tail_txn_commit_page_count(commit_desc);
+    commit_desc.final_state_slot = result.final_state_slot;
+    commit_desc.recurrent_slot_count = MTP_QBLOCK_TXN_MAX_ROWS;
+    commit_desc.sampler_commit_tokens = result.accepted_len;
+    commit_desc.generation = (uint64_t(base) << 16) ^ uint64_t(result.accepted_len);
+    for (uint32_t i = 0; i < LLAMA_MTP_QBLOCK_PAGED_STATE_MAX_PAGES; ++i) {
+        commit_desc.block_table[i] = LLAMA_MTP_QBLOCK_PAGED_STATE_INVALID_PAGE;
+    }
+    for (uint32_t i = 0; i < commit_desc.block_table_pages && i < LLAMA_MTP_QBLOCK_PAGED_STATE_MAX_PAGES; ++i) {
+        commit_desc.block_table[i] = int32_t(i);
+    }
+    result.commit_page_count = llama_mtp_qblock_tail_txn_commit_page_count(commit_desc);
+    result.commit_table0 = commit_desc.block_table[0];
+    result.commit_desc_status = llama_mtp_qblock_tail_txn_commit_validate_static(commit_desc);
+    llama_mtp_qblock_paged_consumer_map_v1 commit_map = {};
+    result.commit_export_status = llama_mtp_qblock_tail_txn_commit_export_consumer_map(commit_desc, &commit_map);
+    result.commit_map_valid_tail = commit_map.valid_tail_tokens;
+    result.commit_map_table_pages = commit_map.block_table_pages;
+    if (result.commit_export_status == LLAMA_MTP_QBLOCK_TAIL_TXN_COMMIT_OK) {
+        result.commit_map_range_status = llama_mtp_qblock_paged_consumer_map_validate_range(
+                commit_map, commit_desc.logical_base_token, commit_desc.accepted_tokens);
+    }
+    llama_mtp_qblock_paged_state_v1 commit_state = {};
+    llama_mtp_qblock_paged_state_status commit_state_status = llama_mtp_qblock_paged_state_init_absolute_empty(
+            commit_state, commit_desc.logical_base_token, commit_desc.physical_pages, commit_desc.generation);
+    for (uint32_t i = 0; commit_state_status == LLAMA_MTP_QBLOCK_PAGED_STATE_OK && i < result.commit_page_count; ++i) {
+        commit_state_status = llama_mtp_qblock_paged_state_claim_txn_page(commit_state, uint32_t(commit_desc.block_table[i]), nullptr);
+    }
+    result.commit_apply_status = commit_state_status == LLAMA_MTP_QBLOCK_PAGED_STATE_OK ?
+        llama_mtp_qblock_tail_txn_commit_apply(commit_state, commit_desc) :
+        LLAMA_MTP_QBLOCK_TAIL_TXN_COMMIT_BAD_PAGE_STATE;
+
     if (result.lineage_status != MTP_QBLOCK_TXN_LINEAGE_OK) {
         result.state_status = MTP_V4_144_TAIL_STATE_LINEAGE_REJECTED;
         return result;
@@ -834,6 +886,40 @@ static bool mtp_qblock_sibling_target_rows_sampler_oracle_enabled() {
     return (env && atoi(env) != 0) ||
         mtp_qblock_branch_txn_recurrent_commit_enabled() ||
         mtp_qblock_branch_txn_kv_any_enabled();
+}
+
+static bool mtp_actmat_env_enabled(const char * primary, const char * fallback = nullptr) {
+    const char * env = getenv(primary);
+    if ((env == nullptr || env[0] == '\0') && fallback != nullptr) {
+        env = getenv(fallback);
+    }
+    return env && atoi(env) != 0;
+}
+
+static bool mtp_actmat_qpacket_census_enabled() {
+    return mtp_actmat_env_enabled("LLAMA_MTP_ACTMAT_QPACKET_CENSUS", "LLAMA_ACTMAT_QPACKET_CENSUS");
+}
+
+static bool mtp_actmat_qpacket_guard_enabled() {
+    return mtp_actmat_env_enabled("LLAMA_MTP_ACTMAT_QPACKET_GUARD", "LLAMA_ACTMAT_QPACKET_GUARD");
+}
+
+static bool mtp_actmat_qpacket_strict_enabled() {
+    return mtp_actmat_env_enabled("LLAMA_MTP_ACTMAT_QPACKET_STRICT", "LLAMA_ACTMAT_QPACKET_STRICT");
+}
+
+static bool mtp_actmat_qpacket_desc_env_enabled() {
+    return mtp_actmat_env_enabled("LLAMA_MTP_ACTMAT_QPACKET_DESC_ENV", "LLAMA_ACTMAT_QPACKET_DESC_ENV");
+}
+
+static void mtp_actmat_qpacket_contract_fail(int slot_id, const char * phase, const char * reason, bool strict) {
+    fprintf(stderr,
+            "MTP_ACTMAT_QPACKET_CONTRACT: phase=%s slot=%d status=reject reason=%s strict=%d\n",
+            phase ? phase : "-", slot_id, reason ? reason : "unknown", strict ? 1 : 0);
+    if (strict) {
+        GGML_ABORT("MTP ACTMAT QPACKET contract violation: phase=%s slot=%d reason=%s",
+                phase ? phase : "-", slot_id, reason ? reason : "unknown");
+    }
 }
 
 static bool mtp_batch_row_is_qblock_sidecar(const llama_batch & batch, int32_t i) {
@@ -1063,7 +1149,7 @@ static mtp_verify_backend_choice mtp_select_verify_backend(
         bool per_slot_requested,
         bool target_serial_requested,
         bool replay_repair_requested,
-        bool unsafe_requested,
+        bool unsafe_enabled,
         bool exact_verify,
         size_t n_draft) {
     const uint32_t n_rs_seq = ctx != nullptr ? llama_n_rs_seq(ctx) : 0;
@@ -1089,7 +1175,7 @@ static mtp_verify_backend_choice mtp_select_verify_backend(
         return choice;
     }
 
-    if (recurrent_prefix_required && mtp_serial_equiv_prefix_enabled() && !replay_repair_requested && !unsafe_requested && !mtp_target_batch_verify_ubatch1_enabled()) {
+    if (recurrent_prefix_required && mtp_serial_equiv_prefix_enabled() && !replay_repair_requested && !unsafe_enabled && !mtp_target_batch_verify_ubatch1_enabled()) {
         // This backend is opt-in and fail-closed until the reserved
         // LLM_GRAPH_TYPE_DECODER_PREFIX_VERIFY graph has a real token-major
         // qwen35/qwen35moe implementation. Do not alias it to causal_batched.
@@ -1115,7 +1201,7 @@ static mtp_verify_backend_choice mtp_select_verify_backend(
         return choice;
     }
 
-    if (recurrent_prefix_required && !replay_repair_requested && !unsafe_requested) {
+    if (recurrent_prefix_required && !replay_repair_requested && !unsafe_enabled) {
         if (mtp_recurrent_prefix_v0_enabled()) {
             // v0 is intentionally serial-equivalent: it runs the existing token-by-token
             // verifier under the recurrent_prefix contract so later optimized kernels
@@ -1146,7 +1232,7 @@ static mtp_verify_backend_choice mtp_select_verify_backend(
     }
 
     choice.backend = MTP_VERIFY_BACKEND_CAUSAL_BATCHED;
-    choice.reason = unsafe_requested ? "unsafe_batched_env" : "causal_batched";
+    choice.reason = unsafe_enabled ? "active_batched_default" : "causal_batched";
     return choice;
 }
 
@@ -2873,6 +2959,94 @@ struct server_slot {
                                 mtp_qblock_sibling_logits_probe_enabled() ? 1 : 0);
                     }
                 }
+            }
+            const bool actmat_qpacket_candidate = !serial_verify && spec_i_batch.size() >= 2 && spec_i_batch.size() <= 5;
+            if (mtp_actmat_qpacket_guard_enabled() && !serial_verify) {
+                const bool strict = mtp_actmat_qpacket_strict_enabled();
+                if (spec_i_batch.size() != spec_draft.size() + 1) {
+                    mtp_actmat_qpacket_contract_fail(id, "update_batch", "row_count_not_sample_plus_draft", strict);
+                }
+                if (spec_i_batch.size() < 2 || spec_i_batch.size() > 5) {
+                    mtp_actmat_qpacket_contract_fail(id, "update_batch", "active_count_not_2_5", strict);
+                }
+                for (size_t row = 0; row < spec_i_batch.size(); ++row) {
+                    const int32_t i_batch_row = spec_i_batch[row];
+                    if (i_batch_row < 0 || i_batch_row >= batch.n_tokens) {
+                        mtp_actmat_qpacket_contract_fail(id, "update_batch", "row_index_out_of_batch", strict);
+                        continue;
+                    }
+                    if (mtp_batch_row_is_qblock_sidecar(batch, i_batch_row)) {
+                        mtp_actmat_qpacket_contract_fail(id, "update_batch", "sidecar_row_in_qpacket", strict);
+                    }
+                    if (batch.qblock_row_parent != nullptr) {
+                        const int32_t expected_parent = row == 0 ? -1 : (int32_t) row - 1;
+                        if (batch.qblock_row_parent[i_batch_row] != expected_parent) {
+                            mtp_actmat_qpacket_contract_fail(id, "update_batch", "non_linear_parent", strict);
+                        }
+                    }
+                    if (batch.qblock_row_output_policy != nullptr &&
+                            batch.qblock_row_output_policy[i_batch_row] != MTP_QBLOCK_ROW_OUTPUT_FULL_LOGITS) {
+                        mtp_actmat_qpacket_contract_fail(id, "update_batch", "non_full_logits_policy", strict);
+                    }
+                }
+                if (actmat_qpacket_candidate) {
+                    fprintf(stderr,
+                            "MTP_ACTMAT_QPACKET_CONTRACT: phase=update_batch slot=%d status=ok active_count=%zu draft=%zu strict=%d\n",
+                            id, spec_i_batch.size(), spec_draft.size(), strict ? 1 : 0);
+                }
+            }
+            if (mtp_actmat_qpacket_census_enabled()) {
+                const uint32_t active_count = (uint32_t) spec_i_batch.size();
+                uint32_t active_mask = 0;
+                uint32_t logits_mask = 0;
+                uint32_t kv_write_mask = 0;
+                uint32_t state_write_mask = 0;
+                for (size_t row = 0; row < spec_i_batch.size() && row < 32; ++row) {
+                    const int32_t i_batch_row = spec_i_batch[row];
+                    if (i_batch_row < 0 || i_batch_row >= batch.n_tokens) {
+                        continue;
+                    }
+                    const uint32_t bit = 1u << row;
+                    active_mask |= bit;
+                    if (batch.logits != nullptr && batch.logits[i_batch_row]) {
+                        logits_mask |= bit;
+                    }
+                    const bool output_full = batch.qblock_row_output_policy == nullptr ||
+                        batch.qblock_row_output_policy[i_batch_row] != MTP_QBLOCK_ROW_OUTPUT_ATTENTION_ONLY;
+                    if (output_full) {
+                        kv_write_mask |= bit;
+                        state_write_mask |= bit;
+                    }
+                }
+                fprintf(stderr,
+                        "MTP_ACTMAT_QPACKET_CENSUS: phase=update_batch slot=%d backend=%s reason=%s draft=%zu active_count=%u capacity=5 active_mask=0x%08x logits_mask=0x%08x kv_write_mask=0x%08x state_write_mask=0x%08x serial_verify=%d rows=[",
+                        id,
+                        mtp_verify_backend_name(spec_verify_backend),
+                        spec_verify_backend_reason,
+                        spec_draft.size(),
+                        active_count,
+                        active_mask,
+                        logits_mask,
+                        kv_write_mask,
+                        state_write_mask,
+                        serial_verify ? 1 : 0);
+                for (size_t row = 0; row < spec_i_batch.size(); ++row) {
+                    const int32_t i_batch_row = spec_i_batch[row];
+                    const bool valid = i_batch_row >= 0 && i_batch_row < batch.n_tokens;
+                    fprintf(stderr,
+                            "%s{r=%zu i=%d token=%d pos=%d parent=%d branch=%d rank=%d policy=%d logits=%d}",
+                            row == 0 ? "" : ",",
+                            row,
+                            (int) i_batch_row,
+                            valid && batch.token != nullptr ? (int) batch.token[i_batch_row] : -1,
+                            valid && batch.pos != nullptr ? (int) batch.pos[i_batch_row] : -1,
+                            valid && batch.qblock_row_parent != nullptr ? (int) batch.qblock_row_parent[i_batch_row] : -999,
+                            valid && batch.qblock_row_branch_id != nullptr ? (int) batch.qblock_row_branch_id[i_batch_row] : -999,
+                            valid && batch.qblock_row_candidate_rank != nullptr ? (int) batch.qblock_row_candidate_rank[i_batch_row] : -999,
+                            valid && batch.qblock_row_output_policy != nullptr ? (int) batch.qblock_row_output_policy[i_batch_row] : -999,
+                            valid && batch.logits != nullptr && batch.logits[i_batch_row] ? 1 : 0);
+                }
+                fprintf(stderr, "]\n");
             }
             if (const char * env = getenv("LLAMA_MTP_SERIAL_VERIFY_BATCH_DFT_PROCESS_TRACE"); env && atoi(env) != 0) {
                 fprintf(stderr,
@@ -5333,12 +5507,13 @@ private:
             //   - serial_equiv_ubatch1: experimental exact recurrent verifier that forces verifier decode
             //     through one-token ubatches and serial-replays only rejected/partial prefixes;
             //   - serial_equiv_prefix: opt-in, fail-closed placeholder for the future token-major graph.
-            // Until a faster recurrent-prefix backend exists, exact recurrent qwen35moe / multi-draft verification
-            // deliberately selects serial_oracle unless an explicit experimental backend is requested.
+            // Default ROCm/MTP experience uses active target-batch verification; set
+            // LLAMA_MTP_TARGET_BATCH_VERIFY_UNSAFE=0 for strict serial controls.
             const bool replay_accepted = mtp_target_batch_verify_replay_accepted_enabled();
             const bool replay_partial = mtp_target_batch_verify_replay_partial_enabled();
             const bool replay_repair_requested = replay_accepted || (replay_partial && mtp_target_batch_verify_ubatch1_enabled());
             const bool unsafe_requested = mtp_target_batch_verify_unsafe_requested();
+            const bool unsafe_enabled = mtp_target_batch_verify_unsafe_enabled();
             const bool exact_verify = mtp_exact_single_slot_verify_enabled() || mtp_exact_multi_slot_verify_per_slot_enabled();
             const mtp_verify_backend_choice verify_choice = mtp_select_verify_backend(
                     model_tgt,
@@ -5346,7 +5521,7 @@ private:
                     mtp_per_slot_verify_multi && !slot.spec_draft.empty(),
                     mtp_target_serial_verify_enabled(),
                     replay_repair_requested,
-                    unsafe_requested,
+                    unsafe_enabled,
                     exact_verify,
                     slot.spec_draft.size());
             slot.spec_verify_backend = verify_choice.backend;
@@ -5357,7 +5532,7 @@ private:
 
             if (mtp_verify_trace_enabled() && !slot.spec_draft.empty()) {
                 fprintf(stderr,
-                        "MTP_VERIFY_BACKEND: slot=%d backend=%s reason=%s draft=%zu n_rs_seq=%u qwen35moe=%d exact=%d replay_accepted=%d replay_partial=%d replay_repair=%d unsafe_requested=%d compare=%d recurrent_prefix_required=%d recurrent_prefix_v0=%d serial_equiv_prefix=%d prefix_exact_tail_batch=%d prefix_roweq_layer_ffn_batch=%d\n",
+                        "MTP_VERIFY_BACKEND: slot=%d backend=%s reason=%s draft=%zu n_rs_seq=%u qwen35moe=%d exact=%d replay_accepted=%d replay_partial=%d replay_repair=%d unsafe_requested=%d unsafe_enabled=%d compare=%d recurrent_prefix_required=%d recurrent_prefix_v0=%d serial_equiv_prefix=%d prefix_exact_tail_batch=%d prefix_roweq_layer_ffn_batch=%d\n",
                         slot.id,
                         mtp_verify_backend_name(slot.spec_verify_backend),
                         slot.spec_verify_backend_reason,
@@ -5369,6 +5544,7 @@ private:
                         replay_partial ? 1 : 0,
                         replay_repair_requested ? 1 : 0,
                         unsafe_requested ? 1 : 0,
+                        unsafe_enabled ? 1 : 0,
                         mtp_verify_compare_enabled() ? 1 : 0,
                         slot.spec_verify_recurrent_prefix_required ? 1 : 0,
                         mtp_recurrent_prefix_v0_enabled() ? 1 : 0,
@@ -6101,6 +6277,74 @@ private:
                 }
             }
 
+            if (mtp_actmat_qpacket_census_enabled() && !mtp_target_verify_slot_ptrs.empty()) {
+                for (const auto * slot_ptr : mtp_target_verify_slot_ptrs) {
+                    int rows_in_view = 0;
+                    uint32_t view_mask = 0;
+                    uint32_t logits_mask = 0;
+                    uint32_t kv_write_mask = 0;
+                    uint32_t state_write_mask = 0;
+                    for (size_t row = 0; row < slot_ptr->spec_i_batch.size() && row < 32; ++row) {
+                        const int32_t i_batch_slot = slot_ptr->spec_i_batch[row];
+                        if (i_batch_slot < i || i_batch_slot >= i + n_tokens) {
+                            continue;
+                        }
+                        const int32_t j = i_batch_slot - i;
+                        const uint32_t bit = 1u << row;
+                        rows_in_view++;
+                        view_mask |= bit;
+                        if (batch_view.logits != nullptr && batch_view.logits[j]) {
+                            logits_mask |= bit;
+                        }
+                        const bool output_full = batch_view.qblock_row_output_policy == nullptr ||
+                            batch_view.qblock_row_output_policy[j] != MTP_QBLOCK_ROW_OUTPUT_ATTENTION_ONLY;
+                        if (output_full) {
+                            kv_write_mask |= bit;
+                            state_write_mask |= bit;
+                        }
+                    }
+                    fprintf(stderr,
+                            "MTP_ACTMAT_QPACKET_CENSUS: phase=target_decode slot=%d backend=%s reason=%s draft=%zu active_count=%zu rows_in_view=%d view_mask=0x%08x logits_mask=0x%08x kv_write_mask=0x%08x state_write_mask=0x%08x qblock_sidecar_rows=%d batch_tokens=%d batch_offset=%d prefix_verify=%d rows=[",
+                            slot_ptr->id,
+                            mtp_verify_backend_name(slot_ptr->spec_verify_backend),
+                            slot_ptr->spec_verify_backend_reason,
+                            slot_ptr->spec_draft.size(),
+                            slot_ptr->spec_i_batch.size(),
+                            rows_in_view,
+                            view_mask,
+                            logits_mask,
+                            kv_write_mask,
+                            state_write_mask,
+                            mtp_qblock_sidecar_rows_in_view,
+                            (int) n_tokens,
+                            (int) i,
+                            slot_ptr->spec_verify_backend == MTP_VERIFY_BACKEND_SERIAL_EQUIV_PREFIX ? 1 : 0);
+                    bool first = true;
+                    for (size_t row = 0; row < slot_ptr->spec_i_batch.size(); ++row) {
+                        const int32_t i_batch_slot = slot_ptr->spec_i_batch[row];
+                        if (i_batch_slot < i || i_batch_slot >= i + n_tokens) {
+                            continue;
+                        }
+                        const int32_t j = i_batch_slot - i;
+                        fprintf(stderr,
+                                "%s{r=%zu i=%d j=%d token=%d pos=%d parent=%d branch=%d rank=%d policy=%d logits=%d}",
+                                first ? "" : ",",
+                                row,
+                                (int) i_batch_slot,
+                                (int) j,
+                                batch_view.token != nullptr ? (int) batch_view.token[j] : -1,
+                                batch_view.pos != nullptr ? (int) batch_view.pos[j] : -1,
+                                batch_view.qblock_row_parent != nullptr ? (int) batch_view.qblock_row_parent[j] : -999,
+                                batch_view.qblock_row_branch_id != nullptr ? (int) batch_view.qblock_row_branch_id[j] : -999,
+                                batch_view.qblock_row_candidate_rank != nullptr ? (int) batch_view.qblock_row_candidate_rank[j] : -999,
+                                batch_view.qblock_row_output_policy != nullptr ? (int) batch_view.qblock_row_output_policy[j] : -999,
+                                batch_view.logits != nullptr && batch_view.logits[j] ? 1 : 0);
+                        first = false;
+                    }
+                    fprintf(stderr, "]\n");
+                }
+            }
+
             bool mtp_short_no_cache_prompt_batch = false;
             if (batch.n_tokens > 0 && mtp_target_verify_slots == 0 && mtp_qblock_sidecar_rows_in_view == 0) {
                 int prompt_short_slots = 0;
@@ -6168,7 +6412,31 @@ private:
                     mtp_target_verify_slots > 0 &&
                     mtp_qblock_verify_rows_in_view == n_tokens &&
                     !mtp_qblock_verify_disabled();
+                const size_t mtp_actmat_qpacket_desc_rows = mtp_target_verify_slot_ptrs.size() == 1 ?
+                    mtp_target_verify_slot_ptrs.front()->spec_i_batch.size() : 0;
+                uint32_t mtp_actmat_qpacket_desc_mask = 0;
+                if (mtp_actmat_qpacket_desc_rows > 0 && mtp_actmat_qpacket_desc_rows < 32) {
+                    mtp_actmat_qpacket_desc_mask = (1u << mtp_actmat_qpacket_desc_rows) - 1u;
+                }
+                char mtp_actmat_qpacket_desc_n_buf[32] = {};
+                char mtp_actmat_qpacket_desc_mask_buf[16] = {};
+                snprintf(mtp_actmat_qpacket_desc_n_buf, sizeof(mtp_actmat_qpacket_desc_n_buf), "%zu", mtp_actmat_qpacket_desc_rows);
+                snprintf(mtp_actmat_qpacket_desc_mask_buf, sizeof(mtp_actmat_qpacket_desc_mask_buf), "0x%08x", mtp_actmat_qpacket_desc_mask);
+                const bool mtp_actmat_qpacket_target_view =
+                    mtp_target_verify_slots > 0 &&
+                    mtp_target_verify_slot_ptrs.size() == 1 &&
+                    mtp_qblock_sidecar_rows_in_view == 0 &&
+                    mtp_target_verify_rows_in_view == n_tokens;
+                const bool mtp_actmat_qpacket_desc_active =
+                    mtp_actmat_qpacket_desc_env_enabled() &&
+                    mtp_actmat_qpacket_target_view &&
+                    mtp_actmat_qpacket_desc_rows >= 2 &&
+                    mtp_actmat_qpacket_desc_rows <= 5 &&
+                    mtp_actmat_qpacket_desc_rows == (size_t) n_tokens;
                 mtp_env_flag_scope mtp_qblock_target_verify_scope("LLAMA_MTP_QBLOCK_TARGET_VERIFY_ACTIVE", mtp_qblock_target_verify_active);
+                mtp_env_flag_scope mtp_actmat_qpacket_active_scope("LLAMA_MTP_ACTMAT_QPACKET_ACTIVE", mtp_actmat_qpacket_desc_active);
+                mtp_env_var_scope mtp_actmat_qpacket_n_scope("LLAMA_MTP_ACTMAT_QPACKET_N", mtp_actmat_qpacket_desc_n_buf, mtp_actmat_qpacket_desc_active);
+                mtp_env_var_scope mtp_actmat_qpacket_mask_scope("LLAMA_MTP_ACTMAT_QPACKET_MASK", mtp_actmat_qpacket_desc_mask_buf, mtp_actmat_qpacket_desc_active);
                 const bool mtp_qblock_sibling_logits_probe_active =
                     mtp_qblock_sibling_logits_probe_enabled() && mtp_target_verify_slots > 0;
                 mtp_env_flag_scope mtp_qblock_sibling_logits_raw_scope(
@@ -10406,7 +10674,8 @@ private:
                     const char * tail_bytes_authority_reason = "not_requested";
                     bool tail_dispatch_bytes_authoritative = false;
                     if (mtp_qblock_txn_tail_page_requested()) {
-                        const uint32_t supported_flags = GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_SCRATCH_OVERLAY;
+                        const uint32_t supported_flags = GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_SCRATCH_OVERLAY |
+                            GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_OWNED_TAIL_WRITE;
                         if (!tail_metadata_active) {
                             tail_bytes_authority_reason = "metadata_not_active";
                         } else if (!tail_consumer_requested) {
@@ -10505,13 +10774,26 @@ private:
                                 tail_commit_req_end,
                                 slot.id);
                     }
+                    const bool tail_dispatch_enable_requested = mtp_qblock_txn_tail_page_dispatch_enable_requested();
+                    bool tail_dispatch_active = false;
+                    const char * tail_dispatch_enable_reason = tail_dispatch_enable_requested ? tail_dispatch_blocker : "not_requested";
+                    const char * tail_runtime_reason_emit = tail_runtime_reason;
+                    if (tail_dispatch_enable_requested && strcmp(tail_dispatch_blocker, "dispatch_disabled") == 0) {
+                        tail_dispatch_active = true;
+                        tail_dispatch_enable_reason = "ok";
+                        tail_dispatch_blocker = "none";
+                        tail_runtime_reason_emit = "runtime_metadata_ready_consumer_map_registered_dispatch_active";
+                    }
                     fprintf(stderr,
-                            "MTP_QBLOCK_TXN_TAIL_PAGE_RUNTIME: slot=%d requested=%d proof=%d metadata_active=%d dispatch_active=0 reason=%s reject_depth=%zu depth1=%zu selected=%d sampled=%d candidate_rank=%d ordinary_accepted=%zu rollback=%zu output_tokens=%zu contract_tail_status=%u contract_lineage_status=%u contract_state_status=%u accepted_len=%u new_valid_tail=%u final_state_slot=%u state_valid_tail=%u state_page_valid=%u state_free=%u boundary_slot=%u logical_tokens=%u physical_page=%u consumer_requested=%d map_attempted=%d map_registered=%d map_reason=%s map_logical_base=%u map_valid_tail=%u map_page_tokens=%u map_physical_pages=%u map_table_pages=%u map_table0=%d map_flags=0x%x map_generation=%llu sampler_ok=%d sampler_touched=%d kv_attempted=%d kv_ok=%d kv_touched=%d kv_kind=%s kv_status=%s kv_reason=%s recurrent_attempted=%d recurrent_ok=%d recurrent_touched=%d recurrent_restored=%d recurrent_status=%s recurrent_reason=%s dispatch_query_active=%d dispatch_query_match=%d dispatch_blocker=%s bytes_authoritative=%d bytes_authoritative_reason=%s proof_page_count=%u proof_page_begin=%u proof_page_end=%u proof_k_page_bytes=%u proof_v_page_bytes=%u proof_kv_page_bytes=%u proof_table0=%d proof_table1=%d proof_table2=%d proof_table3=%d proof_k_byte_base0=%llu proof_v_byte_base0=%llu proof_kv_byte_base0=%llu last_dispatch_bind_count=%llu last_dispatch_node=%s last_dispatch_layer=%d last_dispatch_graph_inst=%d last_dispatch_nk=%d last_dispatch_logical_base=%u last_dispatch_valid_tail=%u last_dispatch_table0=%d last_dispatch_flags=0x%x last_dispatch_generation=%llu dispatch_req_begin=%llu dispatch_req_end=%llu dispatch_bind_begin=%llu dispatch_bind_end=%llu producer_snapshot_available=%d producer_snapshot_covers_commit=%d producer_snapshot_reason=%s producer_snapshot_begin=%llu producer_snapshot_end=%llu pre_dispatch_covers_commit=%d safe_commit=0 source=post_final_tail_page_runtime_contract output_token_list=[",
+                            "MTP_QBLOCK_TXN_TAIL_PAGE_RUNTIME: slot=%d requested=%d proof=%d metadata_active=%d dispatch_active=%d dispatch_enable_requested=%d dispatch_enable_reason=%s reason=%s reject_depth=%zu depth1=%zu selected=%d sampled=%d candidate_rank=%d ordinary_accepted=%zu rollback=%zu output_tokens=%zu contract_tail_status=%u contract_lineage_status=%u contract_state_status=%u commit_desc_status=%u commit_export_status=%u commit_apply_status=%u commit_map_range_status=%u commit_page_count=%u commit_map_valid_tail=%u commit_map_table_pages=%u commit_table0=%d accepted_len=%u new_valid_tail=%u final_state_slot=%u state_valid_tail=%u state_page_valid=%u state_free=%u boundary_slot=%u logical_tokens=%u physical_page=%u consumer_requested=%d map_attempted=%d map_registered=%d map_reason=%s map_logical_base=%u map_valid_tail=%u map_page_tokens=%u map_physical_pages=%u map_table_pages=%u map_table0=%d map_flags=0x%x map_generation=%llu sampler_ok=%d sampler_touched=%d kv_attempted=%d kv_ok=%d kv_touched=%d kv_kind=%s kv_status=%s kv_reason=%s recurrent_attempted=%d recurrent_ok=%d recurrent_touched=%d recurrent_restored=%d recurrent_status=%s recurrent_reason=%s dispatch_query_active=%d dispatch_query_match=%d dispatch_blocker=%s bytes_authoritative=%d bytes_authoritative_reason=%s proof_page_count=%u proof_page_begin=%u proof_page_end=%u proof_k_page_bytes=%u proof_v_page_bytes=%u proof_kv_page_bytes=%u proof_table0=%d proof_table1=%d proof_table2=%d proof_table3=%d proof_k_byte_base0=%llu proof_v_byte_base0=%llu proof_kv_byte_base0=%llu last_dispatch_bind_count=%llu last_dispatch_node=%s last_dispatch_layer=%d last_dispatch_graph_inst=%d last_dispatch_nk=%d last_dispatch_logical_base=%u last_dispatch_valid_tail=%u last_dispatch_table0=%d last_dispatch_flags=0x%x last_dispatch_generation=%llu dispatch_req_begin=%llu dispatch_req_end=%llu dispatch_bind_begin=%llu dispatch_bind_end=%llu producer_snapshot_available=%d producer_snapshot_covers_commit=%d producer_snapshot_reason=%s producer_snapshot_begin=%llu producer_snapshot_end=%llu pre_dispatch_covers_commit=%d safe_commit=0 source=post_final_tail_page_runtime_contract output_token_list=[",
                             slot.id,
                             mtp_qblock_txn_tail_page_requested() ? 1 : 0,
                             mtp_qblock_txn_tail_page_proof_enabled() ? 1 : 0,
                             tail_metadata_active ? 1 : 0,
-                            tail_runtime_reason,
+                            tail_dispatch_active ? 1 : 0,
+                            tail_dispatch_enable_requested ? 1 : 0,
+                            tail_dispatch_enable_reason,
+                            tail_runtime_reason_emit,
                             slot.mtp_qblock_branch_replay_reject_depth,
                             slot.mtp_qblock_branch_replay_reject_depth + 1,
                             (int) slot.mtp_qblock_branch_replay_selected,
@@ -10523,6 +10805,14 @@ private:
                             (unsigned) tail_runtime.tail_status,
                             (unsigned) tail_runtime.lineage_status,
                             (unsigned) tail_runtime.state_status,
+                            (unsigned) tail_runtime.commit_desc_status,
+                            (unsigned) tail_runtime.commit_export_status,
+                            (unsigned) tail_runtime.commit_apply_status,
+                            (unsigned) tail_runtime.commit_map_range_status,
+                            tail_runtime.commit_page_count,
+                            tail_runtime.commit_map_valid_tail,
+                            tail_runtime.commit_map_table_pages,
+                            tail_runtime.commit_table0,
                             tail_runtime.accepted_len,
                             tail_runtime.new_valid_tail,
                             tail_runtime.final_state_slot,

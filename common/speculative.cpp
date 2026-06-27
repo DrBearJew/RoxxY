@@ -30,6 +30,8 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"eagle3",        COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3}, // local backwards-compatible alias
     {"draft-mtp",     COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
     {"mtp",           COMMON_SPECULATIVE_TYPE_DRAFT_MTP},    // local backwards-compatible alias
+    {"draft-jetspec", COMMON_SPECULATIVE_TYPE_DRAFT_JETSPEC},
+    {"jetspec",       COMMON_SPECULATIVE_TYPE_DRAFT_JETSPEC}, // local experimental alias
     {"ngram-simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
     {"ngram_simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE}, // local backwards-compatible alias
 
@@ -69,6 +71,101 @@ static bool common_speculative_hidden_shift_trace_enabled() {
 static bool common_speculative_env_enabled(const char * name) {
     const char * env = getenv(name);
     return env && atoi(env) != 0;
+}
+
+static constexpr int32_t JETSPEC_QWEN36_DRAFT_BLOCK_SIZE  = 16;
+static constexpr int32_t JETSPEC_QWEN36_TARGET_TAP_COUNT  = 5;
+static constexpr int32_t JETSPEC_QWEN36_TARGET_HIDDEN     = 2048;
+static constexpr int32_t JETSPEC_QWEN36_TARGET_LAYERS     = 40;
+static constexpr int32_t JETSPEC_QWEN36_TARGET_TAP_WIDTH  = JETSPEC_QWEN36_TARGET_TAP_COUNT * JETSPEC_QWEN36_TARGET_HIDDEN;
+static constexpr int32_t JETSPEC_QWEN36_DRAFT_LAYERS      = 8;
+static constexpr int32_t JETSPEC_QWEN36_DRAFT_HEADS       = 32;
+static constexpr int32_t JETSPEC_QWEN36_DRAFT_HEADS_KV    = 4;
+static constexpr int32_t JETSPEC_QWEN36_VOCAB_SIZE        = 248320;
+static constexpr int32_t JETSPEC_TRANSACTION_PHASE_COUNT  = 9;
+static constexpr int32_t JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT = 7;
+static constexpr const char * JETSPEC_TRANSACTION_PHASE_ORDER =
+    "snapshot_pre_round|reserve_transient_tree_pages|build_tree|build_verify_mask|accept_path|commit_tokens|commit_hidden_kv_survivors|discard_rejected_branches|publish_post_commit_state";
+static constexpr const char * JETSPEC_TRANSACTION_ROLLBACK_POINTS =
+    "after_reserve|after_build_tree|after_verify_mask|after_accept|after_token_commit|after_hidden_kv_commit|after_rejected_discard";
+static constexpr const char * JETSPEC_PRE_ROUND_SNAPSHOT_PHASE = "snapshot_pre_round";
+static constexpr const char * JETSPEC_TRANSIENT_RESERVATION_PHASE = "reserve_transient_tree_pages";
+static constexpr const char * JETSPEC_TRANSIENT_RESERVATION_ROLLBACK_POINT = "after_reserve";
+static constexpr const char * JETSPEC_TRANSIENT_RESERVATION_DESCRIPTOR = "transient_reservation_descriptor_only";
+static constexpr const char * JETSPEC_TREE_BUILD_PHASE = "build_tree";
+static constexpr const char * JETSPEC_TREE_BUILD_ROLLBACK_POINT = "after_build_tree";
+static constexpr const char * JETSPEC_TREE_BUILD_DESCRIPTOR = "tree_build_descriptor_only";
+static constexpr int32_t JETSPEC_TREE_ROOT_PARENT = -1;
+static constexpr int32_t JETSPEC_TREE_ROOT_DEPTH = 0;
+
+static bool common_speculative_jetspec_expect_i32(const char * what, int32_t actual, int32_t expected, std::string & reason) {
+    if (actual == expected) {
+        return true;
+    }
+    reason = std::string(what) + "=" + std::to_string(actual) + " expected=" + std::to_string(expected);
+    return false;
+}
+
+static bool common_speculative_jetspec_expect_meta_str(
+        const llama_model * model, const char * key, const char * expected, std::string & reason) {
+    char value[128] = {};
+    const int32_t n = llama_model_meta_val_str(model, key, value, sizeof(value));
+    if (n < 0) {
+        reason = std::string("missing metadata ") + key;
+        return false;
+    }
+    if (std::strcmp(value, expected) != 0) {
+        reason = std::string(key) + "=" + value + " expected=" + expected;
+        return false;
+    }
+    return true;
+}
+
+static bool common_speculative_jetspec_preflight(
+        const common_params_speculative_draft & params, int32_t tap_count, int32_t tap_width, std::string & reason) {
+    if (params.ctx_tgt == nullptr || params.ctx_dft == nullptr) {
+        reason = "missing target or draft context";
+        return false;
+    }
+
+    const llama_model * model_tgt = llama_get_model(params.ctx_tgt);
+    const llama_model * model_dft = llama_get_model(params.ctx_dft);
+    if (model_tgt == nullptr || model_dft == nullptr) {
+        reason = "missing target or draft model";
+        return false;
+    }
+
+    const llama_vocab * vocab_tgt = llama_model_get_vocab(model_tgt);
+    const llama_vocab * vocab_dft = llama_model_get_vocab(model_dft);
+    if (vocab_tgt == nullptr || vocab_dft == nullptr) {
+        reason = "missing target or draft vocab";
+        return false;
+    }
+
+    if (!common_speculative_jetspec_expect_meta_str(model_dft, "general.architecture", "jetspec_qwen3_draft_head", reason) ||
+        !common_speculative_jetspec_expect_meta_str(model_dft, "jetspec.architecture", "qwen3_draft_head", reason) ||
+        !common_speculative_jetspec_expect_meta_str(model_dft, "jetspec.source_architecture", "DFlashDraftModel", reason) ||
+        !common_speculative_jetspec_expect_meta_str(model_dft, "jetspec.tensor_data_dtype", "bfloat16", reason)) {
+        return false;
+    }
+
+    const int32_t target_hidden = llama_model_n_embd(model_tgt);
+    if (!common_speculative_jetspec_expect_i32("target.n_embd", target_hidden, JETSPEC_QWEN36_TARGET_HIDDEN, reason) ||
+        !common_speculative_jetspec_expect_i32("target.n_layer", llama_model_n_layer(model_tgt), JETSPEC_QWEN36_TARGET_LAYERS, reason) ||
+        !common_speculative_jetspec_expect_i32("target.vocab", llama_vocab_n_tokens(vocab_tgt), JETSPEC_QWEN36_VOCAB_SIZE, reason) ||
+        !common_speculative_jetspec_expect_i32("draft.n_ctx_train", llama_model_n_ctx_train(model_dft), JETSPEC_QWEN36_DRAFT_BLOCK_SIZE, reason) ||
+        !common_speculative_jetspec_expect_i32("draft.n_embd", llama_model_n_embd(model_dft), JETSPEC_QWEN36_TARGET_HIDDEN, reason) ||
+        !common_speculative_jetspec_expect_i32("draft.n_layer", llama_model_n_layer(model_dft), JETSPEC_QWEN36_DRAFT_LAYERS, reason) ||
+        !common_speculative_jetspec_expect_i32("draft.n_head", llama_model_n_head(model_dft), JETSPEC_QWEN36_DRAFT_HEADS, reason) ||
+        !common_speculative_jetspec_expect_i32("draft.n_head_kv", llama_model_n_head_kv(model_dft), JETSPEC_QWEN36_DRAFT_HEADS_KV, reason) ||
+        !common_speculative_jetspec_expect_i32("draft.vocab", llama_vocab_n_tokens(vocab_dft), JETSPEC_QWEN36_VOCAB_SIZE, reason) ||
+        !common_speculative_jetspec_expect_i32("target_tap_count", tap_count, JETSPEC_QWEN36_TARGET_TAP_COUNT, reason) ||
+        !common_speculative_jetspec_expect_i32("target_tap_width", tap_width, JETSPEC_QWEN36_TARGET_TAP_WIDTH, reason) ||
+        !common_speculative_jetspec_expect_i32("target_tap_width_vs_target", tap_width, tap_count * target_hidden, reason)) {
+        return false;
+    }
+
+    return true;
 }
 
 static bool common_speculative_are_compatible(
@@ -431,6 +528,529 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
     void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/) override {
         // noop
+    }
+
+    bool need_embd() const override {
+        return false;
+    }
+};
+
+struct common_speculative_impl_draft_jetspec : public common_speculative_impl {
+    common_params_speculative_draft params; // reuses draft ctx_tgt/ctx_dft binding, no draft-head graph yet
+
+    enum class jetspec_runtime_phase {
+        waiting_for_target_taps,
+        waiting_for_pre_round_snapshot,
+        pre_round_snapshot_ready,
+        target_taps_captured,
+        transaction_plan_scaffold_ready,
+        transient_reservation_descriptor_ready,
+        tree_build_descriptor_ready,
+        disabled,
+    };
+
+    enum class jetspec_runtime_failure {
+        none,
+        missing_target_context,
+        invalid_binding,
+        invalid_target_taps,
+        invalid_pre_round_snapshot,
+        invalid_transaction_plan,
+        invalid_transient_reservation_descriptor,
+        invalid_tree_build_descriptor,
+    };
+
+    struct jetspec_target_tap_row_state {
+        int32_t      batch_index = -1;
+        llama_pos    pos         = -1;
+        llama_seq_id seq_id      = -1;
+    };
+
+    std::vector<float> target_tap_rows;
+    std::vector<jetspec_target_tap_row_state> target_tap_row_state;
+    size_t n_target_tap_rows_total = 0;
+    size_t n_target_tap_rows_cached = 0;
+    size_t n_target_tap_process = 0;
+    size_t n_runtime_state_resets = 0;
+    size_t n_runtime_draft_calls = 0;
+    size_t n_transaction_plan_scaffolds = 0;
+    size_t n_transient_reservation_descriptors = 0;
+    size_t n_tree_build_descriptors = 0;
+    size_t n_pre_round_snapshots = 0;
+    uint64_t target_tap_hash_last = 0;
+    uint64_t pre_round_snapshot_hash_last = 0;
+    uint64_t pre_round_prompt_hash_last = 0;
+    uint64_t transaction_plan_hash_last = 0;
+    uint64_t transient_reservation_hash_last = 0;
+    uint64_t tree_build_descriptor_hash_last = 0;
+    int32_t target_tap_count_last = 0;
+    int32_t target_tap_width_last = 0;
+    int32_t pre_round_seq_id_last = -1;
+    int32_t transient_reservation_seq_id_last = -1;
+    int32_t tree_build_seq_id_last = -1;
+    size_t pre_round_prompt_tokens_last = 0;
+    int32_t transient_reservation_node_budget_last = 0;
+    int32_t transient_reservation_actual_pages_last = 0;
+    int32_t tree_build_node_budget_last = 0;
+    int32_t tree_build_root_parent_last = JETSPEC_TREE_ROOT_PARENT;
+    int32_t tree_build_root_depth_last = JETSPEC_TREE_ROOT_DEPTH;
+    int32_t tree_build_actual_nodes_last = 0;
+    int32_t transaction_plan_phase_count_last = 0;
+    int32_t transaction_plan_rollback_count_last = 0;
+    jetspec_runtime_phase runtime_phase = jetspec_runtime_phase::waiting_for_target_taps;
+    jetspec_runtime_failure runtime_failure = jetspec_runtime_failure::none;
+    bool target_taps_active = true;
+    bool pre_round_snapshot_ready = false;
+    bool transaction_plan_ready = false;
+    bool transient_reservation_ready = false;
+    bool tree_build_descriptor_ready = false;
+    bool trace_taps = false;
+
+    static const char * jetspec_runtime_phase_name(jetspec_runtime_phase phase) {
+        switch (phase) {
+            case jetspec_runtime_phase::waiting_for_target_taps:        return "waiting_for_target_taps";
+            case jetspec_runtime_phase::waiting_for_pre_round_snapshot:  return "waiting_for_pre_round_snapshot";
+            case jetspec_runtime_phase::pre_round_snapshot_ready:        return "pre_round_snapshot_ready";
+            case jetspec_runtime_phase::target_taps_captured:           return "target_taps_captured";
+            case jetspec_runtime_phase::transaction_plan_scaffold_ready:        return "transaction_plan_scaffold_ready";
+            case jetspec_runtime_phase::transient_reservation_descriptor_ready: return "transient_reservation_descriptor_ready";
+            case jetspec_runtime_phase::tree_build_descriptor_ready:            return "tree_build_descriptor_ready";
+            case jetspec_runtime_phase::disabled:                              return "disabled";
+        }
+        return "unknown";
+    }
+
+    static const char * jetspec_runtime_failure_name(jetspec_runtime_failure failure) {
+        switch (failure) {
+            case jetspec_runtime_failure::none:                     return "none";
+            case jetspec_runtime_failure::missing_target_context:   return "missing_target_context";
+            case jetspec_runtime_failure::invalid_binding:          return "invalid_binding";
+            case jetspec_runtime_failure::invalid_target_taps:        return "invalid_target_taps";
+            case jetspec_runtime_failure::invalid_pre_round_snapshot: return "invalid_pre_round_snapshot";
+            case jetspec_runtime_failure::invalid_transaction_plan:                    return "invalid_transaction_plan";
+            case jetspec_runtime_failure::invalid_transient_reservation_descriptor:     return "invalid_transient_reservation_descriptor";
+            case jetspec_runtime_failure::invalid_tree_build_descriptor:                return "invalid_tree_build_descriptor";
+        }
+        return "unknown";
+    }
+
+    common_speculative_impl_draft_jetspec(const common_params_speculative & params, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_JETSPEC, n_seq)
+        , params(params.draft) {
+        trace_taps = common_speculative_env_enabled("LLAMA_JETSPEC_TRACE") ||
+                     common_speculative_env_enabled("LLAMA_JETSPEC_TAP_TRACE") ||
+                     common_speculative_env_enabled("LLAMA_JETSPEC_STATE_TRACE");
+        if (this->params.ctx_tgt != nullptr) {
+            llama_set_jetspec_target_hidden_taps(this->params.ctx_tgt, true, true);
+        } else {
+            disable_runtime_state(jetspec_runtime_failure::missing_target_context, 0, 0, nullptr);
+        }
+        LOG_WRN("%s: draft-jetspec accepted as P5F binding-preflight/runtime-state/tap-ingestion route; runtime_supported=false, no draft tokens will be generated\n", __func__);
+    }
+
+    ~common_speculative_impl_draft_jetspec() override {
+        if (params.ctx_tgt != nullptr) {
+            llama_set_jetspec_target_hidden_taps(params.ctx_tgt, false, true);
+        }
+    }
+
+    void reset_runtime_state() {
+        target_tap_hash_last = 0;
+        pre_round_snapshot_hash_last = 0;
+        pre_round_prompt_hash_last = 0;
+        transaction_plan_hash_last = 0;
+        transient_reservation_hash_last = 0;
+        tree_build_descriptor_hash_last = 0;
+        target_tap_count_last = 0;
+        target_tap_width_last = 0;
+        pre_round_seq_id_last = -1;
+        transient_reservation_seq_id_last = -1;
+        tree_build_seq_id_last = -1;
+        pre_round_prompt_tokens_last = 0;
+        transient_reservation_node_budget_last = 0;
+        transient_reservation_actual_pages_last = 0;
+        tree_build_node_budget_last = 0;
+        tree_build_root_parent_last = JETSPEC_TREE_ROOT_PARENT;
+        tree_build_root_depth_last = JETSPEC_TREE_ROOT_DEPTH;
+        tree_build_actual_nodes_last = 0;
+        transaction_plan_phase_count_last = 0;
+        transaction_plan_rollback_count_last = 0;
+        pre_round_snapshot_ready = false;
+        transaction_plan_ready = false;
+        transient_reservation_ready = false;
+        tree_build_descriptor_ready = false;
+        n_target_tap_rows_cached = 0;
+        runtime_phase = target_taps_active ? jetspec_runtime_phase::waiting_for_target_taps : jetspec_runtime_phase::disabled;
+        runtime_failure = target_taps_active ? jetspec_runtime_failure::none : runtime_failure;
+        target_tap_rows.clear();
+        target_tap_row_state.clear();
+        n_runtime_state_resets++;
+    }
+
+    void disable_runtime_state(jetspec_runtime_failure failure, int32_t tap_count, int32_t tap_width, const float * taps) {
+        runtime_phase = jetspec_runtime_phase::disabled;
+        runtime_failure = failure;
+        target_tap_count_last = tap_count;
+        target_tap_width_last = tap_width;
+        target_taps_active = false;
+        n_target_tap_rows_cached = 0;
+        pre_round_snapshot_hash_last = 0;
+        pre_round_prompt_hash_last = 0;
+        transaction_plan_hash_last = 0;
+        transient_reservation_hash_last = 0;
+        tree_build_descriptor_hash_last = 0;
+        pre_round_seq_id_last = -1;
+        transient_reservation_seq_id_last = -1;
+        tree_build_seq_id_last = -1;
+        pre_round_prompt_tokens_last = 0;
+        transient_reservation_node_budget_last = 0;
+        transient_reservation_actual_pages_last = 0;
+        tree_build_node_budget_last = 0;
+        tree_build_root_parent_last = JETSPEC_TREE_ROOT_PARENT;
+        tree_build_root_depth_last = JETSPEC_TREE_ROOT_DEPTH;
+        tree_build_actual_nodes_last = 0;
+        transaction_plan_phase_count_last = 0;
+        transaction_plan_rollback_count_last = 0;
+        pre_round_snapshot_ready = false;
+        transaction_plan_ready = false;
+        transient_reservation_ready = false;
+        tree_build_descriptor_ready = false;
+        target_tap_rows.clear();
+        target_tap_row_state.clear();
+        if (params.ctx_tgt != nullptr) {
+            llama_set_jetspec_target_hidden_taps(params.ctx_tgt, false, true);
+        }
+        LOG_WRN("%s: draft-jetspec runtime state disabled reason=%s taps=%d width=%d ptr=%p\n",
+                __func__, jetspec_runtime_failure_name(failure), tap_count, tap_width, (const void *) taps);
+    }
+
+    int32_t capture_target_tap_row_state(const llama_batch & batch) {
+        target_tap_row_state.clear();
+        if (batch.logits == nullptr) {
+            return 0;
+        }
+        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            if (batch.logits[i] == 0) {
+                continue;
+            }
+            jetspec_target_tap_row_state row;
+            row.batch_index = i;
+            row.pos = batch.pos != nullptr ? batch.pos[i] : -1;
+            if (batch.n_seq_id != nullptr && batch.seq_id != nullptr && batch.n_seq_id[i] > 0 && batch.seq_id[i] != nullptr) {
+                row.seq_id = batch.seq_id[i][0];
+            }
+            target_tap_row_state.push_back(row);
+        }
+        return (int32_t) target_tap_row_state.size();
+    }
+
+    bool build_pre_round_snapshot(llama_seq_id seq_id, const llama_tokens & prompt) {
+        pre_round_snapshot_ready = false;
+        pre_round_snapshot_hash_last = 0;
+        pre_round_prompt_hash_last = 0;
+        pre_round_seq_id_last = -1;
+        pre_round_prompt_tokens_last = 0;
+        if (seq_id < 0 || (uint32_t) seq_id >= n_seq) {
+            return false;
+        }
+
+        pre_round_seq_id_last = (int32_t) seq_id;
+        pre_round_prompt_tokens_last = prompt.size();
+        pre_round_prompt_hash_last = common_speculative_fnv1a64(prompt.data(), prompt.size() * sizeof(prompt[0]));
+
+        const int64_t snapshot_words[] = {
+            (int64_t) pre_round_seq_id_last,
+            (int64_t) pre_round_prompt_tokens_last,
+            (int64_t) pre_round_prompt_hash_last,
+            JETSPEC_TRANSACTION_PHASE_COUNT,
+        };
+        pre_round_snapshot_hash_last = common_speculative_fnv1a64(snapshot_words, sizeof(snapshot_words));
+        pre_round_snapshot_hash_last ^= common_speculative_fnv1a64(JETSPEC_PRE_ROUND_SNAPSHOT_PHASE, std::strlen(JETSPEC_PRE_ROUND_SNAPSHOT_PHASE));
+        pre_round_snapshot_ready = true;
+        n_pre_round_snapshots++;
+        runtime_phase = jetspec_runtime_phase::pre_round_snapshot_ready;
+        return true;
+    }
+
+    bool build_transaction_plan_scaffold() {
+        transaction_plan_ready = false;
+        transaction_plan_hash_last = 0;
+        transaction_plan_phase_count_last = 0;
+        transaction_plan_rollback_count_last = 0;
+        if (!pre_round_snapshot_ready || pre_round_snapshot_hash_last == 0) {
+            return false;
+        }
+        if (n_target_tap_rows_cached == 0 || target_tap_row_state.size() != n_target_tap_rows_cached) {
+            return false;
+        }
+
+        std::vector<int64_t> plan_words;
+        plan_words.reserve(8 + target_tap_row_state.size() * 3);
+        plan_words.push_back((int64_t) pre_round_snapshot_hash_last);
+        plan_words.push_back((int64_t) pre_round_seq_id_last);
+        plan_words.push_back((int64_t) pre_round_prompt_tokens_last);
+        plan_words.push_back((int64_t) pre_round_prompt_hash_last);
+        plan_words.push_back(JETSPEC_TRANSACTION_PHASE_COUNT);
+        plan_words.push_back(JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT);
+        plan_words.push_back((int64_t) n_target_tap_rows_cached);
+        plan_words.push_back((int64_t) target_tap_hash_last);
+        for (const auto & row : target_tap_row_state) {
+            plan_words.push_back((int64_t) row.batch_index);
+            plan_words.push_back((int64_t) row.pos);
+            plan_words.push_back((int64_t) row.seq_id);
+        }
+
+        transaction_plan_hash_last = common_speculative_fnv1a64(plan_words.data(), plan_words.size() * sizeof(plan_words[0]));
+        transaction_plan_hash_last ^= common_speculative_fnv1a64(JETSPEC_TRANSACTION_PHASE_ORDER, std::strlen(JETSPEC_TRANSACTION_PHASE_ORDER));
+        transaction_plan_hash_last ^= common_speculative_fnv1a64(JETSPEC_TRANSACTION_ROLLBACK_POINTS, std::strlen(JETSPEC_TRANSACTION_ROLLBACK_POINTS));
+        transaction_plan_phase_count_last = JETSPEC_TRANSACTION_PHASE_COUNT;
+        transaction_plan_rollback_count_last = JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT;
+        transaction_plan_ready = true;
+        n_transaction_plan_scaffolds++;
+        runtime_phase = jetspec_runtime_phase::transaction_plan_scaffold_ready;
+        return true;
+    }
+
+    bool build_transient_reservation_descriptor() {
+        transient_reservation_ready = false;
+        transient_reservation_hash_last = 0;
+        transient_reservation_seq_id_last = -1;
+        transient_reservation_node_budget_last = 0;
+        transient_reservation_actual_pages_last = 0;
+        if (!transaction_plan_ready || transaction_plan_hash_last == 0) {
+            return false;
+        }
+        if (!pre_round_snapshot_ready || pre_round_snapshot_hash_last == 0) {
+            return false;
+        }
+        if (n_target_tap_rows_cached == 0 || target_tap_row_state.size() != n_target_tap_rows_cached) {
+            return false;
+        }
+
+        transient_reservation_seq_id_last = pre_round_seq_id_last;
+        transient_reservation_node_budget_last = (int32_t) target_tap_row_state.size();
+        if (transient_reservation_node_budget_last <= 0 || transient_reservation_node_budget_last > JETSPEC_QWEN36_DRAFT_BLOCK_SIZE) {
+            return false;
+        }
+        transient_reservation_actual_pages_last = 0;
+
+        std::vector<int64_t> reservation_words;
+        reservation_words.reserve(11 + target_tap_row_state.size() * 3);
+        reservation_words.push_back((int64_t) transaction_plan_hash_last);
+        reservation_words.push_back((int64_t) pre_round_snapshot_hash_last);
+        reservation_words.push_back((int64_t) pre_round_seq_id_last);
+        reservation_words.push_back((int64_t) pre_round_prompt_tokens_last);
+        reservation_words.push_back((int64_t) transient_reservation_seq_id_last);
+        reservation_words.push_back((int64_t) transient_reservation_node_budget_last);
+        reservation_words.push_back((int64_t) transient_reservation_actual_pages_last);
+        reservation_words.push_back((int64_t) n_target_tap_rows_cached);
+        reservation_words.push_back((int64_t) target_tap_hash_last);
+        reservation_words.push_back(JETSPEC_QWEN36_DRAFT_BLOCK_SIZE);
+        reservation_words.push_back(JETSPEC_TRANSACTION_PHASE_COUNT);
+        for (const auto & row : target_tap_row_state) {
+            reservation_words.push_back((int64_t) row.batch_index);
+            reservation_words.push_back((int64_t) row.pos);
+            reservation_words.push_back((int64_t) row.seq_id);
+        }
+
+        transient_reservation_hash_last = common_speculative_fnv1a64(reservation_words.data(), reservation_words.size() * sizeof(reservation_words[0]));
+        transient_reservation_hash_last ^= common_speculative_fnv1a64(JETSPEC_TRANSIENT_RESERVATION_PHASE, std::strlen(JETSPEC_TRANSIENT_RESERVATION_PHASE));
+        transient_reservation_hash_last ^= common_speculative_fnv1a64(JETSPEC_TRANSIENT_RESERVATION_ROLLBACK_POINT, std::strlen(JETSPEC_TRANSIENT_RESERVATION_ROLLBACK_POINT));
+        transient_reservation_hash_last ^= common_speculative_fnv1a64(JETSPEC_TRANSIENT_RESERVATION_DESCRIPTOR, std::strlen(JETSPEC_TRANSIENT_RESERVATION_DESCRIPTOR));
+        transient_reservation_ready = true;
+        n_transient_reservation_descriptors++;
+        runtime_phase = jetspec_runtime_phase::transient_reservation_descriptor_ready;
+        return true;
+    }
+
+    bool build_tree_build_descriptor() {
+        tree_build_descriptor_ready = false;
+        tree_build_descriptor_hash_last = 0;
+        tree_build_seq_id_last = -1;
+        tree_build_node_budget_last = 0;
+        tree_build_root_parent_last = JETSPEC_TREE_ROOT_PARENT;
+        tree_build_root_depth_last = JETSPEC_TREE_ROOT_DEPTH;
+        tree_build_actual_nodes_last = 0;
+        if (!transient_reservation_ready || transient_reservation_hash_last == 0) {
+            return false;
+        }
+        if (!transaction_plan_ready || transaction_plan_hash_last == 0) {
+            return false;
+        }
+        if (!pre_round_snapshot_ready || pre_round_snapshot_hash_last == 0) {
+            return false;
+        }
+        if (transient_reservation_actual_pages_last != 0) {
+            return false;
+        }
+        if (transient_reservation_node_budget_last <= 0 || transient_reservation_node_budget_last > JETSPEC_QWEN36_DRAFT_BLOCK_SIZE) {
+            return false;
+        }
+        if (n_target_tap_rows_cached == 0 || target_tap_row_state.size() != n_target_tap_rows_cached) {
+            return false;
+        }
+
+        tree_build_seq_id_last = pre_round_seq_id_last;
+        tree_build_node_budget_last = transient_reservation_node_budget_last;
+        tree_build_root_parent_last = JETSPEC_TREE_ROOT_PARENT;
+        tree_build_root_depth_last = JETSPEC_TREE_ROOT_DEPTH;
+        tree_build_actual_nodes_last = 0;
+
+        std::vector<int64_t> tree_words;
+        tree_words.reserve(15 + target_tap_row_state.size() * 3);
+        tree_words.push_back((int64_t) transaction_plan_hash_last);
+        tree_words.push_back((int64_t) pre_round_snapshot_hash_last);
+        tree_words.push_back((int64_t) transient_reservation_hash_last);
+        tree_words.push_back((int64_t) pre_round_prompt_tokens_last);
+        tree_words.push_back((int64_t) pre_round_prompt_hash_last);
+        tree_words.push_back((int64_t) tree_build_seq_id_last);
+        tree_words.push_back((int64_t) tree_build_node_budget_last);
+        tree_words.push_back((int64_t) tree_build_root_parent_last);
+        tree_words.push_back((int64_t) tree_build_root_depth_last);
+        tree_words.push_back((int64_t) tree_build_actual_nodes_last);
+        tree_words.push_back((int64_t) n_target_tap_rows_cached);
+        tree_words.push_back((int64_t) target_tap_hash_last);
+        tree_words.push_back(JETSPEC_QWEN36_DRAFT_BLOCK_SIZE);
+        tree_words.push_back(JETSPEC_TRANSACTION_PHASE_COUNT);
+        tree_words.push_back(JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT);
+        for (const auto & row : target_tap_row_state) {
+            tree_words.push_back((int64_t) row.batch_index);
+            tree_words.push_back((int64_t) row.pos);
+            tree_words.push_back((int64_t) row.seq_id);
+        }
+
+        tree_build_descriptor_hash_last = common_speculative_fnv1a64(tree_words.data(), tree_words.size() * sizeof(tree_words[0]));
+        tree_build_descriptor_hash_last ^= common_speculative_fnv1a64(JETSPEC_TREE_BUILD_PHASE, std::strlen(JETSPEC_TREE_BUILD_PHASE));
+        tree_build_descriptor_hash_last ^= common_speculative_fnv1a64(JETSPEC_TREE_BUILD_ROLLBACK_POINT, std::strlen(JETSPEC_TREE_BUILD_ROLLBACK_POINT));
+        tree_build_descriptor_hash_last ^= common_speculative_fnv1a64(JETSPEC_TREE_BUILD_DESCRIPTOR, std::strlen(JETSPEC_TREE_BUILD_DESCRIPTOR));
+        tree_build_descriptor_ready = true;
+        n_tree_build_descriptors++;
+        runtime_phase = jetspec_runtime_phase::tree_build_descriptor_ready;
+        return true;
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        reset_runtime_state();
+        runtime_phase = jetspec_runtime_phase::waiting_for_pre_round_snapshot;
+        if (!build_pre_round_snapshot(seq_id, prompt)) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_pre_round_snapshot, 0, 0, nullptr);
+            return;
+        }
+        if (trace_taps) {
+            LOG_INF("%s: draft-jetspec pre_round_snapshot_ready=%d pre_round_snapshot_hash=%016" PRIx64 " pre_round_seq_id=%d pre_round_prompt_tokens=%zu pre_round_prompt_hash=%016" PRIx64 " transaction_phase=%s no_reserve=1 no_tree_build=1 no_verify_mask=1 no_kv_mutation=1 no_publish=1 no_draft_tokens=1\n",
+                    __func__, pre_round_snapshot_ready ? 1 : 0, pre_round_snapshot_hash_last,
+                    pre_round_seq_id_last, pre_round_prompt_tokens_last, pre_round_prompt_hash_last,
+                    JETSPEC_PRE_ROUND_SNAPSHOT_PHASE);
+        }
+    }
+
+    bool process(const llama_batch & batch) override {
+        if (!target_taps_active) {
+            return true;
+        }
+
+        int32_t n_rows = 0;
+        if (batch.logits != nullptr) {
+            for (int32_t i = 0; i < batch.n_tokens; ++i) {
+                n_rows += batch.logits[i] != 0;
+            }
+        }
+        if (n_rows == 0) {
+            n_target_tap_rows_cached = 0;
+            transaction_plan_hash_last = 0;
+            transient_reservation_hash_last = 0;
+            tree_build_descriptor_hash_last = 0;
+            transaction_plan_phase_count_last = 0;
+            transaction_plan_rollback_count_last = 0;
+            transaction_plan_ready = false;
+            transient_reservation_ready = false;
+            tree_build_descriptor_ready = false;
+            target_tap_rows.clear();
+            target_tap_row_state.clear();
+            runtime_phase = jetspec_runtime_phase::waiting_for_target_taps;
+            return true;
+        }
+
+        const int32_t tap_count = llama_get_jetspec_target_hidden_tap_count(params.ctx_tgt);
+        const int32_t tap_width = llama_get_jetspec_target_hidden_tap_width(params.ctx_tgt);
+        float * taps = llama_get_jetspec_target_hidden_taps(params.ctx_tgt);
+        if (tap_count != 5 || tap_width != 10240 || taps == nullptr) {
+            LOG_WRN("%s: draft-jetspec target taps unavailable after target decode (%d taps, width %d, ptr %p); disabling JetSpec tap ingestion\n",
+                    __func__, tap_count, tap_width, (void *) taps);
+            disable_runtime_state(jetspec_runtime_failure::invalid_target_taps, tap_count, tap_width, taps);
+            return true;
+        }
+
+        const size_t n_values = (size_t) n_rows * (size_t) tap_width;
+        target_tap_rows.assign(taps, taps + n_values);
+        target_tap_hash_last = common_speculative_fnv1a64(target_tap_rows.data(), n_values * sizeof(float));
+        target_tap_count_last = tap_count;
+        target_tap_width_last = tap_width;
+        n_target_tap_rows_cached = (size_t) n_rows;
+        n_target_tap_rows_total += (size_t) n_rows;
+        n_target_tap_process++;
+        runtime_phase = jetspec_runtime_phase::target_taps_captured;
+        runtime_failure = jetspec_runtime_failure::none;
+
+        const int32_t n_row_state = capture_target_tap_row_state(batch);
+        if (n_row_state != n_rows) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_target_taps, tap_count, tap_width, taps);
+            return true;
+        }
+        if (!pre_round_snapshot_ready) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_pre_round_snapshot, tap_count, tap_width, taps);
+            return true;
+        }
+        if (!build_transaction_plan_scaffold()) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_transaction_plan, tap_count, tap_width, taps);
+            return true;
+        }
+        if (!build_transient_reservation_descriptor()) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_transient_reservation_descriptor, tap_count, tap_width, taps);
+            return true;
+        }
+        if (!build_tree_build_descriptor()) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_tree_build_descriptor, tap_count, tap_width, taps);
+            return true;
+        }
+
+        if (trace_taps) {
+            LOG_INF("%s: draft-jetspec runtime_state phase=%s failure=%s pre_round_snapshot_ready=%d pre_round_snapshot_hash=%016" PRIx64 " pre_round_seq_id=%d pre_round_prompt_tokens=%zu pre_round_prompt_hash=%016" PRIx64 " captured_rows=%zu row_state=%zu taps=%d width=%d hash=%016" PRIx64 " transaction_plan_ready=%d transaction_plan_hash=%016" PRIx64 " transaction_plan_phases=%d rollback_points=%d transient_reservation_ready=%d transient_reservation_hash=%016" PRIx64 " transient_tree_node_budget=%d actual_pages_reserved=0 tree_build_descriptor_ready=%d tree_build_descriptor_hash=%016" PRIx64 " planned_tree_node_budget=%d actual_tree_nodes=0 total_rows=%zu process=%zu resets=%zu\n",
+                    __func__, jetspec_runtime_phase_name(runtime_phase), jetspec_runtime_failure_name(runtime_failure),
+                    pre_round_snapshot_ready ? 1 : 0, pre_round_snapshot_hash_last, pre_round_seq_id_last,
+                    pre_round_prompt_tokens_last, pre_round_prompt_hash_last,
+                    n_target_tap_rows_cached, target_tap_row_state.size(), tap_count, tap_width, target_tap_hash_last,
+                    transaction_plan_ready ? 1 : 0, transaction_plan_hash_last, transaction_plan_phase_count_last,
+                    transaction_plan_rollback_count_last, transient_reservation_ready ? 1 : 0, transient_reservation_hash_last,
+                    transient_reservation_node_budget_last, tree_build_descriptor_ready ? 1 : 0, tree_build_descriptor_hash_last,
+                    tree_build_node_budget_last,
+                    n_target_tap_rows_total, n_target_tap_process, n_runtime_state_resets);
+            LOG_INF("%s: draft-jetspec transaction_plan_scaffold order=%s failpoints=%s transaction_phase=%s transient_reservation_phase=reserve_transient_tree_pages rollback_point=after_reserve transient_reservation_descriptor_only=1 transient_reservation_ready=%d transient_reservation_hash=%016" PRIx64 " actual_pages_reserved=0 pre_publish_visible_state_unmodified=1 no_reserve=1 no_real_reserve=1 no_page_map_write=1 no_tree_build=1 no_verify_mask=1 no_kv_mutation=1 no_publish=1 no_draft_tokens=1\n",
+                    __func__, JETSPEC_TRANSACTION_PHASE_ORDER, JETSPEC_TRANSACTION_ROLLBACK_POINTS, JETSPEC_PRE_ROUND_SNAPSHOT_PHASE,
+                    transient_reservation_ready ? 1 : 0, transient_reservation_hash_last);
+            LOG_INF("%s: draft-jetspec tree_build_descriptor tree_build_phase=build_tree rollback_point=after_build_tree tree_build_descriptor_only=1 tree_build_descriptor_ready=%d tree_build_descriptor_hash=%016" PRIx64 " planned_tree_node_budget=%d actual_tree_nodes=0 root_parent=%d root_depth=%d pre_publish_visible_state_unmodified=1 no_real_tree_build=1 no_tree_arrays=1 no_verify_mask=1 no_accept=1 no_kv_mutation=1 no_publish=1 no_draft_tokens=1\n",
+                    __func__, tree_build_descriptor_ready ? 1 : 0, tree_build_descriptor_hash_last,
+                    tree_build_node_budget_last, tree_build_root_parent_last, tree_build_root_depth_last);
+        }
+
+        return true;
+    }
+
+    void draft(common_speculative_draft_params_vec & /*dparams*/) override {
+        n_runtime_draft_calls++;
+        if (trace_taps) {
+            LOG_INF("%s: draft-jetspec runtime_state phase=%s failure=%s pre_round_snapshot_ready=%d pre_round_snapshot_hash=%016" PRIx64 " captured_rows=%zu hash=%016" PRIx64 " transaction_plan_ready=%d transaction_plan_hash=%016" PRIx64 " transient_reservation_ready=%d transient_reservation_hash=%016" PRIx64 " actual_pages_reserved=0 tree_build_descriptor_ready=%d tree_build_descriptor_hash=%016" PRIx64 " actual_tree_nodes=0 draft_call=%zu no_draft=1 no_kv_mutation=1 no_graph_exec=1 no_reserve=1 no_real_reserve=1 no_page_map_write=1 no_real_tree_build=1 no_tree_arrays=1 no_tree_build=1 no_verify_mask=1 no_accept=1\n",
+                    __func__, jetspec_runtime_phase_name(runtime_phase), jetspec_runtime_failure_name(runtime_failure),
+                    pre_round_snapshot_ready ? 1 : 0, pre_round_snapshot_hash_last,
+                    n_target_tap_rows_cached, target_tap_hash_last, transaction_plan_ready ? 1 : 0,
+                    transaction_plan_hash_last, transient_reservation_ready ? 1 : 0, transient_reservation_hash_last,
+                    tree_build_descriptor_ready ? 1 : 0, tree_build_descriptor_hash_last, n_runtime_draft_calls);
+        }
+        // fail closed: do not emit draft tokens before draft-head graph, tree verify, and rollback runtime exist.
+    }
+
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/) override {
+        // noop until tree commit/rollback state is implemented.
     }
 
     bool need_embd() const override {
@@ -2285,6 +2905,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:  return "draft-simple";
         case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
         case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_JETSPEC: return "draft-jetspec";
         case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram-simple";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   return "ngram-map-k";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
@@ -2342,6 +2963,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_draft_simple = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE));
         bool has_draft_eagle3 = false; // TODO PR-18039: if params.speculative.eagle3
         bool has_mtp = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) && params.draft.ctx_dft != nullptr;
+        bool has_draft_jetspec = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_JETSPEC));
 
         bool has_ngram_cache   = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_CACHE));
         bool has_ngram_simple  = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE));
@@ -2350,7 +2972,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_ngram_mod     = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MOD));
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 9);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 10);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -2376,9 +2998,30 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 LOG_WRN("%s: draft model is not specified - cannot use 'draft' type\n", __func__);
                 has_draft_simple = false;
             }
-        } else if (has_draft_model_path && !has_mtp && !has_draft_eagle3) {
+        } else if (has_draft_model_path && !has_mtp && !has_draft_eagle3 && !has_draft_jetspec) {
             LOG_WRN("%s: draft model is specified but 'draft' speculative type is not explicitly enabled - enabling it\n", __func__);
             has_draft_simple = true;
+        }
+
+        if (has_draft_jetspec) {
+            if (!common_speculative_env_enabled("LLAMA_JETSPEC_EXPERIMENTAL")) {
+                LOG_WRN("%s: draft-jetspec requires LLAMA_JETSPEC_EXPERIMENTAL=1; disabling JetSpec before runtime execution\n", __func__);
+                has_draft_jetspec = false;
+            } else if (params.draft.ctx_tgt == nullptr || params.draft.ctx_dft == nullptr) {
+                LOG_WRN("%s: draft-jetspec requires explicit target and draft contexts; disabling JetSpec before runtime execution\n", __func__);
+                has_draft_jetspec = false;
+            } else {
+                llama_set_jetspec_target_hidden_taps(params.draft.ctx_tgt, true, true);
+                const int32_t tap_count = llama_get_jetspec_target_hidden_tap_count(params.draft.ctx_tgt);
+                const int32_t tap_width = llama_get_jetspec_target_hidden_tap_width(params.draft.ctx_tgt);
+                std::string preflight_reason;
+                if (!common_speculative_jetspec_preflight(params.draft, tap_count, tap_width, preflight_reason)) {
+                    llama_set_jetspec_target_hidden_taps(params.draft.ctx_tgt, false, true);
+                    LOG_WRN("%s: draft-jetspec preflight failed (%s; taps=%d width=%d); disabling JetSpec before runtime execution\n",
+                            __func__, preflight_reason.c_str(), tap_count, tap_width);
+                    has_draft_jetspec = false;
+                }
+            }
         }
 
         if (has_draft_simple) {
@@ -2389,6 +3032,9 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         }
         if (has_mtp) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, params));
+        }
+        if (has_draft_jetspec) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_JETSPEC, params));
         }
     }
 
@@ -2409,6 +3055,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
                 impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_DRAFT_JETSPEC: {
+                impls.push_back(std::make_unique<common_speculative_impl_draft_jetspec>(config.params, n_seq));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {

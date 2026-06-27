@@ -1,0 +1,36 @@
+{
+  "ancestor": [
+    [true, false, false, false, false],
+    [true, true, false, false, false],
+    [true, false, true, false, false],
+    [true, true, false, true, false],
+    [true, false, true, false, true]
+  ],
+  "bucket_size": 7,
+  "bucketed_qq_bias": [
+    ["0", "-inf", "-inf", "-inf", "-inf", "-inf", "-inf"],
+    ["0", "0", "-inf", "-inf", "-inf", "-inf", "-inf"],
+    ["0", "-inf", "0", "-inf", "-inf", "-inf", "-inf"],
+    ["0", "0", "-inf", "0", "-inf", "-inf", "-inf"],
+    ["0", "-inf", "0", "-inf", "0", "-inf", "-inf"],
+    ["-inf", "-inf", "-inf", "-inf", "-inf", "0", "-inf"],
+    ["-inf", "-inf", "-inf", "-inf", "-inf", "-inf", "0"]
+  ],
+  "num_nodes": 5,
+  "past_len": 2,
+  "qq_bias": [
+    ["0", "-inf", "-inf", "-inf", "-inf"],
+    ["0", "0", "-inf", "-inf", "-inf"],
+    ["0", "-inf", "0", "-inf", "-inf"],
+    ["0", "0", "-inf", "0", "-inf"],
+    ["0", "-inf", "0", "-inf", "0"]
+  ],
+  "sibling_pairs": [[1, 2], [2, 1]],
+  "verify_allowed_mask": [
+    [true, true, true, false, false, false, false],
+    [true, true, true, true, false, false, false],
+    [true, true, true, false, true, false, false],
+    [true, true, true, true, false, true, false],
+    [true, true, true, false, true, false, true]
+  ]
+}

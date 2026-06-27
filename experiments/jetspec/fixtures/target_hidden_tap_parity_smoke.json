@@ -1,0 +1,26 @@
+{
+  "mode": "target_hidden_tap_parity",
+  "spec": {
+    "target_layer_ids": [1, 10, 19, 28, 37],
+    "target_hidden_size": 2048,
+    "num_target_layers": 40,
+    "block_size": 16,
+    "mask_token_id": 248070,
+    "draft_fc_input_size": 10240
+  },
+  "target_model": {
+    "has_token_embeddings": true,
+    "has_lm_head": true,
+    "hidden_size": 2048,
+    "layer_count": 40
+  },
+  "hidden_state_generator": {
+    "base": 0,
+    "state_stride": 100000,
+    "element_stride": 1
+  },
+  "baseline_logits": [
+    [0.1, 0.3, 0.2, 0.9, 0.4],
+    [1.2, 0.8, 1.5, 1.1, 0.0]
+  ]
+}

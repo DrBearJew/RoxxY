@@ -1,0 +1,333 @@
+{
+  "actions": [
+    {
+      "blockers": [
+        "needs accepted-path physical gather/compact from transient tree slots to committed tail",
+        "must preserve [root | accepted] only and defer correction hidden",
+        "must not silently use seq_cp, seq_rm, or seq_import_physical"
+      ],
+      "claims_performance": false,
+      "claims_promotion": false,
+      "classification": "exact_missing_primitive",
+      "evidence": [
+        "P5H hidden/KV survivors [root | accepted] only",
+        "P5I hidden_kv_survivor_commit is missing_primitive"
+      ],
+      "id": "hidden_kv_survivor_commit",
+      "locations": [],
+      "primitive": "missing primitive",
+      "runtime_executed_now": false,
+      "touches_production_now": false
+    },
+    {
+      "blockers": [
+        "needs tree-node ownership discard that makes rejected transient slots unreachable",
+        "range seq_rm is not sufficient without accepted-path ownership proof",
+        "must preserve cross-sequence slots"
+      ],
+      "claims_performance": false,
+      "claims_promotion": false,
+      "classification": "exact_missing_primitive",
+      "evidence": [
+        "P5H rejected tree nodes unreachable after commit",
+        "P5I rejected_branch_discard is missing_primitive"
+      ],
+      "id": "rejected_branch_discard",
+      "locations": [],
+      "primitive": "missing primitive",
+      "runtime_executed_now": false,
+      "touches_production_now": false
+    },
+    {
+      "blockers": [
+        "needs explicit tree-gather isolation contract across seq_to_stream mappings",
+        "must prove other-sequence slots unchanged after gather/discard",
+        "must not infer safety from existing seq_id assertions alone"
+      ],
+      "claims_performance": false,
+      "claims_promotion": false,
+      "classification": "exact_missing_primitive",
+      "evidence": [
+        "P5H cross-sequence slot isolation",
+        "P5I cross_sequence_isolation is missing_primitive"
+      ],
+      "id": "cross_sequence_isolation",
+      "locations": [],
+      "primitive": "missing primitive",
+      "runtime_executed_now": false,
+      "touches_production_now": false
+    }
+  ],
+  "coverage": {
+    "classification_counts": {
+      "blocked_pending_explicit_approval": 0,
+      "exact_existing_primitive_candidate": 0,
+      "exact_missing_primitive": 3
+    },
+    "implicit_mappings_forbidden": [
+      "llama_kv_cache::seq_cp",
+      "llama_kv_cache::seq_import_physical",
+      "llama_kv_cache::seq_rm",
+      "seq_cp",
+      "seq_import_physical",
+      "seq_rm"
+    ],
+    "no_action_executes_runtime_now": true,
+    "no_action_touches_production_now": true,
+    "required_actions": [
+      "hidden_kv_survivor_commit",
+      "rejected_branch_discard",
+      "cross_sequence_isolation"
+    ],
+    "required_actions_present": true
+  },
+  "existing_symbols_audited": [
+    {
+      "location_count": 10,
+      "locations": [
+        {
+          "line": 147,
+          "path": "src/llama-kv-cache.h",
+          "text": "bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;"
+        },
+        {
+          "line": 174,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "return strncmp(reason, \"seq_rm(\", 7) == 0 ||"
+        },
+        {
+          "line": 1508,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {"
+        },
+        {
+          "line": 1512,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "\"seq_rm(seq=%d,p0=%lld,p1=%lld)\","
+        },
+        {
+          "line": 1686,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {"
+        },
+        {
+          "line": 2165,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "if (!cells.is_empty(dst_idx) && cells.seq_has(dst_idx, seq_id_dst) && cells.seq_rm(dst_idx, seq_id_dst) && dst_idx < head) {"
+        },
+        {
+          "line": 2211,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "if (!seq_rm(seq_id_dst, -1, -1)) {"
+        },
+        {
+          "line": 2937,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "seq_rm(s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1);"
+        }
+      ],
+      "purpose": "existing sequence range removal; not an exact accepted-path tree gather primitive",
+      "symbol": "seq_rm"
+    },
+    {
+      "location_count": 5,
+      "locations": [
+        {
+          "line": 148,
+          "path": "src/llama-kv-cache.h",
+          "text": "void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;"
+        },
+        {
+          "line": 176,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "strcmp(reason, \"seq_cp\") == 0;"
+        },
+        {
+          "line": 1727,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {"
+        },
+        {
+          "line": 1730,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "clear_mtp_qblock_tail_page_maps(\"seq_cp\");"
+        },
+        {
+          "line": 1778,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "GGML_ASSERT(is_full && \"seq_cp() is only supported for full KV buffers\");"
+        }
+      ],
+      "purpose": "existing sequence copy; forbidden as an implicit tree survivor commit mapping",
+      "symbol": "seq_cp"
+    },
+    {
+      "location_count": 4,
+      "locations": [
+        {
+          "line": 149,
+          "path": "src/llama-kv-cache.h",
+          "text": "bool seq_import_physical(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, size_t * bytes_copied = nullptr, size_t * cells_copied = nullptr, const char ** reason = nullptr);"
+        },
+        {
+          "line": 1815,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "bool llama_kv_cache::seq_import_physical(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, size_t * bytes_copied, size_t * cells_copied, const char ** reason) {"
+        },
+        {
+          "line": 1835,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "clear_mtp_qblock_tail_page_maps(\"seq_import_physical\");"
+        },
+        {
+          "line": 1874,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "\"MTP_QBLOCK_KV_PERSISTENCE: op=seq_import_physical status=%s path=%s detail=%s seq_src=%d seq_dst=%d src_count=%zu src_min=%u src_max_excl=%u bytes=%zu cells=%zu v_trans=%d n_stream=%u\\n\","
+        }
+      ],
+      "purpose": "existing physical import/rebind helper; forbidden as an implicit tree survivor commit mapping",
+      "symbol": "seq_import_physical"
+    },
+    {
+      "location_count": 4,
+      "locations": [
+        {
+          "line": 150,
+          "path": "src/llama-kv-cache.h",
+          "text": "void seq_keep(llama_seq_id seq_id)                                                          override;"
+        },
+        {
+          "line": 2340,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "void llama_kv_cache::seq_keep(llama_seq_id seq_id) {"
+        },
+        {
+          "line": 2342,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "clear_mtp_qblock_tail_page_maps(\"seq_keep\");"
+        },
+        {
+          "line": 2350,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "if (cells.seq_keep(i, seq_id)) {"
+        }
+      ],
+      "purpose": "existing sequence keep helper; not an exact rejected-branch discard primitive",
+      "symbol": "seq_keep"
+    },
+    {
+      "location_count": 8,
+      "locations": [
+        {
+          "line": 265,
+          "path": "src/llama-kv-cache.h",
+          "text": "slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;"
+        },
+        {
+          "line": 372,
+          "path": "src/llama-kv-cache.h",
+          "text": "// the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())"
+        },
+        {
+          "line": 373,
+          "path": "src/llama-kv-cache.h",
+          "text": "// note: this is not part of the KV state and it's only used to speed-up the find_slot() method"
+        },
+        {
+          "line": 2215,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "slot_info sinfo = find_slot(ubatch, false);"
+        },
+        {
+          "line": 2544,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "const auto sinfo_new = find_slot(ubatch, false);"
+        },
+        {
+          "line": 2677,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {"
+        },
+        {
+          "line": 2974,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "slot_info sinfo_new = find_slot(ubatch, false);"
+        },
+        {
+          "line": 4845,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "sinfo = find_slot(ubatch, false);"
+        }
+      ],
+      "purpose": "existing slot search helper; not an exact transient tree slot reservation primitive",
+      "symbol": "find_slot"
+    },
+    {
+      "location_count": 8,
+      "locations": [
+        {
+          "line": 268,
+          "path": "src/llama-kv-cache.h",
+          "text": "void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);"
+        },
+        {
+          "line": 2222,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "apply_ubatch(sinfo, ubatch);"
+        },
+        {
+          "line": 2567,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "apply_ubatch(sinfo_new, ubatch);"
+        },
+        {
+          "line": 2876,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {"
+        },
+        {
+          "line": 3006,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "apply_ubatch(tx.sinfo, ubatch);"
+        },
+        {
+          "line": 4851,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "// TODO: we cannot yet restore llama_kv_cell_ext as the apply_ubatch() does not support it yet"
+        },
+        {
+          "line": 4853,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "apply_ubatch(sinfo, ubatch);"
+        },
+        {
+          "line": 5213,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);"
+        }
+      ],
+      "purpose": "existing ubatch slot application; not an exact JetSpec gather/compact primitive",
+      "symbol": "apply_ubatch"
+    }
+  ],
+  "ok": true,
+  "production_paths_touched": [],
+  "runtime_boundary": {
+    "draft_head_graph_executed": false,
+    "draft_tokens_emitted": false,
+    "llama_context_created": false,
+    "no_runtime_execution": true,
+    "performance_claimed": false,
+    "promotion_claimed": false,
+    "real_kv_mutated": false,
+    "runtime_supported": false,
+    "server_route_added": false,
+    "source_text_read_only": true
+  },
+  "scope": "experiments/jetspec only",
+  "source_files": [
+    "src/llama-kv-cache.h",
+    "src/llama-kv-cache.cpp"
+  ],
+  "status": "kv_primitive_audit_verified_not_executed"
+}

@@ -1,0 +1,191 @@
+{
+  "status": "page_map_ownership_oracle_verified_not_executed",
+  "scope": "experiments/jetspec only",
+  "production_paths_touched": [],
+  "runtime_boundary": {
+    "llama_context_created": false,
+    "draft_head_graph_executed": false,
+    "draft_tokens_emitted": false,
+    "real_kv_mutated": false,
+    "server_route_added": false,
+    "runtime_supported": false,
+    "performance_claimed": false,
+    "promotion_claimed": false
+  },
+  "page_map": {
+    "page_tokens": 16,
+    "logical_base_token": 0,
+    "valid_tail_tokens": 80,
+    "physical_pages": 64,
+    "block_table_pages": 5,
+    "block_table": [10, 11, 12, 13, 14],
+    "generation": 7,
+    "flags": [
+      "transient_tree",
+      "accepted_survivor",
+      "rejected_branch",
+      "cross_sequence_guard"
+    ]
+  },
+  "tree_round": {
+    "root_node_id": 0,
+    "accepted_path": [0, 1, 4],
+    "tree_nodes": [
+      {"id": 0, "parent": null, "token": 10, "physical_page": 10, "role": "root", "seq_id": 0},
+      {"id": 1, "parent": 0, "token": 11, "physical_page": 11, "role": "accepted_survivor", "seq_id": 0},
+      {"id": 2, "parent": 0, "token": 12, "physical_page": 13, "role": "rejected_branch", "seq_id": 0},
+      {"id": 3, "parent": 2, "token": 13, "physical_page": 14, "role": "rejected_branch", "seq_id": 0},
+      {"id": 4, "parent": 1, "token": 22, "physical_page": 12, "role": "accepted_survivor", "seq_id": 0}
+    ],
+    "post_commit_survivor_pages": [10, 11, 12],
+    "accepted_path_reads_rejected_pages": false,
+    "rollback_restores_pre_round_state": true,
+    "correction_hidden_deferred": true,
+    "committed_output_contract": "[root | accepted]"
+  },
+  "page_ownership": {
+    "page_owners": [
+      {"physical_page": 10, "seq_id": 0, "role": "transient_root", "immutable_prefix_shared": false},
+      {"physical_page": 11, "seq_id": 0, "role": "accepted_survivor", "immutable_prefix_shared": false},
+      {"physical_page": 12, "seq_id": 0, "role": "accepted_survivor", "immutable_prefix_shared": false},
+      {"physical_page": 13, "seq_id": 0, "role": "rejected_branch", "immutable_prefix_shared": false},
+      {"physical_page": 14, "seq_id": 0, "role": "rejected_branch", "immutable_prefix_shared": false},
+      {"physical_page": 50, "seq_id": 9, "role": "other_sequence", "immutable_prefix_shared": false},
+      {"physical_page": 51, "seq_id": 9, "role": "other_sequence", "immutable_prefix_shared": false}
+    ],
+    "other_sequence_pages_before": [50, 51],
+    "other_sequence_pages_after": [50, 51]
+  },
+  "helper_mappings": [
+    {
+      "helper": "seq_cp",
+      "verdict": "audited_non_exact_helper",
+      "implicit_mapping_allowed": false,
+      "exact_existing_primitive_proven": false,
+      "reason": "seq_cp cannot silently become accepted-path page survivor commit"
+    },
+    {
+      "helper": "seq_rm",
+      "verdict": "audited_non_exact_helper",
+      "implicit_mapping_allowed": false,
+      "exact_existing_primitive_proven": false,
+      "reason": "seq_rm range removal cannot prove rejected tree page discard"
+    },
+    {
+      "helper": "seq_import_physical",
+      "verdict": "audited_non_exact_helper",
+      "implicit_mapping_allowed": false,
+      "exact_existing_primitive_proven": false,
+      "reason": "seq_import_physical is not a JetSpec transient page ownership oracle"
+    }
+  ],
+  "candidate_primitives": [
+    {
+      "name": "llama_kv_cache_jetspec_validate_page_ownership_oracle_candidate",
+      "status": "design_only_missing_implementation",
+      "implementation_approved": false,
+      "touches_production_now": false,
+      "runtime_executed_now": false,
+      "claims_performance": false,
+      "claims_promotion": false,
+      "source_backing": ["P5K design-only primitive packet", "QBlock PageAttention descriptor lessons"]
+    },
+    {
+      "name": "llama_kv_cache_jetspec_reserve_transient_tree_pages_candidate",
+      "status": "design_only_missing_implementation",
+      "implementation_approved": false,
+      "touches_production_now": false,
+      "runtime_executed_now": false,
+      "claims_performance": false,
+      "claims_promotion": false,
+      "source_backing": ["P5H transient slot readiness", "P5K missing implementation design"]
+    },
+    {
+      "name": "llama_kv_cache_jetspec_commit_page_survivor_path_candidate",
+      "status": "design_only_missing_implementation",
+      "implementation_approved": false,
+      "touches_production_now": false,
+      "runtime_executed_now": false,
+      "claims_performance": false,
+      "claims_promotion": false,
+      "source_backing": ["P5H [root | accepted] ownership", "P5K hidden_kv_survivor_commit design"]
+    },
+    {
+      "name": "llama_kv_cache_jetspec_discard_rejected_tree_pages_candidate",
+      "status": "design_only_missing_implementation",
+      "implementation_approved": false,
+      "touches_production_now": false,
+      "runtime_executed_now": false,
+      "claims_performance": false,
+      "claims_promotion": false,
+      "source_backing": ["P5H rejected node unreachability", "P5K rejected_branch_discard design"]
+    }
+  ],
+  "oracle_cases": [
+    {
+      "id": "hidden_kv_survivor_page_ownership",
+      "status": "oracle_case_verified",
+      "touches_production_now": false,
+      "runtime_executed_now": false,
+      "claims_performance": false,
+      "claims_promotion": false,
+      "invariants": [
+        "accepted path pages map to [root | accepted] only",
+        "correction hidden deferred",
+        "accepted path physical gather/compact explicit"
+      ],
+      "source_backing": ["P5K hidden_kv_survivor_commit design", "P5H [root | accepted] ownership"],
+      "checks": {
+        "accepted_path_physical_gather_compact_explicit": true,
+        "committed_output_contract": "[root | accepted]",
+        "correction_hidden_deferred": true
+      }
+    },
+    {
+      "id": "rejected_branch_page_unreachable",
+      "status": "oracle_case_verified",
+      "touches_production_now": false,
+      "runtime_executed_now": false,
+      "claims_performance": false,
+      "claims_promotion": false,
+      "invariants": [
+        "rejected transient pages unreachable after commit",
+        "accepted path cannot read rejected siblings or descendants",
+        "rollback restores pre-round page snapshot"
+      ],
+      "source_backing": ["P5K rejected_branch_discard design", "P5H rejected tree nodes unreachable after commit"],
+      "checks": {
+        "rejected_transient_pages_unreachable_after_commit": true,
+        "accepted_path_reads_rejected_pages": false,
+        "rollback_restores_pre_round_state": true
+      }
+    },
+    {
+      "id": "cross_sequence_page_isolation",
+      "status": "oracle_case_verified",
+      "touches_production_now": false,
+      "runtime_executed_now": false,
+      "claims_performance": false,
+      "claims_promotion": false,
+      "invariants": [
+        "other-sequence pages unchanged",
+        "no duplicate mutable physical page ownership",
+        "rollback preserves other sequences"
+      ],
+      "source_backing": ["P5K cross_sequence_isolation design", "QBlock PageAttention page-map safety lessons"],
+      "checks": {
+        "other_sequence_pages_unchanged": true,
+        "duplicate_mutable_physical_page_ownership": false,
+        "rollback_preserves_other_sequences": true
+      }
+    }
+  ],
+  "qblock_page_attention_lessons": {
+    "identity_maps_are_oracle_only": true,
+    "visible_noncanonical_owned_overlays_fail_closed": true,
+    "full_current_k_map_required": true,
+    "canonical_write_through_required_until_proven_safe": true,
+    "no_performance_or_promotion_claim": true,
+    "identity_map_claims_speed_feature": false
+  }
+}

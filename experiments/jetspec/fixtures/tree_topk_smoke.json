@@ -1,0 +1,16 @@
+{
+  "topk_by_depth": [
+    [
+      {"token": 11, "logprob": -0.1, "rank": 0},
+      {"token": 12, "logprob": -0.3, "rank": 1}
+    ],
+    [
+      {"token": 21, "logprob": -0.2, "rank": 0},
+      {"token": 22, "logprob": -0.4, "rank": 1}
+    ],
+    [
+      {"token": 31, "logprob": -0.5, "rank": 0},
+      {"token": 32, "logprob": -0.6, "rank": 1}
+    ]
+  ]
+}

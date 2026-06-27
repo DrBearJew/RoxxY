@@ -20,6 +20,11 @@ struct packed16_registry_entry {
     ggml_tensor * scales   = nullptr;
     ggml_cuda_packed16_sidecar_meta meta = {};
     ggml_cuda_mtp_qblock_tail_page_map_v1 tail_page_map = {};
+    ggml_cuda_mtp_qblock_full_page_map_v1 full_page_map = {};
+    ggml_cuda_mtp_qblock_full_page_map_v1 full_page_map_base = {};
+    std::vector<int32_t> full_page_table_host;
+    int32_t * full_page_table_device = nullptr;
+    size_t full_page_table_capacity = 0;
 };
 
 struct v4_k16d16_registry_entry {
@@ -30,6 +35,7 @@ struct v4_k16d16_registry_entry {
 static std::mutex s_packed16_mutex;
 static std::unordered_map<const void *, packed16_registry_entry> s_packed16_registry;
 static ggml_cuda_mtp_qblock_tail_page_map_v1 s_packed16_tail_page_published_map = {};
+static ggml_cuda_mtp_qblock_full_page_map_v1 s_packed16_full_page_published_map = {};
 static ggml_cuda_mtp_qblock_tail_page_map_v1 s_packed16_tail_page_producer_snapshot_map = {};
 static ggml_cuda_mtp_qblock_tail_page_map_v1 s_packed16_tail_page_dispatch_bind_map = {};
 static ggml_cuda_mtp_qblock_tail_page_dispatch_bind_v1 s_packed16_tail_page_last_dispatch_bind = {};
@@ -44,13 +50,272 @@ struct packed16_tail_page_pending_dispatch_bind {
 static std::vector<packed16_tail_page_pending_dispatch_bind> s_packed16_tail_page_pending_dispatch_binds;
 static uint64_t s_packed16_tail_page_pending_dispatch_bind_count = 0;
 static uint32_t s_packed16_tail_page_consumer_no_map_nk_max = 0;
+struct packed16_tail_page_retired_highwater_state {
+    bool valid = false;
+    uint32_t nk = 0;
+    unsigned long long generation = 0;
+    uint64_t reset_count = 0;
+};
+static packed16_tail_page_retired_highwater_state s_packed16_tail_page_retired_highwater = {};
+
+struct packed16_tail_page_owned_write_ready_state {
+    ggml_cuda_mtp_qblock_tail_page_map_v1 map = {};
+    uint32_t physical_page = 0;
+    bool k_ready = false;
+    bool v_ready = false;
+    uint64_t k_ready_count = 0;
+    uint64_t v_ready_count = 0;
+    uint64_t pair_ready_count = 0;
+    bool k_exclusive = false;
+    bool v_exclusive = false;
+    uint64_t k_exclusive_count = 0;
+    uint64_t v_exclusive_count = 0;
+};
+static packed16_tail_page_owned_write_ready_state s_packed16_tail_page_owned_write_ready = {};
+
+struct packed16_tail_page_owned_deferred_proof_attempt {
+    ggml_cuda_mtp_qblock_tail_page_map_v1 map = {};
+    uint32_t logical_base = 0;
+    uint32_t n_tokens = 0;
+    uint32_t physical_page = 0;
+    bool is_k = false;
+    bool is_v = false;
+    uint64_t attempt_id = 0;
+    uint64_t record_event_seq = 0;
+    uint64_t record_highwater_update_seq = 0;
+    uint64_t record_resolve_count = 0;
+    uint32_t record_live_highwater = 0;
+    bool record_route_complete_same_map = false;
+    bool record_k_ready = false;
+    bool record_v_ready = false;
+    uint64_t record_plan_id = 0;
+    uint64_t record_plan_event_seq = 0;
+    uint32_t record_plan_expected_layers = 0;
+    uint32_t record_plan_expected_pages = 0;
+    uint64_t record_plan_bound_layer_pages = 0;
+    uint32_t record_plan_canonical_page_base = 0;
+    uint32_t record_plan_page_end = 0;
+    uint32_t record_plan_owned_page_base = 0;
+    uint32_t record_plan_overlay_page_base = 0;
+    bool record_plan_ready = false;
+    bool record_plan_before_record = false;
+    bool record_plan_route_complete = false;
+    bool record_plan_write_through = false;
+    bool record_plan_owned_write = false;
+    bool record_plan_exclusive_skip = false;
+    uint64_t record_live_window_highwater_event_seq = 0;
+    uint64_t record_live_window_highwater_update_seq = 0;
+    uint64_t record_live_window_route_complete_event_seq = 0;
+    uint32_t record_live_window_highwater = 0;
+    bool record_live_window_after_highwater = false;
+    bool record_live_window_after_route_complete = false;
+    bool record_live_window_route_complete_same_map = false;
+    bool record_live_window_post_highwater = false;
+    bool record_live_window_cross_highwater = false;
+};
+
+struct packed16_tail_page_owned_deferred_proof_state {
+    std::vector<packed16_tail_page_owned_deferred_proof_attempt> attempts;
+    uint64_t next_attempt_id = 0;
+    uint64_t dropped_attempts = 0;
+    uint64_t resolve_count = 0;
+};
+static packed16_tail_page_owned_deferred_proof_state s_packed16_tail_page_owned_deferred_proof = {};
+static uint64_t s_packed16_tail_page_owned_deferred_proof_event_seq = 0;
+static uint64_t s_packed16_tail_page_owned_deferred_proof_highwater_update_seq = 0;
+
+struct packed16_tail_page_owned_write_plan_state {
+    ggml_cuda_mtp_qblock_tail_page_map_v1 map = {};
+    uint64_t plan_id = 0;
+    uint64_t plan_event_seq = 0;
+    uint32_t expected_layer_count = 0;
+    uint32_t expected_page_count = 0;
+    uint64_t expected_layer_page_count = 0;
+    uint64_t bind_count_at_plan = 0;
+    uint64_t bound_layer_pages_at_plan = 0;
+};
+static packed16_tail_page_owned_write_plan_state s_packed16_tail_page_owned_write_plan = {};
+static uint64_t s_packed16_tail_page_owned_write_next_plan_id = 0;
+
+struct packed16_tail_page_owned_live_window_state {
+    uint64_t highwater_event_seq = 0;
+    uint64_t highwater_update_seq = 0;
+    uint32_t highwater_nk = 0;
+    unsigned long long highwater_generation = 0;
+    uint64_t route_complete_event_seq = 0;
+    uint64_t route_complete_bind_count = 0;
+    uint32_t route_complete_highwater = 0;
+    unsigned long long route_complete_generation = 0;
+    ggml_cuda_mtp_qblock_tail_page_map_v1 route_complete_map = {};
+    uint64_t reset_count = 0;
+};
+static packed16_tail_page_owned_live_window_state s_packed16_tail_page_owned_live_window = {};
+
+struct packed16_tail_page_route_complete_state {
+    ggml_cuda_mtp_qblock_tail_page_map_v1 map = {};
+    uint32_t expected_layer_count = 0;
+    uint32_t expected_page_count = 0;
+    uint64_t expected_layer_page_count = 0;
+    std::unordered_set<int32_t> bound_layers;
+    std::unordered_set<uint64_t> bound_layer_pages;
+    uint32_t bound_page_mask = 0;
+    uint32_t min_bound_nk = 0;
+    uint32_t max_bound_nk = 0;
+    uint32_t min_physical_page = 0;
+    uint32_t max_physical_page = 0;
+    uint64_t slot_translate_count = 0;
+    uint64_t slot_translate_reject_count = 0;
+    uint64_t bind_count = 0;
+    uint64_t complete_count = 0;
+};
+static packed16_tail_page_route_complete_state s_packed16_tail_page_route_complete = {};
 static unsigned long long s_packed16_generation = 0;
 static std::mutex s_v4_k16d16_mutex;
 static std::unordered_map<const void *, v4_k16d16_registry_entry> s_v4_k16d16_registry;
 
 static bool ggml_cuda_mtp_qblock_tail_page_registry_trace_enabled() {
-    const char * v = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_REGISTRY_TRACE");
-    return v && atoi(v) != 0;
+    static const bool enabled = []() {
+        const char * v = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_REGISTRY_TRACE");
+        return v && atoi(v) != 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_cuda_mtp_qblock_owned_tail_write_ready_trace_enabled() {
+    if (ggml_cuda_mtp_qblock_tail_page_registry_trace_enabled()) {
+        return true;
+    }
+    static const bool enabled = []() {
+        const char * v = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE_READY_TRACE");
+        return v && atoi(v) != 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_cuda_mtp_qblock_owned_tail_write_exclusive_requested() {
+    static const bool requested = []() {
+        const char * paged = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION");
+        const char * owned = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE");
+        const char * excl  = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE_EXCLUSIVE");
+        return paged && atoi(paged) != 0 && owned && atoi(owned) != 0 && excl && atoi(excl) != 0;
+    }();
+    return requested;
+}
+
+static bool ggml_cuda_mtp_qblock_owned_tail_write_exclusive_all_bound_env_requested() {
+    static const bool requested = []() {
+        const char * all_bound = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE_EXCLUSIVE_ALL_BOUND");
+        return all_bound && atoi(all_bound) != 0;
+    }();
+    return requested;
+}
+
+static bool ggml_cuda_mtp_qblock_owned_tail_write_exclusive_all_bound_unsafe_requested() {
+    static const bool requested = []() {
+        const char * unsafe = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE_EXCLUSIVE_ALL_BOUND_UNSAFE");
+        return unsafe && atoi(unsafe) != 0;
+    }();
+    return requested;
+}
+
+static bool ggml_cuda_mtp_qblock_owned_tail_write_exclusive_all_bound_requested() {
+    static const bool requested = []() {
+        return ggml_cuda_mtp_qblock_owned_tail_write_exclusive_requested() &&
+            ggml_cuda_mtp_qblock_owned_tail_write_exclusive_all_bound_env_requested() &&
+            ggml_cuda_mtp_qblock_owned_tail_write_exclusive_all_bound_unsafe_requested();
+    }();
+    return requested;
+}
+
+
+static bool ggml_cuda_mtp_qblock_owned_tail_write_exclusive_trace_enabled() {
+    if (ggml_cuda_mtp_qblock_owned_tail_write_ready_trace_enabled()) {
+        return true;
+    }
+    static const bool enabled = []() {
+        const char * v = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE_EXCLUSIVE_TRACE");
+        return v && atoi(v) != 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_cuda_mtp_qblock_owned_tail_write_deferred_proof_requested() {
+    static const bool requested = []() {
+        const char * paged = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION");
+        const char * owned = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE");
+        const char * proof = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE_DEFERRED_PROOF");
+        return paged && atoi(paged) != 0 && owned && atoi(owned) != 0 && proof && atoi(proof) != 0;
+    }();
+    return requested;
+}
+
+static bool ggml_cuda_mtp_qblock_owned_tail_write_plan_proof_requested() {
+    static const bool requested = []() {
+        const char * paged = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION");
+        const char * owned = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE");
+        const char * proof = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE_PLAN_PROOF");
+        return paged && atoi(paged) != 0 && owned && atoi(owned) != 0 && proof && atoi(proof) != 0;
+    }();
+    return requested;
+}
+
+static bool ggml_cuda_mtp_qblock_owned_tail_write_live_window_proof_requested() {
+    static const bool requested = []() {
+        const char * paged = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION");
+        const char * owned = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE");
+        const char * proof = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE_LIVE_WINDOW_PROOF");
+        return paged && atoi(paged) != 0 && owned && atoi(owned) != 0 && proof && atoi(proof) != 0;
+    }();
+    return requested;
+}
+
+static bool ggml_cuda_mtp_qblock_owned_tail_write_require_prepublished_map_requested() {
+    static const bool requested = []() {
+        const char * paged   = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION");
+        const char * owned   = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE");
+        const char * require = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE_REQUIRE_PREPUBLISHED_MAP");
+        return paged && atoi(paged) != 0 && owned && atoi(owned) != 0 && require && atoi(require) != 0;
+    }();
+    return requested;
+}
+
+static bool ggml_cuda_mtp_qblock_owned_tail_write_dual_dest_candidate_requested() {
+    static const bool requested = []() {
+        const char * paged = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION");
+        const char * owned = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE");
+        const char * dual  = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE_DUAL_DEST_CANDIDATE");
+        return paged && atoi(paged) != 0 && owned && atoi(owned) != 0 && dual && atoi(dual) != 0;
+    }();
+    return requested;
+}
+
+static bool ggml_cuda_mtp_qblock_tail_page_producer_snapshot_owned_proof_requested() {
+    static const bool requested = []() {
+        const char * import = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_PRODUCER_STATE_IMPORT");
+        const char * proof  = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_PRODUCER_SNAPSHOT_OWNED_PROOF");
+        return import && atoi(import) != 0 && proof && atoi(proof) != 0;
+    }();
+    return requested;
+}
+
+static bool ggml_cuda_mtp_qblock_owned_tail_write_any_proof_requested() {
+    return ggml_cuda_mtp_qblock_owned_tail_write_deferred_proof_requested() ||
+        ggml_cuda_mtp_qblock_owned_tail_write_plan_proof_requested() ||
+        ggml_cuda_mtp_qblock_owned_tail_write_live_window_proof_requested();
+}
+
+static bool ggml_cuda_mtp_qblock_tail_page_route_complete_trace_enabled() {
+    if (ggml_cuda_mtp_qblock_tail_page_registry_trace_enabled() ||
+            ggml_cuda_mtp_qblock_owned_tail_write_exclusive_trace_enabled() ||
+            ggml_cuda_mtp_qblock_owned_tail_write_plan_proof_requested() ||
+            ggml_cuda_mtp_qblock_owned_tail_write_live_window_proof_requested()) {
+        return true;
+    }
+    static const bool enabled = []() {
+        const char * v = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_ROUTE_COMPLETE_TRACE");
+        return v && atoi(v) != 0;
+    }();
+    return enabled;
 }
 
 static dp16_packed_i8_desc_v1 ggml_cuda_make_packed16_i8_desc(
@@ -62,9 +327,11 @@ static dp16_packed_i8_desc_v1 ggml_cuda_make_packed16_i8_desc(
     desc.words_per_vector = DP16_PACKED_I8X16_WORDS;
     desc.bytes_per_vector = DP16_PACKED_I8X16_BYTES;
     desc.bytes_per_word = DP16_PACKED_I8_WORD_BYTES;
-    desc.layout_kind = meta.layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_D16_PLANAR ?
-        DP16_PACKED_I8_LAYOUT_D16_PLANAR :
-        (meta.layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_ROW ? DP16_PACKED_I8_LAYOUT_ROW : DP16_PACKED_I8_LAYOUT_UNKNOWN);
+    desc.layout_kind = meta.layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_PAGE16_D16 ?
+        DP16_PACKED_I8_LAYOUT_PAGE16_D16 :
+        (meta.layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_D16_PLANAR ?
+            DP16_PACKED_I8_LAYOUT_D16_PLANAR :
+            (meta.layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_ROW ? DP16_PACKED_I8_LAYOUT_ROW : DP16_PACKED_I8_LAYOUT_UNKNOWN));
     desc.axis_x = DP16_PACKED_I8_AXIS_D16;
     desc.axis_y = DP16_PACKED_I8_AXIS_TOKEN;
     desc.axis_z = DP16_PACKED_I8_AXIS_HEAD;
@@ -74,9 +341,11 @@ static dp16_packed_i8_desc_v1 ggml_cuda_make_packed16_i8_desc(
     desc.physical_x = desc.logical_x;
     desc.physical_y = desc.logical_y;
     desc.physical_z = desc.logical_z;
-    desc.scale_layout = meta.scale_layout == GGML_CUDA_PACKED16_K_SCALE_LAYOUT_QBLOCK_PLANAR ?
-        DP16_PACKED_I8_SCALE_LAYOUT_QBLOCK_PLANAR :
-        (meta.scale_layout == GGML_CUDA_PACKED16_K_SCALE_LAYOUT_ROW ? DP16_PACKED_I8_SCALE_LAYOUT_ROW : DP16_PACKED_I8_SCALE_LAYOUT_UNKNOWN);
+    desc.scale_layout = meta.scale_layout == GGML_CUDA_PACKED16_K_SCALE_LAYOUT_PAGE16_QBLOCK ?
+        DP16_PACKED_I8_SCALE_LAYOUT_PAGE16_QBLOCK :
+        (meta.scale_layout == GGML_CUDA_PACKED16_K_SCALE_LAYOUT_QBLOCK_PLANAR ?
+            DP16_PACKED_I8_SCALE_LAYOUT_QBLOCK_PLANAR :
+            (meta.scale_layout == GGML_CUDA_PACKED16_K_SCALE_LAYOUT_ROW ? DP16_PACKED_I8_SCALE_LAYOUT_ROW : DP16_PACKED_I8_SCALE_LAYOUT_UNKNOWN));
     desc.scale_axis_x = DP16_PACKED_I8_AXIS_QBLOCK;
     desc.scale_axis_y = DP16_PACKED_I8_AXIS_TOKEN;
     desc.scale_axis_z = DP16_PACKED_I8_AXIS_HEAD;
@@ -85,7 +354,14 @@ static dp16_packed_i8_desc_v1 ggml_cuda_make_packed16_i8_desc(
     constexpr uint64_t scale_bytes = sizeof(uint16_t);
     desc.z_stride_bytes = uint64_t(meta.payload_head_stride) * word_bytes;
     desc.scale_z_stride_bytes = uint64_t(meta.scale_head_stride) * scale_bytes;
-    if (meta.layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_D16_PLANAR) {
+    if (meta.layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_PAGE16_D16) {
+        desc.x_stride_bytes = uint64_t(meta.payload_d16_plane_stride) * word_bytes;
+        desc.y_stride_bytes = uint64_t(meta.payload_token_stride) * word_bytes;
+        desc.plane_stride_bytes = uint64_t(GGML_CUDA_PACKED16_K_WORDS_PER_PAGE16) * word_bytes;
+        desc.scale_x_stride_bytes = uint64_t(meta.scale_qblock_plane_stride) * scale_bytes;
+        desc.scale_y_stride_bytes = uint64_t(meta.scale_token_stride) * scale_bytes;
+        desc.scale_plane_stride_bytes = uint64_t(GGML_CUDA_PACKED16_K_SCALE_PER_PAGE16) * scale_bytes;
+    } else if (meta.layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_D16_PLANAR) {
         desc.x_stride_bytes = uint64_t(meta.payload_d16_plane_stride) * word_bytes;
         desc.y_stride_bytes = uint64_t(meta.payload_token_stride) * word_bytes;
         desc.plane_stride_bytes = desc.x_stride_bytes;
@@ -118,8 +394,10 @@ static ggml_cuda_packed16_sidecar_meta ggml_cuda_make_pdmq_k_sidecar_meta(
     meta.d = (uint16_t) d;
     meta.block_size = QK8_0;
     meta.layout_kind = layout_kind;
-    meta.scale_layout = layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_D16_PLANAR ?
-        GGML_CUDA_PACKED16_K_SCALE_LAYOUT_QBLOCK_PLANAR : GGML_CUDA_PACKED16_K_SCALE_LAYOUT_ROW;
+    meta.scale_layout = layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_PAGE16_D16 ?
+        GGML_CUDA_PACKED16_K_SCALE_LAYOUT_PAGE16_QBLOCK :
+        (layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_D16_PLANAR ?
+            GGML_CUDA_PACKED16_K_SCALE_LAYOUT_QBLOCK_PLANAR : GGML_CUDA_PACKED16_K_SCALE_LAYOUT_ROW);
     meta.k_format = (uint8_t) k_format;
     meta.code_bits = (uint8_t) ggml_cuda_pdmq_k_code_bits(k_format);
     meta.zero_point = (uint8_t) ggml_cuda_pdmq_k_zero_point(k_format);
@@ -130,7 +408,12 @@ static ggml_cuda_packed16_sidecar_meta ggml_cuda_make_pdmq_k_sidecar_meta(
     meta.payload_words_per_token = (uint32_t) words;
     meta.payload_head_stride = size_t(kv_capacity) * words;
     meta.scale_head_stride = size_t(kv_capacity) * qblocks;
-    if (k_format == GGML_CUDA_PDMQ_K_FORMAT_PACKED16_Q8_272 && layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_D16_PLANAR) {
+    if (k_format == GGML_CUDA_PDMQ_K_FORMAT_PACKED16_Q8_272 && layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_PAGE16_D16) {
+        meta.payload_token_stride = size_t(GGML_CUDA_PACKED16_K_WORDS_PER_D16);
+        meta.scale_token_stride = 1;
+        meta.payload_d16_plane_stride = size_t(GGML_CUDA_PACKED16_K_PAGE16_TOKENS) * size_t(GGML_CUDA_PACKED16_K_WORDS_PER_D16);
+        meta.scale_qblock_plane_stride = size_t(GGML_CUDA_PACKED16_K_PAGE16_TOKENS);
+    } else if (k_format == GGML_CUDA_PDMQ_K_FORMAT_PACKED16_Q8_272 && layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_D16_PLANAR) {
         meta.payload_token_stride = size_t(GGML_CUDA_PACKED16_K_WORDS_PER_D16);
         meta.scale_token_stride = 1;
         meta.payload_d16_plane_stride = size_t(kv_capacity) * size_t(GGML_CUDA_PACKED16_K_WORDS_PER_D16);
@@ -183,6 +466,11 @@ void llama_kv_cache_register_pdmq_k_with_layout_info(const void * k_view_data, g
         layout_kind = ggml_cuda_packed16_k_layout_kind_from_env();
     }
     entry.meta = ggml_cuda_make_pdmq_k_sidecar_meta(payload, scales, k_format, layout_kind, kv_capacity, d, ++s_packed16_generation);
+    if (old_payload != payload || old_scales != scales) {
+        entry.full_page_map = {};
+        entry.full_page_map_base = {};
+        entry.full_page_table_host.clear();
+    }
 
     ggml_cuda_mtp_qblock_tail_page_map_v1 inherited_map = {};
     if (old_payload == payload && old_scales == scales && ggml_cuda_mtp_qblock_tail_page_map_valid(old_map)) {
@@ -309,6 +597,32 @@ static bool ggml_cuda_mtp_qblock_tail_page_map_valid(
     return true;
 }
 
+static bool ggml_cuda_mtp_qblock_full_page_map_valid(
+        const ggml_cuda_mtp_qblock_full_page_map_v1 & map) {
+    if (!map.active) {
+        return false;
+    }
+    if (map.version != GGML_CUDA_MTP_QBLOCK_FULL_PAGE_MAP_VERSION ||
+            map.abi_bytes != sizeof(ggml_cuda_mtp_qblock_full_page_map_v1)) {
+        return false;
+    }
+    if (map.page_tokens == 0 || map.valid_tokens == 0 || map.physical_pages == 0 ||
+            map.block_table_pages == 0 || map.block_table == nullptr) {
+        return false;
+    }
+    const uint32_t required_pages = (map.valid_tokens + map.page_tokens - 1u) / map.page_tokens;
+    return required_pages != 0 && required_pages <= map.block_table_pages && map.block_table_pages <= map.physical_pages &&
+        map.non_identity_page_begin <= map.non_identity_page_end && map.non_identity_page_end <= map.block_table_pages;
+}
+
+static uint64_t ggml_cuda_mtp_qblock_tail_page_map_generation(
+        const uint32_t logical_base_token,
+        const uint32_t valid_tail_tokens,
+        const uint32_t flags) {
+    const uint64_t raw = (uint64_t(logical_base_token) << 32) ^ uint64_t(valid_tail_tokens) ^ uint64_t(flags);
+    return raw == 0 ? 1u : raw;
+}
+
 static bool ggml_cuda_mtp_qblock_tail_page_map_equal(
         const ggml_cuda_mtp_qblock_tail_page_map_v1 & a,
         const ggml_cuda_mtp_qblock_tail_page_map_v1 & b) {
@@ -326,21 +640,1748 @@ static bool ggml_cuda_mtp_qblock_tail_page_map_equal(
     return true;
 }
 
+static uint32_t ggml_cuda_mtp_qblock_tail_page_map_required_pages(
+        const ggml_cuda_mtp_qblock_tail_page_map_v1 & map) {
+    return map.page_tokens == 0 ? 0 : (map.valid_tail_tokens + map.page_tokens - 1u) / map.page_tokens;
+}
+
+static void ggml_cuda_mtp_qblock_full_page_map_refresh_published_locked() {
+    s_packed16_full_page_published_map = {};
+    for (const auto & kv : s_packed16_registry) {
+        if (ggml_cuda_mtp_qblock_full_page_map_valid(kv.second.full_page_map)) {
+            s_packed16_full_page_published_map = kv.second.full_page_map;
+            return;
+        }
+    }
+}
+
+static void ggml_cuda_mtp_qblock_full_page_map_restore_identity_locked(const char * reason) {
+    size_t restored = 0;
+    for (auto & kv : s_packed16_registry) {
+        packed16_registry_entry & entry = kv.second;
+        if (!ggml_cuda_mtp_qblock_full_page_map_valid(entry.full_page_map_base) || entry.full_page_table_device == nullptr ||
+                entry.full_page_table_host.size() != entry.full_page_map_base.block_table_pages) {
+            continue;
+        }
+        CUDA_CHECK(hipMemcpy(entry.full_page_table_device, entry.full_page_table_host.data(),
+            size_t(entry.full_page_map_base.block_table_pages) * sizeof(int32_t), hipMemcpyHostToDevice));
+        entry.full_page_map = entry.full_page_map_base;
+        entry.full_page_map.block_table = entry.full_page_table_device;
+        for (uint32_t i = 0; i < 4; ++i) {
+            entry.full_page_map.debug_first_pages[i] = i < entry.full_page_map.block_table_pages ? entry.full_page_table_host[i] : -1;
+        }
+        ++restored;
+    }
+    ggml_cuda_mtp_qblock_full_page_map_refresh_published_locked();
+    if (restored != 0 && ggml_cuda_mtp_qblock_tail_page_registry_trace_enabled()) {
+        fprintf(stderr,
+                "MTP_QBLOCK_FULL_PAGE_MAP_REGISTRY: op=restore_base reason=%s restored=%zu\n",
+                reason ? reason : "unknown",
+                restored);
+    }
+}
+
+static bool ggml_cuda_mtp_qblock_full_page_map_apply_owned_tail_overlay_locked(
+        packed16_registry_entry & entry,
+        const ggml_cuda_mtp_qblock_tail_page_map_v1 & tail_map,
+        const char * reason) {
+    if (!ggml_cuda_mtp_qblock_full_page_map_valid(entry.full_page_map_base) || entry.full_page_table_device == nullptr ||
+            entry.full_page_table_host.size() != entry.full_page_map_base.block_table_pages ||
+            !ggml_cuda_mtp_qblock_tail_page_map_valid(tail_map) ||
+            (tail_map.flags & GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_OWNED_TAIL_WRITE) == 0 ||
+            (tail_map.flags & GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_SCRATCH_OVERLAY) != 0 ||
+            tail_map.page_tokens != entry.full_page_map_base.page_tokens || tail_map.logical_base_token % tail_map.page_tokens != 0) {
+        return false;
+    }
+    const uint32_t required_pages = ggml_cuda_mtp_qblock_tail_page_map_required_pages(tail_map);
+    const uint32_t logical_base_page = tail_map.logical_base_token / tail_map.page_tokens;
+    const uint32_t tail_end = tail_map.logical_base_token + tail_map.valid_tail_tokens;
+    if (required_pages == 0 || required_pages > tail_map.block_table_pages ||
+            logical_base_page + required_pages > entry.full_page_map_base.block_table_pages) {
+        return false;
+    }
+    std::vector<int32_t> table = entry.full_page_table_host;
+    for (uint32_t lp = 0; lp < required_pages; ++lp) {
+        const int32_t pp = tail_map.block_table[lp];
+        if (pp < 0 || uint32_t(pp) >= entry.full_page_map_base.physical_pages) {
+            return false;
+        }
+        table[logical_base_page + lp] = pp;
+    }
+    CUDA_CHECK(hipMemcpy(entry.full_page_table_device, table.data(),
+        size_t(entry.full_page_map_base.block_table_pages) * sizeof(int32_t), hipMemcpyHostToDevice));
+    entry.full_page_map = entry.full_page_map_base;
+    entry.full_page_map.block_table = entry.full_page_table_device;
+    entry.full_page_map.flags = entry.full_page_map_base.flags |
+        GGML_CUDA_MTP_QBLOCK_FULL_PAGE_MAP_FLAG_OWNED_TAIL_OVERLAY;
+    entry.full_page_map.valid_tokens = std::max(entry.full_page_map_base.valid_tokens, tail_end);
+    const bool base_has_non_identity = entry.full_page_map_base.non_identity_page_begin < entry.full_page_map_base.non_identity_page_end;
+    entry.full_page_map.non_identity_page_begin = base_has_non_identity ?
+        std::min(entry.full_page_map_base.non_identity_page_begin, logical_base_page) : logical_base_page;
+    entry.full_page_map.non_identity_page_end = base_has_non_identity ?
+        std::max(entry.full_page_map_base.non_identity_page_end, logical_base_page + required_pages) : logical_base_page + required_pages;
+    entry.full_page_map.generation = entry.full_page_map_base.generation ^ (tail_map.generation << 1) ^ uint64_t(entry.full_page_map.flags);
+    if (entry.full_page_map.generation == 0) {
+        entry.full_page_map.generation = 1;
+    }
+    for (uint32_t i = 0; i < 4; ++i) {
+        entry.full_page_map.debug_first_pages[i] = i < entry.full_page_map.block_table_pages ? table[i] : -1;
+    }
+    if (ggml_cuda_mtp_qblock_tail_page_registry_trace_enabled()) {
+        fprintf(stderr,
+                "MTP_QBLOCK_FULL_PAGE_MAP_REGISTRY: op=overlay_owned_tail reason=%s logical_base=%u valid_tail=%u logical_base_page=%u pages=%u table0=%d flags=0x%x generation=%llu\n",
+                reason ? reason : "unknown",
+                tail_map.logical_base_token,
+                tail_map.valid_tail_tokens,
+                logical_base_page,
+                required_pages,
+                tail_map.block_table[0],
+                tail_map.flags,
+                (unsigned long long) tail_map.generation);
+    }
+    return true;
+}
+
+static size_t ggml_cuda_mtp_qblock_full_page_map_apply_owned_tail_overlay_all_locked(
+        const ggml_cuda_mtp_qblock_tail_page_map_v1 & tail_map,
+        const char * reason) {
+    size_t applied = 0;
+    for (auto & kv : s_packed16_registry) {
+        if (ggml_cuda_mtp_qblock_full_page_map_apply_owned_tail_overlay_locked(kv.second, tail_map, reason)) {
+            ++applied;
+        }
+    }
+    ggml_cuda_mtp_qblock_full_page_map_refresh_published_locked();
+    return applied;
+}
+
+static bool ggml_cuda_mtp_qblock_tail_page_map_translate(
+        const ggml_cuda_mtp_qblock_tail_page_map_v1 & map,
+        const uint32_t logical_token,
+        uint32_t * logical_page,
+        uint32_t * slot,
+        uint32_t * physical_page,
+        uint64_t * physical_slot) {
+    if (!ggml_cuda_mtp_qblock_tail_page_map_valid(map) || logical_token < map.logical_base_token) {
+        return false;
+    }
+    const uint32_t rel = logical_token - map.logical_base_token;
+    if (rel >= map.valid_tail_tokens) {
+        return false;
+    }
+    const uint32_t lp = rel / map.page_tokens;
+    const uint32_t required_pages = ggml_cuda_mtp_qblock_tail_page_map_required_pages(map);
+    if (lp >= required_pages || lp >= map.block_table_pages || lp >= GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES) {
+        return false;
+    }
+    const int32_t pp_i32 = map.block_table[lp];
+    if (pp_i32 < 0 || uint32_t(pp_i32) >= map.physical_pages) {
+        return false;
+    }
+    const uint32_t slot_u32 = rel % map.page_tokens;
+    const uint32_t pp = uint32_t(pp_i32);
+    if (logical_page != nullptr) {
+        *logical_page = lp;
+    }
+    if (slot != nullptr) {
+        *slot = slot_u32;
+    }
+    if (physical_page != nullptr) {
+        *physical_page = pp;
+    }
+    if (physical_slot != nullptr) {
+        *physical_slot = uint64_t(pp) * uint64_t(map.page_tokens) + uint64_t(slot_u32);
+    }
+    return true;
+}
+
+static bool ggml_cuda_mtp_qblock_tail_page_route_complete_now_locked() {
+    return s_packed16_tail_page_route_complete.expected_layer_count != 0 &&
+        s_packed16_tail_page_route_complete.expected_page_count != 0 &&
+        s_packed16_tail_page_route_complete.expected_layer_page_count != 0 &&
+        s_packed16_tail_page_route_complete.bound_layer_pages.size() >=
+            s_packed16_tail_page_route_complete.expected_layer_page_count;
+}
+
+static bool ggml_cuda_mtp_qblock_tail_page_route_complete_same_map_locked(
+        const ggml_cuda_mtp_qblock_tail_page_map_v1 & map) {
+    return ggml_cuda_mtp_qblock_tail_page_map_valid(map) &&
+        ggml_cuda_mtp_qblock_tail_page_map_valid(s_packed16_tail_page_route_complete.map) &&
+        ggml_cuda_mtp_qblock_tail_page_map_equal(s_packed16_tail_page_route_complete.map, map) &&
+        ggml_cuda_mtp_qblock_tail_page_route_complete_now_locked();
+}
+
+
+static bool ggml_cuda_mtp_qblock_tail_page_owned_plan_same_map_locked(
+        const ggml_cuda_mtp_qblock_tail_page_map_v1 & map) {
+    return s_packed16_tail_page_owned_write_plan.plan_id != 0 &&
+        ggml_cuda_mtp_qblock_tail_page_map_valid(s_packed16_tail_page_owned_write_plan.map) &&
+        ggml_cuda_mtp_qblock_tail_page_map_valid(map) &&
+        ggml_cuda_mtp_qblock_tail_page_map_equal(s_packed16_tail_page_owned_write_plan.map, map);
+}
+
+
+static void ggml_cuda_mtp_qblock_tail_page_owned_plan_reset_locked(const char * reason) {
+    if (s_packed16_tail_page_owned_write_plan.plan_id == 0 &&
+            !ggml_cuda_mtp_qblock_tail_page_map_valid(s_packed16_tail_page_owned_write_plan.map)) {
+        return;
+    }
+    if (ggml_cuda_mtp_qblock_owned_tail_write_plan_proof_requested()) {
+        fprintf(stderr,
+                "MTP_QBLOCK_TXN_TAIL_PAGE_OWNED_PLAN_PROOF: op=reset reason=%s plan_id=%llu plan_seq=%llu expected_layers=%u expected_pages=%u bound_layer_pages_at_plan=%llu logical_base=%u valid_tail=%u table0=%d flags=0x%x generation=%llu\n",
+                reason ? reason : "unknown",
+                (unsigned long long) s_packed16_tail_page_owned_write_plan.plan_id,
+                (unsigned long long) s_packed16_tail_page_owned_write_plan.plan_event_seq,
+                s_packed16_tail_page_owned_write_plan.expected_layer_count,
+                s_packed16_tail_page_owned_write_plan.expected_page_count,
+                (unsigned long long) s_packed16_tail_page_owned_write_plan.bound_layer_pages_at_plan,
+                s_packed16_tail_page_owned_write_plan.map.logical_base_token,
+                s_packed16_tail_page_owned_write_plan.map.valid_tail_tokens,
+                s_packed16_tail_page_owned_write_plan.map.block_table[0],
+                s_packed16_tail_page_owned_write_plan.map.flags,
+                (unsigned long long) s_packed16_tail_page_owned_write_plan.map.generation);
+    }
+    s_packed16_tail_page_owned_write_plan = {};
+}
+
+static void ggml_cuda_mtp_qblock_tail_page_owned_plan_note_expected_locked(
+        const ggml_cuda_mtp_qblock_tail_page_map_v1 & map,
+        uint32_t expected_layer_count,
+        uint32_t expected_page_count) {
+    if (!ggml_cuda_mtp_qblock_owned_tail_write_plan_proof_requested()) {
+        return;
+    }
+    if (!ggml_cuda_mtp_qblock_tail_page_map_valid(map) || expected_layer_count == 0 || expected_page_count == 0 ||
+            (map.flags & GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_OWNED_TAIL_WRITE) == 0 ||
+            (map.flags & GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_SCRATCH_OVERLAY) != 0) {
+        ggml_cuda_mtp_qblock_tail_page_owned_plan_reset_locked("plan_expected_invalid");
+        return;
+    }
+
+    const bool same_plan = ggml_cuda_mtp_qblock_tail_page_owned_plan_same_map_locked(map) &&
+        s_packed16_tail_page_owned_write_plan.expected_layer_count == expected_layer_count &&
+        s_packed16_tail_page_owned_write_plan.expected_page_count == expected_page_count;
+    if (!same_plan) {
+        s_packed16_tail_page_owned_write_plan.plan_id = ++s_packed16_tail_page_owned_write_next_plan_id;
+        s_packed16_tail_page_owned_write_plan.map = map;
+    }
+    s_packed16_tail_page_owned_write_plan.plan_event_seq = ++s_packed16_tail_page_owned_deferred_proof_event_seq;
+    s_packed16_tail_page_owned_write_plan.expected_layer_count = expected_layer_count;
+    s_packed16_tail_page_owned_write_plan.expected_page_count = expected_page_count;
+    s_packed16_tail_page_owned_write_plan.expected_layer_page_count = uint64_t(expected_layer_count) * uint64_t(expected_page_count);
+    s_packed16_tail_page_owned_write_plan.bind_count_at_plan = s_packed16_tail_page_route_complete.bind_count;
+    s_packed16_tail_page_owned_write_plan.bound_layer_pages_at_plan = s_packed16_tail_page_route_complete.bound_layer_pages.size();
+
+    fprintf(stderr,
+            "MTP_QBLOCK_TXN_TAIL_PAGE_OWNED_PLAN_PROOF: op=expected status=ok plan_id=%llu plan_seq=%llu new_plan=%d expected_layers=%u expected_pages=%u expected_layer_pages=%llu bound_layer_pages_at_plan=%llu bind_count_at_plan=%llu route_complete=%d logical_base=%u logical_end=%u valid_tail=%u page_tokens=%u table_pages=%u table0=%d flags=0x%x generation=%llu\n",
+            (unsigned long long) s_packed16_tail_page_owned_write_plan.plan_id,
+            (unsigned long long) s_packed16_tail_page_owned_write_plan.plan_event_seq,
+            same_plan ? 0 : 1,
+            expected_layer_count,
+            expected_page_count,
+            (unsigned long long) s_packed16_tail_page_owned_write_plan.expected_layer_page_count,
+            (unsigned long long) s_packed16_tail_page_owned_write_plan.bound_layer_pages_at_plan,
+            (unsigned long long) s_packed16_tail_page_owned_write_plan.bind_count_at_plan,
+            ggml_cuda_mtp_qblock_tail_page_route_complete_same_map_locked(map) ? 1 : 0,
+            map.logical_base_token,
+            map.logical_base_token + map.valid_tail_tokens,
+            map.valid_tail_tokens,
+            map.page_tokens,
+            map.block_table_pages,
+            map.block_table[0],
+            map.flags,
+            (unsigned long long) map.generation);
+}
+
+static void ggml_cuda_mtp_qblock_tail_page_owned_live_window_route_reset_locked(const char * reason) {
+    if (s_packed16_tail_page_owned_live_window.route_complete_event_seq != 0 &&
+            ggml_cuda_mtp_qblock_owned_tail_write_live_window_proof_requested()) {
+        fprintf(stderr,
+                "MTP_QBLOCK_TXN_TAIL_PAGE_OWNED_LIVE_WINDOW_PROOF: op=route_reset reason=%s route_complete_seq=%llu route_complete_bind_count=%llu route_complete_highwater=%u highwater_seq=%llu highwater_update_seq=%llu highwater=%u logical_base=%u valid_tail=%u table0=%d flags=0x%x generation=%llu reset_count=%llu\n",
+                reason ? reason : "unknown",
+                (unsigned long long) s_packed16_tail_page_owned_live_window.route_complete_event_seq,
+                (unsigned long long) s_packed16_tail_page_owned_live_window.route_complete_bind_count,
+                s_packed16_tail_page_owned_live_window.route_complete_highwater,
+                (unsigned long long) s_packed16_tail_page_owned_live_window.highwater_event_seq,
+                (unsigned long long) s_packed16_tail_page_owned_live_window.highwater_update_seq,
+                s_packed16_tail_page_owned_live_window.highwater_nk,
+                s_packed16_tail_page_owned_live_window.route_complete_map.logical_base_token,
+                s_packed16_tail_page_owned_live_window.route_complete_map.valid_tail_tokens,
+                s_packed16_tail_page_owned_live_window.route_complete_map.block_table[0],
+                s_packed16_tail_page_owned_live_window.route_complete_map.flags,
+                (unsigned long long) s_packed16_tail_page_owned_live_window.route_complete_map.generation,
+                (unsigned long long) s_packed16_tail_page_owned_live_window.reset_count);
+    }
+    s_packed16_tail_page_owned_live_window.route_complete_event_seq = 0;
+    s_packed16_tail_page_owned_live_window.route_complete_bind_count = 0;
+    s_packed16_tail_page_owned_live_window.route_complete_highwater = 0;
+    s_packed16_tail_page_owned_live_window.route_complete_generation = 0;
+    s_packed16_tail_page_owned_live_window.route_complete_map = {};
+}
+
+static void ggml_cuda_mtp_qblock_tail_page_route_complete_reset_locked(const char * reason) {
+    const bool had_state = ggml_cuda_mtp_qblock_tail_page_map_valid(s_packed16_tail_page_route_complete.map) ||
+        s_packed16_tail_page_route_complete.expected_layer_count != 0 ||
+        s_packed16_tail_page_route_complete.expected_page_count != 0 ||
+        !s_packed16_tail_page_route_complete.bound_layers.empty() ||
+        !s_packed16_tail_page_route_complete.bound_layer_pages.empty();
+    if (had_state && ggml_cuda_mtp_qblock_tail_page_route_complete_trace_enabled()) {
+        fprintf(stderr,
+                "MTP_QBLOCK_TXN_TAIL_PAGE_ROUTE_COMPLETE: op=reset reason=%s expected_layers=%u expected_pages=%u expected_layer_pages=%llu bound_layers=%zu bound_layer_pages=%zu page_mask=0x%x complete=%d logical_base=%u valid_tail=%u table0=%d generation=%llu\n",
+                reason ? reason : "unknown",
+                s_packed16_tail_page_route_complete.expected_layer_count,
+                s_packed16_tail_page_route_complete.expected_page_count,
+                (unsigned long long) s_packed16_tail_page_route_complete.expected_layer_page_count,
+                s_packed16_tail_page_route_complete.bound_layers.size(),
+                s_packed16_tail_page_route_complete.bound_layer_pages.size(),
+                s_packed16_tail_page_route_complete.bound_page_mask,
+                ggml_cuda_mtp_qblock_tail_page_route_complete_now_locked() ? 1 : 0,
+                s_packed16_tail_page_route_complete.map.logical_base_token,
+                s_packed16_tail_page_route_complete.map.valid_tail_tokens,
+                s_packed16_tail_page_route_complete.map.block_table[0],
+                (unsigned long long) s_packed16_tail_page_route_complete.map.generation);
+    }
+    ggml_cuda_mtp_qblock_tail_page_owned_plan_reset_locked(reason);
+    ggml_cuda_mtp_qblock_tail_page_owned_live_window_route_reset_locked(reason);
+    s_packed16_tail_page_route_complete = {};
+}
+
+void llama_kv_cache_note_mtp_qblock_tail_page_route_expected(
+        const ggml_cuda_mtp_qblock_tail_page_map_v1 * map,
+        uint32_t expected_layer_count) {
+    if (map == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(s_packed16_mutex);
+    const uint32_t expected_page_count = ggml_cuda_mtp_qblock_tail_page_map_required_pages(*map);
+    if (!ggml_cuda_mtp_qblock_tail_page_map_valid(*map) || expected_layer_count == 0 || expected_page_count == 0) {
+        ggml_cuda_mtp_qblock_tail_page_route_complete_reset_locked("route_expected_invalid");
+        return;
+    }
+    if (ggml_cuda_mtp_qblock_tail_page_map_valid(s_packed16_tail_page_route_complete.map) &&
+            !ggml_cuda_mtp_qblock_tail_page_map_equal(s_packed16_tail_page_route_complete.map, *map)) {
+        ggml_cuda_mtp_qblock_tail_page_route_complete_reset_locked("route_expected_new_map");
+    }
+    if (!ggml_cuda_mtp_qblock_tail_page_map_valid(s_packed16_tail_page_route_complete.map)) {
+        s_packed16_tail_page_route_complete.map = *map;
+    }
+    s_packed16_tail_page_route_complete.expected_layer_count = expected_layer_count;
+    s_packed16_tail_page_route_complete.expected_page_count = expected_page_count;
+    s_packed16_tail_page_route_complete.expected_layer_page_count = uint64_t(expected_layer_count) * uint64_t(expected_page_count);
+    if (ggml_cuda_mtp_qblock_tail_page_route_complete_trace_enabled()) {
+        fprintf(stderr,
+                "MTP_QBLOCK_TXN_TAIL_PAGE_ROUTE_COMPLETE: op=expected status=ok expected_layers=%u expected_pages=%u expected_layer_pages=%llu bound_layers=%zu bound_layer_pages=%zu page_mask=0x%x complete=%d logical_base=%u logical_end=%u valid_tail=%u page_tokens=%u table_pages=%u table0=%d flags=0x%x generation=%llu\n",
+                expected_layer_count,
+                expected_page_count,
+                (unsigned long long) s_packed16_tail_page_route_complete.expected_layer_page_count,
+                s_packed16_tail_page_route_complete.bound_layers.size(),
+                s_packed16_tail_page_route_complete.bound_layer_pages.size(),
+                s_packed16_tail_page_route_complete.bound_page_mask,
+                ggml_cuda_mtp_qblock_tail_page_route_complete_now_locked() ? 1 : 0,
+                map->logical_base_token,
+                map->logical_base_token + map->valid_tail_tokens,
+                map->valid_tail_tokens,
+                map->page_tokens,
+                map->block_table_pages,
+                map->block_table[0],
+                map->flags,
+                (unsigned long long) map->generation);
+    }
+    ggml_cuda_mtp_qblock_tail_page_owned_plan_note_expected_locked(*map, expected_layer_count, expected_page_count);
+}
+
+static void ggml_cuda_mtp_qblock_tail_page_owned_deferred_proof_resolve_locked(const char * trigger);
+
+static void ggml_cuda_mtp_qblock_tail_page_route_complete_record_bind_locked(
+        const ggml_cuda_mtp_qblock_tail_page_map_v1 & map,
+        int layer,
+        int nk,
+        const char * node_name) {
+    if (!ggml_cuda_mtp_qblock_tail_page_map_valid(map) || layer < 0 || nk <= 0) {
+        return;
+    }
+    const bool was_complete = ggml_cuda_mtp_qblock_tail_page_route_complete_now_locked();
+    if (ggml_cuda_mtp_qblock_tail_page_map_valid(s_packed16_tail_page_route_complete.map) &&
+            !ggml_cuda_mtp_qblock_tail_page_map_equal(s_packed16_tail_page_route_complete.map, map)) {
+        ggml_cuda_mtp_qblock_tail_page_route_complete_reset_locked("route_bind_new_map");
+    }
+    if (!ggml_cuda_mtp_qblock_tail_page_map_valid(s_packed16_tail_page_route_complete.map)) {
+        s_packed16_tail_page_route_complete.map = map;
+    }
+    if (ggml_cuda_mtp_qblock_tail_page_route_complete_now_locked() &&
+            !ggml_cuda_mtp_qblock_tail_page_route_complete_trace_enabled() &&
+            !ggml_cuda_mtp_qblock_owned_tail_write_any_proof_requested()) {
+        return;
+    }
+    s_packed16_tail_page_route_complete.bound_layers.insert(layer);
+    ++s_packed16_tail_page_route_complete.bind_count;
+    const uint32_t nk_u32 = (uint32_t) nk;
+    if (s_packed16_tail_page_route_complete.min_bound_nk == 0 || nk_u32 < s_packed16_tail_page_route_complete.min_bound_nk) {
+        s_packed16_tail_page_route_complete.min_bound_nk = nk_u32;
+    }
+    if (nk_u32 > s_packed16_tail_page_route_complete.max_bound_nk) {
+        s_packed16_tail_page_route_complete.max_bound_nk = nk_u32;
+    }
+
+    const uint32_t required_pages = ggml_cuda_mtp_qblock_tail_page_map_required_pages(map);
+    uint32_t translated_pages = 0;
+    uint32_t last_logical_page = 0;
+    uint32_t last_slot = 0;
+    uint32_t last_physical_page = 0;
+    uint64_t last_physical_slot = 0;
+    for (uint32_t lp = 0; lp < required_pages && lp < GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES; ++lp) {
+        const uint32_t logical_token = map.logical_base_token + lp * map.page_tokens;
+        uint32_t logical_page = 0;
+        uint32_t slot = 0;
+        uint32_t physical_page = 0;
+        uint64_t physical_slot = 0;
+        if (!ggml_cuda_mtp_qblock_tail_page_map_translate(map, logical_token, &logical_page, &slot, &physical_page, &physical_slot)) {
+            ++s_packed16_tail_page_route_complete.slot_translate_reject_count;
+            continue;
+        }
+        const uint64_t layer_page_key = (uint64_t(uint32_t(layer)) << 32) | uint64_t(logical_page);
+        s_packed16_tail_page_route_complete.bound_layer_pages.insert(layer_page_key);
+        if (logical_page < 32) {
+            s_packed16_tail_page_route_complete.bound_page_mask |= (uint32_t(1) << logical_page);
+        }
+        if (s_packed16_tail_page_route_complete.min_physical_page == 0 || physical_page < s_packed16_tail_page_route_complete.min_physical_page) {
+            s_packed16_tail_page_route_complete.min_physical_page = physical_page;
+        }
+        if (physical_page > s_packed16_tail_page_route_complete.max_physical_page) {
+            s_packed16_tail_page_route_complete.max_physical_page = physical_page;
+        }
+        ++s_packed16_tail_page_route_complete.slot_translate_count;
+        ++translated_pages;
+        last_logical_page = logical_page;
+        last_slot = slot;
+        last_physical_page = physical_page;
+        last_physical_slot = physical_slot;
+    }
+
+    const bool complete = ggml_cuda_mtp_qblock_tail_page_route_complete_now_locked();
+    if (complete) {
+        ++s_packed16_tail_page_route_complete.complete_count;
+    }
+    if (ggml_cuda_mtp_qblock_tail_page_route_complete_trace_enabled()) {
+        fprintf(stderr,
+                "MTP_QBLOCK_TXN_TAIL_PAGE_ROUTE_COMPLETE: op=bind status=ok layer=%d node=%s nk=%d expected_layers=%u expected_pages=%u expected_layer_pages=%llu bound_layers=%zu bound_layer_pages=%zu page_mask=0x%x complete=%d translated_pages=%u translate_rejects=%llu min_nk=%u max_nk=%u min_phys=%u max_phys=%u last_lp=%u last_slot=%u last_phys=%u last_phys_slot=%llu bind_count=%llu complete_count=%llu logical_base=%u logical_end=%u valid_tail=%u page_tokens=%u table_pages=%u table0=%d generation=%llu\n",
+                layer,
+                node_name ? node_name : "(null)",
+                nk,
+                s_packed16_tail_page_route_complete.expected_layer_count,
+                s_packed16_tail_page_route_complete.expected_page_count,
+                (unsigned long long) s_packed16_tail_page_route_complete.expected_layer_page_count,
+                s_packed16_tail_page_route_complete.bound_layers.size(),
+                s_packed16_tail_page_route_complete.bound_layer_pages.size(),
+                s_packed16_tail_page_route_complete.bound_page_mask,
+                complete ? 1 : 0,
+                translated_pages,
+                (unsigned long long) s_packed16_tail_page_route_complete.slot_translate_reject_count,
+                s_packed16_tail_page_route_complete.min_bound_nk,
+                s_packed16_tail_page_route_complete.max_bound_nk,
+                s_packed16_tail_page_route_complete.min_physical_page,
+                s_packed16_tail_page_route_complete.max_physical_page,
+                last_logical_page,
+                last_slot,
+                last_physical_page,
+                (unsigned long long) last_physical_slot,
+                (unsigned long long) s_packed16_tail_page_route_complete.bind_count,
+                (unsigned long long) s_packed16_tail_page_route_complete.complete_count,
+                map.logical_base_token,
+                map.logical_base_token + map.valid_tail_tokens,
+                map.valid_tail_tokens,
+                map.page_tokens,
+                map.block_table_pages,
+                map.block_table[0],
+                (unsigned long long) map.generation);
+    }
+    if (complete && ggml_cuda_mtp_qblock_owned_tail_write_live_window_proof_requested() &&
+            (!was_complete || s_packed16_tail_page_owned_live_window.route_complete_event_seq == 0)) {
+        const uint64_t event_seq = ++s_packed16_tail_page_owned_deferred_proof_event_seq;
+        s_packed16_tail_page_owned_live_window.route_complete_event_seq = event_seq;
+        s_packed16_tail_page_owned_live_window.route_complete_bind_count = s_packed16_tail_page_route_complete.bind_count;
+        s_packed16_tail_page_owned_live_window.route_complete_highwater = s_packed16_tail_page_consumer_no_map_nk_max;
+        s_packed16_tail_page_owned_live_window.route_complete_generation = s_packed16_generation;
+        s_packed16_tail_page_owned_live_window.route_complete_map = map;
+        fprintf(stderr,
+                "MTP_QBLOCK_TXN_TAIL_PAGE_OWNED_LIVE_WINDOW_PROOF: op=route_complete event_seq=%llu after_highwater=%d highwater_seq=%llu highwater_update_seq=%llu highwater=%u bind_count=%llu expected_layers=%u expected_pages=%u bound_layer_pages=%zu logical_base=%u valid_tail=%u table0=%d flags=0x%x generation=%llu\n",
+                (unsigned long long) event_seq,
+                s_packed16_tail_page_owned_live_window.highwater_event_seq != 0 &&
+                    event_seq > s_packed16_tail_page_owned_live_window.highwater_event_seq ? 1 : 0,
+                (unsigned long long) s_packed16_tail_page_owned_live_window.highwater_event_seq,
+                (unsigned long long) s_packed16_tail_page_owned_live_window.highwater_update_seq,
+                s_packed16_tail_page_owned_live_window.highwater_nk,
+                (unsigned long long) s_packed16_tail_page_route_complete.bind_count,
+                s_packed16_tail_page_route_complete.expected_layer_count,
+                s_packed16_tail_page_route_complete.expected_page_count,
+                s_packed16_tail_page_route_complete.bound_layer_pages.size(),
+                map.logical_base_token,
+                map.valid_tail_tokens,
+                map.block_table[0],
+                map.flags,
+                (unsigned long long) map.generation);
+        ggml_cuda_mtp_qblock_tail_page_owned_deferred_proof_resolve_locked("route_complete_live_window");
+    }
+}
+
+enum packed16_tail_page_owned_deferred_proof_reason : uint8_t {
+    PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_OK = 0,
+    PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_BAD_KIND,
+    PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_BAD_MAP,
+    PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_NOT_OWNED_MAP,
+    PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_PHYSICAL_PAGE_MISMATCH,
+    PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_RANGE_NOT_COVERED,
+    PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_READY_MAP_MISMATCH,
+    PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_KV_PAIR_NOT_READY,
+    PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_ROUTE_INCOMPLETE,
+    PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_NO_ROUTE_HIGHWATER,
+    PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_BEFORE_ROUTE_HIGHWATER,
+    PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_K_DEFERRED_NOT_SEEN,
+    PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_REASON_COUNT,
+};
+
+static const char * ggml_cuda_mtp_qblock_tail_page_owned_deferred_proof_reason_name(
+        const packed16_tail_page_owned_deferred_proof_reason reason) {
+    switch (reason) {
+        case PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_OK:                    return "ok";
+        case PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_BAD_KIND:              return "bad_kind";
+        case PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_BAD_MAP:               return "bad_map";
+        case PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_NOT_OWNED_MAP:         return "not_owned_map";
+        case PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_PHYSICAL_PAGE_MISMATCH:return "physical_page_mismatch";
+        case PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_RANGE_NOT_COVERED:     return "range_not_covered";
+        case PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_READY_MAP_MISMATCH:    return "ready_map_mismatch";
+        case PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_KV_PAIR_NOT_READY:     return "kv_pair_not_ready";
+        case PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_ROUTE_INCOMPLETE:      return "route_incomplete";
+        case PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_NO_ROUTE_HIGHWATER:    return "no_route_highwater";
+        case PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_BEFORE_ROUTE_HIGHWATER:return "before_route_highwater";
+        case PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_K_DEFERRED_NOT_SEEN:   return "k_deferred_not_seen";
+        default:                                                            return "unknown";
+    }
+}
+
+static bool ggml_cuda_mtp_qblock_tail_page_owned_deferred_proof_attempt_same_range(
+        const packed16_tail_page_owned_deferred_proof_attempt & a,
+        const packed16_tail_page_owned_deferred_proof_attempt & b) {
+    return a.logical_base == b.logical_base &&
+        a.n_tokens == b.n_tokens &&
+        a.physical_page == b.physical_page &&
+        ggml_cuda_mtp_qblock_tail_page_map_equal(a.map, b.map);
+}
+
+static packed16_tail_page_owned_deferred_proof_reason ggml_cuda_mtp_qblock_tail_page_owned_deferred_proof_base_reason_locked(
+        const packed16_tail_page_owned_deferred_proof_attempt & attempt) {
+    const uint64_t req_begin = attempt.logical_base;
+    const uint64_t req_end = req_begin + attempt.n_tokens;
+    const uint64_t map_begin = attempt.map.logical_base_token;
+    const uint64_t map_end = map_begin + attempt.map.valid_tail_tokens;
+    if (!attempt.is_k && !attempt.is_v) {
+        return PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_BAD_KIND;
+    }
+    if (!ggml_cuda_mtp_qblock_tail_page_map_valid(attempt.map)) {
+        return PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_BAD_MAP;
+    }
+    if ((attempt.map.flags & GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_OWNED_TAIL_WRITE) == 0 ||
+            (attempt.map.flags & GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_SCRATCH_OVERLAY) != 0) {
+        return PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_NOT_OWNED_MAP;
+    }
+    uint32_t mapped_logical_page = 0;
+    uint32_t mapped_slot = 0;
+    uint32_t mapped_physical_page = 0;
+    uint64_t mapped_physical_slot = 0;
+    if (!ggml_cuda_mtp_qblock_tail_page_map_translate(
+            attempt.map, attempt.logical_base, &mapped_logical_page, &mapped_slot, &mapped_physical_page, &mapped_physical_slot) ||
+            mapped_physical_page != attempt.physical_page) {
+        return PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_PHYSICAL_PAGE_MISMATCH;
+    }
+    if (attempt.n_tokens == 0 || req_end <= req_begin || req_begin < map_begin || req_end > map_end) {
+        return PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_RANGE_NOT_COVERED;
+    }
+    const bool same_map = ggml_cuda_mtp_qblock_tail_page_map_valid(s_packed16_tail_page_owned_write_ready.map) &&
+        ggml_cuda_mtp_qblock_tail_page_map_equal(s_packed16_tail_page_owned_write_ready.map, attempt.map) &&
+        s_packed16_tail_page_owned_write_ready.physical_page == attempt.physical_page;
+    if (!same_map) {
+        return PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_READY_MAP_MISMATCH;
+    }
+    if (!s_packed16_tail_page_owned_write_ready.k_ready || !s_packed16_tail_page_owned_write_ready.v_ready) {
+        return PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_KV_PAIR_NOT_READY;
+    }
+    if (!ggml_cuda_mtp_qblock_tail_page_route_complete_same_map_locked(attempt.map)) {
+        return PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_ROUTE_INCOMPLETE;
+    }
+    if (s_packed16_tail_page_consumer_no_map_nk_max == 0) {
+        return PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_NO_ROUTE_HIGHWATER;
+    }
+    if (attempt.logical_base < s_packed16_tail_page_consumer_no_map_nk_max) {
+        return PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_BEFORE_ROUTE_HIGHWATER;
+    }
+    return PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_OK;
+}
+
+static void ggml_cuda_mtp_qblock_tail_page_owned_deferred_proof_reset_locked(const char * reason) {
+    if (s_packed16_tail_page_owned_deferred_proof.attempts.empty() &&
+            s_packed16_tail_page_owned_deferred_proof.next_attempt_id == 0 &&
+            s_packed16_tail_page_owned_deferred_proof.dropped_attempts == 0) {
+        return;
+    }
+    if (ggml_cuda_mtp_qblock_owned_tail_write_deferred_proof_requested()) {
+        fprintf(stderr,
+                "MTP_QBLOCK_TXN_TAIL_PAGE_OWNED_DEFERRED_PROOF: op=reset reason=%s attempts=%zu next_attempt_id=%llu dropped=%llu resolves=%llu\n",
+                reason ? reason : "unknown",
+                s_packed16_tail_page_owned_deferred_proof.attempts.size(),
+                (unsigned long long) s_packed16_tail_page_owned_deferred_proof.next_attempt_id,
+                (unsigned long long) s_packed16_tail_page_owned_deferred_proof.dropped_attempts,
+                (unsigned long long) s_packed16_tail_page_owned_deferred_proof.resolve_count);
+    }
+    if (ggml_cuda_mtp_qblock_owned_tail_write_plan_proof_requested()) {
+        fprintf(stderr,
+                "MTP_QBLOCK_TXN_TAIL_PAGE_OWNED_PLAN_PROOF: op=attempt_reset reason=%s attempts=%zu next_attempt_id=%llu dropped=%llu resolves=%llu\n",
+                reason ? reason : "unknown",
+                s_packed16_tail_page_owned_deferred_proof.attempts.size(),
+                (unsigned long long) s_packed16_tail_page_owned_deferred_proof.next_attempt_id,
+                (unsigned long long) s_packed16_tail_page_owned_deferred_proof.dropped_attempts,
+                (unsigned long long) s_packed16_tail_page_owned_deferred_proof.resolve_count);
+    }
+    if (ggml_cuda_mtp_qblock_owned_tail_write_live_window_proof_requested()) {
+        fprintf(stderr,
+                "MTP_QBLOCK_TXN_TAIL_PAGE_OWNED_LIVE_WINDOW_PROOF: op=attempt_reset reason=%s attempts=%zu next_attempt_id=%llu dropped=%llu resolves=%llu highwater_seq=%llu highwater_update_seq=%llu highwater=%u route_complete_seq=%llu route_complete_highwater=%u reset_count=%llu\n",
+                reason ? reason : "unknown",
+                s_packed16_tail_page_owned_deferred_proof.attempts.size(),
+                (unsigned long long) s_packed16_tail_page_owned_deferred_proof.next_attempt_id,
+                (unsigned long long) s_packed16_tail_page_owned_deferred_proof.dropped_attempts,
+                (unsigned long long) s_packed16_tail_page_owned_deferred_proof.resolve_count,
+                (unsigned long long) s_packed16_tail_page_owned_live_window.highwater_event_seq,
+                (unsigned long long) s_packed16_tail_page_owned_live_window.highwater_update_seq,
+                s_packed16_tail_page_owned_live_window.highwater_nk,
+                (unsigned long long) s_packed16_tail_page_owned_live_window.route_complete_event_seq,
+                s_packed16_tail_page_owned_live_window.route_complete_highwater,
+                (unsigned long long) s_packed16_tail_page_owned_live_window.reset_count);
+    }
+    s_packed16_tail_page_owned_deferred_proof = {};
+}
+
+static void ggml_cuda_mtp_qblock_tail_page_owned_deferred_proof_resolve_locked(const char * trigger) {
+    const bool deferred_proof_requested = ggml_cuda_mtp_qblock_owned_tail_write_deferred_proof_requested();
+    const bool plan_proof_requested = ggml_cuda_mtp_qblock_owned_tail_write_plan_proof_requested();
+    const bool live_window_proof_requested = ggml_cuda_mtp_qblock_owned_tail_write_live_window_proof_requested();
+    if (!ggml_cuda_mtp_qblock_owned_tail_write_any_proof_requested() ||
+            s_packed16_tail_page_owned_deferred_proof.attempts.empty()) {
+        return;
+    }
+    uint64_t reason_counts[PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_REASON_COUNT] = {};
+    std::vector<bool> k_would_skip_by_attempt(s_packed16_tail_page_owned_deferred_proof.attempts.size(), false);
+    std::vector<bool> k_all_bound_would_skip_by_attempt(s_packed16_tail_page_owned_deferred_proof.attempts.size(), false);
+    std::vector<bool> k_plan_bound_no_miss_by_attempt(s_packed16_tail_page_owned_deferred_proof.attempts.size(), false);
+    uint64_t k_attempts = 0;
+    uint64_t v_attempts = 0;
+    uint64_t k_would_skip = 0;
+    uint64_t v_would_skip = 0;
+    uint64_t k_route_ready = 0;
+    uint64_t v_route_ready = 0;
+    uint64_t k_no_highwater = 0;
+    uint64_t v_no_highwater = 0;
+    uint64_t k_pre_highwater = 0;
+    uint64_t v_pre_highwater = 0;
+    uint64_t k_post_highwater = 0;
+    uint64_t v_post_highwater = 0;
+    uint64_t k_cross_highwater = 0;
+    uint64_t v_cross_highwater = 0;
+    uint64_t k_post_highwater_tokens = 0;
+    uint64_t v_post_highwater_tokens = 0;
+    uint64_t k_retired_no_highwater = 0;
+    uint64_t v_retired_no_highwater = 0;
+    uint64_t k_retired_pre_highwater = 0;
+    uint64_t v_retired_pre_highwater = 0;
+    uint64_t k_retired_post_highwater = 0;
+    uint64_t v_retired_post_highwater = 0;
+    uint64_t k_record_no_highwater = 0;
+    uint64_t v_record_no_highwater = 0;
+    uint64_t k_record_pre_highwater = 0;
+    uint64_t v_record_pre_highwater = 0;
+    uint64_t k_record_post_highwater = 0;
+    uint64_t v_record_post_highwater = 0;
+    uint64_t k_record_cross_highwater = 0;
+    uint64_t v_record_cross_highwater = 0;
+    uint64_t k_record_no_to_live_highwater = 0;
+    uint64_t v_record_no_to_live_highwater = 0;
+    uint64_t first_record_event_seq = 0;
+    uint64_t last_record_event_seq = 0;
+    uint64_t k_plan_ready = 0;
+    uint64_t v_plan_ready = 0;
+    uint64_t k_plan_before_record = 0;
+    uint64_t v_plan_before_record = 0;
+    uint64_t k_plan_write_through = 0;
+    uint64_t v_plan_write_through = 0;
+    uint64_t k_plan_owned_write = 0;
+    uint64_t v_plan_owned_write = 0;
+    uint64_t k_plan_exclusive_skip = 0;
+    uint64_t v_plan_exclusive_skip = 0;
+    uint64_t k_plan_route_complete = 0;
+    uint64_t v_plan_route_complete = 0;
+    uint64_t k_plan_route_incomplete = 0;
+    uint64_t v_plan_route_incomplete = 0;
+    uint64_t k_plan_no_highwater_owned = 0;
+    uint64_t v_plan_no_highwater_owned = 0;
+    uint64_t k_plan_pre_highwater_owned = 0;
+    uint64_t v_plan_pre_highwater_owned = 0;
+    uint64_t k_plan_post_highwater_owned = 0;
+    uint64_t v_plan_post_highwater_owned = 0;
+    uint64_t k_plan_cross_highwater_owned = 0;
+    uint64_t v_plan_cross_highwater_owned = 0;
+    uint64_t k_plan_all_expected_known = 0;
+    uint64_t v_plan_all_expected_known = 0;
+    uint64_t k_plan_bound_before_record = 0;
+    uint64_t v_plan_bound_before_record = 0;
+    uint64_t k_plan_bound_at_resolve = 0;
+    uint64_t v_plan_bound_at_resolve = 0;
+    uint64_t k_plan_missing_layer_pages_at_record = 0;
+    uint64_t v_plan_missing_layer_pages_at_record = 0;
+    uint64_t k_plan_known_no_miss = 0;
+    uint64_t v_plan_known_no_miss = 0;
+    uint64_t k_plan_bound_no_miss_would_skip = 0;
+    uint64_t v_plan_bound_no_miss_would_skip = 0;
+    uint64_t v_plan_bound_no_miss_k_missing = 0;
+    uint64_t k_live_after_highwater = 0;
+    uint64_t v_live_after_highwater = 0;
+    uint64_t k_live_after_route_complete = 0;
+    uint64_t v_live_after_route_complete = 0;
+    uint64_t k_live_after_both = 0;
+    uint64_t v_live_after_both = 0;
+    uint64_t k_live_after_both_pre_highwater = 0;
+    uint64_t v_live_after_both_pre_highwater = 0;
+    uint64_t k_live_after_both_post_highwater = 0;
+    uint64_t v_live_after_both_post_highwater = 0;
+    uint64_t k_live_after_both_cross_highwater = 0;
+    uint64_t v_live_after_both_cross_highwater = 0;
+    uint64_t k_live_after_both_owned = 0;
+    uint64_t v_live_after_both_owned = 0;
+    uint64_t k_live_base_ok = 0;
+    uint64_t v_live_base_ok = 0;
+    uint64_t k_all_bound_would_skip = 0;
+    uint64_t v_all_bound_would_skip = 0;
+    uint64_t v_all_bound_k_missing = 0;
+    for (size_t i = 0; i < s_packed16_tail_page_owned_deferred_proof.attempts.size(); ++i) {
+        const packed16_tail_page_owned_deferred_proof_attempt & attempt = s_packed16_tail_page_owned_deferred_proof.attempts[i];
+        if (attempt.is_k) {
+            ++k_attempts;
+        } else if (attempt.is_v) {
+            ++v_attempts;
+        }
+        if (attempt.record_event_seq != 0) {
+            if (first_record_event_seq == 0 || attempt.record_event_seq < first_record_event_seq) {
+                first_record_event_seq = attempt.record_event_seq;
+            }
+            if (attempt.record_event_seq > last_record_event_seq) {
+                last_record_event_seq = attempt.record_event_seq;
+            }
+        }
+        if (attempt.record_plan_ready) {
+            if (attempt.is_k) {
+                ++k_plan_ready;
+            } else if (attempt.is_v) {
+                ++v_plan_ready;
+            }
+        }
+        if (attempt.record_plan_before_record) {
+            if (attempt.is_k) {
+                ++k_plan_before_record;
+            } else if (attempt.is_v) {
+                ++v_plan_before_record;
+            }
+        }
+        if (attempt.record_plan_write_through) {
+            if (attempt.is_k) {
+                ++k_plan_write_through;
+            } else if (attempt.is_v) {
+                ++v_plan_write_through;
+            }
+        }
+        if (attempt.record_plan_owned_write) {
+            if (attempt.is_k) {
+                ++k_plan_owned_write;
+            } else if (attempt.is_v) {
+                ++v_plan_owned_write;
+            }
+            const uint64_t req_begin = attempt.logical_base;
+            const uint64_t req_end = req_begin + attempt.n_tokens;
+            const uint32_t record_highwater = attempt.record_live_highwater;
+            if (record_highwater == 0) {
+                if (attempt.is_k) {
+                    ++k_plan_no_highwater_owned;
+                } else if (attempt.is_v) {
+                    ++v_plan_no_highwater_owned;
+                }
+            } else if (req_begin < record_highwater) {
+                if (attempt.is_k) {
+                    ++k_plan_pre_highwater_owned;
+                } else if (attempt.is_v) {
+                    ++v_plan_pre_highwater_owned;
+                }
+                if (req_end > record_highwater) {
+                    if (attempt.is_k) {
+                        ++k_plan_cross_highwater_owned;
+                    } else if (attempt.is_v) {
+                        ++v_plan_cross_highwater_owned;
+                    }
+                }
+            } else {
+                if (attempt.is_k) {
+                    ++k_plan_post_highwater_owned;
+                } else if (attempt.is_v) {
+                    ++v_plan_post_highwater_owned;
+                }
+            }
+        }
+        const uint64_t plan_expected_layer_pages =
+            uint64_t(attempt.record_plan_expected_layers) * uint64_t(attempt.record_plan_expected_pages);
+        const bool plan_all_expected_known = attempt.record_plan_ready && plan_expected_layer_pages != 0;
+        if (plan_all_expected_known) {
+            if (attempt.is_k) {
+                ++k_plan_all_expected_known;
+            } else if (attempt.is_v) {
+                ++v_plan_all_expected_known;
+            }
+            const uint64_t missing_at_record = attempt.record_plan_bound_layer_pages >= plan_expected_layer_pages ?
+                0 : plan_expected_layer_pages - attempt.record_plan_bound_layer_pages;
+            if (missing_at_record == 0 && attempt.record_plan_before_record) {
+                if (attempt.is_k) {
+                    ++k_plan_bound_before_record;
+                } else if (attempt.is_v) {
+                    ++v_plan_bound_before_record;
+                }
+            } else {
+                if (attempt.is_k) {
+                    k_plan_missing_layer_pages_at_record += missing_at_record;
+                } else if (attempt.is_v) {
+                    v_plan_missing_layer_pages_at_record += missing_at_record;
+                }
+            }
+        }
+        const bool plan_same_map_bound_at_resolve = plan_all_expected_known &&
+            ggml_cuda_mtp_qblock_tail_page_route_complete_same_map_locked(attempt.map) &&
+            s_packed16_tail_page_route_complete.expected_layer_count == attempt.record_plan_expected_layers &&
+            s_packed16_tail_page_route_complete.expected_page_count == attempt.record_plan_expected_pages &&
+            s_packed16_tail_page_route_complete.expected_layer_page_count == plan_expected_layer_pages;
+        if (plan_same_map_bound_at_resolve) {
+            if (attempt.is_k) {
+                ++k_plan_bound_at_resolve;
+            } else if (attempt.is_v) {
+                ++v_plan_bound_at_resolve;
+            }
+        }
+        const bool plan_known_no_miss = plan_all_expected_known && attempt.record_plan_before_record &&
+            attempt.record_plan_owned_write && s_packed16_tail_page_consumer_no_map_nk_max == 0;
+        if (plan_known_no_miss) {
+            if (attempt.is_k) {
+                ++k_plan_known_no_miss;
+            } else if (attempt.is_v) {
+                ++v_plan_known_no_miss;
+            }
+        }
+        if (attempt.is_k && plan_known_no_miss && plan_same_map_bound_at_resolve) {
+            k_plan_bound_no_miss_by_attempt[i] = true;
+            ++k_plan_bound_no_miss_would_skip;
+        }
+        if (attempt.record_plan_exclusive_skip) {
+            if (attempt.is_k) {
+                ++k_plan_exclusive_skip;
+            } else if (attempt.is_v) {
+                ++v_plan_exclusive_skip;
+            }
+        }
+        if (attempt.record_plan_route_complete) {
+            if (attempt.is_k) {
+                ++k_plan_route_complete;
+            } else if (attempt.is_v) {
+                ++v_plan_route_complete;
+            }
+        } else if (attempt.record_plan_ready) {
+            if (attempt.is_k) {
+                ++k_plan_route_incomplete;
+            } else if (attempt.is_v) {
+                ++v_plan_route_incomplete;
+            }
+        }
+        if (attempt.record_live_window_after_highwater) {
+            if (attempt.is_k) {
+                ++k_live_after_highwater;
+            } else if (attempt.is_v) {
+                ++v_live_after_highwater;
+            }
+        }
+        if (attempt.record_live_window_after_route_complete) {
+            if (attempt.is_k) {
+                ++k_live_after_route_complete;
+            } else if (attempt.is_v) {
+                ++v_live_after_route_complete;
+            }
+        }
+        if (attempt.record_live_window_after_highwater && attempt.record_live_window_after_route_complete) {
+            if (attempt.is_k) {
+                ++k_live_after_both;
+            } else if (attempt.is_v) {
+                ++v_live_after_both;
+            }
+            if (attempt.record_plan_owned_write) {
+                if (attempt.is_k) {
+                    ++k_live_after_both_owned;
+                } else if (attempt.is_v) {
+                    ++v_live_after_both_owned;
+                }
+            }
+            if (attempt.record_live_window_post_highwater) {
+                if (attempt.is_k) {
+                    ++k_live_after_both_post_highwater;
+                } else if (attempt.is_v) {
+                    ++v_live_after_both_post_highwater;
+                }
+            } else if (attempt.record_live_window_cross_highwater) {
+                if (attempt.is_k) {
+                    ++k_live_after_both_cross_highwater;
+                } else if (attempt.is_v) {
+                    ++v_live_after_both_cross_highwater;
+                }
+            } else {
+                if (attempt.is_k) {
+                    ++k_live_after_both_pre_highwater;
+                } else if (attempt.is_v) {
+                    ++v_live_after_both_pre_highwater;
+                }
+            }
+        }
+        const packed16_tail_page_owned_deferred_proof_reason reason =
+            ggml_cuda_mtp_qblock_tail_page_owned_deferred_proof_base_reason_locked(attempt);
+        const bool route_ready = reason == PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_OK ||
+            reason == PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_NO_ROUTE_HIGHWATER ||
+            reason == PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_BEFORE_ROUTE_HIGHWATER;
+        if (route_ready) {
+            if (attempt.is_k) {
+                ++k_route_ready;
+            } else if (attempt.is_v) {
+                ++v_route_ready;
+            }
+            const uint64_t req_begin = attempt.logical_base;
+            const uint64_t req_end = req_begin + attempt.n_tokens;
+            const uint32_t live_highwater = s_packed16_tail_page_consumer_no_map_nk_max;
+            if (live_highwater == 0) {
+                if (attempt.is_k) {
+                    ++k_no_highwater;
+                } else if (attempt.is_v) {
+                    ++v_no_highwater;
+                }
+            } else if (attempt.logical_base < live_highwater) {
+                if (attempt.is_k) {
+                    ++k_pre_highwater;
+                } else if (attempt.is_v) {
+                    ++v_pre_highwater;
+                }
+                if (req_end > live_highwater) {
+                    const uint64_t post_tokens = req_end - live_highwater;
+                    if (attempt.is_k) {
+                        ++k_cross_highwater;
+                        k_post_highwater_tokens += post_tokens;
+                    } else if (attempt.is_v) {
+                        ++v_cross_highwater;
+                        v_post_highwater_tokens += post_tokens;
+                    }
+                }
+            } else {
+                if (attempt.is_k) {
+                    ++k_post_highwater;
+                    k_post_highwater_tokens += attempt.n_tokens;
+                } else if (attempt.is_v) {
+                    ++v_post_highwater;
+                    v_post_highwater_tokens += attempt.n_tokens;
+                }
+            }
+            const uint32_t record_highwater = attempt.record_live_highwater;
+            if (record_highwater == 0) {
+                if (attempt.is_k) {
+                    ++k_record_no_highwater;
+                } else if (attempt.is_v) {
+                    ++v_record_no_highwater;
+                }
+                if (live_highwater != 0) {
+                    if (attempt.is_k) {
+                        ++k_record_no_to_live_highwater;
+                    } else if (attempt.is_v) {
+                        ++v_record_no_to_live_highwater;
+                    }
+                }
+            } else if (req_begin < record_highwater) {
+                if (attempt.is_k) {
+                    ++k_record_pre_highwater;
+                } else if (attempt.is_v) {
+                    ++v_record_pre_highwater;
+                }
+                if (req_end > record_highwater) {
+                    if (attempt.is_k) {
+                        ++k_record_cross_highwater;
+                    } else if (attempt.is_v) {
+                        ++v_record_cross_highwater;
+                    }
+                }
+            } else {
+                if (attempt.is_k) {
+                    ++k_record_post_highwater;
+                } else if (attempt.is_v) {
+                    ++v_record_post_highwater;
+                }
+            }
+            if (!s_packed16_tail_page_retired_highwater.valid || s_packed16_tail_page_retired_highwater.nk == 0) {
+                if (attempt.is_k) {
+                    ++k_retired_no_highwater;
+                } else if (attempt.is_v) {
+                    ++v_retired_no_highwater;
+                }
+            } else if (attempt.logical_base < s_packed16_tail_page_retired_highwater.nk) {
+                if (attempt.is_k) {
+                    ++k_retired_pre_highwater;
+                } else if (attempt.is_v) {
+                    ++v_retired_pre_highwater;
+                }
+            } else {
+                if (attempt.is_k) {
+                    ++k_retired_post_highwater;
+                } else if (attempt.is_v) {
+                    ++v_retired_post_highwater;
+                }
+            }
+        }
+        if (attempt.record_live_window_after_highwater && attempt.record_live_window_after_route_complete &&
+                attempt.record_live_window_post_highwater && reason == PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_OK) {
+            if (attempt.is_k) {
+                ++k_live_base_ok;
+            } else if (attempt.is_v) {
+                ++v_live_base_ok;
+            }
+        }
+        if (attempt.is_k && reason == PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_NO_ROUTE_HIGHWATER &&
+                s_packed16_tail_page_consumer_no_map_nk_max == 0) {
+            k_all_bound_would_skip_by_attempt[i] = true;
+            ++k_all_bound_would_skip;
+        }
+        if (attempt.is_k && reason == PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_OK) {
+            k_would_skip_by_attempt[i] = true;
+            ++k_would_skip;
+        } else if (!attempt.is_v) {
+            ++reason_counts[reason];
+        } else if (reason != PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_OK) {
+            ++reason_counts[reason];
+        }
+    }
+    for (size_t i = 0; i < s_packed16_tail_page_owned_deferred_proof.attempts.size(); ++i) {
+        const packed16_tail_page_owned_deferred_proof_attempt & attempt = s_packed16_tail_page_owned_deferred_proof.attempts[i];
+        if (!attempt.is_v) {
+            continue;
+        }
+        const packed16_tail_page_owned_deferred_proof_reason reason =
+            ggml_cuda_mtp_qblock_tail_page_owned_deferred_proof_base_reason_locked(attempt);
+        bool k_seen = false;
+        if (reason == PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_OK) {
+            for (size_t j = 0; j < s_packed16_tail_page_owned_deferred_proof.attempts.size(); ++j) {
+                if (k_would_skip_by_attempt[j] && ggml_cuda_mtp_qblock_tail_page_owned_deferred_proof_attempt_same_range(
+                        s_packed16_tail_page_owned_deferred_proof.attempts[j], attempt)) {
+                    k_seen = true;
+                    break;
+                }
+            }
+            if (k_seen) {
+                ++v_would_skip;
+            } else {
+                ++reason_counts[PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_K_DEFERRED_NOT_SEEN];
+            }
+        } else if (reason == PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_NO_ROUTE_HIGHWATER &&
+                s_packed16_tail_page_consumer_no_map_nk_max == 0) {
+            for (size_t j = 0; j < s_packed16_tail_page_owned_deferred_proof.attempts.size(); ++j) {
+                if (k_all_bound_would_skip_by_attempt[j] && ggml_cuda_mtp_qblock_tail_page_owned_deferred_proof_attempt_same_range(
+                        s_packed16_tail_page_owned_deferred_proof.attempts[j], attempt)) {
+                    k_seen = true;
+                    break;
+                }
+            }
+            if (k_seen) {
+                ++v_all_bound_would_skip;
+            } else {
+                ++v_all_bound_k_missing;
+            }
+        }
+        const uint64_t plan_expected_layer_pages =
+            uint64_t(attempt.record_plan_expected_layers) * uint64_t(attempt.record_plan_expected_pages);
+        const bool plan_same_map_bound_at_resolve = attempt.record_plan_ready && plan_expected_layer_pages != 0 &&
+            attempt.record_plan_before_record && attempt.record_plan_owned_write &&
+            s_packed16_tail_page_consumer_no_map_nk_max == 0 &&
+            ggml_cuda_mtp_qblock_tail_page_route_complete_same_map_locked(attempt.map) &&
+            s_packed16_tail_page_route_complete.expected_layer_count == attempt.record_plan_expected_layers &&
+            s_packed16_tail_page_route_complete.expected_page_count == attempt.record_plan_expected_pages &&
+            s_packed16_tail_page_route_complete.expected_layer_page_count == plan_expected_layer_pages;
+        if (plan_same_map_bound_at_resolve) {
+            bool k_plan_seen = false;
+            for (size_t j = 0; j < s_packed16_tail_page_owned_deferred_proof.attempts.size(); ++j) {
+                if (k_plan_bound_no_miss_by_attempt[j] && ggml_cuda_mtp_qblock_tail_page_owned_deferred_proof_attempt_same_range(
+                        s_packed16_tail_page_owned_deferred_proof.attempts[j], attempt)) {
+                    k_plan_seen = true;
+                    break;
+                }
+            }
+            if (k_plan_seen) {
+                ++v_plan_bound_no_miss_would_skip;
+            } else {
+                ++v_plan_bound_no_miss_k_missing;
+            }
+        }
+    }
+    ++s_packed16_tail_page_owned_deferred_proof.resolve_count;
+    const bool same_map = ggml_cuda_mtp_qblock_tail_page_map_valid(s_packed16_tail_page_owned_write_ready.map) &&
+        ggml_cuda_mtp_qblock_tail_page_map_valid(s_packed16_tail_page_route_complete.map) &&
+        ggml_cuda_mtp_qblock_tail_page_map_equal(s_packed16_tail_page_owned_write_ready.map, s_packed16_tail_page_route_complete.map);
+    const bool pair_ready = same_map && s_packed16_tail_page_owned_write_ready.k_ready && s_packed16_tail_page_owned_write_ready.v_ready;
+    const bool route_complete = ggml_cuda_mtp_qblock_tail_page_route_complete_now_locked();
+    const ggml_cuda_mtp_qblock_tail_page_map_v1 & log_map = ggml_cuda_mtp_qblock_tail_page_map_valid(s_packed16_tail_page_route_complete.map) ?
+        s_packed16_tail_page_route_complete.map : s_packed16_tail_page_owned_deferred_proof.attempts.front().map;
+    if (deferred_proof_requested) {
+        fprintf(stderr,
+            "MTP_QBLOCK_TXN_TAIL_PAGE_OWNED_DEFERRED_PROOF: op=resolve trigger=%s status=%s attempts=%zu k_attempts=%llu v_attempts=%llu would_skip_k=%llu would_skip_v=%llu route_ready_k=%llu route_ready_v=%llu no_highwater_k=%llu no_highwater_v=%llu pre_highwater_k=%llu pre_highwater_v=%llu post_highwater_k=%llu post_highwater_v=%llu cross_highwater_k=%llu cross_highwater_v=%llu post_highwater_tokens_k=%llu post_highwater_tokens_v=%llu record_no_highwater_k=%llu record_no_highwater_v=%llu record_pre_highwater_k=%llu record_pre_highwater_v=%llu record_post_highwater_k=%llu record_post_highwater_v=%llu record_cross_highwater_k=%llu record_cross_highwater_v=%llu record_no_to_live_highwater_k=%llu record_no_to_live_highwater_v=%llu first_record_seq=%llu last_record_seq=%llu highwater_update_seq=%llu retired_valid=%d retired_highwater=%u retired_generation=%llu retired_reset_count=%llu retired_no_highwater_k=%llu retired_no_highwater_v=%llu retired_pre_highwater_k=%llu retired_pre_highwater_v=%llu retired_post_highwater_k=%llu retired_post_highwater_v=%llu pair_ready=%d route_complete=%d no_map_highwater=%u expected_layers=%u expected_pages=%u bound_layer_pages=%zu logical_base=%u valid_tail=%u table0=%d flags=0x%x generation=%llu dropped=%llu bad_kind=%llu bad_map=%llu not_owned_map=%llu physical_page_mismatch=%llu range_not_covered=%llu ready_map_mismatch=%llu kv_pair_not_ready=%llu route_incomplete=%llu no_route_highwater=%llu before_route_highwater=%llu k_deferred_not_seen=%llu resolve_count=%llu\n",
+            trigger ? trigger : "unknown",
+            (k_would_skip != 0 && v_would_skip != 0) ? "would_skip" : "blocked",
+            s_packed16_tail_page_owned_deferred_proof.attempts.size(),
+            (unsigned long long) k_attempts,
+            (unsigned long long) v_attempts,
+            (unsigned long long) k_would_skip,
+            (unsigned long long) v_would_skip,
+            (unsigned long long) k_route_ready,
+            (unsigned long long) v_route_ready,
+            (unsigned long long) k_no_highwater,
+            (unsigned long long) v_no_highwater,
+            (unsigned long long) k_pre_highwater,
+            (unsigned long long) v_pre_highwater,
+            (unsigned long long) k_post_highwater,
+            (unsigned long long) v_post_highwater,
+            (unsigned long long) k_cross_highwater,
+            (unsigned long long) v_cross_highwater,
+            (unsigned long long) k_post_highwater_tokens,
+            (unsigned long long) v_post_highwater_tokens,
+            (unsigned long long) k_record_no_highwater,
+            (unsigned long long) v_record_no_highwater,
+            (unsigned long long) k_record_pre_highwater,
+            (unsigned long long) v_record_pre_highwater,
+            (unsigned long long) k_record_post_highwater,
+            (unsigned long long) v_record_post_highwater,
+            (unsigned long long) k_record_cross_highwater,
+            (unsigned long long) v_record_cross_highwater,
+            (unsigned long long) k_record_no_to_live_highwater,
+            (unsigned long long) v_record_no_to_live_highwater,
+            (unsigned long long) first_record_event_seq,
+            (unsigned long long) last_record_event_seq,
+            (unsigned long long) s_packed16_tail_page_owned_deferred_proof_highwater_update_seq,
+            s_packed16_tail_page_retired_highwater.valid ? 1 : 0,
+            s_packed16_tail_page_retired_highwater.nk,
+            (unsigned long long) s_packed16_tail_page_retired_highwater.generation,
+            (unsigned long long) s_packed16_tail_page_retired_highwater.reset_count,
+            (unsigned long long) k_retired_no_highwater,
+            (unsigned long long) v_retired_no_highwater,
+            (unsigned long long) k_retired_pre_highwater,
+            (unsigned long long) v_retired_pre_highwater,
+            (unsigned long long) k_retired_post_highwater,
+            (unsigned long long) v_retired_post_highwater,
+            pair_ready ? 1 : 0,
+            route_complete ? 1 : 0,
+            s_packed16_tail_page_consumer_no_map_nk_max,
+            s_packed16_tail_page_route_complete.expected_layer_count,
+            s_packed16_tail_page_route_complete.expected_page_count,
+            s_packed16_tail_page_route_complete.bound_layer_pages.size(),
+            log_map.logical_base_token,
+            log_map.valid_tail_tokens,
+            log_map.block_table[0],
+            log_map.flags,
+            (unsigned long long) log_map.generation,
+            (unsigned long long) s_packed16_tail_page_owned_deferred_proof.dropped_attempts,
+            (unsigned long long) reason_counts[PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_BAD_KIND],
+            (unsigned long long) reason_counts[PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_BAD_MAP],
+            (unsigned long long) reason_counts[PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_NOT_OWNED_MAP],
+            (unsigned long long) reason_counts[PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_PHYSICAL_PAGE_MISMATCH],
+            (unsigned long long) reason_counts[PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_RANGE_NOT_COVERED],
+            (unsigned long long) reason_counts[PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_READY_MAP_MISMATCH],
+            (unsigned long long) reason_counts[PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_KV_PAIR_NOT_READY],
+            (unsigned long long) reason_counts[PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_ROUTE_INCOMPLETE],
+            (unsigned long long) reason_counts[PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_NO_ROUTE_HIGHWATER],
+            (unsigned long long) reason_counts[PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_BEFORE_ROUTE_HIGHWATER],
+            (unsigned long long) reason_counts[PACKED16_TAIL_PAGE_OWNED_DEFERRED_PROOF_K_DEFERRED_NOT_SEEN],
+            (unsigned long long) s_packed16_tail_page_owned_deferred_proof.resolve_count);
+    }
+    if (plan_proof_requested) {
+        fprintf(stderr,
+                "MTP_QBLOCK_TXN_TAIL_PAGE_OWNED_PLAN_PROOF: op=resolve trigger=%s status=%s attempts=%zu k_attempts=%llu v_attempts=%llu plan_ready_k=%llu plan_ready_v=%llu plan_before_record_k=%llu plan_before_record_v=%llu plan_write_through_k=%llu plan_write_through_v=%llu plan_owned_write_k=%llu plan_owned_write_v=%llu plan_exclusive_skip_k=%llu plan_exclusive_skip_v=%llu plan_route_complete_k=%llu plan_route_complete_v=%llu plan_route_incomplete_k=%llu plan_route_incomplete_v=%llu plan_no_highwater_owned_k=%llu plan_no_highwater_owned_v=%llu plan_pre_highwater_owned_k=%llu plan_pre_highwater_owned_v=%llu plan_post_highwater_owned_k=%llu plan_post_highwater_owned_v=%llu plan_cross_highwater_owned_k=%llu plan_cross_highwater_owned_v=%llu plan_all_expected_known_k=%llu plan_all_expected_known_v=%llu plan_bound_before_record_k=%llu plan_bound_before_record_v=%llu plan_bound_at_resolve_k=%llu plan_bound_at_resolve_v=%llu plan_missing_layer_pages_at_record_k=%llu plan_missing_layer_pages_at_record_v=%llu plan_known_no_miss_k=%llu plan_known_no_miss_v=%llu plan_bound_no_miss_would_skip_k=%llu plan_bound_no_miss_would_skip_v=%llu plan_bound_no_miss_k_missing_v=%llu first_record_seq=%llu last_record_seq=%llu current_plan_id=%llu current_plan_seq=%llu current_plan_expected_layers=%u current_plan_expected_pages=%u current_plan_bound_layer_pages_at_plan=%llu pair_ready=%d route_complete=%d no_map_highwater=%u expected_layers=%u expected_pages=%u bound_layer_pages=%zu logical_base=%u valid_tail=%u table0=%d flags=0x%x generation=%llu resolve_count=%llu\n",
+                trigger ? trigger : "unknown",
+                (k_plan_ready != 0 && v_plan_ready != 0) ? "planned" : "blocked",
+                s_packed16_tail_page_owned_deferred_proof.attempts.size(),
+                (unsigned long long) k_attempts,
+                (unsigned long long) v_attempts,
+                (unsigned long long) k_plan_ready,
+                (unsigned long long) v_plan_ready,
+                (unsigned long long) k_plan_before_record,
+                (unsigned long long) v_plan_before_record,
+                (unsigned long long) k_plan_write_through,
+                (unsigned long long) v_plan_write_through,
+                (unsigned long long) k_plan_owned_write,
+                (unsigned long long) v_plan_owned_write,
+                (unsigned long long) k_plan_exclusive_skip,
+                (unsigned long long) v_plan_exclusive_skip,
+                (unsigned long long) k_plan_route_complete,
+                (unsigned long long) v_plan_route_complete,
+                (unsigned long long) k_plan_route_incomplete,
+                (unsigned long long) v_plan_route_incomplete,
+                (unsigned long long) k_plan_no_highwater_owned,
+                (unsigned long long) v_plan_no_highwater_owned,
+                (unsigned long long) k_plan_pre_highwater_owned,
+                (unsigned long long) v_plan_pre_highwater_owned,
+                (unsigned long long) k_plan_post_highwater_owned,
+                (unsigned long long) v_plan_post_highwater_owned,
+                (unsigned long long) k_plan_cross_highwater_owned,
+                (unsigned long long) v_plan_cross_highwater_owned,
+                (unsigned long long) k_plan_all_expected_known,
+                (unsigned long long) v_plan_all_expected_known,
+                (unsigned long long) k_plan_bound_before_record,
+                (unsigned long long) v_plan_bound_before_record,
+                (unsigned long long) k_plan_bound_at_resolve,
+                (unsigned long long) v_plan_bound_at_resolve,
+                (unsigned long long) k_plan_missing_layer_pages_at_record,
+                (unsigned long long) v_plan_missing_layer_pages_at_record,
+                (unsigned long long) k_plan_known_no_miss,
+                (unsigned long long) v_plan_known_no_miss,
+                (unsigned long long) k_plan_bound_no_miss_would_skip,
+                (unsigned long long) v_plan_bound_no_miss_would_skip,
+                (unsigned long long) v_plan_bound_no_miss_k_missing,
+                (unsigned long long) first_record_event_seq,
+                (unsigned long long) last_record_event_seq,
+                (unsigned long long) s_packed16_tail_page_owned_write_plan.plan_id,
+                (unsigned long long) s_packed16_tail_page_owned_write_plan.plan_event_seq,
+                s_packed16_tail_page_owned_write_plan.expected_layer_count,
+                s_packed16_tail_page_owned_write_plan.expected_page_count,
+                (unsigned long long) s_packed16_tail_page_owned_write_plan.bound_layer_pages_at_plan,
+                pair_ready ? 1 : 0,
+                route_complete ? 1 : 0,
+                s_packed16_tail_page_consumer_no_map_nk_max,
+                s_packed16_tail_page_route_complete.expected_layer_count,
+                s_packed16_tail_page_route_complete.expected_page_count,
+                s_packed16_tail_page_route_complete.bound_layer_pages.size(),
+                log_map.logical_base_token,
+                log_map.valid_tail_tokens,
+                log_map.block_table[0],
+                log_map.flags,
+                (unsigned long long) log_map.generation,
+                (unsigned long long) s_packed16_tail_page_owned_deferred_proof.resolve_count);
+    }
+    if (live_window_proof_requested) {
+        fprintf(stderr,
+                "MTP_QBLOCK_TXN_TAIL_PAGE_OWNED_LIVE_WINDOW_PROOF: op=resolve trigger=%s status=%s attempts=%zu k_attempts=%llu v_attempts=%llu would_skip_k=%llu would_skip_v=%llu after_highwater_k=%llu after_highwater_v=%llu after_route_complete_k=%llu after_route_complete_v=%llu after_both_k=%llu after_both_v=%llu after_both_owned_k=%llu after_both_owned_v=%llu after_both_pre_highwater_k=%llu after_both_pre_highwater_v=%llu after_both_post_highwater_k=%llu after_both_post_highwater_v=%llu after_both_cross_highwater_k=%llu after_both_cross_highwater_v=%llu live_base_ok_k=%llu live_base_ok_v=%llu first_record_seq=%llu last_record_seq=%llu highwater_seq=%llu highwater_update_seq=%llu highwater=%u highwater_generation=%llu route_complete_seq=%llu route_complete_bind_count=%llu route_complete_highwater=%u route_complete_generation=%llu current_highwater=%u pair_ready=%d route_complete=%d expected_layers=%u expected_pages=%u bound_layer_pages=%zu logical_base=%u valid_tail=%u table0=%d flags=0x%x generation=%llu resolve_count=%llu\n",
+                trigger ? trigger : "unknown",
+                (k_live_base_ok != 0 && v_live_base_ok != 0 && k_would_skip != 0 && v_would_skip != 0) ? "live_window_would_skip" :
+                    ((k_live_after_both_post_highwater != 0 || v_live_after_both_post_highwater != 0) ? "live_window_candidate" : "blocked"),
+                s_packed16_tail_page_owned_deferred_proof.attempts.size(),
+                (unsigned long long) k_attempts,
+                (unsigned long long) v_attempts,
+                (unsigned long long) k_would_skip,
+                (unsigned long long) v_would_skip,
+                (unsigned long long) k_live_after_highwater,
+                (unsigned long long) v_live_after_highwater,
+                (unsigned long long) k_live_after_route_complete,
+                (unsigned long long) v_live_after_route_complete,
+                (unsigned long long) k_live_after_both,
+                (unsigned long long) v_live_after_both,
+                (unsigned long long) k_live_after_both_owned,
+                (unsigned long long) v_live_after_both_owned,
+                (unsigned long long) k_live_after_both_pre_highwater,
+                (unsigned long long) v_live_after_both_pre_highwater,
+                (unsigned long long) k_live_after_both_post_highwater,
+                (unsigned long long) v_live_after_both_post_highwater,
+                (unsigned long long) k_live_after_both_cross_highwater,
+                (unsigned long long) v_live_after_both_cross_highwater,
+                (unsigned long long) k_live_base_ok,
+                (unsigned long long) v_live_base_ok,
+                (unsigned long long) first_record_event_seq,
+                (unsigned long long) last_record_event_seq,
+                (unsigned long long) s_packed16_tail_page_owned_live_window.highwater_event_seq,
+                (unsigned long long) s_packed16_tail_page_owned_live_window.highwater_update_seq,
+                s_packed16_tail_page_owned_live_window.highwater_nk,
+                (unsigned long long) s_packed16_tail_page_owned_live_window.highwater_generation,
+                (unsigned long long) s_packed16_tail_page_owned_live_window.route_complete_event_seq,
+                (unsigned long long) s_packed16_tail_page_owned_live_window.route_complete_bind_count,
+                s_packed16_tail_page_owned_live_window.route_complete_highwater,
+                (unsigned long long) s_packed16_tail_page_owned_live_window.route_complete_generation,
+                s_packed16_tail_page_consumer_no_map_nk_max,
+                pair_ready ? 1 : 0,
+                route_complete ? 1 : 0,
+                s_packed16_tail_page_route_complete.expected_layer_count,
+                s_packed16_tail_page_route_complete.expected_page_count,
+                s_packed16_tail_page_route_complete.bound_layer_pages.size(),
+                log_map.logical_base_token,
+                log_map.valid_tail_tokens,
+                log_map.block_table[0],
+                log_map.flags,
+                (unsigned long long) log_map.generation,
+                (unsigned long long) s_packed16_tail_page_owned_deferred_proof.resolve_count);
+        fprintf(stderr,
+                "MTP_QBLOCK_TXN_TAIL_PAGE_OWNED_LIVE_WINDOW_PROOF: op=all_bound_resolve trigger=%s status=%s attempts=%zu k_attempts=%llu v_attempts=%llu all_bound_would_skip_k=%llu all_bound_would_skip_v=%llu all_bound_k_missing_v=%llu current_highwater=%u pair_ready=%d route_complete=%d expected_layers=%u expected_pages=%u bound_layer_pages=%zu logical_base=%u valid_tail=%u table0=%d flags=0x%x generation=%llu resolve_count=%llu\n",
+                trigger ? trigger : "unknown",
+                (k_all_bound_would_skip != 0 && v_all_bound_would_skip != 0) ? "all_bound_would_skip" : "blocked",
+                s_packed16_tail_page_owned_deferred_proof.attempts.size(),
+                (unsigned long long) k_attempts,
+                (unsigned long long) v_attempts,
+                (unsigned long long) k_all_bound_would_skip,
+                (unsigned long long) v_all_bound_would_skip,
+                (unsigned long long) v_all_bound_k_missing,
+                s_packed16_tail_page_consumer_no_map_nk_max,
+                pair_ready ? 1 : 0,
+                route_complete ? 1 : 0,
+                s_packed16_tail_page_route_complete.expected_layer_count,
+                s_packed16_tail_page_route_complete.expected_page_count,
+                s_packed16_tail_page_route_complete.bound_layer_pages.size(),
+                log_map.logical_base_token,
+                log_map.valid_tail_tokens,
+                log_map.block_table[0],
+                log_map.flags,
+                (unsigned long long) log_map.generation,
+                (unsigned long long) s_packed16_tail_page_owned_deferred_proof.resolve_count);
+    }
+}
+
+static void ggml_cuda_mtp_qblock_tail_page_owned_deferred_proof_record_locked(
+        const char * kind,
+        const ggml_cuda_mtp_qblock_tail_page_map_v1 & map,
+        uint32_t logical_base,
+        uint32_t n_tokens,
+        uint32_t physical_page) {
+    const bool deferred_proof_requested = ggml_cuda_mtp_qblock_owned_tail_write_deferred_proof_requested();
+    const bool plan_proof_requested = ggml_cuda_mtp_qblock_owned_tail_write_plan_proof_requested();
+    const bool live_window_proof_requested = ggml_cuda_mtp_qblock_owned_tail_write_live_window_proof_requested();
+    if (!ggml_cuda_mtp_qblock_owned_tail_write_any_proof_requested()) {
+        return;
+    }
+    packed16_tail_page_owned_deferred_proof_attempt attempt = {};
+    attempt.map = map;
+    attempt.logical_base = logical_base;
+    attempt.n_tokens = n_tokens;
+    attempt.physical_page = physical_page;
+    attempt.is_k = kind && strcmp(kind, "K") == 0;
+    attempt.is_v = kind && strcmp(kind, "V") == 0;
+    attempt.attempt_id = ++s_packed16_tail_page_owned_deferred_proof.next_attempt_id;
+    attempt.record_event_seq = ++s_packed16_tail_page_owned_deferred_proof_event_seq;
+    attempt.record_highwater_update_seq = s_packed16_tail_page_owned_deferred_proof_highwater_update_seq;
+    attempt.record_resolve_count = s_packed16_tail_page_owned_deferred_proof.resolve_count;
+    attempt.record_live_highwater = s_packed16_tail_page_consumer_no_map_nk_max;
+    attempt.record_route_complete_same_map = ggml_cuda_mtp_qblock_tail_page_route_complete_same_map_locked(map);
+    attempt.record_k_ready = s_packed16_tail_page_owned_write_ready.k_ready;
+    attempt.record_v_ready = s_packed16_tail_page_owned_write_ready.v_ready;
+
+    const bool plan_same_map = ggml_cuda_mtp_qblock_tail_page_owned_plan_same_map_locked(map);
+    uint32_t plan_mapped_physical_page = 0;
+    const bool plan_mapped = ggml_cuda_mtp_qblock_tail_page_map_translate(
+            map, logical_base, nullptr, nullptr, &plan_mapped_physical_page, nullptr);
+    const uint32_t page_tokens = map.page_tokens;
+    attempt.record_plan_id = plan_same_map ? s_packed16_tail_page_owned_write_plan.plan_id : 0;
+    attempt.record_plan_event_seq = plan_same_map ? s_packed16_tail_page_owned_write_plan.plan_event_seq : 0;
+    attempt.record_plan_expected_layers = plan_same_map ? s_packed16_tail_page_owned_write_plan.expected_layer_count : 0;
+    attempt.record_plan_expected_pages = plan_same_map ? s_packed16_tail_page_owned_write_plan.expected_page_count : 0;
+    attempt.record_plan_bound_layer_pages = plan_same_map ? s_packed16_tail_page_route_complete.bound_layer_pages.size() : 0;
+    attempt.record_plan_canonical_page_base = page_tokens != 0 ? (logical_base / page_tokens) * page_tokens : 0;
+    attempt.record_plan_page_end = page_tokens != 0 ? attempt.record_plan_canonical_page_base + page_tokens : 0;
+    attempt.record_plan_owned_page_base = page_tokens != 0 ? physical_page * page_tokens : 0;
+    attempt.record_plan_overlay_page_base = attempt.record_plan_owned_page_base;
+    attempt.record_plan_ready = plan_same_map;
+    attempt.record_plan_before_record = attempt.record_plan_event_seq != 0 && attempt.record_plan_event_seq < attempt.record_event_seq;
+    attempt.record_plan_route_complete = plan_same_map && attempt.record_route_complete_same_map;
+    attempt.record_plan_owned_write = plan_same_map && plan_mapped && plan_mapped_physical_page == physical_page &&
+        (map.flags & GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_OWNED_TAIL_WRITE) != 0 &&
+        (map.flags & GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_SCRATCH_OVERLAY) == 0;
+    attempt.record_plan_write_through = attempt.record_plan_owned_write;
+    attempt.record_plan_exclusive_skip = false;
+    if (live_window_proof_requested) {
+        attempt.record_live_window_highwater_event_seq = s_packed16_tail_page_owned_live_window.highwater_event_seq;
+        attempt.record_live_window_highwater_update_seq = s_packed16_tail_page_owned_live_window.highwater_update_seq;
+        attempt.record_live_window_route_complete_event_seq = s_packed16_tail_page_owned_live_window.route_complete_event_seq;
+        attempt.record_live_window_highwater = s_packed16_tail_page_owned_live_window.highwater_nk;
+        attempt.record_live_window_route_complete_same_map =
+            s_packed16_tail_page_owned_live_window.route_complete_event_seq != 0 &&
+            ggml_cuda_mtp_qblock_tail_page_map_valid(s_packed16_tail_page_owned_live_window.route_complete_map) &&
+            ggml_cuda_mtp_qblock_tail_page_map_equal(s_packed16_tail_page_owned_live_window.route_complete_map, map);
+        attempt.record_live_window_after_highwater =
+            attempt.record_live_window_highwater_event_seq != 0 &&
+            attempt.record_event_seq > attempt.record_live_window_highwater_event_seq;
+        attempt.record_live_window_after_route_complete =
+            attempt.record_live_window_route_complete_same_map &&
+            attempt.record_live_window_route_complete_event_seq != 0 &&
+            attempt.record_event_seq > attempt.record_live_window_route_complete_event_seq;
+        const uint64_t req_begin = logical_base;
+        const uint64_t req_end = req_begin + n_tokens;
+        attempt.record_live_window_post_highwater =
+            attempt.record_live_window_highwater != 0 && req_begin >= attempt.record_live_window_highwater;
+        attempt.record_live_window_cross_highwater =
+            attempt.record_live_window_highwater != 0 && req_begin < attempt.record_live_window_highwater &&
+            req_end > attempt.record_live_window_highwater;
+    }
+
+    const uint64_t record_plan_expected_layer_pages =
+        uint64_t(attempt.record_plan_expected_layers) * uint64_t(attempt.record_plan_expected_pages);
+    const uint64_t record_plan_missing_layer_pages =
+        attempt.record_plan_bound_layer_pages >= record_plan_expected_layer_pages ?
+            0 : record_plan_expected_layer_pages - attempt.record_plan_bound_layer_pages;
+    const bool record_plan_bound_before_record = attempt.record_plan_before_record &&
+        record_plan_expected_layer_pages != 0 && record_plan_missing_layer_pages == 0;
+
+    s_packed16_tail_page_owned_deferred_proof.attempts.push_back(attempt);
+    static constexpr size_t MAX_OWNED_DEFERRED_PROOF_ATTEMPTS = 1024;
+    if (s_packed16_tail_page_owned_deferred_proof.attempts.size() > MAX_OWNED_DEFERRED_PROOF_ATTEMPTS) {
+        s_packed16_tail_page_owned_deferred_proof.attempts.erase(s_packed16_tail_page_owned_deferred_proof.attempts.begin());
+        ++s_packed16_tail_page_owned_deferred_proof.dropped_attempts;
+    }
+    if (deferred_proof_requested) {
+        fprintf(stderr,
+                "MTP_QBLOCK_TXN_TAIL_PAGE_OWNED_DEFERRED_PROOF: op=record kind=%s attempt_id=%llu record_seq=%llu attempts=%zu logical_base=%u valid_tail=%u req_end=%llu physical_page=%u record_highwater=%u record_highwater_update_seq=%llu record_resolve_count=%llu record_route_complete=%d record_k_ready=%d record_v_ready=%d table0=%d flags=0x%x generation=%llu\n",
+                attempt.is_k ? "K" : (attempt.is_v ? "V" : "?"),
+                (unsigned long long) attempt.attempt_id,
+                (unsigned long long) attempt.record_event_seq,
+                s_packed16_tail_page_owned_deferred_proof.attempts.size(),
+                logical_base,
+                n_tokens,
+                (unsigned long long) ((uint64_t) logical_base + n_tokens),
+                physical_page,
+                attempt.record_live_highwater,
+                (unsigned long long) attempt.record_highwater_update_seq,
+                (unsigned long long) attempt.record_resolve_count,
+                attempt.record_route_complete_same_map ? 1 : 0,
+                attempt.record_k_ready ? 1 : 0,
+                attempt.record_v_ready ? 1 : 0,
+                map.block_table[0],
+                map.flags,
+                (unsigned long long) map.generation);
+    }
+    if (plan_proof_requested) {
+        fprintf(stderr,
+                "MTP_QBLOCK_TXN_TAIL_PAGE_OWNED_PLAN_PROOF: op=record kind=%s attempt_id=%llu record_seq=%llu attempts=%zu logical_base=%u valid_tail=%u req_end=%llu physical_page=%u record_highwater=%u plan_id=%llu plan_seq=%llu plan_ready=%d plan_before_record=%d plan_expected_layers=%u plan_expected_pages=%u plan_expected_layer_pages=%llu plan_bound_layer_pages=%llu plan_missing_layer_pages=%llu plan_bound_before_record=%d plan_route_complete=%d plan_write_through=%d plan_owned_write=%d plan_exclusive_skip=%d canonical_page_base=%u page_end=%u owned_page_base=%u overlay_page_base=%u table0=%d flags=0x%x generation=%llu\n",
+                attempt.is_k ? "K" : (attempt.is_v ? "V" : "?"),
+                (unsigned long long) attempt.attempt_id,
+                (unsigned long long) attempt.record_event_seq,
+                s_packed16_tail_page_owned_deferred_proof.attempts.size(),
+                logical_base,
+                n_tokens,
+                (unsigned long long) ((uint64_t) logical_base + n_tokens),
+                physical_page,
+                attempt.record_live_highwater,
+                (unsigned long long) attempt.record_plan_id,
+                (unsigned long long) attempt.record_plan_event_seq,
+                attempt.record_plan_ready ? 1 : 0,
+                attempt.record_plan_before_record ? 1 : 0,
+                attempt.record_plan_expected_layers,
+                attempt.record_plan_expected_pages,
+                (unsigned long long) record_plan_expected_layer_pages,
+                (unsigned long long) attempt.record_plan_bound_layer_pages,
+                (unsigned long long) record_plan_missing_layer_pages,
+                record_plan_bound_before_record ? 1 : 0,
+                attempt.record_plan_route_complete ? 1 : 0,
+                attempt.record_plan_write_through ? 1 : 0,
+                attempt.record_plan_owned_write ? 1 : 0,
+                attempt.record_plan_exclusive_skip ? 1 : 0,
+                attempt.record_plan_canonical_page_base,
+                attempt.record_plan_page_end,
+                attempt.record_plan_owned_page_base,
+                attempt.record_plan_overlay_page_base,
+                map.block_table[0],
+                map.flags,
+                (unsigned long long) map.generation);
+    }
+    if (live_window_proof_requested) {
+        fprintf(stderr,
+                "MTP_QBLOCK_TXN_TAIL_PAGE_OWNED_LIVE_WINDOW_PROOF: op=record kind=%s attempt_id=%llu record_seq=%llu attempts=%zu logical_base=%u valid_tail=%u req_end=%llu physical_page=%u highwater=%u highwater_seq=%llu highwater_update_seq=%llu route_complete_seq=%llu after_highwater=%d after_route_complete=%d route_complete_same_map=%d post_highwater=%d cross_highwater=%d plan_owned_write=%d plan_exclusive_skip=%d table0=%d flags=0x%x generation=%llu\n",
+                attempt.is_k ? "K" : (attempt.is_v ? "V" : "?"),
+                (unsigned long long) attempt.attempt_id,
+                (unsigned long long) attempt.record_event_seq,
+                s_packed16_tail_page_owned_deferred_proof.attempts.size(),
+                logical_base,
+                n_tokens,
+                (unsigned long long) ((uint64_t) logical_base + n_tokens),
+                physical_page,
+                attempt.record_live_window_highwater,
+                (unsigned long long) attempt.record_live_window_highwater_event_seq,
+                (unsigned long long) attempt.record_live_window_highwater_update_seq,
+                (unsigned long long) attempt.record_live_window_route_complete_event_seq,
+                attempt.record_live_window_after_highwater ? 1 : 0,
+                attempt.record_live_window_after_route_complete ? 1 : 0,
+                attempt.record_live_window_route_complete_same_map ? 1 : 0,
+                attempt.record_live_window_post_highwater ? 1 : 0,
+                attempt.record_live_window_cross_highwater ? 1 : 0,
+                attempt.record_plan_owned_write ? 1 : 0,
+                attempt.record_plan_exclusive_skip ? 1 : 0,
+                map.block_table[0],
+                map.flags,
+                (unsigned long long) map.generation);
+    }
+}
+
+static void ggml_cuda_mtp_qblock_tail_page_owned_write_ready_reset_locked(const char * reason) {
+    const bool had_state = ggml_cuda_mtp_qblock_tail_page_map_valid(s_packed16_tail_page_owned_write_ready.map) ||
+        s_packed16_tail_page_owned_write_ready.k_ready || s_packed16_tail_page_owned_write_ready.v_ready;
+    if (had_state) {
+        ggml_cuda_mtp_qblock_full_page_map_restore_identity_locked(reason ? reason : "owned_ready_reset");
+    }
+    if (had_state && ggml_cuda_mtp_qblock_owned_tail_write_ready_trace_enabled()) {
+        fprintf(stderr,
+                "MTP_QBLOCK_TXN_TAIL_PAGE_OWNED_READY: op=reset reason=%s k_ready=%d v_ready=%d pair_ready=%d logical_base=%u valid_tail=%u table0=%d generation=%llu\n",
+                reason ? reason : "unknown",
+                s_packed16_tail_page_owned_write_ready.k_ready ? 1 : 0,
+                s_packed16_tail_page_owned_write_ready.v_ready ? 1 : 0,
+                (s_packed16_tail_page_owned_write_ready.k_ready && s_packed16_tail_page_owned_write_ready.v_ready) ? 1 : 0,
+                s_packed16_tail_page_owned_write_ready.map.logical_base_token,
+                s_packed16_tail_page_owned_write_ready.map.valid_tail_tokens,
+                s_packed16_tail_page_owned_write_ready.map.block_table[0],
+                (unsigned long long) s_packed16_tail_page_owned_write_ready.map.generation);
+    }
+    ggml_cuda_mtp_qblock_tail_page_owned_deferred_proof_reset_locked(reason);
+    s_packed16_tail_page_owned_write_ready = {};
+}
+
+static void ggml_cuda_mtp_qblock_tail_page_record_owned_write_ready(
+        const char * kind,
+        bool ready,
+        const ggml_cuda_mtp_qblock_tail_page_map_v1 & map,
+        uint32_t logical_base,
+        uint32_t n_tokens,
+        uint32_t physical_page,
+        const char * reason) {
+    const bool is_k = kind && strcmp(kind, "K") == 0;
+    const bool is_v = kind && strcmp(kind, "V") == 0;
+    uint32_t mapped_logical_page = 0;
+    uint32_t mapped_slot = 0;
+    uint32_t mapped_physical_page = 0;
+    uint64_t mapped_physical_slot = 0;
+    const bool mapped_page_ok = ggml_cuda_mtp_qblock_tail_page_map_translate(
+        map, logical_base, &mapped_logical_page, &mapped_slot, &mapped_physical_page, &mapped_physical_slot);
+    const bool map_ok = ready &&
+        (is_k || is_v) &&
+        ggml_cuda_mtp_qblock_tail_page_map_valid(map) &&
+        (map.flags & GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_OWNED_TAIL_WRITE) != 0 &&
+        (map.flags & GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_SCRATCH_OVERLAY) == 0 &&
+        mapped_page_ok && mapped_physical_page == physical_page &&
+        n_tokens > 0 && logical_base >= map.logical_base_token &&
+        (uint64_t) logical_base + n_tokens <= (uint64_t) map.logical_base_token + map.valid_tail_tokens;
+
+    std::lock_guard<std::mutex> lock(s_packed16_mutex);
+    if (!map_ok) {
+        if (ggml_cuda_mtp_qblock_owned_tail_write_ready_trace_enabled()) {
+            fprintf(stderr,
+                    "MTP_QBLOCK_TXN_TAIL_PAGE_OWNED_READY: op=record kind=%s status=skip reason=%s logical_base=%u valid_tail=%u physical_page=%u map_valid=%d flags=0x%x table0=%d generation=%llu\n",
+                    kind ? kind : "?",
+                    reason ? reason : "not_ready",
+                    logical_base,
+                    n_tokens,
+                    physical_page,
+                    ggml_cuda_mtp_qblock_tail_page_map_valid(map) ? 1 : 0,
+                    map.flags,
+                    map.block_table[0],
+                    (unsigned long long) map.generation);
+        }
+        return;
+    }
+
+    if (ggml_cuda_mtp_qblock_tail_page_map_valid(s_packed16_tail_page_owned_write_ready.map) &&
+            !ggml_cuda_mtp_qblock_tail_page_map_equal(s_packed16_tail_page_owned_write_ready.map, map)) {
+        ggml_cuda_mtp_qblock_tail_page_owned_write_ready_reset_locked("owned_ready_new_map");
+    }
+    if (!ggml_cuda_mtp_qblock_tail_page_map_valid(s_packed16_tail_page_owned_write_ready.map)) {
+        s_packed16_tail_page_owned_write_ready.map = map;
+        s_packed16_tail_page_owned_write_ready.physical_page = physical_page;
+    }
+
+    if (is_k) {
+        s_packed16_tail_page_owned_write_ready.k_ready = true;
+        ++s_packed16_tail_page_owned_write_ready.k_ready_count;
+    } else {
+        s_packed16_tail_page_owned_write_ready.v_ready = true;
+        ++s_packed16_tail_page_owned_write_ready.v_ready_count;
+    }
+    ggml_cuda_mtp_qblock_tail_page_owned_deferred_proof_record_locked(
+            is_k ? "K" : "V", map, logical_base, n_tokens, physical_page);
+    const bool pair_ready = s_packed16_tail_page_owned_write_ready.k_ready &&
+        s_packed16_tail_page_owned_write_ready.v_ready &&
+        s_packed16_tail_page_owned_write_ready.physical_page == physical_page &&
+        ggml_cuda_mtp_qblock_tail_page_map_equal(s_packed16_tail_page_owned_write_ready.map, map);
+    size_t full_overlay_maps = 0;
+    if (pair_ready) {
+        ++s_packed16_tail_page_owned_write_ready.pair_ready_count;
+        full_overlay_maps = ggml_cuda_mtp_qblock_full_page_map_apply_owned_tail_overlay_all_locked(map, "pair_ready");
+    }
+    if (ggml_cuda_mtp_qblock_owned_tail_write_ready_trace_enabled()) {
+        fprintf(stderr,
+                "MTP_QBLOCK_TXN_TAIL_PAGE_OWNED_READY: op=record kind=%s status=ok reason=%s k_ready=%d v_ready=%d pair_ready=%d full_overlay_maps=%zu logical_base=%u valid_tail=%u physical_page=%u flags=0x%x generation=%llu k_ready_count=%llu v_ready_count=%llu pair_ready_count=%llu\n",
+                is_k ? "K" : "V",
+                reason ? reason : "ok",
+                s_packed16_tail_page_owned_write_ready.k_ready ? 1 : 0,
+                s_packed16_tail_page_owned_write_ready.v_ready ? 1 : 0,
+                pair_ready ? 1 : 0,
+                full_overlay_maps,
+                map.logical_base_token,
+                map.valid_tail_tokens,
+                physical_page,
+                map.flags,
+                (unsigned long long) map.generation,
+                (unsigned long long) s_packed16_tail_page_owned_write_ready.k_ready_count,
+                (unsigned long long) s_packed16_tail_page_owned_write_ready.v_ready_count,
+                (unsigned long long) s_packed16_tail_page_owned_write_ready.pair_ready_count);
+    }
+    if (pair_ready && (s_packed16_tail_page_consumer_no_map_nk_max != 0 ||
+            ggml_cuda_mtp_qblock_tail_page_route_complete_same_map_locked(map))) {
+        ggml_cuda_mtp_qblock_tail_page_owned_deferred_proof_resolve_locked("ready_record");
+    }
+}
+
+static bool ggml_cuda_mtp_qblock_tail_page_owned_write_exclusive_allowed(
+        const char * kind,
+        const ggml_cuda_mtp_qblock_tail_page_map_v1 & map,
+        uint32_t logical_base,
+        uint32_t n_tokens,
+        uint32_t physical_page) {
+    const bool is_k = kind && strcmp(kind, "K") == 0;
+    const bool is_v = kind && strcmp(kind, "V") == 0;
+    const bool exclusive_requested = ggml_cuda_mtp_qblock_owned_tail_write_exclusive_requested();
+    const bool trace = ggml_cuda_mtp_qblock_owned_tail_write_exclusive_trace_enabled();
+    if (!exclusive_requested && !trace) {
+        return false;
+    }
+    const char * reason = "ok";
+    bool allowed = false;
+    bool pair_ready = false;
+    bool same_map = false;
+    uint32_t no_map_highwater = 0;
+    bool k_ready = false;
+    bool v_ready = false;
+    bool k_exclusive = false;
+    bool v_exclusive = false;
+    bool route_complete_same_map = false;
+    const bool all_bound_env_requested = ggml_cuda_mtp_qblock_owned_tail_write_exclusive_all_bound_env_requested();
+    const bool all_bound_unsafe_requested = ggml_cuda_mtp_qblock_owned_tail_write_exclusive_all_bound_unsafe_requested();
+    const bool all_bound_exclusive_requested = ggml_cuda_mtp_qblock_owned_tail_write_exclusive_all_bound_requested();
+    bool all_bound_no_miss = false;
+
+    std::lock_guard<std::mutex> lock(s_packed16_mutex);
+    no_map_highwater = s_packed16_tail_page_consumer_no_map_nk_max;
+    k_ready = s_packed16_tail_page_owned_write_ready.k_ready;
+    v_ready = s_packed16_tail_page_owned_write_ready.v_ready;
+    k_exclusive = s_packed16_tail_page_owned_write_ready.k_exclusive;
+    v_exclusive = s_packed16_tail_page_owned_write_ready.v_exclusive;
+    same_map = ggml_cuda_mtp_qblock_tail_page_map_valid(map) &&
+        ggml_cuda_mtp_qblock_tail_page_map_valid(s_packed16_tail_page_owned_write_ready.map) &&
+        ggml_cuda_mtp_qblock_tail_page_map_equal(s_packed16_tail_page_owned_write_ready.map, map) &&
+        s_packed16_tail_page_owned_write_ready.physical_page == physical_page;
+    pair_ready = same_map && k_ready && v_ready;
+    route_complete_same_map = ggml_cuda_mtp_qblock_tail_page_route_complete_same_map_locked(map);
+
+    const uint64_t req_begin = logical_base;
+    const uint64_t req_end = req_begin + n_tokens;
+    const uint64_t map_begin = map.logical_base_token;
+    const uint64_t map_end = map_begin + map.valid_tail_tokens;
+    if (!exclusive_requested) {
+        reason = "exclusive_env_disabled";
+    } else if (!is_k && !is_v) {
+        reason = "bad_kind";
+    } else if (!ggml_cuda_mtp_qblock_tail_page_map_valid(map)) {
+        reason = "bad_map";
+    } else if ((map.flags & GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_OWNED_TAIL_WRITE) == 0 ||
+            (map.flags & GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_SCRATCH_OVERLAY) != 0) {
+        reason = "not_owned_map";
+    } else {
+        uint32_t mapped_logical_page = 0;
+        uint32_t mapped_slot = 0;
+        uint32_t mapped_physical_page = 0;
+        uint64_t mapped_physical_slot = 0;
+        if (!ggml_cuda_mtp_qblock_tail_page_map_translate(
+                map, logical_base, &mapped_logical_page, &mapped_slot, &mapped_physical_page, &mapped_physical_slot) ||
+                mapped_physical_page != physical_page) {
+            reason = "physical_page_mismatch";
+        } else if (n_tokens == 0 || req_end <= req_begin || req_begin < map_begin || req_end > map_end) {
+            reason = "range_not_covered";
+        } else if (!same_map) {
+            reason = "ready_map_mismatch";
+        } else if (!pair_ready) {
+            reason = "kv_pair_not_ready";
+        } else if (!route_complete_same_map) {
+            reason = "route_incomplete";
+        } else {
+            all_bound_no_miss = all_bound_exclusive_requested && no_map_highwater == 0;
+            if (all_bound_env_requested && !all_bound_unsafe_requested && no_map_highwater == 0) {
+                reason = "all_bound_unsafe_gate_disabled";
+            } else if (!all_bound_no_miss && no_map_highwater == 0) {
+                reason = "no_route_highwater";
+            } else if (!all_bound_no_miss && logical_base < no_map_highwater) {
+                reason = "before_route_highwater";
+            } else if (is_v && !s_packed16_tail_page_owned_write_ready.k_exclusive) {
+                reason = "k_exclusive_not_seen";
+            } else {
+                allowed = true;
+                reason = all_bound_no_miss ? "all_bound_no_miss" : "route_highwater";
+                if (is_k) {
+                    s_packed16_tail_page_owned_write_ready.k_exclusive = true;
+                    ++s_packed16_tail_page_owned_write_ready.k_exclusive_count;
+                    k_exclusive = true;
+                } else {
+                    s_packed16_tail_page_owned_write_ready.v_exclusive = true;
+                    ++s_packed16_tail_page_owned_write_ready.v_exclusive_count;
+                    v_exclusive = true;
+                }
+            }
+        }
+    }
+
+    if (trace) {
+        fprintf(stderr,
+                "MTP_QBLOCK_TXN_TAIL_PAGE_OWNED_EXCLUSIVE: kind=%s status=%s reason=%s logical_base=%u valid_tail=%u physical_page=%u no_map_highwater=%u all_bound_mode=%d all_bound_env=%d all_bound_unsafe=%d all_bound_no_miss=%d k_ready=%d v_ready=%d pair_ready=%d route_complete=%d k_exclusive=%d v_exclusive=%d flags=0x%x generation=%llu k_exclusive_count=%llu v_exclusive_count=%llu\n",
+                is_k ? "K" : (is_v ? "V" : "?"),
+                allowed ? "ok" : "skip",
+                reason,
+                logical_base,
+                n_tokens,
+                physical_page,
+                no_map_highwater,
+                all_bound_exclusive_requested ? 1 : 0,
+                all_bound_env_requested ? 1 : 0,
+                all_bound_unsafe_requested ? 1 : 0,
+                all_bound_no_miss ? 1 : 0,
+                k_ready ? 1 : 0,
+                v_ready ? 1 : 0,
+                pair_ready ? 1 : 0,
+                route_complete_same_map ? 1 : 0,
+                (s_packed16_tail_page_owned_write_ready.k_exclusive || k_exclusive) ? 1 : 0,
+                (s_packed16_tail_page_owned_write_ready.v_exclusive || v_exclusive) ? 1 : 0,
+                map.flags,
+                (unsigned long long) map.generation,
+                (unsigned long long) s_packed16_tail_page_owned_write_ready.k_exclusive_count,
+                (unsigned long long) s_packed16_tail_page_owned_write_ready.v_exclusive_count);
+    }
+    return allowed;
+}
+
 static bool ggml_cuda_mtp_qblock_tail_page_entry_accepts(
         const packed16_registry_entry & entry,
         const ggml_cuda_mtp_qblock_tail_page_map_v1 & map) {
+    const uint64_t required_tokens = uint64_t(map.physical_pages) * uint64_t(map.page_tokens);
     return ggml_cuda_mtp_qblock_tail_page_map_valid(map) &&
         entry.payload && entry.scales &&
         entry.meta.k_format == GGML_CUDA_PDMQ_K_FORMAT_PACKED16_Q8_272 &&
         entry.meta.d == GGML_CUDA_PACKED16_K_TILE_D &&
-        entry.meta.kv_capacity >= map.physical_pages * map.page_tokens;
+        uint64_t(entry.meta.kv_capacity) >= required_tokens;
 }
 
 static bool ggml_cuda_mtp_qblock_tail_page_dispatch_trace_enabled() {
-    return ggml_cuda_mtp_qblock_tail_page_registry_trace_enabled() ||
-        (getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_DISPATCH_TRACE") && atoi(getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_DISPATCH_TRACE")) != 0) ||
-        (getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_CONSUMER_TRACE") && atoi(getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_CONSUMER_TRACE")) != 0) ||
-        (getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_PROOF") && atoi(getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_PROOF")) != 0);
+    if (ggml_cuda_mtp_qblock_tail_page_registry_trace_enabled()) {
+        return true;
+    }
+    static const bool enabled = []() {
+        const char * dispatch = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_DISPATCH_TRACE");
+        const char * consumer = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_CONSUMER_TRACE");
+        const char * proof = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_PROOF");
+        return (dispatch && atoi(dispatch) != 0) ||
+            (consumer && atoi(consumer) != 0) ||
+            (proof && atoi(proof) != 0);
+    }();
+    return enabled;
 }
 
 static bool ggml_cuda_mtp_qblock_tail_page_map_physical_page_for_token(
@@ -507,10 +2548,20 @@ void llama_kv_cache_register_mtp_qblock_tail_page_map(const void * k_view_data, 
         entry.meta.d == GGML_CUDA_PACKED16_K_TILE_D &&
         entry.meta.kv_capacity >= (map ? map->physical_pages * map->page_tokens : 0u);
     const char * producer_map_env = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_PRODUCER_MAP");
-    const bool publish_global = producer_map_env && *producer_map_env && atoi(producer_map_env) != 0;
+    const char * paged_attention_env = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION");
+    const bool publish_global = (producer_map_env && *producer_map_env && atoi(producer_map_env) != 0) ||
+        (paged_attention_env && *paged_attention_env && atoi(paged_attention_env) != 0);
     const bool map_valid = map && ggml_cuda_mtp_qblock_tail_page_map_valid(*map);
     if (map && sidecar_ok && map_valid) {
         if (publish_global) {
+            if (ggml_cuda_mtp_qblock_tail_page_map_valid(s_packed16_tail_page_owned_write_ready.map) &&
+                    !ggml_cuda_mtp_qblock_tail_page_map_equal(s_packed16_tail_page_owned_write_ready.map, *map)) {
+                ggml_cuda_mtp_qblock_tail_page_owned_write_ready_reset_locked("register_new_map");
+            }
+            if (ggml_cuda_mtp_qblock_tail_page_map_valid(s_packed16_tail_page_route_complete.map) &&
+                    !ggml_cuda_mtp_qblock_tail_page_map_equal(s_packed16_tail_page_route_complete.map, *map)) {
+                ggml_cuda_mtp_qblock_tail_page_route_complete_reset_locked("register_new_map");
+            }
             s_packed16_tail_page_published_map = *map;
             for (auto & kv : s_packed16_registry) {
                 packed16_registry_entry & candidate = kv.second;
@@ -522,6 +2573,8 @@ void llama_kv_cache_register_mtp_qblock_tail_page_map(const void * k_view_data, 
             entry.tail_page_map = *map;
         }
     } else if (publish_global) {
+        ggml_cuda_mtp_qblock_tail_page_owned_write_ready_reset_locked("register_invalid_global");
+        ggml_cuda_mtp_qblock_tail_page_route_complete_reset_locked("register_invalid_global");
         s_packed16_tail_page_published_map = {};
         for (auto & kv : s_packed16_registry) {
             kv.second.tail_page_map = {};
@@ -529,6 +2582,8 @@ void llama_kv_cache_register_mtp_qblock_tail_page_map(const void * k_view_data, 
     } else {
         const ggml_tensor * payload = entry.payload;
         const ggml_tensor * scales = entry.scales;
+        ggml_cuda_mtp_qblock_tail_page_owned_write_ready_reset_locked("register_local_clear");
+        ggml_cuda_mtp_qblock_tail_page_route_complete_reset_locked("register_local_clear");
         entry.tail_page_map = {};
         if (payload && scales) {
             for (auto & kv : s_packed16_registry) {
@@ -571,6 +2626,8 @@ void llama_kv_cache_clear_mtp_qblock_tail_page_map(const void * k_view_data) {
                     (unsigned long long) s_packed16_tail_page_dispatch_bind_count,
                     s_packed16_registry.size());
         }
+        ggml_cuda_mtp_qblock_tail_page_owned_write_ready_reset_locked("clear_tail_page_map");
+        ggml_cuda_mtp_qblock_tail_page_route_complete_reset_locked("clear_tail_page_map");
         s_packed16_tail_page_published_map = {};
         s_packed16_tail_page_dispatch_bind_map = {};
         s_packed16_tail_page_dispatch_bind_count = 0;
@@ -593,6 +2650,34 @@ void llama_kv_cache_get_mtp_qblock_tail_page_map(const void * k_view_data, ggml_
         *map = it->second.tail_page_map;
         return;
     }
+    if (found && ggml_cuda_mtp_qblock_tail_page_producer_snapshot_owned_proof_requested()) {
+        if (ggml_cuda_mtp_qblock_tail_page_entry_accepts(it->second, s_packed16_tail_page_published_map)) {
+            *map = s_packed16_tail_page_published_map;
+            if (ggml_cuda_mtp_qblock_tail_page_registry_trace_enabled()) {
+                fprintf(stderr,
+                        "MTP_QBLOCK_TXN_TAIL_PAGE_REGISTRY: op=get_global_fallback key=%p logical_base=%u valid_tail=%u flags=0x%x table0=%d\n",
+                        k_view_data,
+                        map->logical_base_token,
+                        map->valid_tail_tokens,
+                        map->flags,
+                        map->block_table[0]);
+            }
+            return;
+        }
+        if (ggml_cuda_mtp_qblock_tail_page_entry_accepts(it->second, s_packed16_tail_page_producer_snapshot_map)) {
+            *map = s_packed16_tail_page_producer_snapshot_map;
+            if (ggml_cuda_mtp_qblock_tail_page_registry_trace_enabled()) {
+                fprintf(stderr,
+                        "MTP_QBLOCK_TXN_TAIL_PAGE_REGISTRY: op=get_producer_snapshot_fallback key=%p logical_base=%u valid_tail=%u flags=0x%x table0=%d\n",
+                        k_view_data,
+                        map->logical_base_token,
+                        map->valid_tail_tokens,
+                        map->flags,
+                        map->block_table[0]);
+            }
+            return;
+        }
+    }
     if (ggml_cuda_mtp_qblock_tail_page_registry_trace_enabled()) {
         const bool global_active = ggml_cuda_mtp_qblock_tail_page_map_valid(s_packed16_tail_page_published_map);
         const bool global_accepted = found && ggml_cuda_mtp_qblock_tail_page_entry_accepts(it->second, s_packed16_tail_page_published_map);
@@ -607,6 +2692,139 @@ void llama_kv_cache_get_mtp_qblock_tail_page_map(const void * k_view_data, ggml_
                 found ? (unsigned) it->second.meta.d : 0u,
                 found ? (unsigned) it->second.meta.kv_capacity : 0u,
                 (unsigned) s_packed16_tail_page_consumer_no_map_nk_max);
+    }
+}
+
+void llama_kv_cache_register_mtp_qblock_full_page_map_host(
+        const void * k_view_data,
+        const ggml_cuda_mtp_qblock_full_page_map_v1 * map,
+        const int32_t * host_block_table) {
+    if (!k_view_data) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(s_packed16_mutex);
+    auto it = s_packed16_registry.find(k_view_data);
+    if (it == s_packed16_registry.end()) {
+        return;
+    }
+    packed16_registry_entry & entry = it->second;
+    auto clear_entry = [&]() {
+        entry.full_page_map = {};
+        entry.full_page_map_base = {};
+        entry.full_page_table_host.clear();
+    };
+    const bool map_basic_ok = map && map->active &&
+        map->version == GGML_CUDA_MTP_QBLOCK_FULL_PAGE_MAP_VERSION &&
+        map->abi_bytes == sizeof(ggml_cuda_mtp_qblock_full_page_map_v1) &&
+        map->logical_base_token == 0 && map->valid_tokens != 0 &&
+        map->page_tokens == GGML_CUDA_PACKED16_K_PAGE16_TOKENS &&
+        map->physical_pages != 0 && map->block_table_pages != 0 &&
+        host_block_table != nullptr;
+    const bool sidecar_ok = entry.payload && entry.scales &&
+        entry.meta.k_format == GGML_CUDA_PDMQ_K_FORMAT_PACKED16_Q8_272 &&
+        entry.meta.d == GGML_CUDA_PACKED16_K_TILE_D &&
+        map_basic_ok && entry.meta.kv_capacity >= map->physical_pages * map->page_tokens &&
+        map->non_identity_page_begin <= map->non_identity_page_end && map->non_identity_page_end <= map->block_table_pages;
+    if (!map_basic_ok || !sidecar_ok) {
+        clear_entry();
+        return;
+    }
+    const uint32_t required_pages = (map->valid_tokens + map->page_tokens - 1u) / map->page_tokens;
+    if (required_pages == 0 || required_pages > map->block_table_pages || map->block_table_pages > map->physical_pages) {
+        clear_entry();
+        return;
+    }
+    for (uint32_t i = 0; i < required_pages; ++i) {
+        if (host_block_table[i] < 0 || uint32_t(host_block_table[i]) >= map->physical_pages) {
+            clear_entry();
+            return;
+        }
+    }
+    if (entry.full_page_table_capacity < map->block_table_pages) {
+        if (entry.full_page_table_device != nullptr) {
+            CUDA_CHECK(hipFree(entry.full_page_table_device));
+            entry.full_page_table_device = nullptr;
+            entry.full_page_table_capacity = 0;
+        }
+        CUDA_CHECK(hipMalloc((void **) &entry.full_page_table_device, size_t(map->block_table_pages) * sizeof(int32_t)));
+        entry.full_page_table_capacity = map->block_table_pages;
+    }
+    CUDA_CHECK(hipMemcpy(entry.full_page_table_device, host_block_table,
+        size_t(map->block_table_pages) * sizeof(int32_t), hipMemcpyHostToDevice));
+    entry.full_page_table_host.assign(host_block_table, host_block_table + map->block_table_pages);
+    entry.full_page_map_base = *map;
+    entry.full_page_map_base.block_table = entry.full_page_table_device;
+    entry.full_page_map = entry.full_page_map_base;
+    for (uint32_t i = 0; i < 4; ++i) {
+        entry.full_page_map_base.debug_first_pages[i] = i < map->block_table_pages ? host_block_table[i] : -1;
+        entry.full_page_map.debug_first_pages[i] = entry.full_page_map_base.debug_first_pages[i];
+    }
+    if (s_packed16_tail_page_owned_write_ready.k_ready && s_packed16_tail_page_owned_write_ready.v_ready &&
+            ggml_cuda_mtp_qblock_tail_page_map_valid(s_packed16_tail_page_owned_write_ready.map)) {
+        (void) ggml_cuda_mtp_qblock_full_page_map_apply_owned_tail_overlay_locked(
+            entry, s_packed16_tail_page_owned_write_ready.map, "register_after_pair_ready");
+    }
+    ggml_cuda_mtp_qblock_full_page_map_refresh_published_locked();
+    if (ggml_cuda_mtp_qblock_tail_page_registry_trace_enabled()) {
+        fprintf(stderr,
+                "MTP_QBLOCK_FULL_PAGE_MAP_REGISTRY: op=register key=%p pages=%u valid_tokens=%u physical_pages=%u table_ptr=%p first_pages=[%d,%d,%d,%d] generation=%llu\n",
+                k_view_data,
+                entry.full_page_map.block_table_pages,
+                entry.full_page_map.valid_tokens,
+                entry.full_page_map.physical_pages,
+                (const void *) entry.full_page_map.block_table,
+                entry.full_page_map.debug_first_pages[0],
+                entry.full_page_map.debug_first_pages[1],
+                entry.full_page_map.debug_first_pages[2],
+                entry.full_page_map.debug_first_pages[3],
+                (unsigned long long) entry.full_page_map.generation);
+    }
+}
+
+void llama_kv_cache_clear_mtp_qblock_full_page_map(const void * k_view_data) {
+    if (!k_view_data) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(s_packed16_mutex);
+    auto it = s_packed16_registry.find(k_view_data);
+    if (it != s_packed16_registry.end()) {
+        it->second.full_page_map = {};
+        it->second.full_page_map_base = {};
+        it->second.full_page_table_host.clear();
+        ggml_cuda_mtp_qblock_full_page_map_refresh_published_locked();
+    }
+}
+
+void llama_kv_cache_get_mtp_qblock_full_page_map(const void * k_view_data, ggml_cuda_mtp_qblock_full_page_map_v1 * map) {
+    if (!map) {
+        return;
+    }
+    *map = {};
+    std::lock_guard<std::mutex> lock(s_packed16_mutex);
+    auto it = s_packed16_registry.find(k_view_data);
+    if (it != s_packed16_registry.end() && ggml_cuda_mtp_qblock_full_page_map_valid(it->second.full_page_map)) {
+        *map = it->second.full_page_map;
+        return;
+    }
+    if (ggml_cuda_mtp_qblock_full_page_map_valid(s_packed16_full_page_published_map)) {
+        *map = s_packed16_full_page_published_map;
+        if (ggml_cuda_mtp_qblock_tail_page_registry_trace_enabled()) {
+            fprintf(stderr,
+                    "MTP_QBLOCK_FULL_PAGE_MAP_REGISTRY: op=get_published_fallback key=%p found=%d valid_tokens=%u pages=%u table_ptr=%p flags=0x%x\n",
+                    k_view_data,
+                    it != s_packed16_registry.end() ? 1 : 0,
+                    map->valid_tokens,
+                    map->block_table_pages,
+                    (const void *) map->block_table,
+                    map->flags);
+        }
+    } else if (ggml_cuda_mtp_qblock_tail_page_registry_trace_enabled()) {
+        fprintf(stderr,
+                "MTP_QBLOCK_FULL_PAGE_MAP_REGISTRY: op=get_miss key=%p found=%d published=%d registry_size=%zu\n",
+                k_view_data,
+                it != s_packed16_registry.end() ? 1 : 0,
+                ggml_cuda_mtp_qblock_full_page_map_valid(s_packed16_full_page_published_map) ? 1 : 0,
+                s_packed16_registry.size());
     }
 }
 
@@ -678,6 +2896,8 @@ void llama_kv_cache_record_mtp_qblock_tail_page_dispatch_bind(
                 nk,
                 s_packed16_tail_page_dispatch_bind_count,
                 trace);
+        ggml_cuda_mtp_qblock_tail_page_route_complete_record_bind_locked(*map, layer, nk, node_name);
+        ggml_cuda_mtp_qblock_tail_page_owned_deferred_proof_resolve_locked("dispatch_bind");
     }
     if (trace) {
         fprintf(stderr,
@@ -733,6 +2953,44 @@ void llama_kv_cache_record_mtp_qblock_tail_page_consumer_miss(uint32_t nk, const
     }
     const uint32_t old_nk_max = s_packed16_tail_page_consumer_no_map_nk_max;
     s_packed16_tail_page_consumer_no_map_nk_max = nk;
+    const bool any_proof_requested = ggml_cuda_mtp_qblock_owned_tail_write_any_proof_requested();
+    const bool deferred_proof_requested = ggml_cuda_mtp_qblock_owned_tail_write_deferred_proof_requested();
+    const bool live_window_proof_requested = ggml_cuda_mtp_qblock_owned_tail_write_live_window_proof_requested();
+    uint64_t event_seq = 0;
+    uint64_t highwater_update_seq = s_packed16_tail_page_owned_deferred_proof_highwater_update_seq;
+    if (any_proof_requested) {
+        event_seq = ++s_packed16_tail_page_owned_deferred_proof_event_seq;
+        highwater_update_seq = ++s_packed16_tail_page_owned_deferred_proof_highwater_update_seq;
+    }
+    if (live_window_proof_requested) {
+        s_packed16_tail_page_owned_live_window.highwater_event_seq = event_seq;
+        s_packed16_tail_page_owned_live_window.highwater_update_seq = highwater_update_seq;
+        s_packed16_tail_page_owned_live_window.highwater_nk = nk;
+        s_packed16_tail_page_owned_live_window.highwater_generation = s_packed16_generation;
+        fprintf(stderr,
+                "MTP_QBLOCK_TXN_TAIL_PAGE_OWNED_LIVE_WINDOW_PROOF: op=highwater event_seq=%llu highwater_update_seq=%llu old_nk_max=%u new_nk_max=%u reason=%s pending_attempts=%zu route_complete_seq=%llu route_complete_highwater=%u generation=%llu\n",
+                (unsigned long long) event_seq,
+                (unsigned long long) highwater_update_seq,
+                old_nk_max,
+                nk,
+                reason,
+                s_packed16_tail_page_owned_deferred_proof.attempts.size(),
+                (unsigned long long) s_packed16_tail_page_owned_live_window.route_complete_event_seq,
+                s_packed16_tail_page_owned_live_window.route_complete_highwater,
+                (unsigned long long) s_packed16_generation);
+    }
+    if (deferred_proof_requested) {
+        fprintf(stderr,
+                "MTP_QBLOCK_TXN_TAIL_PAGE_OWNED_DEFERRED_PROOF: op=highwater_update event_seq=%llu highwater_update_seq=%llu old_nk_max=%u new_nk_max=%u reason=%s pending_attempts=%zu generation=%llu\n",
+                (unsigned long long) event_seq,
+                (unsigned long long) highwater_update_seq,
+                old_nk_max,
+                nk,
+                reason,
+                s_packed16_tail_page_owned_deferred_proof.attempts.size(),
+                (unsigned long long) s_packed16_generation);
+    }
+    ggml_cuda_mtp_qblock_tail_page_owned_deferred_proof_resolve_locked("consumer_highwater");
     if (ggml_cuda_mtp_qblock_tail_page_registry_trace_enabled()) {
         fprintf(stderr,
                 "MTP_QBLOCK_TXN_TAIL_PAGE_REGISTRY: op=consumer_no_map_highwater old_nk_max=%u new_nk_max=%u reason=%s\n",
@@ -758,6 +3016,11 @@ void llama_kv_cache_reset_mtp_qblock_tail_page_lifecycle_preserve_snapshot(bool 
     const uint64_t old_dispatch_bind_count = s_packed16_tail_page_dispatch_bind_count;
     const bool global_scratch = had_global_map &&
         (s_packed16_tail_page_published_map.flags & GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_SCRATCH_OVERLAY) != 0;
+    const bool global_owned = had_global_map &&
+        (s_packed16_tail_page_published_map.flags & GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_OWNED_TAIL_WRITE) != 0 &&
+        (s_packed16_tail_page_published_map.flags & GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_SCRATCH_OVERLAY) == 0;
+    const bool preserve_owned_snapshot = global_owned &&
+        ggml_cuda_mtp_qblock_tail_page_producer_snapshot_owned_proof_requested();
     const uint32_t old_no_map_nk_max = s_packed16_tail_page_consumer_no_map_nk_max;
     size_t active_entries = 0;
     for (const auto & kv : s_packed16_registry) {
@@ -767,13 +3030,51 @@ void llama_kv_cache_reset_mtp_qblock_tail_page_lifecycle_preserve_snapshot(bool 
     }
 
     bool snapshot_saved = false;
-    if (data_invalidates && keep_producer_snapshot && global_scratch) {
+    if (data_invalidates && keep_producer_snapshot && (global_scratch || preserve_owned_snapshot)) {
         s_packed16_tail_page_producer_snapshot_map = s_packed16_tail_page_published_map;
         snapshot_saved = true;
     } else if (data_invalidates && !keep_producer_snapshot) {
         s_packed16_tail_page_producer_snapshot_map = {};
     }
 
+    if (ggml_cuda_mtp_qblock_owned_tail_write_live_window_proof_requested()) {
+        ++s_packed16_tail_page_owned_live_window.reset_count;
+        const bool same_map = ggml_cuda_mtp_qblock_tail_page_map_valid(s_packed16_tail_page_owned_write_ready.map) &&
+            ggml_cuda_mtp_qblock_tail_page_map_valid(s_packed16_tail_page_route_complete.map) &&
+            ggml_cuda_mtp_qblock_tail_page_map_equal(s_packed16_tail_page_owned_write_ready.map, s_packed16_tail_page_route_complete.map);
+        const bool pair_ready = same_map && s_packed16_tail_page_owned_write_ready.k_ready && s_packed16_tail_page_owned_write_ready.v_ready;
+        const bool route_complete = ggml_cuda_mtp_qblock_tail_page_route_complete_now_locked();
+        fprintf(stderr,
+                "MTP_QBLOCK_TXN_TAIL_PAGE_OWNED_LIVE_WINDOW_PROOF: op=lifecycle_reset data_invalidates=%d keep_snapshot=%d preserve_owned_snapshot=%d snapshot_saved=%d attempts=%zu pair_ready=%d route_complete=%d old_highwater=%u highwater_seq=%llu highwater_update_seq=%llu route_complete_seq=%llu route_complete_highwater=%u expected_layers=%u expected_pages=%u bound_layer_pages=%zu logical_base=%u valid_tail=%u table0=%d flags=0x%x generation=%llu reset_count=%llu\n",
+                data_invalidates ? 1 : 0,
+                keep_producer_snapshot ? 1 : 0,
+                preserve_owned_snapshot ? 1 : 0,
+                snapshot_saved ? 1 : 0,
+                s_packed16_tail_page_owned_deferred_proof.attempts.size(),
+                pair_ready ? 1 : 0,
+                route_complete ? 1 : 0,
+                old_no_map_nk_max,
+                (unsigned long long) s_packed16_tail_page_owned_live_window.highwater_event_seq,
+                (unsigned long long) s_packed16_tail_page_owned_live_window.highwater_update_seq,
+                (unsigned long long) s_packed16_tail_page_owned_live_window.route_complete_event_seq,
+                s_packed16_tail_page_owned_live_window.route_complete_highwater,
+                s_packed16_tail_page_route_complete.expected_layer_count,
+                s_packed16_tail_page_route_complete.expected_page_count,
+                s_packed16_tail_page_route_complete.bound_layer_pages.size(),
+                s_packed16_tail_page_route_complete.map.logical_base_token,
+                s_packed16_tail_page_route_complete.map.valid_tail_tokens,
+                s_packed16_tail_page_route_complete.map.block_table[0],
+                s_packed16_tail_page_route_complete.map.flags,
+                (unsigned long long) s_packed16_generation,
+                (unsigned long long) s_packed16_tail_page_owned_live_window.reset_count);
+    }
+
+    // Proof-only: resolve once while live ready/route/highwater state is still intact.
+    // This distinguishes current-boundary ordering from historical retired-highwater evidence.
+    ggml_cuda_mtp_qblock_tail_page_owned_deferred_proof_resolve_locked("pre_lifecycle_reset_current_highwater");
+
+    ggml_cuda_mtp_qblock_tail_page_owned_write_ready_reset_locked("lifecycle_reset");
+    ggml_cuda_mtp_qblock_tail_page_route_complete_reset_locked("lifecycle_reset");
     s_packed16_tail_page_published_map = {};
     s_packed16_tail_page_dispatch_bind_map = {};
     s_packed16_tail_page_dispatch_bind_count = 0;
@@ -782,7 +3083,33 @@ void llama_kv_cache_reset_mtp_qblock_tail_page_lifecycle_preserve_snapshot(bool 
         kv.second.tail_page_map = {};
     }
     if (data_invalidates) {
+        s_packed16_full_page_published_map = {};
+        for (auto & kv : s_packed16_registry) {
+            kv.second.full_page_map = {};
+            kv.second.full_page_map_base = {};
+            kv.second.full_page_table_host.clear();
+        }
         s_packed16_tail_page_consumer_no_map_nk_max = 0;
+        if (old_no_map_nk_max != 0) {
+            s_packed16_tail_page_retired_highwater.valid = true;
+            s_packed16_tail_page_retired_highwater.nk = old_no_map_nk_max;
+            s_packed16_tail_page_retired_highwater.generation = s_packed16_generation;
+            ++s_packed16_tail_page_retired_highwater.reset_count;
+        }
+        if (old_no_map_nk_max != 0 && ggml_cuda_mtp_qblock_owned_tail_write_deferred_proof_requested()) {
+            fprintf(stderr,
+                    "MTP_QBLOCK_TXN_TAIL_PAGE_OWNED_DEFERRED_PROOF: op=highwater_reset reason=lifecycle_reset data_invalidates=1 old_nk_max=%u new_nk_max=0 retired_valid=%d retired_highwater=%u retired_generation=%llu retired_reset_count=%llu generation=%llu\n",
+                    old_no_map_nk_max,
+                    s_packed16_tail_page_retired_highwater.valid ? 1 : 0,
+                    s_packed16_tail_page_retired_highwater.nk,
+                    (unsigned long long) s_packed16_tail_page_retired_highwater.generation,
+                    (unsigned long long) s_packed16_tail_page_retired_highwater.reset_count,
+                    (unsigned long long) s_packed16_generation);
+        }
+        s_packed16_tail_page_owned_live_window.highwater_event_seq = 0;
+        s_packed16_tail_page_owned_live_window.highwater_update_seq = 0;
+        s_packed16_tail_page_owned_live_window.highwater_nk = 0;
+        s_packed16_tail_page_owned_live_window.highwater_generation = 0;
     }
     ++s_packed16_generation;
 
@@ -816,6 +3143,41 @@ bool llama_kv_cache_mtp_qblock_tail_page_published_scratch_map_covers(uint32_t l
     const uint64_t map_begin = map.logical_base_token;
     const uint64_t map_end = map_begin + map.valid_tail_tokens;
     return req_begin >= map_begin && req_end <= map_end;
+}
+
+bool llama_kv_cache_mtp_qblock_tail_page_published_owned_map_covers(uint32_t logical_base, uint32_t n_tokens, uint32_t * physical_page, ggml_cuda_mtp_qblock_tail_page_map_v1 * out_map) {
+    if (physical_page != nullptr) {
+        *physical_page = 0;
+    }
+    if (out_map != nullptr) {
+        *out_map = {};
+    }
+    std::lock_guard<std::mutex> lock(s_packed16_mutex);
+    const ggml_cuda_mtp_qblock_tail_page_map_v1 & map = s_packed16_tail_page_published_map;
+    if (!ggml_cuda_mtp_qblock_tail_page_map_valid(map) ||
+            (map.flags & GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_OWNED_TAIL_WRITE) == 0 ||
+            (map.flags & GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_SCRATCH_OVERLAY) != 0 ||
+            n_tokens == 0 || map.page_tokens == 0 || map.block_table_pages == 0) {
+        return false;
+    }
+    const uint64_t req_begin = logical_base;
+    const uint64_t req_end = req_begin + n_tokens;
+    const uint64_t map_begin = map.logical_base_token;
+    const uint64_t map_end = map_begin + map.valid_tail_tokens;
+    if (req_end <= req_begin || req_begin < map_begin || req_end > map_end) {
+        return false;
+    }
+    const uint64_t rel_page = (req_begin - map_begin) / map.page_tokens;
+    if (rel_page >= map.block_table_pages || rel_page >= GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES || map.block_table[rel_page] < 0) {
+        return false;
+    }
+    if (physical_page != nullptr) {
+        *physical_page = (uint32_t) map.block_table[rel_page];
+    }
+    if (out_map != nullptr) {
+        *out_map = map;
+    }
+    return true;
 }
 
 void llama_kv_cache_register_v4_k16d16(const void * v_view_data, ggml_tensor * v_cache, ggml_tensor * v_tail) {
@@ -890,20 +3252,173 @@ static inline int ggml_cuda_q8k_dot4_kq_env_int(const char * name, int fallback)
     return env ? atoi(env) : fallback;
 }
 
+static inline bool ggml_cuda_q8k_dot4_decode_stage_auto_enabled() {
+    return ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_STAGE_AUTO");
+}
+
+static inline int ggml_cuda_q8k_dot4_decode_stage_threshold(const int fallback) {
+    if (!ggml_cuda_q8k_dot4_decode_stage_auto_enabled()) {
+        return fallback;
+    }
+    const int configured = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_STAGE_AUTO_MIN_NK", 4096);
+    return configured > 0 ? configured : fallback;
+}
+
+static inline int ggml_cuda_q8k_dot4_decode_stage_split_size(const int nk, const int fallback) {
+    const char * explicit_size = getenv("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_SPLITK_SIZE");
+    if (explicit_size && *explicit_size) {
+        const int requested = atoi(explicit_size);
+        return requested > 0 ? requested : fallback;
+    }
+    if (!ggml_cuda_q8k_dot4_decode_stage_auto_enabled()) {
+        return fallback;
+    }
+
+    // Default-off long-context decode policy.  Keep existing kernels and merge
+    // ABI; only coarsen K shards as nk grows so generated-token decode stops
+    // launching dozens of 512-token shards at 32K+ contexts by default.
+    if (nk >= 32768) {
+        const int requested = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_STAGE_AUTO_SPLIT_SIZE_NK32768", 2048);
+        return requested > 0 ? requested : fallback;
+    }
+    if (nk >= 16384) {
+        const int requested = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_STAGE_AUTO_SPLIT_SIZE_NK16384", 2048);
+        return requested > 0 ? requested : fallback;
+    }
+    if (nk >= 8192) {
+        const int requested = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_STAGE_AUTO_SPLIT_SIZE_NK8192", 1024);
+        return requested > 0 ? requested : fallback;
+    }
+    if (nk >= 4096) {
+        const int requested = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_STAGE_AUTO_SPLIT_SIZE_NK4096", 1024);
+        return requested > 0 ? requested : fallback;
+    }
+    return fallback;
+}
+
+struct ggml_cuda_packed16_timing_trace_event {
+    bool active = false;
+    hipEvent_t start = nullptr;
+    hipEvent_t stop = nullptr;
+};
+
+static inline bool ggml_cuda_packed16_timing_trace_enabled() {
+    const char * env = getenv("GGML_CUDA_ROCM_PACKED16_TIMING_TRACE");
+    return env && *env && atoi(env) != 0;
+}
+
+static inline void ggml_cuda_packed16_timing_trace_begin(
+        ggml_cuda_packed16_timing_trace_event & ev,
+        cudaStream_t stream,
+        const char * phase) {
+    ev = {};
+    if (!ggml_cuda_packed16_timing_trace_enabled()) {
+        return;
+    }
+    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+    if (hipStreamIsCapturing(stream, &capture_status) == hipSuccess && capture_status != hipStreamCaptureStatusNone) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "PACKED16_TIMING_TRACE skipped during graph capture phase=%s\n", phase ? phase : "-");
+        }
+        return;
+    }
+    CUDA_CHECK(hipEventCreate(&ev.start));
+    CUDA_CHECK(hipEventCreate(&ev.stop));
+    CUDA_CHECK(hipEventRecord(ev.start, stream));
+    ev.active = true;
+}
+
+static inline float ggml_cuda_packed16_timing_trace_end(
+        ggml_cuda_packed16_timing_trace_event & ev,
+        cudaStream_t stream) {
+    if (!ev.active) {
+        return -1.0f;
+    }
+    CUDA_CHECK(hipEventRecord(ev.stop, stream));
+    CUDA_CHECK(hipEventSynchronize(ev.stop));
+    float elapsed_ms = 0.0f;
+    CUDA_CHECK(hipEventElapsedTime(&elapsed_ms, ev.start, ev.stop));
+    CUDA_CHECK(hipEventDestroy(ev.start));
+    CUDA_CHECK(hipEventDestroy(ev.stop));
+    ev = {};
+    return elapsed_ms;
+}
+
+static inline bool ggml_cuda_mtp_qblock_paged_attention_requested() {
+    static const bool requested = ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION");
+    return requested;
+}
+
+static inline bool ggml_cuda_mtp_qblock_paged_attention_owned_tail_write_requested() {
+    static const bool requested = ggml_cuda_mtp_qblock_paged_attention_requested() &&
+        ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE");
+    return requested;
+}
+
+static inline bool ggml_cuda_mtp_qblock_owned_tail_write_poison_canonical_k_requested() {
+    static const bool requested = ggml_cuda_mtp_qblock_paged_attention_owned_tail_write_requested() &&
+        (ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE_CANONICAL_POISON") ||
+         ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE_CANONICAL_POISON_K") ||
+         ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE_POISON_CANONICAL") ||
+         ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE_POISON_CANONICAL_K"));
+    return requested;
+}
+
+static inline bool ggml_cuda_mtp_qblock_owned_tail_write_poison_canonical_v_requested() {
+    static const bool requested = ggml_cuda_mtp_qblock_paged_attention_owned_tail_write_requested() &&
+        (ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE_CANONICAL_POISON") ||
+         ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE_CANONICAL_POISON_V") ||
+         ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE_POISON_CANONICAL") ||
+         ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE_POISON_CANONICAL_V"));
+    return requested;
+}
+
+static inline int ggml_cuda_mtp_qblock_owned_tail_write_poison_canonical_min_idx() {
+    return ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE_CANONICAL_POISON_MIN_IDX", 0);
+}
+
+static inline int ggml_cuda_mtp_qblock_owned_tail_write_poison_canonical_max_idx() {
+    return ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE_CANONICAL_POISON_MAX_IDX", -1);
+}
+
+static inline bool ggml_cuda_mtp_qblock_owned_tail_write_poison_canonical_range_hits(
+        const uint32_t idx0,
+        const uint32_t n_tokens,
+        const int poison_min_idx,
+        const int poison_max_idx) {
+    if (n_tokens == 0) {
+        return false;
+    }
+    const uint64_t begin = idx0;
+    const uint64_t end = begin + uint64_t(n_tokens);
+    if (poison_min_idx > 0 && end <= uint64_t(poison_min_idx)) {
+        return false;
+    }
+    if (poison_max_idx >= 0 && begin >= uint64_t(poison_max_idx)) {
+        return false;
+    }
+    return true;
+}
+
 static inline bool ggml_cuda_mtp_qblock_txn_tail_backend_proof_enabled() {
     return ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_PROOF");
 }
 
 static inline bool ggml_cuda_mtp_qblock_txn_tail_page_requested() {
-    return ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE");
+    return ggml_cuda_mtp_qblock_paged_attention_requested() ||
+        ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE");
 }
 
 static inline bool ggml_cuda_mtp_qblock_txn_tail_page_consumer_requested() {
-    return ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_CONSUMER");
+    return ggml_cuda_mtp_qblock_paged_attention_requested() ||
+        ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_CONSUMER");
 }
 
 static inline bool ggml_cuda_mtp_qblock_txn_tail_page_producer_map_requested() {
-    return ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_PRODUCER_MAP");
+    return ggml_cuda_mtp_qblock_paged_attention_requested() ||
+        ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_PRODUCER_MAP");
 }
 
 static inline bool ggml_cuda_mtp_qblock_txn_tail_page_scratch_map_requested() {
@@ -1972,6 +4487,31 @@ static inline bool ggml_cuda_pack_k_packed16_env_enabled(const char * name) {
     return env && atoi(env) != 0;
 }
 
+static inline bool ggml_cuda_q8k_dot4_consumer_read_mode_trace_enabled() {
+    const char * v = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_CONSUMER_READ_MODE_TRACE");
+    if (v && atoi(v) != 0) {
+        return true;
+    }
+    v = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_CONSUMER_READ_MODE_TRACE");
+    return v && atoi(v) != 0;
+}
+
+static inline const char * ggml_cuda_q8k_dot4_fattn_node_name(const ggml_tensor * dst) {
+    return dst && dst->name[0] ? dst->name : "-";
+}
+
+static inline int ggml_cuda_q8k_dot4_fattn_layer_from_node_name(const ggml_tensor * dst) {
+    const char * name = ggml_cuda_q8k_dot4_fattn_node_name(dst);
+    constexpr const char * prefix = "__fattn__-";
+    constexpr size_t prefix_len = sizeof("__fattn__-") - 1;
+    if (strncmp(name, prefix, prefix_len) != 0) {
+        return -1;
+    }
+    char * end = nullptr;
+    const long layer = strtol(name + prefix_len, &end, 10);
+    return end && end != name + prefix_len ? (int) layer : -1;
+}
+
 // Packed16 K quality knobs for acceptance/drift experiments. Defaults preserve
 // existing behavior: persistent indexed K-cache packing keeps the current
 // one-step MSE scale at block32 granularity.
@@ -2084,6 +4624,15 @@ static __device__ __forceinline__ half ggml_cuda_pack_k_packed16_load_half_unali
     return v;
 }
 
+static __device__ __forceinline__ int ggml_cuda_pack_k_packed16_i8x4_word_from_lanes(const int qi, const int lane) {
+    const int lane0 = lane & ~3;
+    const uint32_t q0 = uint32_t(__shfl_sync(0xffffffff, qi, lane0 + 0, 32)) & 0xffu;
+    const uint32_t q1 = uint32_t(__shfl_sync(0xffffffff, qi, lane0 + 1, 32)) & 0xffu;
+    const uint32_t q2 = uint32_t(__shfl_sync(0xffffffff, qi, lane0 + 2, 32)) & 0xffu;
+    const uint32_t q3 = uint32_t(__shfl_sync(0xffffffff, qi, lane0 + 3, 32)) & 0xffu;
+    return int(q0 | (q1 << 8) | (q2 << 16) | (q3 << 24));
+}
+
 static __global__ __launch_bounds__(256, 1) void ggml_cuda_pack_k_packed16_from_q8_indexed_kernel(
         const char     * __restrict__ K,       // q8_0 K cache (block_q8_0 rows)
         int            * __restrict__ k_payload,
@@ -2094,13 +4643,13 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_pack_k_packed16_from_
         int n_heads_k,
         int batch,
         int nk_cur,
-        bool tile16_layout) {
+        int layout_kind) {
     const int tid = threadIdx.x;
     const int k_local = blockIdx.x;
     const int hk = blockIdx.y;
     const int b = blockIdx.z;
-    const int qblk = tid;
-    if (k_local >= nk_cur || hk >= n_heads_k || b >= batch || qblk >= GGML_CUDA_Q8K_DOT4_KQ_BLOCKS) {
+    const int d_word = tid;
+    if (k_local >= nk_cur || hk >= n_heads_k || b >= batch || d_word >= GGML_CUDA_PACKED16_K_WORDS) {
         return;
     }
 
@@ -2109,17 +4658,19 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_pack_k_packed16_from_
         return;
     }
 
+    constexpr int WORDS_PER_QBLOCK = QK8_0 / 4;
+    const int qblk = d_word / WORDS_PER_QBLOCK;
+    const int word_in_qblk = d_word - qblk * WORDS_PER_QBLOCK;
     const size_t q8_row = (size_t(b) * size_t(n_heads_k) + size_t(hk)) * size_t(kv_size) + size_t(cell);
     const char * src = K + q8_row * nb11 + qblk * sizeof(block_q8_0);
 
     const size_t head_base = (size_t(b) * size_t(n_heads_k) + size_t(hk)) * size_t(kv_size);
-    k_scales[ggml_cuda_packed16_k_scale_index(head_base, kv_size, int(cell), qblk, tile16_layout)] = ggml_cuda_pack_k_packed16_load_half_unaligned(src);
-#pragma unroll
-    for (int i = 0; i < QK8_0 / 4; ++i) {
-        const int d_word = qblk * (QK8_0 / 4) + i;
-        k_payload[ggml_cuda_packed16_k_payload_index(head_base, kv_size, int(cell), d_word, tile16_layout)] =
-            ggml_cuda_pack_k_packed16_load_i32_unaligned(src + sizeof(half) + 4 * i);
+    if (word_in_qblk == 0) {
+        k_scales[ggml_cuda_packed16_k_scale_index(head_base, kv_size, int(cell), qblk, layout_kind)] =
+            ggml_cuda_pack_k_packed16_load_half_unaligned(src);
     }
+    k_payload[ggml_cuda_packed16_k_payload_index(head_base, kv_size, int(cell), d_word, layout_kind)] =
+        ggml_cuda_pack_k_packed16_load_i32_unaligned(src + sizeof(half) + 4 * word_in_qblk);
 }
 
 // Indexed variant: writes to absolute KV cache slots using k_idxs.
@@ -2141,7 +4692,8 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_quant_k_packed16_inde
         int scale_mode,
         float scale_mul,
         int scale_group_qblocks,
-        bool tile16_layout) {
+        int layout_kind,
+        int overlay_page_base) {
     GGML_UNUSED(nb02);
     const int tid = threadIdx.x;
     const int k_local = blockIdx.x;
@@ -2157,6 +4709,8 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_quant_k_packed16_inde
     if (cell < 0 || cell >= kv_size) {
         return;
     }
+    const int overlay_cell = overlay_page_base >= 0 ? overlay_page_base + k_local : -1;
+    const bool overlay_valid = overlay_cell >= 0 && overlay_cell < kv_size;
 
     // Preserve the existing packer contract: graph code may pass f32 or f16
     // storage, and existing callers provide byte strides describing the row.
@@ -2199,10 +4753,19 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_quant_k_packed16_inde
         const int qi = max(-128, min(127, int(lrintf(x / scale))));
 
         const size_t head_base = (size_t(b) * size_t(n_heads_k) + size_t(hk)) * size_t(kv_size);
-        int * dst_word = k_payload + ggml_cuda_packed16_k_payload_index(head_base, kv_size, int(cell), d / 4, tile16_layout);
-        ((int8_t *) dst_word)[d & 3] = (int8_t) qi;
+        const int packed_word = ggml_cuda_pack_k_packed16_i8x4_word_from_lanes(qi, lane);
+        if ((lane & 3) == 0) {
+            k_payload[ggml_cuda_packed16_k_payload_index(head_base, kv_size, int(cell), d / 4, layout_kind)] = packed_word;
+            if (overlay_valid) {
+                k_payload[ggml_cuda_packed16_k_payload_index(head_base, kv_size, overlay_cell, d / 4, layout_kind)] = packed_word;
+            }
+        }
         if (lane == 0) {
-            k_scales[ggml_cuda_packed16_k_scale_index(head_base, kv_size, int(cell), q_block, tile16_layout)] = __float2half(scale);
+            const half hscale = __float2half(scale);
+            k_scales[ggml_cuda_packed16_k_scale_index(head_base, kv_size, int(cell), q_block, layout_kind)] = hscale;
+            if (overlay_valid) {
+                k_scales[ggml_cuda_packed16_k_scale_index(head_base, kv_size, overlay_cell, q_block, layout_kind)] = hscale;
+            }
         }
         return;
     }
@@ -2263,10 +4826,19 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_quant_k_packed16_inde
     const int qi = max(-128, min(127, int(lrintf(x / scale))));
 
     const size_t head_base = (size_t(b) * size_t(n_heads_k) + size_t(hk)) * size_t(kv_size);
-    int * dst_word = k_payload + ggml_cuda_packed16_k_payload_index(head_base, kv_size, int(cell), d / 4, tile16_layout);
-    ((int8_t *) dst_word)[d & 3] = (int8_t) qi;
+    const int packed_word = ggml_cuda_pack_k_packed16_i8x4_word_from_lanes(qi, lane);
+    if ((lane & 3) == 0) {
+        k_payload[ggml_cuda_packed16_k_payload_index(head_base, kv_size, int(cell), d / 4, layout_kind)] = packed_word;
+        if (overlay_valid) {
+            k_payload[ggml_cuda_packed16_k_payload_index(head_base, kv_size, overlay_cell, d / 4, layout_kind)] = packed_word;
+        }
+    }
     if (lane == 0) {
-        k_scales[ggml_cuda_packed16_k_scale_index(head_base, kv_size, int(cell), q_block, tile16_layout)] = __float2half(scale);
+        const half hscale = __float2half(scale);
+        k_scales[ggml_cuda_packed16_k_scale_index(head_base, kv_size, int(cell), q_block, layout_kind)] = hscale;
+        if (overlay_valid) {
+            k_scales[ggml_cuda_packed16_k_scale_index(head_base, kv_size, overlay_cell, q_block, layout_kind)] = hscale;
+        }
     }
 }
 
@@ -2278,7 +4850,7 @@ static __global__ __launch_bounds__(128, 1) void ggml_cuda_mtp_qblock_txn_tail_k
         int page_base,
         int kv_size,
         int n_heads_k,
-        bool tile16_layout) {
+        int layout_kind) {
     const int tid = threadIdx.x;
     const int slot = blockIdx.x;
     const int hk = blockIdx.y;
@@ -2296,11 +4868,11 @@ static __global__ __launch_bounds__(128, 1) void ggml_cuda_mtp_qblock_txn_tail_k
 
     for (int d_word = tid; d_word < GGML_CUDA_PACKED16_K_WORDS; d_word += blockDim.x) {
         scratch_payload[scratch_row * size_t(GGML_CUDA_PACKED16_K_WORDS) + size_t(d_word)] =
-            k_payload[ggml_cuda_packed16_k_payload_index(head_base, kv_size, token, d_word, tile16_layout)];
+            k_payload[ggml_cuda_packed16_k_payload_index(head_base, kv_size, token, d_word, layout_kind)];
     }
     for (int qblk = tid; qblk < GGML_CUDA_PACKED16_K_QBLOCKS; qblk += blockDim.x) {
         scratch_scales[scratch_row * size_t(GGML_CUDA_PACKED16_K_QBLOCKS) + size_t(qblk)] =
-            k_scales[ggml_cuda_packed16_k_scale_index(head_base, kv_size, token, qblk, tile16_layout)];
+            k_scales[ggml_cuda_packed16_k_scale_index(head_base, kv_size, token, qblk, layout_kind)];
     }
 }
 
@@ -2323,7 +4895,7 @@ static __global__ __launch_bounds__(128, 1) void ggml_cuda_mtp_qblock_txn_tail_k
         int page_base,
         int kv_size,
         int n_heads_k,
-        bool tile16_layout) {
+        int layout_kind) {
     const int tid = threadIdx.x;
     const int slot = blockIdx.x;
     const int hk = blockIdx.y;
@@ -2340,12 +4912,50 @@ static __global__ __launch_bounds__(128, 1) void ggml_cuda_mtp_qblock_txn_tail_k
     const size_t scratch_row = (size_t(b) * size_t(n_heads_k) + size_t(hk)) * size_t(MTP_V4_144_PAGE_TOKENS) + size_t(slot);
 
     for (int d_word = tid; d_word < GGML_CUDA_PACKED16_K_WORDS; d_word += blockDim.x) {
-        k_payload[ggml_cuda_packed16_k_payload_index(head_base, kv_size, token, d_word, tile16_layout)] =
+        k_payload[ggml_cuda_packed16_k_payload_index(head_base, kv_size, token, d_word, layout_kind)] =
             scratch_payload[scratch_row * size_t(GGML_CUDA_PACKED16_K_WORDS) + size_t(d_word)];
     }
     for (int qblk = tid; qblk < GGML_CUDA_PACKED16_K_QBLOCKS; qblk += blockDim.x) {
-        k_scales[ggml_cuda_packed16_k_scale_index(head_base, kv_size, token, qblk, tile16_layout)] =
+        k_scales[ggml_cuda_packed16_k_scale_index(head_base, kv_size, token, qblk, layout_kind)] =
             scratch_scales[scratch_row * size_t(GGML_CUDA_PACKED16_K_QBLOCKS) + size_t(qblk)];
+    }
+}
+
+template <typename idx_t>
+static __global__ __launch_bounds__(128, 1) void ggml_cuda_mtp_qblock_poison_canonical_k_indexed_kernel(
+        int         * __restrict__ k_payload,
+        half        * __restrict__ k_scales,
+        const idx_t * __restrict__ k_idxs,
+        int nk_cur,
+        int n_heads_k,
+        int batch,
+        int kv_size,
+        int layout_kind,
+        int poison_min_idx,
+        int poison_max_idx) {
+    const int tid = threadIdx.x;
+    const int k_local = blockIdx.x;
+    const int hk = blockIdx.y;
+    const int b = blockIdx.z;
+    if (k_local >= nk_cur || hk >= n_heads_k || b >= batch) {
+        return;
+    }
+
+    const int64_t cell64 = (int64_t) k_idxs[k_local];
+    if (cell64 < 0 || cell64 >= kv_size) {
+        return;
+    }
+    const int cell = (int) cell64;
+    if ((poison_min_idx > 0 && cell < poison_min_idx) || (poison_max_idx >= 0 && cell >= poison_max_idx)) {
+        return;
+    }
+    const size_t head_base = (size_t(b) * size_t(n_heads_k) + size_t(hk)) * size_t(kv_size);
+
+    for (int d_word = tid; d_word < GGML_CUDA_PACKED16_K_WORDS; d_word += blockDim.x) {
+        k_payload[ggml_cuda_packed16_k_payload_index(head_base, kv_size, cell, d_word, layout_kind)] = 0x7f7f7f7f;
+    }
+    for (int qblk = tid; qblk < GGML_CUDA_PACKED16_K_QBLOCKS; qblk += blockDim.x) {
+        k_scales[ggml_cuda_packed16_k_scale_index(head_base, kv_size, cell, qblk, layout_kind)] = __float2half(16.0f);
     }
 }
 
@@ -2469,6 +5079,26 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
             (blockfa_recthist_v4_single ? "blockfa_recthist_v4_single" : "packed16");
     const char * variant_note = blockfa_recthist_v4_single_effective ? "blockfa_recthist_v4_single" :
             (full_fa ? "full_fa_from_logits" : "kq_only_diagnostic_zero_output");
+    if (ggml_cuda_q8k_dot4_consumer_read_mode_trace_enabled() && k_is_i32_packed16) {
+        fprintf(stderr,
+                "MTP_QBLOCK_CONSUMER_READ_MODE: backend=rocm_q8k_dot4_kq read_mode=canonical node=%s layer=%d graph_inst=%d variant=%s note=%s nq=%d nk=%d hq=%d hk=%d gqa_ratio=%d K=%s k_phys=%s V=%s full_fa=%d blockfa=%d v4_144_decode=%d\n",
+                ggml_cuda_q8k_dot4_fattn_node_name(dst),
+                ggml_cuda_q8k_dot4_fattn_layer_from_node_name(dst),
+                fa_inst_i32,
+                variant_name,
+                variant_note,
+                nq,
+                nk,
+                n_heads_q,
+                n_heads_k,
+                gqa_ratio,
+                ggml_type_name(K->type),
+                ggml_cuda_q8k_dot4_k_physical_name(K),
+                ggml_type_name(V->type),
+                full_fa ? 1 : 0,
+                blockfa_recthist_any_effective ? 1 : 0,
+                v4_144_decode_diag_env ? 1 : 0);
+    }
     if (fused_variant_effective && !full_fa) {
         GGML_ABORT("q8k_dot4_kq blockFA variant requires GGML_CUDA_ROCM_Q8K_DOT4_KQ_FULL_FA=1");
     }
@@ -2891,12 +5521,22 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                     const bool inline_q4 = !v4_144_decode_diag && (ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_INLINE_Q4") || impl_inline_q4);
                     const bool q4pair = !v4_144_decode_diag && V->type == GGML_TYPE_Q4_0 &&
                         (ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_Q4PAIR") || impl_q4pair);
-                    const int splitk_threshold = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_SPLITK_THRESHOLD", 2048);
+                    const int splitk_threshold = ggml_cuda_q8k_dot4_kq_env_int(
+                        "GGML_CUDA_ROCM_Q8K_DOT4_DECODE_SPLITK_THRESHOLD",
+                        ggml_cuda_q8k_dot4_decode_stage_threshold(2048));
+                    const int decode_splitk_size = ggml_cuda_q8k_dot4_decode_stage_split_size(nk, 512);
                     const bool v4_144_splitk = v4_144_decode_diag &&
                         (v4_144_nomtp_decode || v4_144_pv4_standard || impl_splitk || ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_V4_K16D16_144_DECODE_SPLITK"));
                     const bool splitk = !impl_logits_debug && !impl_dsplit &&
                         (ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_SPLITK") || impl_splitk || impl_small_verify_splitk || nk >= splitk_threshold) &&
                         (V->type == GGML_TYPE_Q4_0 || v4_144_splitk);
+                    if (splitk && ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_STAGE_LOG")) {
+                        fprintf(stderr,
+                            "Q8K_DECODE_STAGE_POLICY: auto=%d impl=%s nq=%d nk=%d V=%s threshold=%d split_size=%d explicit_impl=%d v4_splitk=%d\n",
+                            ggml_cuda_q8k_dot4_decode_stage_auto_enabled() ? 1 : 0,
+                            packed16_decode_impl, nq, nk, ggml_type_name(V->type), splitk_threshold, decode_splitk_size,
+                            packed16_decode_impl_explicit ? 1 : 0, v4_144_splitk ? 1 : 0);
+                    }
                     // small_verify/batched_splitk only apply for nq >= 2; nq == 1 falls through
                     // to regular decode (splitk/BN64/etc)
                     if (impl_small_verify && nq < 2) impl_small_verify = false;
@@ -3022,7 +5662,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                         return;
                     }
                     if (splitk) {
-                        const int split_size = ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_DECODE_SPLITK_SIZE", 512);
+                        const int split_size = decode_splitk_size;
                         const int n_splits = (nk + split_size - 1) / split_size;
                         blockfa_partial_o.alloc((size_t) batch * nq * n_heads_q * n_splits * 256);
                         blockfa_partial_m.alloc((size_t) batch * nq * n_heads_q * n_splits);
@@ -3251,10 +5891,12 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
     const int k_scale_group_qblocks = ggml_cuda_pack_k_packed16_scale_group_qblocks();
     const int packed8_q4_scale_mode = ggml_cuda_pack_k_packed8_q4_scale_mode();
     const float packed8_q4_scale_mul = ggml_cuda_pack_k_packed8_q4_scale_mul();
-    const bool tile16_layout = ggml_cuda_packed16_k_layout_tile16();
-    const int layout_kind = tile16_layout ? GGML_CUDA_PACKED16_K_LAYOUT_D16_PLANAR : GGML_CUDA_PACKED16_K_LAYOUT_ROW;
+    const int requested_layout = ggml_cuda_packed16_k_layout_kind_from_env();
     const int k_format = payload_is_packed8 ? GGML_CUDA_PDMQ_K_FORMAT_PACKED8_Q4_144 : GGML_CUDA_PDMQ_K_FORMAT_PACKED16_Q8_272;
-    const int effective_layout = payload_is_packed8 ? GGML_CUDA_PACKED16_K_LAYOUT_ROW : layout_kind;
+    const int effective_layout = payload_is_packed8 ? GGML_CUDA_PACKED16_K_LAYOUT_ROW : requested_layout;
+    if (payload_is_packed16 && effective_layout == GGML_CUDA_PACKED16_K_LAYOUT_PAGE16_D16 && (kv_size % GGML_CUDA_PACKED16_K_PAGE16_TOKENS) != 0) {
+        GGML_ABORT("packed16 page16_d16 layout requires kv_capacity multiple of %d, got %d", GGML_CUDA_PACKED16_K_PAGE16_TOKENS, kv_size);
+    }
     cudaStream_t stream = ctx.stream();
 
     const bool txn_tail_backend_trace = ggml_cuda_mtp_qblock_txn_tail_backend_proof_enabled();
@@ -3386,7 +6028,7 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
             (long long) payload->ne[0], (long long) payload->ne[1], (long long) payload->ne[2], (long long) payload->ne[3],
             (long long) scales->ne[0], (long long) scales->ne[1], (long long) scales->ne[2], (long long) scales->ne[3],
             n_heads, nk_cur, kv_size, (long long) src_head_stride_bytes, k_scale_mode, (double) k_scale_mul, k_scale_group_qblocks,
-            packed8_q4_scale_mode, (double) packed8_q4_scale_mul, ggml_cuda_packed16_k_layout_name());
+            packed8_q4_scale_mode, (double) packed8_q4_scale_mul, ggml_cuda_packed16_k_layout_kind_name(effective_layout));
     }
 
     dim3 grid(nk_cur, n_heads, batch);
@@ -3395,7 +6037,73 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
     const int scratch_page_base = (kv_size >= 2 * (int) MTP_V4_144_PAGE_TOKENS)
         ? ((kv_size / (int) MTP_V4_144_PAGE_TOKENS) - 1) * (int) MTP_V4_144_PAGE_TOKENS
         : -1;
+    uint32_t txn_tail_owned_reserved_physical_page = 0;
+    ggml_cuda_mtp_qblock_tail_page_map_v1 txn_tail_owned_reserved_map = {};
+    const bool txn_tail_owned_reserved_map_ok = txn_k_page_merge_active &&
+        ggml_cuda_mtp_qblock_paged_attention_owned_tail_write_requested() &&
+        llama_kv_cache_mtp_qblock_tail_page_published_owned_map_covers(
+            txn_idx_probe.idx0, (uint32_t) nk_cur, &txn_tail_owned_reserved_physical_page, &txn_tail_owned_reserved_map);
+    const bool txn_tail_owned_require_prepublished_map = txn_k_page_merge_active &&
+        ggml_cuda_mtp_qblock_paged_attention_owned_tail_write_requested() &&
+        ggml_cuda_mtp_qblock_owned_tail_write_require_prepublished_map_requested();
+    const bool txn_tail_owned_missing_required_map = txn_tail_owned_require_prepublished_map &&
+        !txn_tail_owned_reserved_map_ok;
+    const int txn_tail_owned_page_base = txn_tail_owned_reserved_map_ok ?
+        (int) (txn_tail_owned_reserved_physical_page * (uint32_t) MTP_V4_144_PAGE_TOKENS) :
+        (txn_tail_owned_missing_required_map ? -1 : scratch_page_base);
+    const bool txn_tail_owned_write_active = txn_k_page_merge_active &&
+        ggml_cuda_mtp_qblock_paged_attention_owned_tail_write_requested() &&
+        !txn_tail_owned_missing_required_map &&
+        txn_tail_owned_page_base >= 0 &&
+        (uint32_t) txn_tail_owned_page_base >= txn_idx_probe.page_end;
+    if (txn_tail_owned_missing_required_map) {
+        fprintf(stderr,
+                "MTP_QBLOCK_TXN_TAIL_PAGE_OWNED_FAIL_CLOSED: kind=K reason=missing_prepublished_owned_map idx0=%u n_tokens=%u scratch_page_base=%d page_end=%u\n",
+                txn_idx_probe.idx0,
+                (uint32_t) nk_cur,
+                scratch_page_base,
+                txn_idx_probe.page_end);
+    }
+    if (txn_k_page_merge_active && ggml_cuda_mtp_qblock_paged_attention_owned_tail_write_requested() &&
+            ggml_cuda_mtp_qblock_owned_tail_write_plan_proof_requested()) {
+        const bool writer_from_map = txn_tail_owned_reserved_map_ok && txn_tail_owned_write_active;
+        const bool legacy_fallback_owned = !txn_tail_owned_reserved_map_ok && txn_tail_owned_write_active;
+        fprintf(stderr,
+                "MTP_QBLOCK_TXN_TAIL_PAGE_OWNED_PLAN_PROOF: op=writer_authority kind=K writer_from_map=%d legacy_fallback_owned=%d owned_write_active=%d map_generation=%llu physical_page_from_map=%u overlay_page_base=%d idx0=%u n_tokens=%u map_logical_base=%u map_valid_tail=%u table0=%d\n",
+                writer_from_map ? 1 : 0,
+                legacy_fallback_owned ? 1 : 0,
+                txn_tail_owned_write_active ? 1 : 0,
+                (unsigned long long) (txn_tail_owned_reserved_map_ok ? txn_tail_owned_reserved_map.generation : 0ull),
+                txn_tail_owned_reserved_map_ok ? txn_tail_owned_reserved_physical_page : 0xffffffffu,
+                txn_tail_owned_write_active ? txn_tail_owned_page_base : -1,
+                txn_idx_probe.idx0,
+                (uint32_t) nk_cur,
+                txn_tail_owned_reserved_map.logical_base_token,
+                txn_tail_owned_reserved_map.valid_tail_tokens,
+                txn_tail_owned_reserved_map.block_table[0]);
+    }
+    if (txn_k_page_merge_active && ggml_cuda_mtp_qblock_paged_attention_owned_tail_write_requested()) {
+        const char * owned_ready_reason = txn_tail_owned_reserved_map_ok ?
+            (txn_tail_owned_write_active ? "ok" : "owned_page_visible") :
+            (txn_tail_owned_missing_required_map ? "missing_prepublished_owned_map" : "no_owned_map");
+        ggml_cuda_mtp_qblock_tail_page_record_owned_write_ready(
+            "K",
+            txn_tail_owned_reserved_map_ok && txn_tail_owned_write_active,
+            txn_tail_owned_reserved_map,
+            txn_idx_probe.idx0,
+            (uint32_t) nk_cur,
+            txn_tail_owned_reserved_physical_page,
+            owned_ready_reason);
+    }
+    const bool txn_tail_owned_exclusive_active = txn_tail_owned_write_active &&
+        ggml_cuda_mtp_qblock_tail_page_owned_write_exclusive_allowed(
+            "K",
+            txn_tail_owned_reserved_map,
+            txn_idx_probe.idx0,
+            (uint32_t) nk_cur,
+            txn_tail_owned_reserved_physical_page);
     const bool txn_tail_scratch_map_active = txn_k_page_merge_active &&
+        !txn_tail_owned_write_active &&
         ggml_cuda_mtp_qblock_txn_tail_page_scratch_map_requested() &&
         scratch_page_base >= 0 &&
         (uint32_t) scratch_page_base >= txn_idx_probe.page_end;
@@ -3416,14 +6124,22 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
         txn_tail_scratch_exclusive_route_complete_ok &&
         txn_tail_scratch_exclusive_min_ok && txn_tail_scratch_exclusive_after_nomap_ok;
 
+    ggml_cuda_packed16_timing_trace_event pack_k_timing;
+    ggml_cuda_packed16_timing_trace_begin(pack_k_timing, stream, "pack_k");
+
     if (txn_k_page_merge_active) {
         ggml_cuda_pool & pool = ctx.pool();
-        if (txn_tail_scratch_map_active) {
-            // Scratch overlay is write-through by default: uncovered consumers
-            // still need canonical rows. The exclusive subgate is a diagnostic
-            // full-win probe and must remain default-off until route coverage is
-            // complete enough to preserve hashes.
-            if (!txn_tail_scratch_exclusive_active) {
+        if (txn_tail_owned_write_active || txn_tail_scratch_map_active) {
+            const int overlay_page_base = txn_tail_owned_write_active ? txn_tail_owned_page_base : scratch_page_base;
+            const bool owned_overlay_dual_candidate = txn_tail_owned_write_active &&
+                !txn_tail_owned_exclusive_active && !txn_tail_scratch_exclusive_active &&
+                ggml_cuda_mtp_qblock_owned_tail_write_dual_dest_candidate_requested();
+            // Scratch/owned overlays are write-through by default: aged-out or
+            // uncovered consumers still need canonical rows. Owned exclusive is
+            // a diagnostic subgate; all-bound no-write-through also requires an
+            // explicit UNSAFE archaeology key after the age-out proof.
+            if (!txn_tail_owned_exclusive_active && !txn_tail_scratch_exclusive_active) {
+                const int dual_overlay_page_base = owned_overlay_dual_candidate ? overlay_page_base : -1;
                 if (k_idxs->type == GGML_TYPE_I64) {
                     ggml_cuda_quant_k_packed16_indexed_kernel<int64_t><<<grid, block, 0, stream>>>(
                         (const half *) k_cur->data,
@@ -3433,7 +6149,7 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
                         src_token_stride_bytes, k_cur->nb[2], k_cur->nb[3],
                         src_head_stride_bytes,
                         nk_cur, n_heads, batch, kv_size,
-                        k_scale_mode, k_scale_mul, k_scale_group_qblocks, tile16_layout);
+                        k_scale_mode, k_scale_mul, k_scale_group_qblocks, effective_layout, dual_overlay_page_base);
                 } else {
                     GGML_ASSERT(k_idxs->type == GGML_TYPE_I32);
                     ggml_cuda_quant_k_packed16_indexed_kernel<int32_t><<<grid, block, 0, stream>>>(
@@ -3444,16 +6160,18 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
                         src_token_stride_bytes, k_cur->nb[2], k_cur->nb[3],
                         src_head_stride_bytes,
                         nk_cur, n_heads, batch, kv_size,
-                        k_scale_mode, k_scale_mul, k_scale_group_qblocks, tile16_layout);
+                        k_scale_mode, k_scale_mul, k_scale_group_qblocks, effective_layout, dual_overlay_page_base);
                 }
                 CUDA_CHECK(cudaGetLastError());
             }
 
-            if (k_idxs->type == GGML_TYPE_I64) {
+            if (owned_overlay_dual_candidate) {
+                // The canonical pack above also populated the owned overlay.
+            } else if (k_idxs->type == GGML_TYPE_I64) {
                 ggml_cuda_pool_alloc<int64_t> local_idxs_alloc(pool);
                 int64_t * local_idxs = local_idxs_alloc.alloc((size_t) nk_cur);
                 ggml_cuda_mtp_qblock_txn_tail_k_fill_local_idxs_kernel<int64_t><<<1, 32, 0, stream>>>(
-                    local_idxs, nk_cur, scratch_page_base);
+                    local_idxs, nk_cur, overlay_page_base);
                 CUDA_CHECK(cudaGetLastError());
                 ggml_cuda_quant_k_packed16_indexed_kernel<int64_t><<<grid, block, 0, stream>>>(
                     (const half *) k_cur->data,
@@ -3463,13 +6181,13 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
                     src_token_stride_bytes, k_cur->nb[2], k_cur->nb[3],
                     src_head_stride_bytes,
                     nk_cur, n_heads, batch, kv_size,
-                    k_scale_mode, k_scale_mul, k_scale_group_qblocks, tile16_layout);
+                    k_scale_mode, k_scale_mul, k_scale_group_qblocks, effective_layout, -1);
             } else {
                 GGML_ASSERT(k_idxs->type == GGML_TYPE_I32);
                 ggml_cuda_pool_alloc<int32_t> local_idxs_alloc(pool);
                 int32_t * local_idxs = local_idxs_alloc.alloc((size_t) nk_cur);
                 ggml_cuda_mtp_qblock_txn_tail_k_fill_local_idxs_kernel<int32_t><<<1, 32, 0, stream>>>(
-                    local_idxs, nk_cur, scratch_page_base);
+                    local_idxs, nk_cur, overlay_page_base);
                 CUDA_CHECK(cudaGetLastError());
                 ggml_cuda_quant_k_packed16_indexed_kernel<int32_t><<<grid, block, 0, stream>>>(
                     (const half *) k_cur->data,
@@ -3479,7 +6197,72 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
                     src_token_stride_bytes, k_cur->nb[2], k_cur->nb[3],
                     src_head_stride_bytes,
                     nk_cur, n_heads, batch, kv_size,
-                    k_scale_mode, k_scale_mul, k_scale_group_qblocks, tile16_layout);
+                    k_scale_mode, k_scale_mul, k_scale_group_qblocks, effective_layout, -1);
+            }
+            const int poison_min_idx = ggml_cuda_mtp_qblock_owned_tail_write_poison_canonical_min_idx();
+            const int poison_max_idx = ggml_cuda_mtp_qblock_owned_tail_write_poison_canonical_max_idx();
+            if (txn_tail_owned_write_active && ggml_cuda_mtp_qblock_owned_tail_write_poison_canonical_k_requested() &&
+                    ggml_cuda_mtp_qblock_owned_tail_write_poison_canonical_range_hits(
+                        txn_idx_probe.idx0, (uint32_t) nk_cur, poison_min_idx, poison_max_idx)) {
+                if (k_idxs->type == GGML_TYPE_I64) {
+                    ggml_cuda_mtp_qblock_poison_canonical_k_indexed_kernel<int64_t><<<grid, dim3(128), 0, stream>>>(
+                        (int *) payload->data,
+                        (half *) scales->data,
+                        (const int64_t *) k_idxs->data,
+                        nk_cur, n_heads, batch, kv_size, effective_layout, poison_min_idx, poison_max_idx);
+                } else {
+                    GGML_ASSERT(k_idxs->type == GGML_TYPE_I32);
+                    ggml_cuda_mtp_qblock_poison_canonical_k_indexed_kernel<int32_t><<<grid, dim3(128), 0, stream>>>(
+                        (int *) payload->data,
+                        (half *) scales->data,
+                        (const int32_t *) k_idxs->data,
+                        nk_cur, n_heads, batch, kv_size, effective_layout, poison_min_idx, poison_max_idx);
+                }
+                CUDA_CHECK(cudaGetLastError());
+                fprintf(stderr,
+                    "MTP_QBLOCK_TXN_TAIL_PAGE_OWNED_CANONICAL_POISON: kind=K status=ok reason=owned_write_active idx0=%u n_tokens=%u poison_min_idx=%d poison_max_idx=%d canonical_page_base=%u owned_page_base=%d physical_page=%u map_logical_base=%u map_valid_tail=%u table0=%d flags=0x%x generation=%llu\n",
+                    txn_idx_probe.idx0,
+                    (uint32_t) nk_cur,
+                    poison_min_idx,
+                    poison_max_idx,
+                    txn_idx_probe.page_base,
+                    txn_tail_owned_page_base,
+                    txn_tail_owned_reserved_physical_page,
+                    txn_tail_owned_reserved_map.logical_base_token,
+                    txn_tail_owned_reserved_map.valid_tail_tokens,
+                    txn_tail_owned_reserved_map.block_table[0],
+                    txn_tail_owned_reserved_map.flags,
+                    (unsigned long long) txn_tail_owned_reserved_map.generation);
+            }
+            if (txn_tail_owned_write_active && overlay_page_base >= 0) {
+                const size_t scratch_rows = size_t(batch) * size_t(n_heads) * size_t(MTP_V4_144_PAGE_TOKENS);
+                ggml_cuda_pool_alloc<int>  owned_payload_alloc(pool);
+                ggml_cuda_pool_alloc<half> owned_scales_alloc(pool);
+                int  * owned_payload = owned_payload_alloc.alloc(scratch_rows * size_t(GGML_CUDA_PACKED16_K_WORDS));
+                half * owned_scales  = owned_scales_alloc.alloc (scratch_rows * size_t(GGML_CUDA_PACKED16_K_QBLOCKS));
+
+                dim3 page_grid(MTP_V4_144_PAGE_TOKENS, n_heads, batch);
+                dim3 page_block(128);
+                ggml_cuda_mtp_qblock_txn_tail_k_copy_page_to_scratch_kernel<<<page_grid, page_block, 0, stream>>>(
+                    (const int *) payload->data,
+                    (const half *) scales->data,
+                    owned_payload,
+                    owned_scales,
+                    (int) txn_idx_probe.page_base,
+                    kv_size,
+                    n_heads,
+                    effective_layout);
+                CUDA_CHECK(cudaGetLastError());
+                ggml_cuda_mtp_qblock_txn_tail_k_commit_scratch_page_kernel<<<page_grid, page_block, 0, stream>>>(
+                    owned_payload,
+                    owned_scales,
+                    (int *) payload->data,
+                    (half *) scales->data,
+                    overlay_page_base,
+                    kv_size,
+                    n_heads,
+                    effective_layout);
+                CUDA_CHECK(cudaGetLastError());
             }
         } else {
             const size_t scratch_rows = size_t(batch) * size_t(n_heads) * size_t(MTP_V4_144_PAGE_TOKENS);
@@ -3498,7 +6281,7 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
                 (int) txn_idx_probe.page_base,
                 kv_size,
                 n_heads,
-                tile16_layout);
+                effective_layout);
             CUDA_CHECK(cudaGetLastError());
 
             if (k_idxs->type == GGML_TYPE_I64) {
@@ -3515,7 +6298,7 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
                     src_token_stride_bytes, k_cur->nb[2], k_cur->nb[3],
                     src_head_stride_bytes,
                     nk_cur, n_heads, batch, MTP_V4_144_PAGE_TOKENS,
-                    k_scale_mode, k_scale_mul, k_scale_group_qblocks, false);
+                    k_scale_mode, k_scale_mul, k_scale_group_qblocks, GGML_CUDA_PACKED16_K_LAYOUT_ROW, -1);
             } else {
                 GGML_ASSERT(k_idxs->type == GGML_TYPE_I32);
                 ggml_cuda_pool_alloc<int32_t> local_idxs_alloc(pool);
@@ -3531,7 +6314,7 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
                     src_token_stride_bytes, k_cur->nb[2], k_cur->nb[3],
                     src_head_stride_bytes,
                     nk_cur, n_heads, batch, MTP_V4_144_PAGE_TOKENS,
-                    k_scale_mode, k_scale_mul, k_scale_group_qblocks, false);
+                    k_scale_mode, k_scale_mul, k_scale_group_qblocks, GGML_CUDA_PACKED16_K_LAYOUT_ROW, -1);
             }
             CUDA_CHECK(cudaGetLastError());
 
@@ -3543,7 +6326,8 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
                 (int) txn_idx_probe.page_base,
                 kv_size,
                 n_heads,
-                tile16_layout);
+                effective_layout);
+            CUDA_CHECK(cudaGetLastError());
         }
     } else if (payload_is_packed8 && is_q8_k) {
         GGML_ABORT("packed8 q4 K writer does not yet accept q8_0 source rows");
@@ -3554,7 +6338,7 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
             (int *) payload->data,
             (half *) scales->data,
             (const int64_t *) k_idxs->data,
-            k_cur->nb[1], kv_size, n_heads, batch, nk_cur, tile16_layout);
+            k_cur->nb[1], kv_size, n_heads, batch, nk_cur, effective_layout);
     } else if (payload_is_packed8 && k_idxs->type == GGML_TYPE_I64) {
         ggml_cuda_quant_k_packed8_q4_indexed_kernel<int64_t><<<grid, block, 0, stream>>>(
             (const char *) k_cur->data, (int *) payload->data, (half *) scales->data, (const int64_t *) k_idxs->data,
@@ -3576,7 +6360,7 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
             (const int64_t *) k_idxs->data,
             src_token_stride_bytes, k_cur->nb[2], k_cur->nb[3],
             src_head_stride_bytes,
-            nk_cur, n_heads, batch, kv_size, k_scale_mode, k_scale_mul, k_scale_group_qblocks, tile16_layout);
+            nk_cur, n_heads, batch, kv_size, k_scale_mode, k_scale_mul, k_scale_group_qblocks, effective_layout, -1);
     } else {
         GGML_ASSERT(k_idxs->type == GGML_TYPE_I32);
         ggml_cuda_quant_k_packed16_indexed_kernel<int32_t><<<grid, block, 0, stream>>>(
@@ -3586,9 +6370,28 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
             (const int32_t *) k_idxs->data,
             src_token_stride_bytes, k_cur->nb[2], k_cur->nb[3],
             src_head_stride_bytes,
-            nk_cur, n_heads, batch, kv_size, k_scale_mode, k_scale_mul, k_scale_group_qblocks, tile16_layout);
+            nk_cur, n_heads, batch, kv_size, k_scale_mode, k_scale_mul, k_scale_group_qblocks, effective_layout, -1);
     }
     CUDA_CHECK(cudaGetLastError());
+    const float pack_k_timing_ms = ggml_cuda_packed16_timing_trace_end(pack_k_timing, stream);
+    if (pack_k_timing_ms >= 0.0f) {
+        fprintf(stderr,
+            "PACKED16_TIMING_TRACE phase=pack_k ms=%.3f nk_cur=%d n_heads=%d batch=%d kv_size=%d layout=%s format=%s src_type=%s idx_type=%s payload_words=%u qblocks=%d txn_merge=%d owned=%d scratch=%d\n",
+            (double) pack_k_timing_ms,
+            nk_cur,
+            n_heads,
+            batch,
+            kv_size,
+            ggml_cuda_packed16_k_layout_kind_name(effective_layout),
+            ggml_cuda_pdmq_k_format_name(k_format),
+            ggml_type_name(k_cur->type),
+            k_idxs->type == GGML_TYPE_I64 ? "i64" : "i32",
+            (unsigned) ggml_cuda_pdmq_k_payload_words_per_token(k_format, (uint32_t) D),
+            D / QK8_0,
+            txn_k_page_merge_active ? 1 : 0,
+            txn_tail_owned_write_active ? 1 : 0,
+            txn_tail_scratch_map_active ? 1 : 0);
+    }
 
     // Bind the just-produced sidecar bytes to their physical layout. Consumers
     // must use this metadata instead of re-reading the environment later.
@@ -3603,16 +6406,31 @@ void ggml_cuda_op_pack_k_packed16(ggml_backend_cuda_context & ctx, ggml_tensor *
         map.version = GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_VERSION;
         map.abi_bytes = sizeof(map);
         map.active = 1;
-        map.flags = txn_tail_scratch_map_active ? GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_SCRATCH_OVERLAY : 0u;
-        map.logical_base_token = txn_tail_scratch_map_active ? txn_idx_probe.idx0 : txn_idx_probe.page_base;
-        map.valid_tail_tokens = txn_tail_scratch_map_active ? (uint32_t) nk_cur : txn_idx_probe.slot_end_excl;
+        map.flags = txn_tail_owned_write_active ? GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_OWNED_TAIL_WRITE :
+            (txn_tail_scratch_map_active ? GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_SCRATCH_OVERLAY : 0u);
         map.page_tokens = MTP_V4_144_PAGE_TOKENS;
         map.physical_pages = (uint32_t) (kv_size / (int) MTP_V4_144_PAGE_TOKENS);
-        map.block_table_pages = 1;
-        map.block_table[0] = txn_tail_scratch_map_active ?
-            (int32_t) (scratch_page_base / (int) MTP_V4_144_PAGE_TOKENS) :
-            (int32_t) (txn_idx_probe.page_base / MTP_V4_144_PAGE_TOKENS);
-        map.generation = (uint64_t(map.logical_base_token) << 32) ^ uint64_t(map.valid_tail_tokens) ^ uint64_t(map.flags);
+        const uint32_t tail_logical_page = txn_idx_probe.page_base / (uint32_t) MTP_V4_144_PAGE_TOKENS;
+        const uint32_t window_pages = tail_logical_page + 1u < GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES ?
+            tail_logical_page + 1u : GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES;
+        const uint32_t window_base_page = tail_logical_page + 1u - window_pages;
+        map.logical_base_token = window_base_page * (uint32_t) MTP_V4_144_PAGE_TOKENS;
+        map.valid_tail_tokens = txn_idx_probe.idx0 + (uint32_t) nk_cur - map.logical_base_token;
+        map.block_table_pages = (map.valid_tail_tokens + map.page_tokens - 1u) / map.page_tokens;
+        if (map.block_table_pages > GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES) {
+            map.block_table_pages = GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES;
+        }
+        for (uint32_t lp = 0; lp < map.block_table_pages; ++lp) {
+            map.block_table[lp] = (int32_t) (window_base_page + lp);
+        }
+        if (txn_tail_owned_write_active || txn_tail_scratch_map_active) {
+            const uint32_t overlay_physical_page = (uint32_t) ((txn_tail_owned_write_active ? txn_tail_owned_page_base : scratch_page_base) / (int) MTP_V4_144_PAGE_TOKENS);
+            const uint32_t tail_rel_page = tail_logical_page - window_base_page;
+            if (tail_rel_page < map.block_table_pages) {
+                map.block_table[tail_rel_page] = (int32_t) overlay_physical_page;
+            }
+        }
+        map.generation = ggml_cuda_mtp_qblock_tail_page_map_generation(map.logical_base_token, map.valid_tail_tokens, map.flags);
         llama_kv_cache_register_mtp_qblock_tail_page_map(dst->data, &map);
         if (k_cur && k_cur->data) {
             llama_kv_cache_register_mtp_qblock_tail_page_map(k_cur->data, &map);
@@ -3770,6 +6588,8 @@ void ggml_cuda_op_pack_v4_k16d16(ggml_backend_cuda_context & ctx, ggml_tensor * 
     dim3 grid(nk_cur, n_heads, batch);
     dim3 block(D);
     cudaStream_t stream = ctx.stream();
+    ggml_cuda_packed16_timing_trace_event pack_v4_timing;
+    ggml_cuda_packed16_timing_trace_begin(pack_v4_timing, stream, "pack_v4");
     if (v_idxs->type == GGML_TYPE_I64) {
         ggml_cuda_pack_v4_k16d16_indexed_kernel<int64_t><<<grid, block, 0, stream>>>(
             (const char *) v_cur->data, (char *) v4->data, (half *) v_tail->data, (const int64_t *) v_idxs->data,
@@ -3782,6 +6602,19 @@ void ggml_cuda_op_pack_v4_k16d16(ggml_backend_cuda_context & ctx, ggml_tensor * 
             v4->nb[1], v4->nb[2], v_tail->nb[1], v_tail->nb[2], nk_cur, n_heads, batch, kv_size, src_f16);
     }
     CUDA_CHECK(cudaGetLastError());
+    const float pack_v4_timing_ms = ggml_cuda_packed16_timing_trace_end(pack_v4_timing, stream);
+    if (pack_v4_timing_ms >= 0.0f) {
+        fprintf(stderr,
+            "PACKED16_TIMING_TRACE phase=pack_v4 ms=%.3f nk_cur=%d n_heads=%d batch=%d kv_size=%d src_type=%s idx_type=%s row_bytes=%d\n",
+            (double) pack_v4_timing_ms,
+            nk_cur,
+            n_heads,
+            batch,
+            kv_size,
+            ggml_type_name(v_cur->type),
+            v_idxs->type == GGML_TYPE_I64 ? "i64" : "i32",
+            GGML_CUDA_V4_K16D16_ROW_BYTES);
+    }
 }
 
 static constexpr int GGML_CUDA_V4_K16D16_144_D = 256;
@@ -3838,6 +6671,13 @@ static __device__ __forceinline__ void ggml_cuda_v4_k16d16_144_store_scale(
     } while (old != assumed);
 }
 
+static __device__ __forceinline__ uint32_t ggml_cuda_v4_k16d16_144_load_nibble(
+        const uint32_t * __restrict__ wordp,
+        const int slot) {
+    const uint32_t shift = uint32_t(4 * (slot & 7));
+    return (*wordp >> shift) & 0x0fu;
+}
+
 template<typename idx_t>
 static __global__ __launch_bounds__(256, 1) void ggml_cuda_pack_v4_k16d16_144_indexed_kernel(
         const char  * __restrict__ Vcur,
@@ -3853,7 +6693,8 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_pack_v4_k16d16_144_in
         int n_heads_v,
         int batch,
         int kv_size,
-        bool src_f16) {
+        bool src_f16,
+        int overlay_page_base) {
     const int d = int(threadIdx.x);
     const int token = int(blockIdx.x);
     const int hv = int(blockIdx.y);
@@ -3869,8 +6710,14 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_pack_v4_k16d16_144_in
     const int cell = (int) cell64;
     const int slot = cell & (GGML_CUDA_V4_K16D16_144_K - 1);
     const int k16_base = cell & ~(GGML_CUDA_V4_K16D16_144_K - 1);
+    const int overlay_cell = overlay_page_base >= 0 ? overlay_page_base + token : -1;
+    const bool overlay_valid = overlay_cell >= 0 && overlay_cell < kv_size;
+    const int overlay_slot = overlay_valid ? (overlay_cell & (GGML_CUDA_V4_K16D16_144_K - 1)) : 0;
+    const int overlay_k16_base = overlay_valid ? (overlay_cell & ~(GGML_CUDA_V4_K16D16_144_K - 1)) : 0;
 
     char * block = v144_cache + int64_t(b) * v144_nb2 + int64_t(hv * kv_size + k16_base) * v144_nb1;
+    char * overlay_block = overlay_valid ?
+        v144_cache + int64_t(b) * v144_nb2 + int64_t(hv * kv_size + overlay_k16_base) * v144_nb1 : nullptr;
     const int d32 = d >> 5;
     const int d0 = d32 * GGML_CUDA_V4_K16D16_144_D32;
 
@@ -3894,11 +6741,21 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_pack_v4_k16d16_144_in
 
     uint32_t * payload = (uint32_t *) block;
     ggml_cuda_v4_k16d16_144_store_nibble(&payload[d * 2 + (slot >> 3)], slot, (uint32_t) q);
+    if (overlay_valid) {
+        uint32_t * overlay_payload = (uint32_t *) overlay_block;
+        ggml_cuda_v4_k16d16_144_store_nibble(&overlay_payload[d * 2 + (overlay_slot >> 3)], overlay_slot, (uint32_t) q);
+    }
 
     if ((d & (GGML_CUDA_V4_K16D16_144_D32 - 1)) == 0) {
+        const half hscale = __float2half(scale);
         half * scales = (half *) (block + GGML_CUDA_V4_K16D16_144_PAYLOAD_BYTES);
         const int scale_idx = d32 * GGML_CUDA_V4_K16D16_144_K + slot;
-        ggml_cuda_v4_k16d16_144_store_scale(scales, scale_idx, __float2half(scale));
+        ggml_cuda_v4_k16d16_144_store_scale(scales, scale_idx, hscale);
+        if (overlay_valid) {
+            half * overlay_scales = (half *) (overlay_block + GGML_CUDA_V4_K16D16_144_PAYLOAD_BYTES);
+            const int overlay_scale_idx = d32 * GGML_CUDA_V4_K16D16_144_K + overlay_slot;
+            ggml_cuda_v4_k16d16_144_store_scale(overlay_scales, overlay_scale_idx, hscale);
+        }
     }
 }
 
@@ -3940,6 +6797,49 @@ static __global__ __launch_bounds__(256, 1) void ggml_cuda_mtp_qblock_txn_tail_v
     const char * src_page = scratch_page + (int64_t(b) * n_heads_v + hv) * GGML_CUDA_V4_K16D16_144_BLOCK_BYTES;
     char * dst_page = v144_cache + int64_t(b) * v144_nb2 + int64_t(hv * kv_size + page_base) * v144_nb1;
     ((uint32_t *) dst_page)[word] = ((const uint32_t *) src_page)[word];
+}
+
+template <typename idx_t>
+static __global__ __launch_bounds__(256, 1) void ggml_cuda_mtp_qblock_poison_canonical_v4_144_indexed_kernel(
+        char        * __restrict__ v144_cache,
+        const idx_t * __restrict__ v_idxs,
+        int64_t v144_nb1,
+        int64_t v144_nb2,
+        int nk_cur,
+        int n_heads_v,
+        int batch,
+        int kv_size,
+        int poison_min_idx,
+        int poison_max_idx) {
+    const int d = int(threadIdx.x);
+    const int token = int(blockIdx.x);
+    const int hv = int(blockIdx.y);
+    const int b = int(blockIdx.z);
+    if (d >= GGML_CUDA_V4_K16D16_144_D || token >= nk_cur || hv >= n_heads_v || b >= batch) {
+        return;
+    }
+
+    const int64_t cell64 = (int64_t) v_idxs[token];
+    if (cell64 < 0 || cell64 >= kv_size) {
+        return;
+    }
+    const int cell = (int) cell64;
+    if ((poison_min_idx > 0 && cell < poison_min_idx) || (poison_max_idx >= 0 && cell >= poison_max_idx)) {
+        return;
+    }
+    const int slot = cell & (GGML_CUDA_V4_K16D16_144_K - 1);
+    const int k16_base = cell & ~(GGML_CUDA_V4_K16D16_144_K - 1);
+
+    char * block = v144_cache + int64_t(b) * v144_nb2 + int64_t(hv * kv_size + k16_base) * v144_nb1;
+    uint32_t * payload = (uint32_t *) block;
+    ggml_cuda_v4_k16d16_144_store_nibble(&payload[d * 2 + (slot >> 3)], slot, 0x0fu);
+
+    if ((d & (GGML_CUDA_V4_K16D16_144_D32 - 1)) == 0) {
+        half * scales = (half *) (block + GGML_CUDA_V4_K16D16_144_PAYLOAD_BYTES);
+        const int d32 = d >> 5;
+        const int scale_idx = d32 * GGML_CUDA_V4_K16D16_144_K + slot;
+        ggml_cuda_v4_k16d16_144_store_scale(scales, scale_idx, __float2half(16.0f));
+    }
 }
 
 void ggml_cuda_op_pack_v4_k16d16_144(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -4074,7 +6974,73 @@ void ggml_cuda_op_pack_v4_k16d16_144(ggml_backend_cuda_context & ctx, ggml_tenso
     const int scratch_page_base = (kv_size >= 2 * (int) MTP_V4_144_PAGE_TOKENS)
         ? ((kv_size / (int) MTP_V4_144_PAGE_TOKENS) - 1) * (int) MTP_V4_144_PAGE_TOKENS
         : -1;
+    uint32_t txn_tail_owned_reserved_physical_page = 0;
+    ggml_cuda_mtp_qblock_tail_page_map_v1 txn_tail_owned_reserved_map = {};
+    const bool txn_tail_owned_reserved_map_ok = txn_v_page_merge_active &&
+        ggml_cuda_mtp_qblock_paged_attention_owned_tail_write_requested() &&
+        llama_kv_cache_mtp_qblock_tail_page_published_owned_map_covers(
+            txn_v_idx_probe.idx0, (uint32_t) nk_cur, &txn_tail_owned_reserved_physical_page, &txn_tail_owned_reserved_map);
+    const bool txn_tail_owned_require_prepublished_map = txn_v_page_merge_active &&
+        ggml_cuda_mtp_qblock_paged_attention_owned_tail_write_requested() &&
+        ggml_cuda_mtp_qblock_owned_tail_write_require_prepublished_map_requested();
+    const bool txn_tail_owned_missing_required_map = txn_tail_owned_require_prepublished_map &&
+        !txn_tail_owned_reserved_map_ok;
+    const int txn_tail_owned_page_base = txn_tail_owned_reserved_map_ok ?
+        (int) (txn_tail_owned_reserved_physical_page * (uint32_t) MTP_V4_144_PAGE_TOKENS) :
+        (txn_tail_owned_missing_required_map ? -1 : scratch_page_base);
+    const bool txn_tail_owned_write_active = txn_v_page_merge_active &&
+        ggml_cuda_mtp_qblock_paged_attention_owned_tail_write_requested() &&
+        !txn_tail_owned_missing_required_map &&
+        txn_tail_owned_page_base >= 0 &&
+        (uint32_t) txn_tail_owned_page_base >= txn_v_idx_probe.page_end;
+    if (txn_tail_owned_missing_required_map) {
+        fprintf(stderr,
+                "MTP_QBLOCK_TXN_TAIL_PAGE_OWNED_FAIL_CLOSED: kind=V reason=missing_prepublished_owned_map idx0=%u n_tokens=%u scratch_page_base=%d page_end=%u\n",
+                txn_v_idx_probe.idx0,
+                (uint32_t) nk_cur,
+                scratch_page_base,
+                txn_v_idx_probe.page_end);
+    }
+    if (txn_v_page_merge_active && ggml_cuda_mtp_qblock_paged_attention_owned_tail_write_requested() &&
+            ggml_cuda_mtp_qblock_owned_tail_write_plan_proof_requested()) {
+        const bool writer_from_map = txn_tail_owned_reserved_map_ok && txn_tail_owned_write_active;
+        const bool legacy_fallback_owned = !txn_tail_owned_reserved_map_ok && txn_tail_owned_write_active;
+        fprintf(stderr,
+                "MTP_QBLOCK_TXN_TAIL_PAGE_OWNED_PLAN_PROOF: op=writer_authority kind=V writer_from_map=%d legacy_fallback_owned=%d owned_write_active=%d map_generation=%llu physical_page_from_map=%u overlay_page_base=%d idx0=%u n_tokens=%u map_logical_base=%u map_valid_tail=%u table0=%d\n",
+                writer_from_map ? 1 : 0,
+                legacy_fallback_owned ? 1 : 0,
+                txn_tail_owned_write_active ? 1 : 0,
+                (unsigned long long) (txn_tail_owned_reserved_map_ok ? txn_tail_owned_reserved_map.generation : 0ull),
+                txn_tail_owned_reserved_map_ok ? txn_tail_owned_reserved_physical_page : 0xffffffffu,
+                txn_tail_owned_write_active ? txn_tail_owned_page_base : -1,
+                txn_v_idx_probe.idx0,
+                (uint32_t) nk_cur,
+                txn_tail_owned_reserved_map.logical_base_token,
+                txn_tail_owned_reserved_map.valid_tail_tokens,
+                txn_tail_owned_reserved_map.block_table[0]);
+    }
+    if (txn_v_page_merge_active && ggml_cuda_mtp_qblock_paged_attention_owned_tail_write_requested()) {
+        const char * owned_ready_reason = txn_tail_owned_reserved_map_ok ?
+            (txn_tail_owned_write_active ? "ok" : "owned_page_visible") :
+            (txn_tail_owned_missing_required_map ? "missing_prepublished_owned_map" : "no_owned_map");
+        ggml_cuda_mtp_qblock_tail_page_record_owned_write_ready(
+            "V",
+            txn_tail_owned_reserved_map_ok && txn_tail_owned_write_active,
+            txn_tail_owned_reserved_map,
+            txn_v_idx_probe.idx0,
+            (uint32_t) nk_cur,
+            txn_tail_owned_reserved_physical_page,
+            owned_ready_reason);
+    }
+    const bool txn_tail_owned_exclusive_active = txn_tail_owned_write_active &&
+        ggml_cuda_mtp_qblock_tail_page_owned_write_exclusive_allowed(
+            "V",
+            txn_tail_owned_reserved_map,
+            txn_v_idx_probe.idx0,
+            (uint32_t) nk_cur,
+            txn_tail_owned_reserved_physical_page);
     const bool txn_tail_scratch_map_active = txn_v_page_merge_active &&
+        !txn_tail_owned_write_active &&
         ggml_cuda_mtp_qblock_txn_tail_page_scratch_map_requested() &&
         scratch_page_base >= 0 &&
         (uint32_t) scratch_page_base >= txn_v_idx_probe.page_end;
@@ -4097,46 +7063,117 @@ void ggml_cuda_op_pack_v4_k16d16_144(ggml_backend_cuda_context & ctx, ggml_tenso
         txn_tail_scratch_exclusive_route_complete_ok &&
         txn_tail_scratch_exclusive_min_ok && txn_tail_scratch_exclusive_after_nomap_ok &&
         txn_tail_scratch_exclusive_published_map_ok;
+
+    ggml_cuda_packed16_timing_trace_event pack_v4_144_timing;
+    ggml_cuda_packed16_timing_trace_begin(pack_v4_144_timing, stream, "pack_v4_144");
+
     if (txn_v_page_merge_active) {
         ggml_cuda_pool & pool = ctx.pool();
-        if (txn_tail_scratch_map_active) {
-            if (!txn_tail_scratch_exclusive_active) {
+        if (txn_tail_owned_write_active || txn_tail_scratch_map_active) {
+            const int overlay_page_base = txn_tail_owned_write_active ? txn_tail_owned_page_base : scratch_page_base;
+            const bool owned_overlay_dual_candidate = txn_tail_owned_write_active &&
+                !txn_tail_owned_exclusive_active && !txn_tail_scratch_exclusive_active &&
+                ggml_cuda_mtp_qblock_owned_tail_write_dual_dest_candidate_requested();
+            if (!txn_tail_owned_exclusive_active && !txn_tail_scratch_exclusive_active) {
+                const int dual_overlay_page_base = owned_overlay_dual_candidate ? overlay_page_base : -1;
                 if (v_idxs->type == GGML_TYPE_I64) {
                     ggml_cuda_pack_v4_k16d16_144_indexed_kernel<int64_t><<<grid, block, 0, stream>>>(
                         (const char *) v_cur->data, (char *) v144->data, (const int64_t *) v_idxs->data,
                         src_token_stride_bytes, v_cur->nb[2], v_cur->nb[3], src_head_stride_bytes,
-                        v144->nb[1], v144->nb[2], nk_cur, n_heads, batch, kv_size, src_f16);
+                        v144->nb[1], v144->nb[2], nk_cur, n_heads, batch, kv_size, src_f16, dual_overlay_page_base);
                 } else {
                     GGML_ASSERT(v_idxs->type == GGML_TYPE_I32);
                     ggml_cuda_pack_v4_k16d16_144_indexed_kernel<int32_t><<<grid, block, 0, stream>>>(
                         (const char *) v_cur->data, (char *) v144->data, (const int32_t *) v_idxs->data,
                         src_token_stride_bytes, v_cur->nb[2], v_cur->nb[3], src_head_stride_bytes,
-                        v144->nb[1], v144->nb[2], nk_cur, n_heads, batch, kv_size, src_f16);
+                        v144->nb[1], v144->nb[2], nk_cur, n_heads, batch, kv_size, src_f16, dual_overlay_page_base);
                 }
                 CUDA_CHECK(cudaGetLastError());
             }
 
-            if (v_idxs->type == GGML_TYPE_I64) {
+            if (owned_overlay_dual_candidate) {
+                // The canonical pack above also populated the owned overlay.
+            } else if (v_idxs->type == GGML_TYPE_I64) {
                 ggml_cuda_pool_alloc<int64_t> local_idxs_alloc(pool);
                 int64_t * local_idxs = local_idxs_alloc.alloc((size_t) nk_cur);
                 ggml_cuda_mtp_qblock_txn_tail_k_fill_local_idxs_kernel<int64_t><<<1, 32, 0, stream>>>(
-                    local_idxs, nk_cur, scratch_page_base);
+                    local_idxs, nk_cur, overlay_page_base);
                 CUDA_CHECK(cudaGetLastError());
                 ggml_cuda_pack_v4_k16d16_144_indexed_kernel<int64_t><<<grid, block, 0, stream>>>(
                     (const char *) v_cur->data, (char *) v144->data, local_idxs,
                     src_token_stride_bytes, v_cur->nb[2], v_cur->nb[3], src_head_stride_bytes,
-                    v144->nb[1], v144->nb[2], nk_cur, n_heads, batch, kv_size, src_f16);
+                    v144->nb[1], v144->nb[2], nk_cur, n_heads, batch, kv_size, src_f16, -1);
             } else {
                 GGML_ASSERT(v_idxs->type == GGML_TYPE_I32);
                 ggml_cuda_pool_alloc<int32_t> local_idxs_alloc(pool);
                 int32_t * local_idxs = local_idxs_alloc.alloc((size_t) nk_cur);
                 ggml_cuda_mtp_qblock_txn_tail_k_fill_local_idxs_kernel<int32_t><<<1, 32, 0, stream>>>(
-                    local_idxs, nk_cur, scratch_page_base);
+                    local_idxs, nk_cur, overlay_page_base);
                 CUDA_CHECK(cudaGetLastError());
                 ggml_cuda_pack_v4_k16d16_144_indexed_kernel<int32_t><<<grid, block, 0, stream>>>(
                     (const char *) v_cur->data, (char *) v144->data, local_idxs,
                     src_token_stride_bytes, v_cur->nb[2], v_cur->nb[3], src_head_stride_bytes,
-                    v144->nb[1], v144->nb[2], nk_cur, n_heads, batch, kv_size, src_f16);
+                    v144->nb[1], v144->nb[2], nk_cur, n_heads, batch, kv_size, src_f16, -1);
+            }
+            const int poison_min_idx = ggml_cuda_mtp_qblock_owned_tail_write_poison_canonical_min_idx();
+            const int poison_max_idx = ggml_cuda_mtp_qblock_owned_tail_write_poison_canonical_max_idx();
+            if (txn_tail_owned_write_active && ggml_cuda_mtp_qblock_owned_tail_write_poison_canonical_v_requested() &&
+                    ggml_cuda_mtp_qblock_owned_tail_write_poison_canonical_range_hits(
+                        txn_v_idx_probe.idx0, (uint32_t) nk_cur, poison_min_idx, poison_max_idx)) {
+                if (v_idxs->type == GGML_TYPE_I64) {
+                    ggml_cuda_mtp_qblock_poison_canonical_v4_144_indexed_kernel<int64_t><<<grid, block, 0, stream>>>(
+                        (char *) v144->data,
+                        (const int64_t *) v_idxs->data,
+                        v144->nb[1], v144->nb[2], nk_cur, n_heads, batch, kv_size, poison_min_idx, poison_max_idx);
+                } else {
+                    GGML_ASSERT(v_idxs->type == GGML_TYPE_I32);
+                    ggml_cuda_mtp_qblock_poison_canonical_v4_144_indexed_kernel<int32_t><<<grid, block, 0, stream>>>(
+                        (char *) v144->data,
+                        (const int32_t *) v_idxs->data,
+                        v144->nb[1], v144->nb[2], nk_cur, n_heads, batch, kv_size, poison_min_idx, poison_max_idx);
+                }
+                CUDA_CHECK(cudaGetLastError());
+                fprintf(stderr,
+                    "MTP_QBLOCK_TXN_TAIL_PAGE_OWNED_CANONICAL_POISON: kind=V status=ok reason=owned_write_active idx0=%u n_tokens=%u poison_min_idx=%d poison_max_idx=%d canonical_page_base=%u owned_page_base=%d physical_page=%u map_logical_base=%u map_valid_tail=%u table0=%d flags=0x%x generation=%llu\n",
+                    txn_v_idx_probe.idx0,
+                    (uint32_t) nk_cur,
+                    poison_min_idx,
+                    poison_max_idx,
+                    txn_v_idx_probe.page_base,
+                    txn_tail_owned_page_base,
+                    txn_tail_owned_reserved_physical_page,
+                    txn_tail_owned_reserved_map.logical_base_token,
+                    txn_tail_owned_reserved_map.valid_tail_tokens,
+                    txn_tail_owned_reserved_map.block_table[0],
+                    txn_tail_owned_reserved_map.flags,
+                    (unsigned long long) txn_tail_owned_reserved_map.generation);
+            }
+            if (txn_tail_owned_write_active && overlay_page_base >= 0) {
+                const size_t scratch_bytes = size_t(batch) * size_t(n_heads) * size_t(GGML_CUDA_V4_K16D16_144_BLOCK_BYTES);
+                ggml_cuda_pool_alloc<char> owned_page_alloc(pool);
+                char * owned_page = owned_page_alloc.alloc(scratch_bytes);
+
+                constexpr int v4_page_words = GGML_CUDA_V4_K16D16_144_BLOCK_BYTES / (int) sizeof(uint32_t);
+                dim3 page_grid((v4_page_words + 255) / 256, n_heads, batch);
+                dim3 page_block(256);
+                ggml_cuda_mtp_qblock_txn_tail_v4_144_copy_page_to_scratch_kernel<<<page_grid, page_block, 0, stream>>>(
+                    (const char *) v144->data,
+                    owned_page,
+                    (int) txn_v_idx_probe.page_base,
+                    v144->nb[1],
+                    v144->nb[2],
+                    kv_size,
+                    n_heads);
+                CUDA_CHECK(cudaGetLastError());
+                ggml_cuda_mtp_qblock_txn_tail_v4_144_commit_scratch_page_kernel<<<page_grid, page_block, 0, stream>>>(
+                    owned_page,
+                    (char *) v144->data,
+                    overlay_page_base,
+                    v144->nb[1],
+                    v144->nb[2],
+                    kv_size,
+                    n_heads);
+                CUDA_CHECK(cudaGetLastError());
             }
         } else {
             const size_t scratch_bytes = size_t(batch) * size_t(n_heads) * size_t(GGML_CUDA_V4_K16D16_144_BLOCK_BYTES);
@@ -4167,7 +7204,7 @@ void ggml_cuda_op_pack_v4_k16d16_144(ggml_backend_cuda_context & ctx, ggml_tenso
                     src_token_stride_bytes, v_cur->nb[2], v_cur->nb[3], src_head_stride_bytes,
                     GGML_CUDA_V4_K16D16_144_ROW_BYTES,
                     int64_t(n_heads) * GGML_CUDA_V4_K16D16_144_BLOCK_BYTES,
-                    nk_cur, n_heads, batch, MTP_V4_144_PAGE_TOKENS, src_f16);
+                    nk_cur, n_heads, batch, MTP_V4_144_PAGE_TOKENS, src_f16, -1);
             } else {
                 GGML_ASSERT(v_idxs->type == GGML_TYPE_I32);
                 ggml_cuda_pool_alloc<int32_t> local_idxs_alloc(pool);
@@ -4180,7 +7217,7 @@ void ggml_cuda_op_pack_v4_k16d16_144(ggml_backend_cuda_context & ctx, ggml_tenso
                     src_token_stride_bytes, v_cur->nb[2], v_cur->nb[3], src_head_stride_bytes,
                     GGML_CUDA_V4_K16D16_144_ROW_BYTES,
                     int64_t(n_heads) * GGML_CUDA_V4_K16D16_144_BLOCK_BYTES,
-                    nk_cur, n_heads, batch, MTP_V4_144_PAGE_TOKENS, src_f16);
+                    nk_cur, n_heads, batch, MTP_V4_144_PAGE_TOKENS, src_f16, -1);
             }
             CUDA_CHECK(cudaGetLastError());
 
@@ -4192,19 +7229,36 @@ void ggml_cuda_op_pack_v4_k16d16_144(ggml_backend_cuda_context & ctx, ggml_tenso
                 v144->nb[2],
                 kv_size,
                 n_heads);
+            CUDA_CHECK(cudaGetLastError());
         }
     } else if (v_idxs->type == GGML_TYPE_I64) {
         ggml_cuda_pack_v4_k16d16_144_indexed_kernel<int64_t><<<grid, block, 0, stream>>>(
             (const char *) v_cur->data, (char *) v144->data, (const int64_t *) v_idxs->data,
             src_token_stride_bytes, v_cur->nb[2], v_cur->nb[3], src_head_stride_bytes,
-            v144->nb[1], v144->nb[2], nk_cur, n_heads, batch, kv_size, src_f16);
+            v144->nb[1], v144->nb[2], nk_cur, n_heads, batch, kv_size, src_f16, -1);
     } else {
         ggml_cuda_pack_v4_k16d16_144_indexed_kernel<int32_t><<<grid, block, 0, stream>>>(
             (const char *) v_cur->data, (char *) v144->data, (const int32_t *) v_idxs->data,
             src_token_stride_bytes, v_cur->nb[2], v_cur->nb[3], src_head_stride_bytes,
-            v144->nb[1], v144->nb[2], nk_cur, n_heads, batch, kv_size, src_f16);
+            v144->nb[1], v144->nb[2], nk_cur, n_heads, batch, kv_size, src_f16, -1);
     }
     CUDA_CHECK(cudaGetLastError());
+    const float pack_v4_144_timing_ms = ggml_cuda_packed16_timing_trace_end(pack_v4_144_timing, stream);
+    if (pack_v4_144_timing_ms >= 0.0f) {
+        fprintf(stderr,
+            "PACKED16_TIMING_TRACE phase=pack_v4_144 ms=%.3f nk_cur=%d n_heads=%d batch=%d kv_size=%d src_type=%s idx_type=%s row_bytes=%d txn_merge=%d owned=%d scratch=%d\n",
+            (double) pack_v4_144_timing_ms,
+            nk_cur,
+            n_heads,
+            batch,
+            kv_size,
+            ggml_type_name(v_cur->type),
+            v_idxs->type == GGML_TYPE_I64 ? "i64" : "i32",
+            GGML_CUDA_V4_K16D16_144_ROW_BYTES,
+            txn_v_page_merge_active ? 1 : 0,
+            txn_tail_owned_write_active ? 1 : 0,
+            txn_tail_scratch_map_active ? 1 : 0);
+    }
 }
 
 #endif // GGML_USE_HIP

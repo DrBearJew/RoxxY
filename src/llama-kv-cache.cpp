@@ -83,9 +83,93 @@ static bool llama_mtp_qblock_tail_page_producer_state_import_enabled() {
     return import && atoi(import) != 0;
 }
 
+static bool llama_mtp_qblock_tail_page_producer_snapshot_owned_proof_enabled() {
+    const char * proof = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_PRODUCER_SNAPSHOT_OWNED_PROOF");
+    return proof && atoi(proof) != 0;
+}
+
+static bool llama_mtp_qblock_paged_attention_enabled() {
+    const char * paged = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION");
+    return paged && atoi(paged) != 0;
+}
+
+static bool llama_mtp_qblock_paged_attention_owned_tail_write_enabled() {
+    const char * owned = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE");
+    return llama_mtp_qblock_paged_attention_enabled() && owned && atoi(owned) != 0;
+}
+
+static bool llama_mtp_qblock_dbv_paged_attention_enabled() {
+    const char * paged = getenv("GGML_CUDA_ROCM_PACKED16_DBV_PAGED_ATTENTION");
+    return paged && atoi(paged) != 0;
+}
+
+static int llama_mtp_qblock_env_int(const char * name, int def) {
+    const char * v = getenv(name);
+    return v && *v ? atoi(v) : def;
+}
+
+static int llama_mtp_qblock_dbv_paged_attention_min_nq() {
+    const int v = llama_mtp_qblock_env_int("GGML_CUDA_ROCM_PACKED16_DBV_PAGED_ATTENTION_MIN_NQ", 16);
+    return v < 1 ? 1 : v;
+}
+
+static bool llama_mtp_qblock_kv_persistence_trace_enabled() {
+    const char * trace = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_KV_PERSISTENCE_TRACE");
+    if (trace && atoi(trace) != 0) {
+        return true;
+    }
+    trace = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_KV_PERSISTENCE_TRACE");
+    return trace && atoi(trace) != 0;
+}
+
+static int llama_mtp_qblock_kv_persistence_trace_min_idx() {
+    const char * v = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_KV_PERSISTENCE_TRACE_MIN_IDX");
+    if (v && *v) {
+        return atoi(v);
+    }
+    return llama_mtp_qblock_env_int("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE_CANONICAL_POISON_MIN_IDX", -1);
+}
+
+static int llama_mtp_qblock_kv_persistence_trace_max_idx() {
+    const char * v = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_KV_PERSISTENCE_TRACE_MAX_IDX");
+    if (v && *v) {
+        return atoi(v);
+    }
+    return llama_mtp_qblock_env_int("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE_CANONICAL_POISON_MAX_IDX", -1);
+}
+
+static bool llama_mtp_qblock_kv_persistence_range_hits(uint32_t begin, uint32_t end) {
+    if (end <= begin) {
+        return false;
+    }
+    const int min_idx = llama_mtp_qblock_kv_persistence_trace_min_idx();
+    const int max_idx = llama_mtp_qblock_kv_persistence_trace_max_idx();
+    if (min_idx >= 0 && end <= (uint32_t) min_idx) {
+        return false;
+    }
+    if (max_idx >= 0 && begin >= (uint32_t) max_idx) {
+        return false;
+    }
+    return true;
+}
+
+static bool llama_mtp_qblock_kv_persistence_map_active(const ggml_tensor * key, ggml_cuda_mtp_qblock_tail_page_map_v1 * map) {
+    if (map) {
+        *map = {};
+    }
+    if (!key || !key->data || !map) {
+        return false;
+    }
+    llama_kv_cache_get_mtp_qblock_tail_page_map(key->data, map);
+    return map->active != 0;
+}
+
 static bool llama_mtp_qblock_tail_page_keep_producer_snapshot_on_clear(const char * reason) {
     if (!llama_mtp_qblock_tail_page_producer_state_import_enabled() || reason == nullptr) {
         return false;
+    }
+    if (llama_mtp_qblock_tail_page_producer_snapshot_owned_proof_enabled()) {
+        return true;
     }
     return strncmp(reason, "seq_rm(", 7) == 0 ||
         strcmp(reason, "state_read") == 0 ||
@@ -1014,9 +1098,10 @@ bool llama_kv_cache::register_mtp_qblock_tail_page_map(const ggml_cuda_mtp_qbloc
     }
 
     bool registered_any = false;
-    auto register_one = [&](ggml_tensor * key) {
+    uint32_t expected_route_layers = 0;
+    auto register_one = [&](ggml_tensor * key) -> bool {
         if (!key || !key->data) {
-            return;
+            return false;
         }
         llama_kv_cache_register_mtp_qblock_tail_page_map(key->data, &map);
         ggml_cuda_mtp_qblock_tail_page_map_v1 check = {};
@@ -1025,29 +1110,37 @@ bool llama_kv_cache::register_mtp_qblock_tail_page_map(const ggml_cuda_mtp_qbloc
         for (uint32_t i = 0; table_equal && i < map.block_table_pages && i < GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES; ++i) {
             table_equal = check.block_table[i] == map.block_table[i];
         }
-        registered_any = registered_any ||
-            (check.active &&
-             check.generation == map.generation &&
-             check.logical_base_token == map.logical_base_token &&
-             check.valid_tail_tokens == map.valid_tail_tokens &&
-             check.flags == map.flags &&
-             check.page_tokens == map.page_tokens &&
-             table_equal);
+        const bool ok =
+            check.active &&
+            check.generation == map.generation &&
+            check.logical_base_token == map.logical_base_token &&
+            check.valid_tail_tokens == map.valid_tail_tokens &&
+            check.flags == map.flags &&
+            check.page_tokens == map.page_tokens &&
+            table_equal;
+        registered_any = registered_any || ok;
+        return ok;
     };
 
     for (const auto & layer : layers) {
-        register_one(layer.k_payload);
+        bool layer_registered = false;
+        layer_registered = register_one(layer.k_payload) || layer_registered;
         for (auto * k_payload_view : layer.k_payload_stream) {
-            register_one(k_payload_view);
+            layer_registered = register_one(k_payload_view) || layer_registered;
         }
-        register_one(layer.k);
+        layer_registered = register_one(layer.k) || layer_registered;
         for (auto * k_view : layer.k_stream) {
-            register_one(k_view);
+            layer_registered = register_one(k_view) || layer_registered;
+        }
+        if (layer_registered) {
+            ++expected_route_layers;
         }
     }
 
     if (!registered_any) {
         clear_mtp_qblock_tail_page_maps("register_tail_page_map_no_sidecar");
+    } else {
+        llama_kv_cache_note_mtp_qblock_tail_page_route_expected(&map, expected_route_layers);
     }
     return registered_any;
 }
@@ -1276,6 +1369,51 @@ bool llama_kv_cache::register_mtp_qblock_tail_page_map_from_producer_snapshot(
     }
 
     const uint64_t imported_generation = producer_map.generation != 0 ? producer_map.generation : generation;
+    const bool owned_tail_write =
+        (producer_map.flags & GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_OWNED_TAIL_WRITE) != 0 &&
+        (producer_map.flags & GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_SCRATCH_OVERLAY) == 0;
+    if (owned_tail_write) {
+        const uint32_t required_pages = (producer_map.valid_tail_tokens + producer_map.page_tokens - 1u) / producer_map.page_tokens;
+        llama_mtp_qblock_paged_state_status status = llama_mtp_qblock_paged_state_init_absolute_empty(
+            mtp_qblock_paged_state,
+            producer_map.logical_base_token,
+            producer_map.physical_pages,
+            imported_generation);
+        if (status != LLAMA_MTP_QBLOCK_PAGED_STATE_OK) {
+            return fail("owned_init_failed");
+        }
+        for (uint32_t lp = 0; lp < required_pages; ++lp) {
+            status = llama_mtp_qblock_paged_state_claim_txn_page(mtp_qblock_paged_state, uint32_t(producer_map.block_table[lp]), nullptr);
+            if (status != LLAMA_MTP_QBLOCK_PAGED_STATE_OK) {
+                (void) llama_mtp_qblock_paged_state_rollback_txn_pages(mtp_qblock_paged_state);
+                clear_mtp_qblock_paged_state();
+                return fail("owned_claim_failed");
+            }
+        }
+        status = llama_mtp_qblock_paged_state_commit_pages(
+            mtp_qblock_paged_state,
+            producer_map.valid_tail_tokens,
+            producer_map.block_table,
+            required_pages,
+            accepted_tokens);
+        if (status != LLAMA_MTP_QBLOCK_PAGED_STATE_OK) {
+            (void) llama_mtp_qblock_paged_state_rollback_txn_pages(mtp_qblock_paged_state);
+            clear_mtp_qblock_paged_state();
+            return fail("owned_commit_failed");
+        }
+        if (llama_mtp_qblock_tail_page_registry_trace_enabled()) {
+            fprintf(stderr,
+                    "MTP_QBLOCK_TXN_TAIL_PAGE_REGISTRY: op=owned_claim_commit logical_base=%u valid_tail=%u physical_pages=%u claimed_pages=%u table0=%d generation=%llu\n",
+                    producer_map.logical_base_token,
+                    producer_map.valid_tail_tokens,
+                    producer_map.physical_pages,
+                    required_pages,
+                    producer_map.block_table[0],
+                    (unsigned long long) imported_generation);
+        }
+        return register_mtp_qblock_tail_page_map_from_paged_state(out_map, reason, producer_map.flags);
+    }
+
     const llama_mtp_qblock_paged_state_status status = llama_mtp_qblock_paged_state_import_committed_pages(
         mtp_qblock_paged_state,
         producer_map.logical_base_token,
@@ -1386,7 +1524,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     if (preserve_disjoint_tail_page_maps_requested ||
             shrink_suffix_tail_page_maps_requested ||
             preserve_shared_seq_tail_page_maps_requested ||
-            llama_mtp_qblock_tail_page_producer_state_import_enabled()) {
+            llama_mtp_qblock_tail_page_producer_state_import_enabled() ||
+            llama_mtp_qblock_paged_attention_enabled()) {
         const uint64_t rm_begin = p0 < 0 ? 0u : (uint64_t) p0;
         const uint64_t rm_end = p1 < 0 ? std::numeric_limits<uint64_t>::max() : (uint64_t) p1;
         bool found_active_map = false;
@@ -1720,6 +1859,34 @@ bool llama_kv_cache::seq_import_physical(llama_seq_id seq_id_src, llama_seq_id s
         return fail("source_seq_empty");
     }
 
+    const bool persistence_trace = llama_mtp_qblock_kv_persistence_trace_enabled();
+    uint32_t src_min_idx = src_idxs[0];
+    uint32_t src_max_idx_excl = src_idxs[0] + 1u;
+    for (const uint32_t src_idx : src_idxs) {
+        src_min_idx = std::min(src_min_idx, src_idx);
+        src_max_idx_excl = std::max(src_max_idx_excl, src_idx + 1u);
+    }
+    auto emit_import_trace = [&](const char * status, const char * path, const char * detail, size_t bytes, size_t cells) {
+        if (!persistence_trace || !llama_mtp_qblock_kv_persistence_range_hits(src_min_idx, src_max_idx_excl)) {
+            return;
+        }
+        fprintf(stderr,
+                "MTP_QBLOCK_KV_PERSISTENCE: op=seq_import_physical status=%s path=%s detail=%s seq_src=%d seq_dst=%d src_count=%zu src_min=%u src_max_excl=%u bytes=%zu cells=%zu v_trans=%d n_stream=%u\n",
+                status ? status : "unknown",
+                path ? path : "unknown",
+                detail ? detail : "unknown",
+                (int) seq_id_src,
+                (int) seq_id_dst,
+                src_idxs.size(),
+                src_min_idx,
+                src_max_idx_excl,
+                bytes,
+                cells,
+                v_trans ? 1 : 0,
+                n_stream);
+    };
+    emit_import_trace("begin", "unknown", "after_clear_tail_maps", 0, 0);
+
     const char * rebind_unavailable_reason = nullptr;
     bool can_rebind = src_strm == dst_strm;
     if (!can_rebind) {
@@ -1741,6 +1908,8 @@ bool llama_kv_cache::seq_import_physical(llama_seq_id seq_id_src, llama_seq_id s
             }
         }
     }
+
+    emit_import_trace(can_rebind ? "path" : "path_unavailable", can_rebind ? "rebind" : "fallback_candidate", rebind_unavailable_reason, 0, 0);
 
     if (can_rebind) {
         std::vector<uint32_t> old_heads = v_heads;
@@ -2007,14 +2176,17 @@ bool llama_kv_cache::seq_import_physical(llama_seq_id seq_id_src, llama_seq_id s
         if (reason) {
             *reason = copied_bytes == 0 ? "attention_physical_rebind_ok" : "attention_physical_tail_copy_ok";
         }
+        emit_import_trace("ok", "rebind", copied_bytes == 0 ? "metadata_rebind_only" : "tail_payload_copy", copied_bytes, src_only_idxs.size());
         return true;
     }
 
     const char * copy_fallback_env = getenv("LLAMA_MTP_QBLOCK_BRANCH_TXN_KV_PHYSICAL_IMPORT_COPY_FALLBACK");
     const bool copy_fallback_enabled = copy_fallback_env && atoi(copy_fallback_env) != 0;
     if (!copy_fallback_enabled) {
+        emit_import_trace("skip", "fallback", rebind_unavailable_reason ? rebind_unavailable_reason : "rebind_unavailable", 0, 0);
         return fail(rebind_unavailable_reason ? rebind_unavailable_reason : "rebind_unavailable");
     }
+    emit_import_trace("path", "fallback", "copy_fallback_enabled", 0, 0);
 
     llama_batch_allocr balloc(hparams.n_pos_per_embd());
     llama_ubatch ubatch = balloc.ubatch_reserve((uint32_t) src_idxs.size(), 1);
@@ -2058,6 +2230,7 @@ bool llama_kv_cache::seq_import_physical(llama_seq_id seq_id_src, llama_seq_id s
     std::vector<uint8_t> copy_tmp;
     const char * copy_pdmq_env = getenv("LLAMA_MTP_QBLOCK_BRANCH_TXN_KV_PHYSICAL_IMPORT_COPY_PDMQ");
     const bool copy_pdmq_sidecars = copy_pdmq_env && atoi(copy_pdmq_env) != 0;
+    emit_import_trace(copy_pdmq_sidecars ? "copy_policy" : "copy_policy", "fallback", copy_pdmq_sidecars ? "copy_pdmq_sidecars" : "skip_pdmq_sidecars", 0, 0);
     auto copy_1d = [&](ggml_tensor * src_base, ggml_tensor * dst_base, int64_t ne0, size_t src_off, size_t dst_off) {
         if (src_base == nullptr || dst_base == nullptr) {
             return src_base == nullptr && dst_base == nullptr;
@@ -2160,6 +2333,7 @@ bool llama_kv_cache::seq_import_physical(llama_seq_id seq_id_src, llama_seq_id s
     if (reason) {
         *reason = "attention_physical_import_ok";
     }
+    emit_import_trace("ok", "fallback", copy_pdmq_sidecars ? "copied_with_pdmq_sidecars" : "copied_without_pdmq_sidecars", copied_bytes, src_idxs.size());
     return true;
 }
 
@@ -2987,24 +3161,59 @@ bool llama_kv_cache::get_implicit_causal_mask_meta(const slot_info & sinfo, cons
     }
 
     const auto & cells = v_cells[sinfo.strm[0]];
-    const uint32_t n_kv_valid = cells.used_max_p1();
+    if (cells.get_has_shift()) {
+        return false;
+    }
+
+    llama_pos p_base = std::numeric_limits<llama_pos>::max();
+    llama_pos p_last = std::numeric_limits<llama_pos>::min();
+    uint32_t cell_count = 0;
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.is_empty(i)) {
+            continue;
+        }
+        if (cells.seq_count(i) != 1 || !cells.seq_has(i, seq_id)) {
+            return false;
+        }
+        const llama_pos pos = cells.pos_get(i);
+        if (pos < 0) {
+            return false;
+        }
+        p_base = std::min(p_base, pos);
+        p_last = std::max(p_last, pos);
+        ++cell_count;
+    }
+    if (cell_count == 0 || p_last < p_base) {
+        return false;
+    }
+
+    const uint64_t n_kv_valid64 = uint64_t(p_last - p_base) + 1u;
     const uint32_t n_kv_padded = get_n_kv(sinfo);
-    if (n_kv_valid == 0 || n_kv_valid > n_kv_padded || n_kv_valid > (uint32_t) std::numeric_limits<int32_t>::max()) {
+    if (n_kv_valid64 == 0 || n_kv_valid64 > n_kv_padded ||
+            n_kv_valid64 > (uint64_t) std::numeric_limits<int32_t>::max() ||
+            n_kv_valid64 > (uint64_t) std::numeric_limits<uint32_t>::max()) {
         return false;
     }
-    if (n_kv_valid < ubatch->n_tokens) {
+    const uint32_t n_kv_valid = (uint32_t) n_kv_valid64;
+    if (cell_count != n_kv_valid || n_kv_valid < ubatch->n_tokens) {
         return false;
     }
 
-    if (cells.used_min() != 0 || cells.get_has_shift()) {
-        return false;
+    std::vector<uint8_t> seen(n_kv_valid, 0);
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.is_empty(i)) {
+            continue;
+        }
+        const uint32_t logical = (uint32_t) (cells.pos_get(i) - p_base);
+        if (logical >= n_kv_valid || seen[logical]) {
+            return false;
+        }
+        seen[logical] = 1;
     }
 
-    const llama_pos p_base = cells.pos_get(0);
     if (ubatch->pos[0] < p_base) {
         return false;
     }
-
     const int64_t q_offset = (int64_t) ubatch->pos[0] - (int64_t) p_base;
     if (q_offset < 0 || q_offset > std::numeric_limits<int32_t>::max()) {
         return false;
@@ -3017,24 +3226,193 @@ bool llama_kv_cache::get_implicit_causal_mask_meta(const slot_info & sinfo, cons
         return false;
     }
     for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
-        if (sinfo.idxs[0][i] != (uint32_t) q_offset + i) {
+        const uint32_t idx = sinfo.idxs[0][i];
+        if (idx >= cells.size() || cells.is_empty(idx) || cells.seq_count(idx) != 1 || !cells.seq_has(idx, seq_id)) {
             return false;
         }
-    }
-
-    for (uint32_t i = 0; i < n_kv_valid; ++i) {
-        if (cells.is_empty(i) || cells.seq_count(i) != 1 || !cells.seq_has(i, seq_id)) {
-            return false;
-        }
-        if (cells.pos_get(i) != p_base + (llama_pos) i) {
+        if (cells.pos_get(idx) != ubatch->pos[i]) {
             return false;
         }
     }
 
     meta[0] = (int32_t) n_kv_valid;
     meta[1] = (int32_t) q_offset;
-    meta[2] = 1; // pure causal contiguous single-sequence mask
+    meta[2] = 1; // pure causal contiguous single-sequence logical mask
     meta[3] = 0;
+    return true;
+}
+
+bool llama_kv_cache::register_mtp_qblock_full_current_k_page_map(
+        const ggml_tensor * k_view,
+        uint32_t n_kv,
+        uint32_t kv_size_total,
+        const slot_info & sinfo,
+        const char ** reason) const {
+    auto fail = [&](const char * why) {
+        if (reason) {
+            *reason = why;
+        }
+        if (k_view && k_view->data) {
+            llama_kv_cache_clear_mtp_qblock_full_page_map(k_view->data);
+        }
+        return false;
+    };
+
+    if (!llama_mtp_qblock_dbv_paged_attention_enabled()) {
+        return fail("disabled");
+    }
+    if (n_stream != 1 || sinfo.n_stream() != 1 || sinfo.strm.empty()) {
+        return fail("multi_stream_unsupported");
+    }
+    if (k_view == nullptr || k_view->data == nullptr) {
+        return fail("missing_k_view");
+    }
+    if (n_kv == 0 || kv_size_total == 0) {
+        return fail("empty_kv");
+    }
+    constexpr uint32_t page_tokens = LLAMA_MTP_QBLOCK_PAGED_STATE_PAGE_TOKENS;
+    if (kv_size_total % page_tokens != 0) {
+        return fail("kv_capacity_not_page_aligned");
+    }
+    const uint32_t physical_pages = kv_size_total / page_tokens;
+    if (n_kv > kv_size_total || physical_pages == 0) {
+        return fail("bad_page_count");
+    }
+    if (sinfo.strm[0] >= v_cells.size()) {
+        return fail("bad_stream");
+    }
+
+    const auto & cells = v_cells[sinfo.strm[0]];
+    if (cells.size() != kv_size_total) {
+        return fail("kv_size_mismatch");
+    }
+
+    llama_seq_id seq_id = -1;
+    llama_pos pos_min = std::numeric_limits<llama_pos>::max();
+    llama_pos pos_max = std::numeric_limits<llama_pos>::min();
+    uint32_t cell_count = 0;
+    for (uint32_t i = 0; i < kv_size_total; ++i) {
+        if (cells.is_empty(i)) {
+            continue;
+        }
+        if (cells.seq_count(i) != 1) {
+            return fail("multi_seq_cell");
+        }
+        const llama_seq_id cur_seq = cells.seq_get(i);
+        if (seq_id < 0) {
+            seq_id = cur_seq;
+        } else if (seq_id != cur_seq) {
+            return fail("mixed_seq_cell");
+        }
+        const llama_pos pos = cells.pos_get(i);
+        if (pos < 0) {
+            return fail("negative_pos");
+        }
+        pos_min = std::min(pos_min, pos);
+        pos_max = std::max(pos_max, pos);
+        ++cell_count;
+    }
+    if (cell_count == 0 || seq_id < 0 || pos_max < pos_min) {
+        return fail("empty_cells");
+    }
+    const uint64_t logical_tokens64 = uint64_t(pos_max - pos_min) + 1u;
+    if (logical_tokens64 == 0 || logical_tokens64 > uint64_t(n_kv) || logical_tokens64 > uint64_t(kv_size_total) ||
+            logical_tokens64 > uint64_t(std::numeric_limits<uint32_t>::max())) {
+        return fail("logical_span_out_of_range");
+    }
+    const uint32_t map_valid_tokens = (uint32_t) logical_tokens64;
+    if (cell_count != map_valid_tokens) {
+        return fail("logical_position_hole");
+    }
+
+    std::vector<uint32_t> physical_by_logical(map_valid_tokens, std::numeric_limits<uint32_t>::max());
+    for (uint32_t i = 0; i < kv_size_total; ++i) {
+        if (cells.is_empty(i)) {
+            continue;
+        }
+        const uint32_t logical = (uint32_t) (cells.pos_get(i) - pos_min);
+        if (logical >= map_valid_tokens || physical_by_logical[logical] != std::numeric_limits<uint32_t>::max()) {
+            return fail("duplicate_logical_pos");
+        }
+        physical_by_logical[logical] = i;
+    }
+
+    const uint32_t block_table_pages = (map_valid_tokens + page_tokens - 1u) / page_tokens;
+    if (block_table_pages == 0) {
+        return fail("empty_block_table");
+    }
+    std::vector<int32_t> block_table(block_table_pages);
+    bool identity = true;
+    uint32_t non_identity_page_begin = block_table_pages;
+    uint32_t non_identity_page_end = block_table_pages;
+    for (uint32_t page = 0; page < block_table_pages; ++page) {
+        const uint32_t logical_base = page * page_tokens;
+        const uint32_t page_valid = std::min(page_tokens, map_valid_tokens - logical_base);
+        const uint32_t first_physical = physical_by_logical[logical_base];
+        if (first_physical == std::numeric_limits<uint32_t>::max() || first_physical % page_tokens != 0) {
+            return fail("physical_page_unaligned");
+        }
+        const uint32_t physical_page = first_physical / page_tokens;
+        if (physical_page >= physical_pages) {
+            return fail("physical_page_oob");
+        }
+        for (uint32_t slot = 0; slot < page_valid; ++slot) {
+            if (physical_by_logical[logical_base + slot] != first_physical + slot) {
+                return fail("physical_page_not_contiguous");
+            }
+        }
+        block_table[page] = (int32_t) physical_page;
+        if (physical_page != page) {
+            identity = false;
+            non_identity_page_begin = std::min(non_identity_page_begin, page);
+            non_identity_page_end = page + 1u;
+        }
+    }
+
+    ggml_cuda_mtp_qblock_full_page_map_v1 map = {};
+    map.version = GGML_CUDA_MTP_QBLOCK_FULL_PAGE_MAP_VERSION;
+    map.abi_bytes = sizeof(ggml_cuda_mtp_qblock_full_page_map_v1);
+    map.active = 1;
+    map.flags = identity ? GGML_CUDA_MTP_QBLOCK_FULL_PAGE_MAP_FLAG_IDENTITY : 0u;
+    map.logical_base_token = 0;
+    map.valid_tokens = map_valid_tokens;
+    map.page_tokens = page_tokens;
+    map.physical_pages = physical_pages;
+    map.block_table_pages = block_table_pages;
+    map.non_identity_page_begin = non_identity_page_begin;
+    map.non_identity_page_end = non_identity_page_end;
+    map.block_table = nullptr;
+    for (uint32_t i = 0; i < 4; ++i) {
+        map.debug_first_pages[i] = i < block_table_pages ? block_table[i] : -1;
+    }
+    const uint64_t raw_generation = (uint64_t(map_valid_tokens) << 32) ^
+        (uint64_t(block_table_pages) << 16) ^ uint64_t(kv_size_total) ^ uint64_t(map.flags) ^
+        (uint64_t(non_identity_page_begin) << 48) ^ (uint64_t(non_identity_page_end) << 24);
+    map.generation = raw_generation == 0 ? 1u : raw_generation;
+
+    llama_kv_cache_register_mtp_qblock_full_page_map_host(k_view->data, &map, block_table.data());
+    ggml_cuda_mtp_qblock_full_page_map_v1 check = {};
+    llama_kv_cache_get_mtp_qblock_full_page_map(k_view->data, &check);
+    if (!check.active || check.valid_tokens != map_valid_tokens || check.block_table_pages != block_table_pages ||
+            check.page_tokens != page_tokens || check.logical_base_token != 0) {
+        return fail("register_failed");
+    }
+    if (reason) {
+        *reason = identity ? "ok_identity" : "ok_full_physical";
+    }
+    if (llama_mtp_qblock_tail_page_registry_trace_enabled()) {
+        fprintf(stderr,
+                "MTP_QBLOCK_FULL_PAGE_MAP: op=publish_full key=%p n_kv=%u valid_tokens=%u kv_size=%u pages=%u physical_pages=%u identity=%d first_pages=[%d,%d,%d,%d] generation=%llu\n",
+                k_view->data,
+                n_kv,
+                map_valid_tokens,
+                kv_size_total,
+                block_table_pages,
+                physical_pages,
+                identity ? 1 : 0,
+                map.debug_first_pages[0], map.debug_first_pages[1], map.debug_first_pages[2], map.debug_first_pages[3],
+                (unsigned long long) map.generation);
+    }
     return true;
 }
 
@@ -3061,12 +3439,16 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
         const size_t row_bytes = kp->nb[1];
 
         // [packed words per head, n_kv, n_head_kv, ns] — fixed kv_size head stride
-        return ggml_view_4d(ctx, kp,
+        ggml_tensor * k_view = ggml_view_4d(ctx, kp,
                 packed_words_per_head, n_kv, n_head_kv, ns,
                 row_bytes,
                 row_bytes * (size_t) kv_size_total,
                 row_bytes * (size_t) kv_size_total * (size_t) n_head_kv,
                 row_bytes * (size_t) kv_size_total * (size_t) n_head_kv * (size_t) sinfo.s0);
+        if (!sinfo.empty() && sinfo.size() >= (size_t) llama_mtp_qblock_dbv_paged_attention_min_nq()) {
+            (void) register_mtp_qblock_full_current_k_page_map(k_view, n_kv, kv_size_total, sinfo);
+        }
+        return k_view;
     }
 
     const uint64_t kv_size      = get_size();
@@ -3077,19 +3459,27 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
     if (k->type == GGML_TYPE_TBQ3_0 || k->type == GGML_TYPE_TBQ4_0) {
-        return ggml_view_3d(ctx, k,
+        ggml_tensor * k_view = ggml_view_3d(ctx, k,
                 n_embd_k_gqa, n_kv, ns,
                 ggml_row_size(k->type, n_embd_k_gqa),
                 ggml_row_size(k->type, n_embd_k_gqa*kv_size),
                 ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+        if (!sinfo.empty() && sinfo.size() >= (size_t) llama_mtp_qblock_dbv_paged_attention_min_nq()) {
+            (void) register_mtp_qblock_full_current_k_page_map(k_view, n_kv, (uint32_t) kv_size, sinfo);
+        }
+        return k_view;
     }
 
-    return ggml_view_4d(ctx, k,
+    ggml_tensor * k_view = ggml_view_4d(ctx, k,
             hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
             ggml_row_size(k->type, hparams.n_embd_head_k(il)),
             ggml_row_size(k->type, n_embd_k_gqa),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+    if (!sinfo.empty() && sinfo.size() >= (size_t) llama_mtp_qblock_dbv_paged_attention_min_nq()) {
+        (void) register_mtp_qblock_full_current_k_page_map(k_view, n_kv, (uint32_t) kv_size, sinfo);
+    }
+    return k_view;
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -3180,6 +3570,168 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     }
 }
 
+bool llama_kv_cache::try_register_mtp_qblock_owned_tail_write_reservation(
+        const slot_info & sinfo,
+        const ggml_tensor * k_cur,
+        const ggml_tensor * k_idxs,
+        const kv_layer & layer) const {
+    if (!llama_mtp_qblock_paged_attention_owned_tail_write_enabled()) {
+        return false;
+    }
+
+    auto emit = [&](const char * status, const char * reason, uint32_t logical_base, uint32_t valid_tail, uint32_t table0, uint64_t generation) {
+        if (llama_mtp_qblock_tail_page_registry_trace_enabled()) {
+            fprintf(stderr,
+                    "MTP_QBLOCK_TXN_TAIL_PAGE_REGISTRY: op=owned_preclaim_commit status=%s reason=%s layer=%u logical_base=%u valid_tail=%u table0=%u generation=%llu\n",
+                    status ? status : "unknown",
+                    reason ? reason : "unknown",
+                    layer.il,
+                    logical_base,
+                    valid_tail,
+                    table0,
+                    (unsigned long long) generation);
+        }
+    };
+    auto fail = [&](const char * reason) {
+        emit("skip", reason, 0, 0, 0, 0);
+        return false;
+    };
+
+    if (n_stream != 1 || sinfo.empty() || sinfo.n_stream() != 1 || sinfo.idxs.empty() || sinfo.idxs[0].empty()) {
+        return fail("not_single_stream");
+    }
+    if (layer.k_payload == nullptr || layer.k_scales == nullptr || layer.k != nullptr) {
+        return fail("not_packed16_only_k");
+    }
+    if (layer.v == nullptr || layer.v->type != GGML_TYPE_V4_K16D16_144 || v_trans) {
+        return fail("not_v4_144_direct_v");
+    }
+    if (k_cur == nullptr || k_idxs == nullptr) {
+        return fail("missing_pack_inputs");
+    }
+    if (k_cur->type != GGML_TYPE_F32) {
+        return fail("not_f32_source");
+    }
+    if (k_idxs->type != GGML_TYPE_I64 && k_idxs->type != GGML_TYPE_I32) {
+        return fail("bad_index_type");
+    }
+
+    const int64_t d64 = hparams.n_embd_head_k(layer.il);
+    if (d64 <= 0 || d64 > UINT32_MAX) {
+        return fail("bad_d");
+    }
+    const uint32_t d = (uint32_t) d64;
+    const bool payload_is_packed16 = layer.k_payload->ne[0] == (int64_t) d / 4;
+    if (!payload_is_packed16) {
+        return fail("not_packed16_q8_k");
+    }
+
+    int64_t n_heads = 0;
+    int64_t nk_cur = 0;
+    if (k_cur->ne[0] == d64) {
+        n_heads = k_cur->ne[1];
+        nk_cur = k_cur->ne[2];
+    } else {
+        if (k_cur->ne[0] % d64 != 0) {
+            return fail("bad_source_shape");
+        }
+        n_heads = k_cur->ne[0] / d64;
+        nk_cur = k_cur->ne[1];
+    }
+    if (k_cur->ne[3] != 1) {
+        return fail("batch_not_one");
+    }
+    if (n_heads <= 0 || nk_cur <= 1 || nk_cur > 8) {
+        return fail("n_tokens_out_of_range");
+    }
+    if (layer.k_payload->ne[1] % n_heads != 0) {
+        return fail("bad_head_capacity");
+    }
+    const uint32_t kv_size = (uint32_t) (layer.k_payload->ne[1] / n_heads);
+    if (kv_size < (uint32_t) nk_cur || kv_size < 2u * LLAMA_MTP_QBLOCK_PAGED_STATE_PAGE_TOKENS) {
+        return fail("bad_kv_capacity");
+    }
+    if (sinfo.idxs[0].size() != (size_t) nk_cur) {
+        return fail("index_count_mismatch");
+    }
+
+    const uint32_t idx0 = sinfo.idxs[0][0];
+    for (int64_t i = 0; i < nk_cur; ++i) {
+        if (sinfo.idxs[0][(size_t) i] != idx0 + (uint32_t) i) {
+            return fail("indices_not_contiguous");
+        }
+    }
+    const uint32_t idx_last = idx0 + (uint32_t) nk_cur - 1u;
+    if (idx_last < idx0 || idx_last >= kv_size) {
+        return fail("indices_out_of_capacity");
+    }
+
+    constexpr uint32_t page_tokens = LLAMA_MTP_QBLOCK_PAGED_STATE_PAGE_TOKENS;
+    const uint32_t page_base = idx0 & ~(page_tokens - 1u);
+    const uint32_t slot_begin = idx0 - page_base;
+    const uint32_t slot_end = slot_begin + (uint32_t) nk_cur;
+    if (slot_end > page_tokens) {
+        return fail("spans_pages");
+    }
+    const uint32_t merge_copy_slots = slot_begin + (page_tokens - slot_end);
+    if (merge_copy_slots == 0) {
+        return fail("full_page_write");
+    }
+    const uint32_t page_end = page_base + page_tokens;
+    const uint32_t physical_pages = kv_size / page_tokens;
+    const uint32_t overlay_page_base = (physical_pages - 1u) * page_tokens;
+    if (physical_pages == 0 || overlay_page_base < page_end) {
+        return fail("no_non_visible_page");
+    }
+
+    const uint32_t flags = GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_OWNED_TAIL_WRITE;
+    const uint32_t physical_page = overlay_page_base / page_tokens;
+    const uint32_t tail_logical_page = page_base / page_tokens;
+    const uint32_t window_pages = tail_logical_page + 1u < GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES ?
+        tail_logical_page + 1u : GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES;
+    const uint32_t window_base_page = tail_logical_page + 1u - window_pages;
+    const uint32_t logical_base_token = window_base_page * page_tokens;
+    const uint32_t valid_tail_tokens = idx0 + (uint32_t) nk_cur - logical_base_token;
+    const uint32_t block_table_pages = (valid_tail_tokens + page_tokens - 1u) / page_tokens;
+    if (block_table_pages == 0 || block_table_pages > GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES) {
+        return fail("owned_preclaim_bad_window");
+    }
+    int32_t block_table[GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES] = {};
+    for (uint32_t lp = 0; lp < block_table_pages; ++lp) {
+        block_table[lp] = (int32_t) (window_base_page + lp);
+    }
+    const uint32_t tail_rel_page = tail_logical_page - window_base_page;
+    if (tail_rel_page >= block_table_pages) {
+        return fail("owned_preclaim_bad_tail_page");
+    }
+    block_table[tail_rel_page] = (int32_t) physical_page;
+
+    const uint64_t raw_generation = (uint64_t(logical_base_token) << 32) ^ uint64_t(valid_tail_tokens) ^ uint64_t(flags);
+    const uint64_t desired_generation = raw_generation == 0 ? 1u : raw_generation;
+    const llama_mtp_qblock_paged_state_status status = llama_mtp_qblock_paged_state_import_committed_pages(
+            mtp_qblock_paged_state,
+            logical_base_token,
+            physical_pages,
+            valid_tail_tokens,
+            block_table,
+            block_table_pages,
+            (uint32_t) nk_cur,
+            desired_generation);
+    if (status != LLAMA_MTP_QBLOCK_PAGED_STATE_OK) {
+        clear_mtp_qblock_paged_state();
+        return fail("owned_preclaim_import_failed");
+    }
+
+    const char * map_reason = nullptr;
+    ggml_cuda_mtp_qblock_tail_page_map_v1 map = {};
+    if (!register_mtp_qblock_tail_page_map_from_paged_state(&map, &map_reason, flags)) {
+        emit("skip", map_reason ? map_reason : "owned_preclaim_publish_failed", logical_base_token, valid_tail_tokens, physical_page, desired_generation);
+        return false;
+    }
+    emit("ok", "ok", map.logical_base_token, map.valid_tail_tokens, (uint32_t) map.block_table[tail_rel_page], map.generation);
+    return true;
+}
+
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
     const int32_t ikv = map_layer_ids.at(il);
 
@@ -3205,6 +3757,10 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
             return pack;
         }
         // Packed16-only mode (no shadow K): indexed pack is the primary K write.
+        // Under owned-tail PageAttention, pre-publish a cache-owned reservation
+        // map before the CUDA writer mirrors bytes into the same non-visible page.
+        // This remains write-through; it does not skip canonical rows.
+        (void) try_register_mtp_qblock_owned_tail_write_reservation(sinfo, k_cur, k_idxs, layers[ikv]);
         llama_mtp_qblock_txn_tail_write_log("K", il, k_cur, k_payload, sinfo);
         ggml_tensor * pack = ggml_pack_k_packed16(ctx, k_cur, k_payload, k_scales, k_idxs);
         return pack;
@@ -4096,6 +4652,52 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     io.write(&v_trans, sizeof(v_trans));
     io.write(&n_layer, sizeof(n_layer));
 
+    const bool persistence_trace = llama_mtp_qblock_kv_persistence_trace_enabled();
+    auto layer_tail_map = [&](const kv_layer & layer, ggml_cuda_mtp_qblock_tail_page_map_v1 & map) {
+        if (cr.strm < layer.k_payload_stream.size() &&
+                llama_mtp_qblock_kv_persistence_map_active(layer.k_payload_stream[cr.strm], &map)) {
+            return true;
+        }
+        if (cr.strm < layer.k_stream.size() &&
+                llama_mtp_qblock_kv_persistence_map_active(layer.k_stream[cr.strm], &map)) {
+            return true;
+        }
+        if (llama_mtp_qblock_kv_persistence_map_active(layer.k_payload, &map)) {
+            return true;
+        }
+        return llama_mtp_qblock_kv_persistence_map_active(layer.k, &map);
+    };
+    auto emit_state_trace = [&](const char * op, const char * kind, const char * status, const kv_layer & layer,
+            uint32_t range_begin, uint32_t range_end, size_t bytes, int tensor_type) {
+        if (!persistence_trace || !llama_mtp_qblock_kv_persistence_range_hits(range_begin, range_end)) {
+            return;
+        }
+        ggml_cuda_mtp_qblock_tail_page_map_v1 map = {};
+        const bool map_active = layer_tail_map(layer, map);
+        fprintf(stderr,
+                "MTP_QBLOCK_KV_PERSISTENCE: op=%s kind=%s status=%s layer=%u stream=%u range_begin=%u range_end=%u bytes=%zu tensor_type=%d has_k=%d has_k_payload=%d has_k_scales=%d has_v=%d v_trans=%u map_active=%d map_logical_base=%u map_valid_tail=%u map_table0=%d map_flags=0x%x map_generation=%llu\n",
+                op ? op : "unknown",
+                kind ? kind : "?",
+                status ? status : "unknown",
+                layer.il,
+                cr.strm,
+                range_begin,
+                range_end,
+                bytes,
+                tensor_type,
+                layer.k != nullptr ? 1 : 0,
+                layer.k_payload != nullptr ? 1 : 0,
+                layer.k_scales != nullptr ? 1 : 0,
+                layer.v != nullptr ? 1 : 0,
+                v_trans,
+                map_active ? 1 : 0,
+                map.logical_base_token,
+                map.valid_tail_tokens,
+                map.block_table[0],
+                map.flags,
+                (unsigned long long) map.generation);
+    };
+
     // Iterate and write all the keys first, each row is a cell
     // Get whole range at a time
     for (const auto & layer : layers) {
@@ -4114,12 +4716,17 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
             const uint64_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
             io.write(&k_size_row, sizeof(k_size_row));
 
-        // Read each range of cells of k_size length and write out
-        for (const auto & range : cr.data) {
-            const size_t range_size = range.second - range.first;
-            const size_t buf_size = range_size * k_size_row;
-            io.write_tensor(k, range.first * k_size_row, buf_size);
-        }
+            // Read each range of cells of k_size length and write out
+            for (const auto & range : cr.data) {
+                const size_t range_size = range.second - range.first;
+                const size_t buf_size = range_size * k_size_row;
+                emit_state_trace("state_write_data", "K", "canonical_serialized", layer, range.first, range.second, buf_size, k_type_i);
+                io.write_tensor(k, range.first * k_size_row, buf_size);
+            }
+        } else if (layer.k_payload || layer.k_scales) {
+            for (const auto & range : cr.data) {
+                emit_state_trace("state_write_data", "K", "packed_sidecar_not_serialized", layer, range.first, range.second, 0, GGML_TYPE_I32);
+            }
         }
     }
 
@@ -4146,6 +4753,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
             for (const auto & range : cr.data) {
                 const size_t range_size = range.second - range.first;
                 const size_t buf_size = range_size * v_size_row;
+                emit_state_trace("state_write_data", "V", "canonical_serialized", layer, range.first, range.second, buf_size, v_type_i);
                 io.write_tensor(v, range.first * v_size_row, buf_size);
             }
         }
@@ -4181,6 +4789,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
                     const size_t range_size = range.second - range.first;
                     const size_t src_offset = (range.first + j * kv_size) * v_size_el;
                     const size_t buf_size = range_size * v_size_el;
+                    emit_state_trace("state_write_data", "V", "canonical_serialized_transposed", layer, range.first, range.second, buf_size, v_type_i);
                     io.write_tensor(v, src_offset, buf_size);
                 }
             }
@@ -4331,6 +4940,53 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         return false;
     }
 
+    const bool persistence_trace = llama_mtp_qblock_kv_persistence_trace_enabled();
+    auto layer_tail_map = [&](const kv_layer & layer, ggml_cuda_mtp_qblock_tail_page_map_v1 & map) {
+        if (strm < layer.k_payload_stream.size() &&
+                llama_mtp_qblock_kv_persistence_map_active(layer.k_payload_stream[strm], &map)) {
+            return true;
+        }
+        if (strm < layer.k_stream.size() &&
+                llama_mtp_qblock_kv_persistence_map_active(layer.k_stream[strm], &map)) {
+            return true;
+        }
+        if (llama_mtp_qblock_kv_persistence_map_active(layer.k_payload, &map)) {
+            return true;
+        }
+        return llama_mtp_qblock_kv_persistence_map_active(layer.k, &map);
+    };
+    auto emit_read_trace = [&](const char * kind, const char * status, const kv_layer & layer,
+            uint32_t range_begin, uint32_t range_end, size_t bytes, int tensor_type) {
+        if (!persistence_trace || !llama_mtp_qblock_kv_persistence_range_hits(range_begin, range_end)) {
+            return;
+        }
+        ggml_cuda_mtp_qblock_tail_page_map_v1 map = {};
+        const bool map_active = layer_tail_map(layer, map);
+        fprintf(stderr,
+                "MTP_QBLOCK_KV_PERSISTENCE: op=state_read_data kind=%s status=%s layer=%u stream=%u range_begin=%u range_end=%u bytes=%zu tensor_type=%d contiguous=%d head=%u has_k=%d has_k_payload=%d has_k_scales=%d has_v=%d v_trans=%u map_active=%d map_logical_base=%u map_valid_tail=%u map_table0=%d map_flags=0x%x map_generation=%llu\n",
+                kind ? kind : "?",
+                status ? status : "unknown",
+                layer.il,
+                strm,
+                range_begin,
+                range_end,
+                bytes,
+                tensor_type,
+                sinfo.is_contiguous() ? 1 : 0,
+                sinfo.empty() ? 0 : sinfo.head(),
+                layer.k != nullptr ? 1 : 0,
+                layer.k_payload != nullptr ? 1 : 0,
+                layer.k_scales != nullptr ? 1 : 0,
+                layer.v != nullptr ? 1 : 0,
+                v_trans,
+                map_active ? 1 : 0,
+                map.logical_base_token,
+                map.valid_tail_tokens,
+                map.block_table[0],
+                map.flags,
+                (unsigned long long) map.generation);
+    };
+
     // For each layer, read the keys for each cell, one row is one cell, read as one contiguous block
     for (const auto & layer : layers) {
         const uint32_t il = layer.il;
@@ -4349,27 +5005,39 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                 return false;
             }
 
-        // Read row size of key
-        uint64_t k_size_row_ref;
-        io.read(&k_size_row_ref, sizeof(k_size_row_ref));
-        const size_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
-        if (k_size_row != k_size_row_ref) {
-            LLAMA_LOG_ERROR("%s: mismatched key row size (%zu != %zu, layer %d)\n", __func__, k_size_row, (size_t) k_size_row_ref, il);
-            return false;
-        }
+            // Read row size of key
+            uint64_t k_size_row_ref;
+            io.read(&k_size_row_ref, sizeof(k_size_row_ref));
+            const size_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
+            if (k_size_row != k_size_row_ref) {
+                LLAMA_LOG_ERROR("%s: mismatched key row size (%zu != %zu, layer %d)\n", __func__, k_size_row, (size_t) k_size_row_ref, il);
+                return false;
+            }
 
-        if (cell_count) {
-            if (sinfo.is_contiguous()) {
-                // Fast path: contiguous cells, single memcpy
-                io.read_tensor(k, sinfo.head() * k_size_row, cell_count * k_size_row);
-            } else {
-                // Slow path: scatter to non-contiguous positions
-                for (uint32_t i = 0; i < cell_count; ++i) {
-                    const size_t dst_offset = sinfo.idxs[0][i] * k_size_row;
-                    io.read_tensor(k, dst_offset, k_size_row);
+            if (cell_count) {
+                if (sinfo.is_contiguous()) {
+                    // Fast path: contiguous cells, single memcpy
+                    emit_read_trace("K", "canonical_restored", layer, sinfo.head(), sinfo.head() + cell_count, cell_count * k_size_row, k_type_i);
+                    io.read_tensor(k, sinfo.head() * k_size_row, cell_count * k_size_row);
+                } else {
+                    // Slow path: scatter to non-contiguous positions
+                    for (uint32_t i = 0; i < cell_count; ++i) {
+                        const size_t dst_offset = sinfo.idxs[0][i] * k_size_row;
+                        emit_read_trace("K", "canonical_restored_scatter", layer, sinfo.idxs[0][i], sinfo.idxs[0][i] + 1, k_size_row, k_type_i);
+                        io.read_tensor(k, dst_offset, k_size_row);
+                    }
                 }
             }
-        }
+        } else if (layer.k_payload || layer.k_scales) {
+            if (cell_count) {
+                if (sinfo.is_contiguous()) {
+                    emit_read_trace("K", "packed_sidecar_not_restored", layer, sinfo.head(), sinfo.head() + cell_count, 0, GGML_TYPE_I32);
+                } else {
+                    for (uint32_t i = 0; i < cell_count; ++i) {
+                        emit_read_trace("K", "packed_sidecar_not_restored_scatter", layer, sinfo.idxs[0][i], sinfo.idxs[0][i] + 1, 0, GGML_TYPE_I32);
+                    }
+                }
+            }
         }
     }
 
@@ -4405,11 +5073,13 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             if (cell_count) {
                 if (sinfo.is_contiguous()) {
                     // Fast path: contiguous cells, single memcpy
+                    emit_read_trace("V", "canonical_restored", layer, sinfo.head(), sinfo.head() + cell_count, cell_count * v_size_row, v_type_i);
                     io.read_tensor(v, sinfo.head() * v_size_row, cell_count * v_size_row);
                 } else {
                     // Slow path: scatter to non-contiguous positions
                     for (uint32_t i = 0; i < cell_count; ++i) {
                         const size_t dst_offset = sinfo.idxs[0][i] * v_size_row;
+                        emit_read_trace("V", "canonical_restored_scatter", layer, sinfo.idxs[0][i], sinfo.idxs[0][i] + 1, v_size_row, v_type_i);
                         io.read_tensor(v, dst_offset, v_size_row);
                     }
                 }
@@ -4459,6 +5129,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                     const uint32_t h = sinfo.head();
                     for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
                         const size_t dst_offset = (h + j * cells.size()) * v_size_el;
+                        emit_read_trace("V", "canonical_restored_transposed", layer, h, h + cell_count, cell_count * v_size_el, v_type_i);
                         io.read_tensor(v, dst_offset, cell_count * v_size_el);
                     }
                 } else {
@@ -4466,6 +5137,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                     for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
                         for (uint32_t i = 0; i < cell_count; ++i) {
                             const size_t dst_offset = (sinfo.idxs[0][i] + j * cells.size()) * v_size_el;
+                            emit_read_trace("V", "canonical_restored_transposed_scatter", layer, sinfo.idxs[0][i], sinfo.idxs[0][i] + 1, v_size_el, v_type_i);
                             io.read_tensor(v, dst_offset, v_size_el);
                         }
                     }

@@ -1,0 +1,51 @@
+{
+  "errors": [],
+  "ok": true,
+  "payload_contract": {
+    "copy_policy": "raw_bf16_no_transform",
+    "dtype": "BF16",
+    "dtype_conversion": "none",
+    "expected_payload_bytes": 947990528,
+    "expected_tensor_count": 91,
+    "ggml_type": 30,
+    "gguf_offsets_monotonic": true,
+    "offsets_match_safetensors_header": true,
+    "packing": "none",
+    "payload_bytes": 947990528,
+    "quantization": "none",
+    "tensor_count": 91
+  },
+  "sample_tensors": [
+    {
+      "copy_policy": "raw_bf16_no_transform",
+      "ggml_type": 30,
+      "gguf_name": "draft.fc.weight",
+      "hf_name": "fc.weight",
+      "nbytes": 41943040,
+      "offset": 0,
+      "shape": [
+        2048,
+        10240
+      ],
+      "source_data_offsets": [
+        0,
+        41943040
+      ]
+    },
+    {
+      "copy_policy": "raw_bf16_no_transform",
+      "ggml_type": 30,
+      "gguf_name": "draft.norm.weight",
+      "hf_name": "norm.weight",
+      "nbytes": 4096,
+      "offset": 947986432,
+      "shape": [
+        2048
+      ],
+      "source_data_offsets": [
+        947986432,
+        947990528
+      ]
+    }
+  ]
+}

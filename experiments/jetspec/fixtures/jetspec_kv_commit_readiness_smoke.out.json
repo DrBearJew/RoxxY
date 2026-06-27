@@ -1,0 +1,266 @@
+{
+  "commit": {
+    "committed_append_tokens": [
+      11,
+      22,
+      99
+    ],
+    "correction_hidden_appended_same_round": false,
+    "hidden_commit": {
+      "accepted_draft_tokens": [
+        11,
+        22
+      ],
+      "accepted_path": [
+        0,
+        1,
+        4
+      ],
+      "appended_node_indices": [
+        0,
+        1,
+        4
+      ],
+      "committed_append_tokens": [
+        11,
+        22,
+        99
+      ],
+      "correction_hidden_appended": false,
+      "correction_token": 99,
+      "discarded_node_indices": [
+        2,
+        3
+      ],
+      "invariants": {
+        "appended_rows_are_root_plus_accepted_nodes": true,
+        "correction_has_no_hidden_until_next_round": true,
+        "post_hidden_trails_committed_by_one": true,
+        "pre_hidden_trails_committed_by_one": true
+      },
+      "post_committed_len": 6,
+      "post_hidden_cache": [
+        [
+          7.0,
+          7.1,
+          7.2
+        ],
+        [
+          8.0,
+          8.1,
+          8.2
+        ],
+        [
+          10.0,
+          10.1,
+          10.2
+        ],
+        [
+          11.0,
+          11.1,
+          11.2
+        ],
+        [
+          22.0,
+          22.1,
+          22.2
+        ]
+      ],
+      "post_hidden_len": 5,
+      "pre_committed_len": 3,
+      "pre_hidden_len": 2
+    },
+    "hidden_kv_survivor_contract": "[root | accepted] only",
+    "model_hidden_cache_trails_committed_tokens_by_one": true,
+    "post_committed_token_ids": [
+      7,
+      8,
+      10,
+      11,
+      22,
+      99
+    ],
+    "pre_committed_token_ids": [
+      7,
+      8,
+      10
+    ],
+    "token_commit_contract": "[accepted draft tokens | correction]"
+  },
+  "llama_cpp_ownership_mapping": {
+    "compact_survivors_to_committed_tail": "missing primitive",
+    "discard_rejected_tree_slots": "missing primitive",
+    "gather_accepted_path": "missing primitive",
+    "preserve_cross_sequence_slots": "missing primitive",
+    "reserve_transient_tree_slots": "missing primitive"
+  },
+  "ok": true,
+  "readiness_boundary": {
+    "draft_head_graph_executed": false,
+    "draft_tokens_emitted": false,
+    "llama_context_instantiated": false,
+    "no_production_kv_mutation": true,
+    "real_kv_cache_mutated": false,
+    "runtime_supported": false,
+    "server_route_added": false
+  },
+  "slot_ownership": {
+    "accepted_path": [
+      0,
+      1,
+      4
+    ],
+    "cross_sequence_isolated": true,
+    "cross_sequence_slots": [
+      {
+        "logical_slot": 50,
+        "refcount": 1,
+        "seq_id": 9,
+        "token": 900,
+        "unchanged": true
+      },
+      {
+        "logical_slot": 51,
+        "refcount": 1,
+        "seq_id": 9,
+        "token": 901,
+        "unchanged": true
+      }
+    ],
+    "discarded_temp_slots": [
+      4,
+      5
+    ],
+    "gather_contract": "past_len + accepted_path",
+    "gather_positions": [
+      2,
+      3,
+      6
+    ],
+    "past_len": 2,
+    "post_kv_slots": [
+      {
+        "logical_slot": 0,
+        "refcount": 1,
+        "seq_id": 0,
+        "source": "pre_committed",
+        "token": 7
+      },
+      {
+        "logical_slot": 1,
+        "refcount": 1,
+        "seq_id": 0,
+        "source": "pre_committed",
+        "token": 8
+      },
+      {
+        "logical_slot": 2,
+        "node_index": 0,
+        "refcount": 1,
+        "sentinel": "root",
+        "seq_id": 0,
+        "source": "accepted_tree_node",
+        "source_temp_slot": 2,
+        "token": 10
+      },
+      {
+        "logical_slot": 3,
+        "node_index": 1,
+        "refcount": 1,
+        "sentinel": "accepted-11",
+        "seq_id": 0,
+        "source": "accepted_tree_node",
+        "source_temp_slot": 3,
+        "token": 11
+      },
+      {
+        "logical_slot": 4,
+        "node_index": 4,
+        "refcount": 1,
+        "sentinel": "accepted-22",
+        "seq_id": 0,
+        "source": "accepted_tree_node",
+        "source_temp_slot": 6,
+        "token": 22
+      }
+    ],
+    "post_kv_tokens": [
+      7,
+      8,
+      10,
+      11,
+      22
+    ],
+    "pre_kv_slots": [
+      {
+        "logical_slot": 0,
+        "refcount": 1,
+        "seq_id": 0,
+        "source": "pre_committed",
+        "token": 7
+      },
+      {
+        "logical_slot": 1,
+        "refcount": 1,
+        "seq_id": 0,
+        "source": "pre_committed",
+        "token": 8
+      }
+    ],
+    "refcounts_all_one_after_commit": true,
+    "rejected_node_indices": [
+      2,
+      3
+    ],
+    "rejected_tree_nodes_unreachable_after_commit": true,
+    "survivor_node_indices": [
+      0,
+      1,
+      4
+    ],
+    "target_seq_id": 0,
+    "tree_temp_slots": [
+      {
+        "node_index": 0,
+        "refcount": 1,
+        "sentinel": "root",
+        "seq_id": 0,
+        "temp_slot": 2,
+        "token": 10
+      },
+      {
+        "node_index": 1,
+        "refcount": 1,
+        "sentinel": "accepted-11",
+        "seq_id": 0,
+        "temp_slot": 3,
+        "token": 11
+      },
+      {
+        "node_index": 2,
+        "refcount": 1,
+        "sentinel": "rejected-12",
+        "seq_id": 0,
+        "temp_slot": 4,
+        "token": 12
+      },
+      {
+        "node_index": 3,
+        "refcount": 1,
+        "sentinel": "rejected-21",
+        "seq_id": 0,
+        "temp_slot": 5,
+        "token": 21
+      },
+      {
+        "node_index": 4,
+        "refcount": 1,
+        "sentinel": "accepted-22",
+        "seq_id": 0,
+        "temp_slot": 6,
+        "token": 22
+      }
+    ]
+  },
+  "status": "kv_commit_readiness_verified_not_executed"
+}

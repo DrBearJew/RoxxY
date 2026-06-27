@@ -28,6 +28,7 @@ struct ggml_cuda_mtp_mmvq_route_census_entry {
     std::string route;
     std::string tensor;
     std::string type;
+    std::string actmat_lane;
     int64_t ncols_x = 0;
     int64_t nrows_x = 0;
     int64_t ncols_dst = 0;
@@ -37,12 +38,115 @@ struct ggml_cuda_mtp_mmvq_route_census_entry {
     uint64_t approx_outputs = 0;
 };
 
+static bool ggml_cuda_mtp_mmvq_env_enabled(const char * name) {
+    const char * env = getenv(name);
+    return env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0 && strcmp(env, "off") != 0 && strcmp(env, "false") != 0;
+}
+
 static bool ggml_cuda_mtp_mmvq_route_census_enabled() {
-    static const bool enabled = []() {
-        const char * env = getenv("LLAMA_MTP_MMVQ_ROUTE_CENSUS");
-        return env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0 && strcmp(env, "off") != 0 && strcmp(env, "false") != 0;
-    }();
+    static const bool enabled =
+        ggml_cuda_mtp_mmvq_env_enabled("LLAMA_MTP_MMVQ_ROUTE_CENSUS") ||
+        ggml_cuda_mtp_mmvq_env_enabled("LLAMA_MTP_ACTMAT_ROUTE_CENSUS") ||
+        ggml_cuda_mtp_mmvq_env_enabled("LLAMA_ACTMAT_ROUTE_CENSUS");
     return enabled;
+}
+
+static const char * ggml_cuda_mtp_mmvq_actmat_lane(const int64_t ncols_dst) {
+    if (ncols_dst == 1) {
+        return "G_decode";
+    }
+    if (ncols_dst >= 2 && ncols_dst <= 5) {
+        return "S_qpacket";
+    }
+    if (ncols_dst >= 6 && ncols_dst <= 32) {
+        return "M_extend";
+    }
+    if (ncols_dst >= 64) {
+        return "L_qslab";
+    }
+    return "G_other";
+}
+
+static bool ggml_cuda_mtp_actmat_qslab_attribution_enabled() {
+    return ggml_cuda_mtp_mmvq_env_enabled("LLAMA_MTP_ACTMAT_QSLAB_ATTRIBUTION") ||
+           ggml_cuda_mtp_mmvq_env_enabled("LLAMA_ACTMAT_QSLAB_ATTRIBUTION");
+}
+
+static bool ggml_cuda_mtp_actmat_g_expect_no_spec() {
+    return ggml_cuda_mtp_mmvq_env_enabled("LLAMA_MTP_ACTMAT_G_EXPECT_NO_SPEC") ||
+           ggml_cuda_mtp_mmvq_env_enabled("LLAMA_ACTMAT_G_EXPECT_NO_SPEC");
+}
+
+static bool ggml_cuda_mtp_actmat_g_strict() {
+    return ggml_cuda_mtp_mmvq_env_enabled("LLAMA_MTP_ACTMAT_G_STRICT") ||
+           ggml_cuda_mtp_mmvq_env_enabled("LLAMA_ACTMAT_G_STRICT");
+}
+
+static bool ggml_cuda_mtp_actmat_q4k_ffn_up_candidate_enabled() {
+    return ggml_cuda_mtp_mmvq_env_enabled("LLAMA_MTP_ACTMAT_Q4K_FFN_UP_CANDIDATE") ||
+           ggml_cuda_mtp_mmvq_env_enabled("LLAMA_ACTMAT_Q4K_FFN_UP_CANDIDATE");
+}
+
+static bool ggml_cuda_mtp_actmat_q4k_interleaved_candidate_enabled() {
+    return ggml_cuda_mtp_mmvq_env_enabled("LLAMA_MTP_ACTMAT_Q4K_INTERLEAVED_CANDIDATE") ||
+           ggml_cuda_mtp_mmvq_env_enabled("LLAMA_ACTMAT_Q4K_INTERLEAVED_CANDIDATE") ||
+           ggml_cuda_mtp_actmat_q4k_ffn_up_candidate_enabled();
+}
+
+static bool ggml_cuda_mtp_actmat_q4k_interleaved_profile_enabled() {
+    return ggml_cuda_mtp_mmvq_env_enabled("LLAMA_MTP_ACTMAT_Q4K_INTERLEAVED_PROFILE") ||
+           ggml_cuda_mtp_mmvq_env_enabled("LLAMA_ACTMAT_Q4K_INTERLEAVED_PROFILE");
+}
+
+static bool ggml_cuda_mtp_actmat_name_contains(const char * name, const char * needle) {
+    return name != nullptr && needle != nullptr && strstr(name, needle) != nullptr;
+}
+
+static const char * ggml_cuda_mtp_actmat_weight_role(const char * name) {
+    if (ggml_cuda_mtp_actmat_name_contains(name, "ffn_up")) {
+        return "ffn_up";
+    }
+    if (ggml_cuda_mtp_actmat_name_contains(name, "ffn_gate")) {
+        return "ffn_gate";
+    }
+    if (ggml_cuda_mtp_actmat_name_contains(name, "ffn_down")) {
+        return "ffn_down";
+    }
+    if (ggml_cuda_mtp_actmat_name_contains(name, "attn_qkv")) {
+        return "attn_qkv";
+    }
+    if (ggml_cuda_mtp_actmat_name_contains(name, "attn_q")) {
+        return "attn_q";
+    }
+    if (ggml_cuda_mtp_actmat_name_contains(name, "attn_k")) {
+        return "attn_k";
+    }
+    if (ggml_cuda_mtp_actmat_name_contains(name, "attn_v")) {
+        return "attn_v";
+    }
+    if (ggml_cuda_mtp_actmat_name_contains(name, "attn_output")) {
+        return "attn_output";
+    }
+    if (ggml_cuda_mtp_actmat_name_contains(name, "attn_gate")) {
+        return "attn_gate";
+    }
+    if (ggml_cuda_mtp_actmat_name_contains(name, "ssm_alpha")) {
+        return "ssm_alpha";
+    }
+    if (ggml_cuda_mtp_actmat_name_contains(name, "ssm_beta")) {
+        return "ssm_beta";
+    }
+    if (ggml_cuda_mtp_actmat_name_contains(name, "ssm_out")) {
+        return "ssm_out";
+    }
+    if (ggml_cuda_mtp_actmat_name_contains(name, "ssm_")) {
+        return "ssm_other";
+    }
+    return "other";
+}
+
+static bool ggml_cuda_mtp_actmat_qpacket_n45_like(const int64_t ncols_dst) {
+    return ncols_dst == 4 || ncols_dst == 5;
 }
 
 static std::mutex & ggml_cuda_mtp_mmvq_route_census_mutex() {
@@ -83,8 +187,8 @@ static void ggml_cuda_mtp_mmvq_route_census_dump() {
     const size_t limit = std::min<size_t>(rows.size(), 96);
     for (size_t i = 0; i < limit; ++i) {
         const auto & r = rows[i];
-        GGML_LOG_INFO("mtp_mmvq_route_census rank=%zu route=%s tensor=%s type=%s ncols_dst=%lld ncols_x=%lld nrows_x=%lld ids=%d fusion=%d calls=%llu approx_outputs=%llu\n",
-                i + 1, r.route.c_str(), r.tensor.c_str(), r.type.c_str(),
+        GGML_LOG_INFO("mtp_mmvq_route_census rank=%zu route=%s tensor=%s type=%s actmat_lane=%s ncols_dst=%lld ncols_x=%lld nrows_x=%lld ids=%d fusion=%d calls=%llu approx_outputs=%llu\n",
+                i + 1, r.route.c_str(), r.tensor.c_str(), r.type.c_str(), r.actmat_lane.c_str(),
                 (long long) r.ncols_dst, (long long) r.ncols_x, (long long) r.nrows_x,
                 r.has_ids ? 1 : 0, r.has_fusion ? 1 : 0,
                 (unsigned long long) r.calls, (unsigned long long) r.approx_outputs);
@@ -122,6 +226,7 @@ static void ggml_cuda_mtp_mmvq_route_census_record(
         entry.route = route ? route : "-";
         entry.tensor = tensor;
         entry.type = type;
+        entry.actmat_lane = ggml_cuda_mtp_mmvq_actmat_lane(ncols_dst);
         entry.ncols_x = ncols_x;
         entry.nrows_x = nrows_x;
         entry.ncols_dst = ncols_dst;
@@ -1959,6 +2064,7 @@ static inline bool ggml_cuda_mtp_mmvq_reuse_act_enabled(const ggml_tensor * src0
     return ggml_cuda_mtp_mmvq_serial_columns_match_name(filter, src0->name);
 }
 
+
 struct ggml_cuda_mtp_q8_dot4_mmvq_act_cache_key {
     const void * data = nullptr;
     int device = -1;
@@ -2121,6 +2227,7 @@ static inline void ggml_cuda_mtp_q8_dot4_mmvq_act_cache_mark_valid(const char * 
     GGML_UNUSED(tensor_name);
 #endif
 }
+
 
 static inline void ggml_cuda_mtp_q8_dot4_mmvq_log_selected(
         const int64_t ncols_x, const int64_t nrows_x, const int64_t ncols_dst,
@@ -5422,22 +5529,65 @@ static bool mul_mat_vec_q_q4_K_interleaved_act_try_launch(
         } \
     } while (0)
 
+    const bool profile_timing = ggml_cuda_mtp_actmat_q4k_interleaved_profile_enabled() &&
+        !ggml_cuda_mtp_q8_dot4_mmvq_stream_is_capturing(stream);
+    cudaEvent_t profile_start = nullptr;
+    cudaEvent_t profile_stop  = nullptr;
+    if (profile_timing) {
+#if defined(GGML_USE_HIP)
+        CUDA_CHECK(hipEventCreate(&profile_start));
+        CUDA_CHECK(hipEventCreate(&profile_stop));
+#else
+        CUDA_CHECK(cudaEventCreate(&profile_start));
+        CUDA_CHECK(cudaEventCreate(&profile_stop));
+#endif
+        CUDA_CHECK(cudaEventRecord(profile_start, stream));
+    }
+
+    bool launched = false;
     switch (ncols_dst) {
         case 2:
             GGML_CUDA_MMVQ_Q4K_INTERLEAVED_ACT_LAUNCH(2);
-            return true;
+            launched = true;
+            break;
         case 3:
             GGML_CUDA_MMVQ_Q4K_INTERLEAVED_ACT_LAUNCH(3);
-            return true;
+            launched = true;
+            break;
         case 4:
             GGML_CUDA_MMVQ_Q4K_INTERLEAVED_ACT_LAUNCH(4);
-            return true;
+            launched = true;
+            break;
         case 5:
             GGML_CUDA_MMVQ_Q4K_INTERLEAVED_ACT_LAUNCH(5);
-            return true;
+            launched = true;
+            break;
         default:
-            return false;
+            launched = false;
+            break;
     }
+
+    if (profile_timing) {
+        CUDA_CHECK(cudaEventRecord(profile_stop, stream));
+        CUDA_CHECK(cudaEventSynchronize(profile_stop));
+        float elapsed_ms = 0.0f;
+#if defined(GGML_USE_HIP)
+        CUDA_CHECK(hipEventElapsedTime(&elapsed_ms, profile_start, profile_stop));
+        CUDA_CHECK(hipEventDestroy(profile_start));
+        CUDA_CHECK(hipEventDestroy(profile_stop));
+#else
+        CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, profile_start, profile_stop));
+        CUDA_CHECK(cudaEventDestroy(profile_start));
+        CUDA_CHECK(cudaEventDestroy(profile_stop));
+#endif
+        if (launched) {
+            GGML_LOG_INFO("%s: actmat_q4k_interleaved_timing tensor=%s role=%s lane=%s ncols_x=%d nrows_x=%d ncols_dst=%d nwarps=%d rows=%d elapsed_ms=%.6f\n",
+                    __func__, src0->name, ggml_cuda_mtp_actmat_weight_role(src0->name), ggml_cuda_mtp_mmvq_actmat_lane(ncols_dst),
+                    ncols_x, nrows_x, ncols_dst, nwarps_requested, rows_requested, (double) elapsed_ms);
+        }
+    }
+
+    return launched;
 
 #undef GGML_CUDA_MMVQ_Q4K_INTERLEAVED_ACT_LAUNCH
 #undef GGML_CUDA_MMVQ_Q4K_INTERLEAVED_ACT_LAUNCH_ROWS
@@ -6918,6 +7068,20 @@ void ggml_cuda_mul_mat_vec_q(
                         ne03, ne3, stride_sample_x_i, stride_sample_y_i, stride_sample_dst_i,
                         cc, warp_size, stream)) {
                 ggml_cuda_mtp_mmvq_route_census_record("mmvq_q4k_interleaved_act", src0, ne00, ne01, ncols_dst_i, false, false);
+                if (ggml_cuda_mtp_actmat_q4k_interleaved_candidate_enabled()) {
+                    const char * role = ggml_cuda_mtp_actmat_weight_role(src0->name);
+                    const char * lane = ggml_cuda_mtp_mmvq_actmat_lane(ncols_dst_i);
+                    const bool n45_like = ggml_cuda_mtp_actmat_qpacket_n45_like(ncols_dst_i);
+                    const bool qpacket_lane = strcmp(lane, "S_qpacket") == 0;
+                    const bool qpacket_active = ggml_cuda_mtp_mmvq_env_enabled("LLAMA_MTP_ACTMAT_QPACKET_ACTIVE");
+                    const bool candidate = qpacket_lane && n45_like;
+                    const char * reject = candidate ? "none" : (!qpacket_lane ? "lane_not_s_qpacket" : "ncols_not_4_or_5");
+                    GGML_LOG_INFO("%s: mtp_weight_route route=actmat_q4k_interleaved_n45 tensor=%s status=%s reject=%s role=%s lane=%s ncols_x=%lld nrows_x=%lld ncols_dst=%lld selected_route=mmvq_q4k_interleaved_act qpacket_active=%d qpacket_like=%d\n",
+                            __func__, src0->name, candidate ? "candidate" : "reject", reject,
+                            role, lane,
+                            (long long) ne00, (long long) ne01, (long long) ncols_dst_i,
+                            qpacket_active ? 1 : 0, n45_like ? 1 : 0);
+                }
                 return;
             }
             if (q5k_interleaved_wanted && mul_mat_vec_q_q5_K_interleaved_act_try_launch(
@@ -7008,6 +7172,55 @@ void ggml_cuda_mul_mat_vec_q(
         const bool has_ids = ids_d != nullptr;
         if (mtp_q8_dot4_mmvq_scope_enabled) {
             ggml_cuda_mtp_q8_dot4_mmvq_log_tensor(src0, src1, dst, ne00, ne01, ncols_dst, has_fusion, has_ids);
+        }
+        if (ggml_cuda_mtp_actmat_g_expect_no_spec()) {
+            const bool spec_env_active =
+                ggml_cuda_mtp_mmvq_env_enabled("LLAMA_MTP_ACTMAT_QPACKET_ACTIVE") ||
+                ggml_cuda_mtp_mmvq_env_enabled("LLAMA_MTP_QBLOCK_TARGET_VERIFY_ACTIVE") ||
+                ggml_cuda_mtp_mmvq_env_enabled("LLAMA_MTP_MMVQ_SERIAL_COLUMNS_ACTIVE");
+            if (spec_env_active) {
+                GGML_LOG_INFO("%s: actmat_g_guard status=reject tensor=%s reason=spec_env_active ncols_dst=%lld qpacket=%d qblock=%d serial_columns=%d strict=%d\n",
+                        __func__, src0->name, (long long) ncols_dst,
+                        ggml_cuda_mtp_mmvq_env_enabled("LLAMA_MTP_ACTMAT_QPACKET_ACTIVE") ? 1 : 0,
+                        ggml_cuda_mtp_mmvq_env_enabled("LLAMA_MTP_QBLOCK_TARGET_VERIFY_ACTIVE") ? 1 : 0,
+                        ggml_cuda_mtp_mmvq_env_enabled("LLAMA_MTP_MMVQ_SERIAL_COLUMNS_ACTIVE") ? 1 : 0,
+                        ggml_cuda_mtp_actmat_g_strict() ? 1 : 0);
+                if (ggml_cuda_mtp_actmat_g_strict()) {
+                    GGML_ABORT("ACTMAT-G no-spec guard saw speculative env for tensor=%s ncols_dst=%lld", src0->name, (long long) ncols_dst);
+                }
+            }
+        }
+        if (ggml_cuda_mtp_actmat_qslab_attribution_enabled() && ncols_dst >= 64) {
+            GGML_LOG_INFO("%s: actmat_qslab_weight phase=prefill_weight tensor=%s type=%s lane=%s ncols_x=%lld nrows_x=%lld ncols_dst=%lld fusion=%d ids=%d approx_outputs=%llu\n",
+                    __func__, src0->name, ggml_type_name(src0->type), ggml_cuda_mtp_mmvq_actmat_lane(ncols_dst),
+                    (long long) ne00, (long long) ne01, (long long) ncols_dst,
+                    has_fusion ? 1 : 0, has_ids ? 1 : 0,
+                    (unsigned long long) ((uint64_t) std::max<int64_t>(ne01, 0) * (uint64_t) std::max<int64_t>(ncols_dst, 0)));
+        }
+        if (ggml_cuda_mtp_actmat_q4k_ffn_up_candidate_enabled()) {
+            const bool type_ok = src0->type == GGML_TYPE_Q4_K;
+            const bool name_ok = ggml_cuda_mtp_actmat_name_contains(src0->name, "ffn_up");
+            const bool n_ok = ncols_dst == 4 || ncols_dst == 5;
+            const bool qpacket_active = ggml_cuda_mtp_mmvq_env_enabled("LLAMA_MTP_ACTMAT_QPACKET_ACTIVE");
+            const char * reject = "none";
+            if (!type_ok) {
+                reject = "type_not_q4_k";
+            } else if (!name_ok) {
+                reject = "tensor_not_ffn_up";
+            } else if (!n_ok) {
+                reject = "ncols_not_4_or_5";
+            } else if (has_ids) {
+                reject = "ids_not_supported";
+            } else if (has_fusion) {
+                reject = "fusion_not_supported";
+            } else if (!qpacket_active) {
+                reject = "qpacket_descriptor_inactive";
+            }
+            const bool candidate = type_ok && name_ok && n_ok && !has_ids && !has_fusion && qpacket_active;
+            GGML_LOG_INFO("%s: mtp_weight_route route=actmat_q4k_ffn_up_n45 tensor=%s status=%s reject=%s ncols_x=%lld nrows_x=%lld ncols_dst=%lld fusion=%d ids=%d qpacket_active=%d\n",
+                    __func__, src0->name, candidate ? "candidate" : "reject", reject,
+                    (long long) ne00, (long long) ne01, (long long) ncols_dst,
+                    has_fusion ? 1 : 0, has_ids ? 1 : 0, qpacket_active ? 1 : 0);
         }
         if (ggml_cuda_mtp_mmvq_serial_columns_enabled(src0, ncols_dst, has_ids, has_fusion)) {
             if (ggml_cuda_mtp_mmvq_serial_columns_log_enabled()) {

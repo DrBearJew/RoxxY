@@ -27,16 +27,18 @@ static constexpr uint32_t DP16_PACKED_I8X16_LANES = 16;
 static constexpr uint32_t DP16_PACKED_I8X16_WORDS = 4;
 static constexpr uint32_t DP16_PACKED_I8X16_BYTES = 16;
 static constexpr uint32_t DP16_PACKED_I8_WORD_BYTES = 4;
+static constexpr uint32_t DP16_PACKED_I8_PAGE16_TOKENS = 16;
 
 struct alignas(DP16_PACKED_I8X16_BYTES) dp16_i8x16_words {
     int32_t word[DP16_PACKED_I8X16_WORDS];
 };
 
 enum dp16_packed_i8_layout_kind {
-    DP16_PACKED_I8_LAYOUT_UNKNOWN    = -1,
-    DP16_PACKED_I8_LAYOUT_ROW        = 0,
-    DP16_PACKED_I8_LAYOUT_D16_PLANAR = 1,
-    DP16_PACKED_I8_LAYOUT_PADDED_2D  = 2,
+    DP16_PACKED_I8_LAYOUT_UNKNOWN      = -1,
+    DP16_PACKED_I8_LAYOUT_ROW          = 0,
+    DP16_PACKED_I8_LAYOUT_D16_PLANAR   = 1,
+    DP16_PACKED_I8_LAYOUT_PADDED_2D    = 2,
+    DP16_PACKED_I8_LAYOUT_PAGE16_D16   = 3,
 };
 
 enum dp16_packed_i8_axis {
@@ -49,9 +51,10 @@ enum dp16_packed_i8_axis {
 };
 
 enum dp16_packed_i8_scale_layout {
-    DP16_PACKED_I8_SCALE_LAYOUT_UNKNOWN       = -1,
-    DP16_PACKED_I8_SCALE_LAYOUT_ROW           = 0,
-    DP16_PACKED_I8_SCALE_LAYOUT_QBLOCK_PLANAR = 1,
+    DP16_PACKED_I8_SCALE_LAYOUT_UNKNOWN         = -1,
+    DP16_PACKED_I8_SCALE_LAYOUT_ROW             = 0,
+    DP16_PACKED_I8_SCALE_LAYOUT_QBLOCK_PLANAR   = 1,
+    DP16_PACKED_I8_SCALE_LAYOUT_PAGE16_QBLOCK   = 2,
 };
 
 struct dp16_packed_i8_desc_v1 {
@@ -149,6 +152,17 @@ static __host__ __device__ __forceinline__ uint64_t dp16_packed_i8_payload_byte_
         const uint32_t y,
         const uint32_t x,
         const uint32_t word) {
+    if (desc.layout_kind == DP16_PACKED_I8_LAYOUT_PAGE16_D16) {
+        const uint32_t y_halo = y + desc.halo_y_before;
+        const uint32_t page = y_halo / DP16_PACKED_I8_PAGE16_TOKENS;
+        const uint32_t slot = y_halo - page * DP16_PACKED_I8_PAGE16_TOKENS;
+        return desc.base_offset_bytes +
+            (uint64_t) z * desc.z_stride_bytes +
+            (uint64_t) page * desc.plane_stride_bytes +
+            (uint64_t) (x + desc.halo_x_before) * desc.x_stride_bytes +
+            (uint64_t) slot * desc.y_stride_bytes +
+            (uint64_t) word * desc.bytes_per_word;
+    }
     return desc.base_offset_bytes +
         (uint64_t) z * desc.z_stride_bytes +
         (uint64_t) (y + desc.halo_y_before) * desc.y_stride_bytes +
@@ -170,6 +184,15 @@ static __host__ __device__ __forceinline__ uint64_t dp16_packed_i8_scale_byte_of
         const uint32_t z,
         const uint32_t y,
         const uint32_t x) {
+    if (desc.scale_layout == DP16_PACKED_I8_SCALE_LAYOUT_PAGE16_QBLOCK) {
+        const uint32_t page = y / DP16_PACKED_I8_PAGE16_TOKENS;
+        const uint32_t slot = y - page * DP16_PACKED_I8_PAGE16_TOKENS;
+        return desc.scale_base_offset_bytes +
+            (uint64_t) z * desc.scale_z_stride_bytes +
+            (uint64_t) page * desc.scale_plane_stride_bytes +
+            (uint64_t) x * desc.scale_x_stride_bytes +
+            (uint64_t) slot * desc.scale_y_stride_bytes;
+    }
     return desc.scale_base_offset_bytes +
         (uint64_t) z * desc.scale_z_stride_bytes +
         (uint64_t) y * desc.scale_y_stride_bytes +

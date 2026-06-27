@@ -1,0 +1,403 @@
+{
+  "accept": {
+    "acceptance_length": 2,
+    "accepted_path": [
+      0,
+      1,
+      4
+    ],
+    "accepted_tokens": [
+      11,
+      22
+    ],
+    "correction_token": 999,
+    "rejected_node_indices": [
+      2,
+      3,
+      5,
+      6
+    ],
+    "target_argmax_by_node": [
+      11,
+      22,
+      31,
+      777,
+      999,
+      888,
+      666
+    ]
+  },
+  "commit": {
+    "accepted_draft_tokens": [
+      11,
+      22
+    ],
+    "appended_node_indices": [
+      0,
+      1,
+      4
+    ],
+    "committed_append_tokens": [
+      11,
+      22,
+      999
+    ],
+    "discarded_node_indices": [
+      2,
+      3,
+      5,
+      6
+    ],
+    "post_committed_token_ids": [
+      5,
+      6,
+      7,
+      11,
+      22,
+      999
+    ],
+    "post_hidden_cache": [
+      [
+        5.0,
+        5.0,
+        5.0
+      ],
+      [
+        6.0,
+        6.0,
+        6.0
+      ],
+      [
+        70.0,
+        71.0,
+        72.0
+      ],
+      [
+        110.0,
+        111.0,
+        112.0
+      ],
+      [
+        220.0,
+        221.0,
+        222.0
+      ]
+    ],
+    "post_hidden_len": 5,
+    "pre_committed_token_ids": [
+      5,
+      6,
+      7
+    ],
+    "pre_hidden_len": 2
+  },
+  "ok": true,
+  "parity": {
+    "baseline_greedy_token_ids": [
+      11,
+      22,
+      999
+    ],
+    "greedy_output_matches_baseline": true,
+    "jetspec_committed_append_tokens": [
+      11,
+      22,
+      999
+    ]
+  },
+  "round_contract": {
+    "accepted_path_isolated_from_rejected_nodes": true,
+    "correction_hidden_appended": false,
+    "post_hidden_trails_committed_by_one": true,
+    "pre_hidden_trails_committed_by_one": true,
+    "prefix_visible_to_all": true,
+    "rejected_sentinels_absent": true
+  },
+  "tree": {
+    "cum_logprob": [
+      0.0,
+      -0.1,
+      -0.3,
+      -0.30000000000000004,
+      -0.5,
+      -0.5,
+      -0.7
+    ],
+    "depth": [
+      0,
+      1,
+      1,
+      2,
+      2,
+      2,
+      2
+    ],
+    "max_depth": 2,
+    "num_nodes": 7,
+    "parent_indices": [
+      -1,
+      0,
+      0,
+      1,
+      1,
+      2,
+      2
+    ],
+    "rank": [
+      -1,
+      0,
+      1,
+      0,
+      1,
+      0,
+      1
+    ],
+    "token_ids": [
+      7,
+      11,
+      12,
+      21,
+      22,
+      21,
+      22
+    ]
+  },
+  "verify": {
+    "ancestor": [
+      [
+        true,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      [
+        true,
+        true,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      [
+        true,
+        false,
+        true,
+        false,
+        false,
+        false,
+        false
+      ],
+      [
+        true,
+        true,
+        false,
+        true,
+        false,
+        false,
+        false
+      ],
+      [
+        true,
+        true,
+        false,
+        false,
+        true,
+        false,
+        false
+      ],
+      [
+        true,
+        false,
+        true,
+        false,
+        false,
+        true,
+        false
+      ],
+      [
+        true,
+        false,
+        true,
+        false,
+        false,
+        false,
+        true
+      ]
+    ],
+    "past_len": 2,
+    "qq_bias": [
+      [
+        "0",
+        "-inf",
+        "-inf",
+        "-inf",
+        "-inf",
+        "-inf",
+        "-inf"
+      ],
+      [
+        "0",
+        "0",
+        "-inf",
+        "-inf",
+        "-inf",
+        "-inf",
+        "-inf"
+      ],
+      [
+        "0",
+        "-inf",
+        "0",
+        "-inf",
+        "-inf",
+        "-inf",
+        "-inf"
+      ],
+      [
+        "0",
+        "0",
+        "-inf",
+        "0",
+        "-inf",
+        "-inf",
+        "-inf"
+      ],
+      [
+        "0",
+        "0",
+        "-inf",
+        "-inf",
+        "0",
+        "-inf",
+        "-inf"
+      ],
+      [
+        "0",
+        "-inf",
+        "0",
+        "-inf",
+        "-inf",
+        "0",
+        "-inf"
+      ],
+      [
+        "0",
+        "-inf",
+        "0",
+        "-inf",
+        "-inf",
+        "-inf",
+        "0"
+      ]
+    ],
+    "sibling_pairs": [
+      [
+        1,
+        2
+      ],
+      [
+        2,
+        1
+      ],
+      [
+        3,
+        4
+      ],
+      [
+        4,
+        3
+      ],
+      [
+        5,
+        6
+      ],
+      [
+        6,
+        5
+      ]
+    ],
+    "verify_allowed_mask": [
+      [
+        true,
+        true,
+        true,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      [
+        true,
+        true,
+        true,
+        true,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      [
+        true,
+        true,
+        true,
+        false,
+        true,
+        false,
+        false,
+        false,
+        false
+      ],
+      [
+        true,
+        true,
+        true,
+        true,
+        false,
+        true,
+        false,
+        false,
+        false
+      ],
+      [
+        true,
+        true,
+        true,
+        true,
+        false,
+        false,
+        true,
+        false,
+        false
+      ],
+      [
+        true,
+        true,
+        true,
+        false,
+        true,
+        false,
+        false,
+        true,
+        false
+      ],
+      [
+        true,
+        true,
+        true,
+        false,
+        true,
+        false,
+        false,
+        false,
+        true
+      ]
+    ]
+  }
+}

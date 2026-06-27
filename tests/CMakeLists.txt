@@ -213,6 +213,7 @@ llama_build_and_test(
 )
 llama_build_and_test(test-regex-partial.cpp)
 llama_build_and_test(test-pdmq-k-formats.cpp)
+llama_build_and_test(test-fa-block-meta.cpp)
 
 if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "s390x")
     set(MODEL_NAME "tinyllamas/stories15M-q4_0.gguf")

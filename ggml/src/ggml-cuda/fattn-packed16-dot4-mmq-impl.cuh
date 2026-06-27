@@ -20,6 +20,7 @@
 #include "fattn-packed16-wmma-builtin.cuh"
 #include "dot4-packed16/dp16-fa-qpack.cuh"
 #include "dot4-packed16/dp16-trace.cuh"
+#include "dot4-packed16/fa-block-meta.cuh"
 #include "dot4-packed16/mtp-qblock-txn-lineage.cuh"
 #include "dot4-packed16/mtp-v4-144-tail-page-state.cuh"
 
@@ -122,6 +123,53 @@ static const char * pdmq_vpath_env() {
     const char * v = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_VPATH");
     return v ? v : "";
 }
+static inline int pdmq_qblock_env_int(const char * name, int fallback) {
+    const char * v = getenv(name);
+    return v && *v ? atoi(v) : fallback;
+}
+
+static inline bool pdmq_qblock_consumer_read_mode_trace_enabled() {
+    const char * v = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_CONSUMER_READ_MODE_TRACE");
+    if (v && atoi(v) != 0) {
+        return true;
+    }
+    v = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_CONSUMER_READ_MODE_TRACE");
+    return v && atoi(v) != 0;
+}
+
+static inline bool pdmq_qblock_tail_page_age_out_trace_enabled() {
+    const char * v = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TAIL_PAGE_AGE_OUT_TRACE");
+    if (v && atoi(v) != 0) {
+        return true;
+    }
+    v = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_AGE_OUT_TRACE");
+    return v && atoi(v) != 0;
+}
+
+static inline int pdmq_qblock_tail_page_age_out_trace_min_idx() {
+    const char * v = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_KV_PERSISTENCE_TRACE_MIN_IDX");
+    if (v && *v) {
+        return atoi(v);
+    }
+    return pdmq_qblock_env_int("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE_CANONICAL_POISON_MIN_IDX", 0);
+}
+
+static inline int pdmq_qblock_tail_page_age_out_trace_max_idx() {
+    const char * v = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_KV_PERSISTENCE_TRACE_MAX_IDX");
+    if (v && *v) {
+        return atoi(v);
+    }
+    return pdmq_qblock_env_int("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE_CANONICAL_POISON_MAX_IDX", -1);
+}
+
+static inline uint64_t pdmq_qblock_u64_min(const uint64_t a, const uint64_t b) {
+    return a < b ? a : b;
+}
+
+static inline uint64_t pdmq_qblock_u64_max(const uint64_t a, const uint64_t b) {
+    return a > b ? a : b;
+}
+
 static inline bool pdmq_pv_wmma_requested() {
     const char * v = getenv("GGML_CUDA_DP16_FA_PV_WMMA");
     return v && atoi(v) != 0;
@@ -293,6 +341,8 @@ static inline int pdmq_clamp_i8(const int x) {
 }
 #endif
 
+static constexpr int PDMQ_IMPLICIT_FLAG_BLOCK_META_FULL_TILE = 1 << 30;
+
 #if defined(__HIPCC__) || defined(__CUDACC__)
 __device__ __constant__ int pdmq_mask_trace_const = 0;
 __device__ unsigned int pdmq_mask_trace_counter = 0;
@@ -404,8 +454,10 @@ static inline bool pdmq_packed16_sidecar_meta_valid(
         const bool verbose,
         const char * context) {
     const char * reject = nullptr;
-    const int expected_scale_layout = meta.layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_D16_PLANAR ?
-        GGML_CUDA_PACKED16_K_SCALE_LAYOUT_QBLOCK_PLANAR : GGML_CUDA_PACKED16_K_SCALE_LAYOUT_ROW;
+    const bool meta_layout_d16_planar = meta.layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_D16_PLANAR;
+    const bool meta_layout_page16_d16 = meta.layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_PAGE16_D16;
+    const int expected_scale_layout = meta_layout_page16_d16 ? GGML_CUDA_PACKED16_K_SCALE_LAYOUT_PAGE16_QBLOCK :
+        (meta_layout_d16_planar ? GGML_CUDA_PACKED16_K_SCALE_LAYOUT_QBLOCK_PLANAR : GGML_CUDA_PACKED16_K_SCALE_LAYOUT_ROW);
     const uint32_t inferred_kv_capacity = (K && K->ne[2] > 0 && packed16_payload && packed16_payload->ne[1] > 0) ?
         (uint32_t) (packed16_payload->ne[1] / K->ne[2]) : 0;
     const uint32_t kv_capacity = meta.kv_capacity ? meta.kv_capacity : inferred_kv_capacity;
@@ -425,7 +477,7 @@ static inline bool pdmq_packed16_sidecar_meta_valid(
         reject = "bad_pdmq_k_meta_code_contract";
     } else if (meta.payload_words_per_token != words) {
         reject = "bad_pdmq_k_meta_payload_words";
-    } else if (meta_packed16 && meta.layout_kind != GGML_CUDA_PACKED16_K_LAYOUT_ROW && meta.layout_kind != GGML_CUDA_PACKED16_K_LAYOUT_D16_PLANAR) {
+    } else if (meta_packed16 && meta.layout_kind != GGML_CUDA_PACKED16_K_LAYOUT_ROW && meta.layout_kind != GGML_CUDA_PACKED16_K_LAYOUT_D16_PLANAR && meta.layout_kind != GGML_CUDA_PACKED16_K_LAYOUT_PAGE16_D16) {
         reject = "bad_packed16_k_meta_layout";
     } else if (meta_packed8 && meta.layout_kind != GGML_CUDA_PACKED16_K_LAYOUT_ROW) {
         reject = "bad_packed8_k_meta_layout";
@@ -450,13 +502,19 @@ static inline bool pdmq_packed16_sidecar_meta_valid(
              meta.payload_d16_plane_stride != size_t(kv_capacity) * size_t(GGML_CUDA_PACKED16_K_WORDS_PER_D16) ||
              meta.scale_qblock_plane_stride != size_t(kv_capacity))) {
         reject = "bad_packed16_k_meta_tile_stride";
+    } else if (meta.layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_PAGE16_D16 &&
+            ((kv_capacity % GGML_CUDA_PACKED16_K_PAGE16_TOKENS) != 0 ||
+             meta.payload_token_stride != size_t(GGML_CUDA_PACKED16_K_WORDS_PER_D16) || meta.scale_token_stride != 1 ||
+             meta.payload_d16_plane_stride != size_t(GGML_CUDA_PACKED16_K_PAGE16_TOKENS) * size_t(GGML_CUDA_PACKED16_K_WORDS_PER_D16) ||
+             meta.scale_qblock_plane_stride != size_t(GGML_CUDA_PACKED16_K_PAGE16_TOKENS))) {
+        reject = "bad_packed16_k_meta_page16_stride";
     } else if (meta_packed8) {
         // packed8 uses explicit row strides below, not the packed-i8x16 vector descriptor.
         reject = nullptr;
     } else if (!dp16_i8x16_desc_has_vector_abi(meta.packed_i8_desc)) {
         reject = "bad_packed16_i8_desc_abi";
-    } else if (meta.packed_i8_desc.layout_kind != (meta.layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_D16_PLANAR ? DP16_PACKED_I8_LAYOUT_D16_PLANAR : DP16_PACKED_I8_LAYOUT_ROW) ||
-            meta.packed_i8_desc.scale_layout != (meta.layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_D16_PLANAR ? DP16_PACKED_I8_SCALE_LAYOUT_QBLOCK_PLANAR : DP16_PACKED_I8_SCALE_LAYOUT_ROW)) {
+    } else if (meta.packed_i8_desc.layout_kind != (meta_layout_page16_d16 ? DP16_PACKED_I8_LAYOUT_PAGE16_D16 : (meta_layout_d16_planar ? DP16_PACKED_I8_LAYOUT_D16_PLANAR : DP16_PACKED_I8_LAYOUT_ROW)) ||
+            meta.packed_i8_desc.scale_layout != (meta_layout_page16_d16 ? DP16_PACKED_I8_SCALE_LAYOUT_PAGE16_QBLOCK : (meta_layout_d16_planar ? DP16_PACKED_I8_SCALE_LAYOUT_QBLOCK_PLANAR : DP16_PACKED_I8_SCALE_LAYOUT_ROW))) {
         reject = "bad_packed16_i8_desc_layout";
     } else if (meta.packed_i8_desc.axis_x != DP16_PACKED_I8_AXIS_D16 ||
             meta.packed_i8_desc.axis_y != DP16_PACKED_I8_AXIS_TOKEN ||
@@ -491,6 +549,14 @@ static inline bool pdmq_packed16_sidecar_meta_valid(
              meta.packed_i8_desc.scale_y_stride_bytes != sizeof(uint16_t) ||
              meta.packed_i8_desc.scale_plane_stride_bytes != meta.packed_i8_desc.scale_x_stride_bytes)) {
         reject = "bad_packed16_i8_desc_tile_stride";
+    } else if (meta.layout_kind == GGML_CUDA_PACKED16_K_LAYOUT_PAGE16_D16 &&
+            (meta.packed_i8_desc.x_stride_bytes != uint64_t(GGML_CUDA_PACKED16_K_PAGE16_TOKENS) * uint64_t(GGML_CUDA_PACKED16_K_WORDS_PER_D16) * DP16_PACKED_I8_WORD_BYTES ||
+             meta.packed_i8_desc.y_stride_bytes != uint64_t(GGML_CUDA_PACKED16_K_WORDS_PER_D16) * DP16_PACKED_I8_WORD_BYTES ||
+             meta.packed_i8_desc.plane_stride_bytes != uint64_t(GGML_CUDA_PACKED16_K_WORDS_PER_PAGE16) * DP16_PACKED_I8_WORD_BYTES ||
+             meta.packed_i8_desc.scale_x_stride_bytes != uint64_t(GGML_CUDA_PACKED16_K_PAGE16_TOKENS) * sizeof(uint16_t) ||
+             meta.packed_i8_desc.scale_y_stride_bytes != sizeof(uint16_t) ||
+             meta.packed_i8_desc.scale_plane_stride_bytes != uint64_t(GGML_CUDA_PACKED16_K_SCALE_PER_PAGE16) * sizeof(uint16_t))) {
+        reject = "bad_packed16_i8_desc_page16_stride";
     }
 
     if (!reject) {
@@ -1299,6 +1365,40 @@ static __device__ __forceinline__ float pdmq_qk_dot_packed8(
 }
 
 template<int BM, int D>
+static __device__ __forceinline__ float pdmq_qk_dot_sidecar_d16_planar(
+        const int   (&q_payload)[BM][D / 4 + 1],
+        const float (&q_scales) [BM][D / QK8_0 + 1],
+        const int qr,
+        const int * __restrict__ k_payload,
+        const half * __restrict__ k_scales,
+        const dp16_packed_i8_desc_v1 & k_desc,
+        const int hk,
+        const int k) {
+    constexpr int QBLOCKS = D / QK8_0;
+
+    float sum = 0.0f;
+#pragma unroll
+    for (int qb = 0; qb < QBLOCKS; ++qb) {
+        int acc = 0;
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int d16 = qb * 2 + half;
+            const int idx = d16 * GGML_CUDA_PACKED16_K_WORDS_PER_D16;
+            const size_t off = ggml_cuda_packed16_k_payload_index_from_desc(k_desc, (uint32_t) hk, (uint32_t) k, (uint32_t) idx);
+            const int4 kw4 = *((const int4 *) (k_payload + off));
+            acc = pdmq_dot4_i8_i8(q_payload[qr][idx + 0], kw4.x, acc);
+            acc = pdmq_dot4_i8_i8(q_payload[qr][idx + 1], kw4.y, acc);
+            acc = pdmq_dot4_i8_i8(q_payload[qr][idx + 2], kw4.z, acc);
+            acc = pdmq_dot4_i8_i8(q_payload[qr][idx + 3], kw4.w, acc);
+        }
+        const float k_scale = __half2float(k_scales[ggml_cuda_packed16_k_scale_index_from_desc(k_desc, (uint32_t) hk, (uint32_t) k, (uint32_t) qb)]);
+        sum += float(acc) * q_scales[qr][qb] * k_scale;
+    }
+    return sum;
+}
+
+
+template<int BM, int D>
 static __device__ __forceinline__ float pdmq_qk_dot_sidecar(
         const int   (&q_payload)[BM][D / 4 + 1],
         const float (&q_scales) [BM][D / QK8_0 + 1],
@@ -1326,25 +1426,7 @@ static __device__ __forceinline__ float pdmq_qk_dot_sidecar(
             k_scales  + scale_row);
     }
 
-    float sum = 0.0f;
-#pragma unroll
-    for (int qb = 0; qb < QBLOCKS; ++qb) {
-        int acc = 0;
-#pragma unroll
-        for (int half = 0; half < 2; ++half) {
-            const int d16 = qb * 2 + half;
-            const int idx = d16 * GGML_CUDA_PACKED16_K_WORDS_PER_D16;
-            const size_t off = ggml_cuda_packed16_k_payload_index_from_desc(k_desc, (uint32_t) hk, (uint32_t) k, (uint32_t) idx);
-            const int4 kw4 = *((const int4 *) (k_payload + off));
-            acc = pdmq_dot4_i8_i8(q_payload[qr][idx + 0], kw4.x, acc);
-            acc = pdmq_dot4_i8_i8(q_payload[qr][idx + 1], kw4.y, acc);
-            acc = pdmq_dot4_i8_i8(q_payload[qr][idx + 2], kw4.z, acc);
-            acc = pdmq_dot4_i8_i8(q_payload[qr][idx + 3], kw4.w, acc);
-        }
-        const float k_scale = __half2float(k_scales[ggml_cuda_packed16_k_scale_index_from_desc(k_desc, (uint32_t) hk, (uint32_t) k, (uint32_t) qb)]);
-        sum += float(acc) * q_scales[qr][qb] * k_scale;
-    }
-    return sum;
+    return pdmq_qk_dot_sidecar_d16_planar<BM, D>(q_payload, q_scales, qr, k_payload, k_scales, k_desc, hk, k);
 }
 
 static __device__ __forceinline__ unsigned int pdmq_f32_bits(const float x) {
@@ -1777,9 +1859,24 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqa2
         if constexpr (KSHARED) {
             constexpr int KP_PER_ROW = PDMQ_D / 4;
             constexpr int KS_PER_ROW = PDMQ_D / QK8_0;
-            for (int idx = tid; idx < tile_n * KP_PER_ROW; idx += int(blockDim.x)) {
-                const int kk = idx / KP_PER_ROW, w = idx - kk * KP_PER_ROW;
-                k_payload_s[kk * (KP_PER_ROW + 1) + w] = k_payload[ggml_cuda_packed16_k_payload_index_from_desc(k_desc, (uint32_t) hk, (uint32_t) (k0 + kk), (uint32_t) w)];
+            if (k_desc.layout_kind == DP16_PACKED_I8_LAYOUT_D16_PLANAR || k_desc.layout_kind == DP16_PACKED_I8_LAYOUT_PAGE16_D16) {
+                constexpr int D16_PLANES = PDMQ_D / GGML_CUDA_PACKED16_K_D16;
+                for (int idx = tid; idx < tile_n * D16_PLANES; idx += int(blockDim.x)) {
+                    const int kk = idx / D16_PLANES, d16 = idx - kk * D16_PLANES;
+                    const int w = d16 * GGML_CUDA_PACKED16_K_WORDS_PER_D16;
+                    const size_t off = ggml_cuda_packed16_k_payload_index_from_desc(k_desc, (uint32_t) hk, (uint32_t) (k0 + kk), (uint32_t) w);
+                    const int4 kw4 = *((const int4 *) (k_payload + off));
+                    int * dst = &k_payload_s[kk * (KP_PER_ROW + 1) + w];
+                    dst[0] = kw4.x;
+                    dst[1] = kw4.y;
+                    dst[2] = kw4.z;
+                    dst[3] = kw4.w;
+                }
+            } else {
+                for (int idx = tid; idx < tile_n * KP_PER_ROW; idx += int(blockDim.x)) {
+                    const int kk = idx / KP_PER_ROW, w = idx - kk * KP_PER_ROW;
+                    k_payload_s[kk * (KP_PER_ROW + 1) + w] = k_payload[ggml_cuda_packed16_k_payload_index_from_desc(k_desc, (uint32_t) hk, (uint32_t) (k0 + kk), (uint32_t) w)];
+                }
             }
             for (int idx = tid; idx < tile_n * KS_PER_ROW; idx += int(blockDim.x)) {
                 const int kk = idx / KS_PER_ROW, s_val = idx - kk * KS_PER_ROW;
@@ -2310,11 +2407,31 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
         if constexpr (KSHARED) {
             constexpr int KP_PER_ROW = PDMQ_D / 4;
             constexpr int KS_PER_ROW = PDMQ_D / QK8_0;
-            for (int idx = tid; idx < tile_n * KP_PER_ROW; idx += int(blockDim.x)) {
-                const int kk = idx / KP_PER_ROW, w = idx - kk * KP_PER_ROW;
-                const int k = k0 + kk;
-                const int k_phys = dp16_fa_qblock_tail_page_physical_k(qblock_program, k);
-                k_payload_s[kk * (KP_PER_ROW + 1) + w] = k_phys >= 0 ? k_payload[ggml_cuda_packed16_k_payload_index_from_desc(k_desc, (uint32_t) hk, (uint32_t) k_phys, (uint32_t) w)] : 0;
+            if (k_desc.layout_kind == DP16_PACKED_I8_LAYOUT_D16_PLANAR || k_desc.layout_kind == DP16_PACKED_I8_LAYOUT_PAGE16_D16) {
+                constexpr int D16_PLANES = PDMQ_D / GGML_CUDA_PACKED16_K_D16;
+                for (int idx = tid; idx < tile_n * D16_PLANES; idx += int(blockDim.x)) {
+                    const int kk = idx / D16_PLANES, d16 = idx - kk * D16_PLANES;
+                    const int w = d16 * GGML_CUDA_PACKED16_K_WORDS_PER_D16;
+                    const int k = k0 + kk;
+                    const int k_phys = dp16_fa_qblock_tail_page_physical_k(qblock_program, k);
+                    int4 kw4 = {0, 0, 0, 0};
+                    if (k_phys >= 0) {
+                        const size_t off = ggml_cuda_packed16_k_payload_index_from_desc(k_desc, (uint32_t) hk, (uint32_t) k_phys, (uint32_t) w);
+                        kw4 = *((const int4 *) (k_payload + off));
+                    }
+                    int * dst = &k_payload_s[kk * (KP_PER_ROW + 1) + w];
+                    dst[0] = kw4.x;
+                    dst[1] = kw4.y;
+                    dst[2] = kw4.z;
+                    dst[3] = kw4.w;
+                }
+            } else {
+                for (int idx = tid; idx < tile_n * KP_PER_ROW; idx += int(blockDim.x)) {
+                    const int kk = idx / KP_PER_ROW, w = idx - kk * KP_PER_ROW;
+                    const int k = k0 + kk;
+                    const int k_phys = dp16_fa_qblock_tail_page_physical_k(qblock_program, k);
+                    k_payload_s[kk * (KP_PER_ROW + 1) + w] = k_phys >= 0 ? k_payload[ggml_cuda_packed16_k_payload_index_from_desc(k_desc, (uint32_t) hk, (uint32_t) k_phys, (uint32_t) w)] : 0;
+                }
             }
             for (int idx = tid; idx < tile_n * KS_PER_ROW; idx += int(blockDim.x)) {
                 const int kk = idx / KS_PER_ROW, s_val = idx - kk * KS_PER_ROW;
@@ -3520,9 +3637,24 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_kern
         if constexpr (KSHARED) {
             constexpr int KP_PER_ROW = PDMQ_D / 4;
             constexpr int KS_PER_ROW = PDMQ_D / QK8_0;
-            for (int idx = tid; idx < tile_n * KP_PER_ROW; idx += int(blockDim.x)) {
-                const int kk = idx / KP_PER_ROW, w = idx - kk * KP_PER_ROW;
-                k_payload_s[kk * (KP_PER_ROW + 1) + w] = k_payload[ggml_cuda_packed16_k_payload_index_from_desc(k_desc, (uint32_t) hk, (uint32_t) (k0 + kk), (uint32_t) w)];
+            if (k_desc.layout_kind == DP16_PACKED_I8_LAYOUT_D16_PLANAR || k_desc.layout_kind == DP16_PACKED_I8_LAYOUT_PAGE16_D16) {
+                constexpr int D16_PLANES = PDMQ_D / GGML_CUDA_PACKED16_K_D16;
+                for (int idx = tid; idx < tile_n * D16_PLANES; idx += int(blockDim.x)) {
+                    const int kk = idx / D16_PLANES, d16 = idx - kk * D16_PLANES;
+                    const int w = d16 * GGML_CUDA_PACKED16_K_WORDS_PER_D16;
+                    const size_t off = ggml_cuda_packed16_k_payload_index_from_desc(k_desc, (uint32_t) hk, (uint32_t) (k0 + kk), (uint32_t) w);
+                    const int4 kw4 = *((const int4 *) (k_payload + off));
+                    int * dst = &k_payload_s[kk * (KP_PER_ROW + 1) + w];
+                    dst[0] = kw4.x;
+                    dst[1] = kw4.y;
+                    dst[2] = kw4.z;
+                    dst[3] = kw4.w;
+                }
+            } else {
+                for (int idx = tid; idx < tile_n * KP_PER_ROW; idx += int(blockDim.x)) {
+                    const int kk = idx / KP_PER_ROW, w = idx - kk * KP_PER_ROW;
+                    k_payload_s[kk * (KP_PER_ROW + 1) + w] = k_payload[ggml_cuda_packed16_k_payload_index_from_desc(k_desc, (uint32_t) hk, (uint32_t) (k0 + kk), (uint32_t) w)];
+                }
             }
             for (int idx = tid; idx < tile_n * KS_PER_ROW; idx += int(blockDim.x)) {
                 const int kk = idx / KS_PER_ROW, s = idx - kk * KS_PER_ROW;
@@ -3537,7 +3669,19 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_kern
         const bool implicit_causal = (implicit_flags & 1) != 0;
         bool exact_tile = full_q && full_k && mask == nullptr;
         if (implicit_causal) {
-            exact_tile = exact_tile && (k0 + BN - 1 < implicit_n_kv) && (k0 + BN - 1 <= implicit_q_offset + q0);
+            if ((implicit_flags & PDMQ_IMPLICIT_FLAG_BLOCK_META_FULL_TILE) != 0) {
+                const ggml_cuda_fa_block_meta_v1 block_meta = ggml_cuda_fa_block_meta_make_legacy_causal(
+                    implicit_n_kv > 0 ? (uint32_t) implicit_n_kv : 0u,
+                    nq > 0 ? (uint32_t) nq : 0u,
+                    implicit_q_offset,
+                    (uint32_t) (implicit_flags & ~PDMQ_IMPLICIT_FLAG_BLOCK_META_FULL_TILE),
+                    (uint32_t) BM,
+                    (uint32_t) BN);
+                exact_tile = exact_tile && ggml_cuda_fa_block_meta_tile_is_full_visible(
+                    block_meta, (uint32_t) q0, (uint32_t) BM, (uint32_t) k0, (uint32_t) BN);
+            } else {
+                exact_tile = exact_tile && (k0 + BN - 1 < implicit_n_kv) && (k0 + BN - 1 <= implicit_q_offset + q0);
+            }
         }
         if constexpr (CAUSAL_MASK) {
             exact_tile = exact_tile && (k0 + BN - 1 <= q_offset + q0);
@@ -3884,6 +4028,97 @@ static inline int pdmq_splitk_roof_pow2(int nk) {
     return 1;
 }
 
+struct p16_streamk_plan {
+    int m_effective = 0;
+    int m_tile = 0;
+    int base_ctas = 0;
+    int compute_units = 0;
+    int resident_ctas_per_cu = 0;
+    int target_ctas = 0;
+    int requested_splits = 1;
+    int supported_splits = 1;
+    int current_splits = 1;
+    int split_len_tokens = 0;
+    int max_splits = 1;
+    int min_nk = 0;
+    size_t partial_o_bytes = 0;
+    size_t partial_meta_bytes = 0;
+    const char * reason = "ok";
+    bool supported = false;
+};
+
+static inline bool p16_streamk_plan_log_enabled() {
+    const char * v = getenv("GGML_CUDA_ROCM_P16_STREAMK_PLAN_LOG");
+    return v && atoi(v) != 0;
+}
+
+static inline bool p16_streamk_auto_enabled() {
+    const char * v = getenv("GGML_CUDA_ROCM_P16_STREAMK_AUTO");
+    return v && atoi(v) != 0;
+}
+
+static inline int p16_streamk_env_int(const char * name, int fallback) {
+    const char * v = getenv(name);
+    return v && *v ? atoi(v) : fallback;
+}
+
+static inline int p16_streamk_clamp_int(const int v, const int lo, const int hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static inline int p16_streamk_nearest_supported_split(const int requested, const int max_splits) {
+    const int req = p16_streamk_clamp_int(requested, 1, max_splits);
+    int lower = 1;
+    while (lower < max_splits && lower * 2 <= req) {
+        lower *= 2;
+    }
+    const int upper = lower < max_splits ? lower * 2 : lower;
+    return (req - lower) < (upper - req) ? lower : upper;
+}
+
+static inline p16_streamk_plan p16_streamk_plan_for_shape(
+        const int nq,
+        const int nk,
+        const int n_heads_q,
+        const int n_heads_k,
+        const int gqa_ratio,
+        const int batch,
+        const int launch_bn,
+        const int current_splits,
+        const bool route_split_supported) {
+    p16_streamk_plan out = {};
+    out.m_effective = nq * gqa_ratio;
+    out.m_tile = p16_streamk_env_int("GGML_CUDA_ROCM_P16_STREAMK_M_TILE", gqa_ratio > 0 ? gqa_ratio : 1);
+    out.m_tile = out.m_tile < 1 ? 1 : out.m_tile;
+    out.base_ctas = batch * n_heads_k * CEIL_DIV(out.m_effective > 0 ? out.m_effective : 1, out.m_tile);
+    out.base_ctas = out.base_ctas < 1 ? 1 : out.base_ctas;
+    out.compute_units = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+    out.compute_units = out.compute_units < 1 ? 1 : out.compute_units;
+    out.resident_ctas_per_cu = p16_streamk_env_int("GGML_CUDA_ROCM_P16_STREAMK_RESIDENT_CTAS_PER_CU", 1);
+    out.resident_ctas_per_cu = out.resident_ctas_per_cu < 1 ? 1 : out.resident_ctas_per_cu;
+    const int default_target_ctas = out.compute_units * out.resident_ctas_per_cu;
+    out.target_ctas = p16_streamk_env_int("GGML_CUDA_ROCM_P16_STREAMK_TARGET_CTAS", default_target_ctas);
+    out.target_ctas = out.target_ctas < 1 ? 1 : out.target_ctas;
+    out.max_splits = p16_streamk_env_int("GGML_CUDA_ROCM_P16_STREAMK_MAX_SPLITS", 32);
+    out.max_splits = p16_streamk_clamp_int(out.max_splits, 1, 64);
+    out.min_nk = p16_streamk_env_int("GGML_CUDA_ROCM_P16_STREAMK_MIN_NK", 4096);
+    out.min_nk = out.min_nk < 0 ? 0 : out.min_nk;
+    out.requested_splits = p16_streamk_clamp_int(CEIL_DIV(out.target_ctas, out.base_ctas), 1, out.max_splits);
+    out.current_splits = current_splits < 1 ? 1 : current_splits;
+    out.supported = route_split_supported && nk >= out.min_nk;
+    out.reason = !route_split_supported ? "route_not_splitk_capable" : (nk < out.min_nk ? "nk_below_min" : "ok");
+    out.supported_splits = out.supported ? p16_streamk_nearest_supported_split(out.requested_splits, out.max_splits) : 1;
+    const int split_den = out.supported_splits > 0 ? out.supported_splits : 1;
+    const int split_len_raw = CEIL_DIV(nk > 0 ? nk : 1, split_den);
+    const int align = launch_bn > 0 ? launch_bn : 1;
+    out.split_len_tokens = CEIL_DIV(split_len_raw, align) * align;
+    const size_t partial_rows = out.supported_splits > 1 ?
+        size_t(out.supported_splits) * size_t(batch) * size_t(nq) * size_t(n_heads_q) : 0;
+    out.partial_o_bytes = partial_rows * size_t(PDMQ_D) * sizeof(float);
+    out.partial_meta_bytes = partial_rows * 2u * sizeof(float);
+    return out;
+}
+
 enum pdmq_shape {
     PDMQ_SHAPE_M1N32,
     PDMQ_SHAPE_M2N32,
@@ -4027,6 +4262,149 @@ static inline pdmq_shape pdmq_select_qwen35_gqa6_qblock_shape(const int nq, cons
         return PDMQ_SHAPE_M2N32;
     }
     return PDMQ_SHAPE_M4N32;
+}
+
+static inline bool pdmq_decode_stage_auto_enabled() {
+    const char * env = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_AUTO");
+    return env && *env && atoi(env) != 0;
+}
+
+static inline bool pdmq_decode_stage_auto_explicitly_disabled() {
+    const char * env = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_AUTO");
+    return env && *env && atoi(env) == 0;
+}
+
+static inline bool pdmq_decode_stage_v4_default_auto_enabled(
+        const pdmq_role role,
+        const int nq,
+        const ggml_type v_type,
+        const pdmq_v_path v_path) {
+    return !pdmq_decode_stage_auto_explicitly_disabled() &&
+        v_type == GGML_TYPE_V4_K16D16_144 && v_path == PDMQ_V_V4_K16D16_144 &&
+        role == PDMQ_ROLE_DECODE && nq <= 1;
+}
+
+static inline bool pdmq_decode_stage_policy_active(
+        const pdmq_role role,
+        const int nq,
+        const ggml_type v_type,
+        const pdmq_v_path v_path) {
+    return pdmq_decode_stage_auto_enabled() ||
+        pdmq_decode_stage_v4_default_auto_enabled(role, nq, v_type, v_path);
+}
+
+static inline bool pdmq_decode_stage_log_enabled() {
+    const char * env = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_LOG");
+    return env && *env && atoi(env) != 0;
+}
+
+static inline bool pdmq_decode_stage_shape_env(const int nq, const char ** env_out) {
+    const char * env = nullptr;
+    if (nq <= 1) {
+        env = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SHAPE_NQ1");
+    } else if (nq <= 2) {
+        env = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SHAPE_NQ2");
+    } else if (nq <= 4) {
+        env = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SHAPE_NQ4");
+    } else if (nq <= 8) {
+        env = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SHAPE_NQ8");
+    }
+    if (env_out) {
+        *env_out = env;
+    }
+    return env && *env;
+}
+
+static inline pdmq_shape pdmq_decode_stage_select_shape(const pdmq_shape current, const int nq) {
+    if (!pdmq_decode_stage_auto_enabled()) {
+        return current;
+    }
+
+    // Shape is hash-sensitive for the production PDMQ path. Stage-auto never
+    // changes it silently; per-nq staged shape envs are explicit experiments.
+    const char * env = nullptr;
+    if (!pdmq_decode_stage_shape_env(nq, &env)) {
+        return current;
+    }
+    return pdmq_parse_shape_env(env);
+}
+
+static inline int pdmq_decode_stage_env_int(const char * name, const int fallback) {
+    const char * env = getenv(name);
+    if (!env || !*env) {
+        return fallback;
+    }
+    const int requested = atoi(env);
+    return requested > 0 ? requested : fallback;
+}
+
+static inline int pdmq_decode_stage_split_select(
+        const int current,
+        const pdmq_role role,
+        const int nq,
+        const int nk,
+        const ggml_type v_type,
+        const pdmq_v_path v_path) {
+    const bool stage_auto = pdmq_decode_stage_auto_enabled();
+    if (!stage_auto && !pdmq_decode_stage_v4_default_auto_enabled(role, nq, v_type, v_path)) {
+        return current;
+    }
+
+    const char * explicit_table = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SPLITK");
+    if (explicit_table && *explicit_table) {
+        const int requested = atoi(explicit_table);
+        return requested > 0 ? requested : current;
+    }
+
+    const bool v4_direct = v_type == GGML_TYPE_V4_K16D16_144 && v_path == PDMQ_V_V4_K16D16_144;
+    const bool raw_q4 = v_type == GGML_TYPE_Q4_0 && v_path == PDMQ_V_RAW_LDS_Q4;
+    const bool raw_other =
+        (v_type == GGML_TYPE_Q8_0 && v_path == PDMQ_V_RAW_LDS_Q8_0) ||
+        (v_type == GGML_TYPE_F16  && v_path == PDMQ_V_RAW_LDS_F16);
+
+    // Production V4/PV4 decode defaults to split-8 today. The staged table is
+    // default-off and follows measured n128 prompt buckets: prompt_n≈4001 liked
+    // split32, prompt_n≈7734 liked split16, prompt_n≈15468 liked split32,
+    // prompt_n≈30936 liked split64. Intermediate envs keep the table sweepable
+    // without changing default runtime.
+    if (v4_direct && role == PDMQ_ROLE_DECODE && nq <= 1) {
+        if (nk >= 32768) {
+            return pdmq_decode_stage_env_int("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SPLITK_NK32768", 64);
+        }
+        if (nk >= 24576) {
+            return pdmq_decode_stage_env_int("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SPLITK_NK24576", 64);
+        }
+        if (nk >= 12288) {
+            return pdmq_decode_stage_env_int("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SPLITK_NK12288", 32);
+        }
+        if (nk >= 6144) {
+            return pdmq_decode_stage_env_int("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SPLITK_NK6144", 16);
+        }
+        if (nk >= 4096) {
+            return pdmq_decode_stage_env_int("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SPLITK_NK4096", 32);
+        }
+        return current;
+    }
+
+    // Raw-LDS q4/q8/f16 GQAX split-K historically jumps to split-32. Use a
+    // default-off coarser matrix for decode/verify to reduce tiny-shard merge and
+    // cache pressure while keeping unsupported shapes gated by existing support checks.
+    if (stage_auto && (raw_q4 || raw_other) && role != PDMQ_ROLE_PREFILL && nq <= 8) {
+        if (nk >= 32768) {
+            return pdmq_decode_stage_env_int("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SPLITK_NK32768", 16);
+        }
+        if (nk >= 16384) {
+            return pdmq_decode_stage_env_int("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SPLITK_NK16384", 8);
+        }
+        if (nk >= 8192) {
+            return pdmq_decode_stage_env_int("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SPLITK_NK8192", 4);
+        }
+        if (nk >= 4096 && role == PDMQ_ROLE_DECODE) {
+            return pdmq_decode_stage_env_int("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SPLITK_NK4096", 2);
+        }
+    }
+
+    return current;
 }
 
 static inline pdmq_shape pdmq_select_shape_auto(
@@ -4317,7 +4695,8 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
 
 
     const int nq = (int) Q->ne[1];
-    const int nk = (int) K->ne[1];
+    const int nk_storage = (int) K->ne[1];
+    int nk = nk_storage;
     const int n_heads_q = (int) Q->ne[2];
     const int n_heads_k = (int) K->ne[2];
     const int gqa_ratio = n_heads_q / n_heads_k;
@@ -4333,10 +4712,9 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     // Production PDMQ uses the same capacity-strided packed16 sidecar contract
     // as the default MTP path. Some prefix/probe QBlock experiments compare
     // against a logical row-local FA view; those must opt in explicitly.
-    const int logical_rows = nk * n_heads_k;
+    const int logical_rows = nk_storage * n_heads_k;
     const int packed_rows = force_logical_k_stride ? logical_rows : sidecar_rows;
     GGML_ASSERT(logical_rows <= sidecar_rows);
-    const bool k_tile16_layout = ggml_cuda_packed16_k_layout_kind_tile16(packed16_layout_kind);
     const dp16_packed_i8_desc_v1 packed16_desc = packed16_meta.packed_i8_desc;
     const int pdmq_k_format = packed16_meta.k_format;
     const uint32_t pdmq_k_kv_capacity = packed16_meta.kv_capacity ? packed16_meta.kv_capacity : (uint32_t) (sidecar_rows / n_heads_k);
@@ -4351,13 +4729,47 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     const int64_t mask_nb03 = mask ? mask->nb[3] : 0;
     const int implicit_n_kv = ggml_get_op_params_i32(dst, 5);
     const int implicit_q_offset = ggml_get_op_params_i32(dst, 6);
-    const int implicit_flags = ggml_get_op_params_i32(dst, 7);
+    int implicit_flags = ggml_get_op_params_i32(dst, 7);
+    const char * fa_block_meta_full_tile_env = getenv("GGML_CUDA_FA_BLOCK_META_FULL_TILE");
+    if (fa_block_meta_full_tile_env && atoi(fa_block_meta_full_tile_env) != 0) {
+        implicit_flags |= PDMQ_IMPLICIT_FLAG_BLOCK_META_FULL_TILE;
+    }
+
+    const bool active_pages_prefill_env = []() {
+        const char * v = getenv("GGML_CUDA_ROCM_PACKED16_PREFILL_ACTIVE_PAGES");
+        return v && atoi(v) != 0;
+    }();
+    const bool active_pages_prefill_trace = []() {
+        const char * v = getenv("GGML_CUDA_ROCM_PACKED16_PREFILL_ACTIVE_PAGES_TRACE");
+        return v && atoi(v) != 0;
+    }();
+    const bool active_pages_prefill_candidate =
+        active_pages_prefill_env &&
+        nq >= PDMQ_BM_PREFILL &&
+        !qblock_inst &&
+        mask == nullptr &&
+        (implicit_flags & GGML_CUDA_FA_BLOCK_META_FLAG_CAUSAL) != 0 &&
+        implicit_n_kv > 0 &&
+        implicit_n_kv <= nk_storage;
+    const char * active_pages_prefill_reason = "ok";
+    if (active_pages_prefill_env && !active_pages_prefill_candidate) {
+        active_pages_prefill_reason = nq < PDMQ_BM_PREFILL ? "not_prefill" :
+            (qblock_inst ? "qblock" :
+            (mask != nullptr ? "dense_mask" :
+            ((implicit_flags & GGML_CUDA_FA_BLOCK_META_FLAG_CAUSAL) == 0 ? "no_causal_meta" :
+            (implicit_n_kv <= 0 ? "bad_active_n_kv" :
+            (implicit_n_kv > nk_storage ? "active_gt_storage" : "unknown")))));
+    }
+    if (active_pages_prefill_candidate) {
+        nk = implicit_n_kv;
+    }
 
     const bool assume_causal = []() {
         const char * v = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_ASSUME_CAUSAL");
         return v && atoi(v) != 0;
     }();
-    const int q_offset = assume_causal ? (nk > nq ? nk - nq : 0) : 0;
+    const int q_offset = active_pages_prefill_candidate ? implicit_q_offset :
+        (assume_causal ? (nk > nq ? nk - nq : 0) : 0);
 
     const bool shape_auto = []() {
         const char * v = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_SHAPE_AUTO");
@@ -4463,6 +4875,10 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         // target-only, QBlock q4, and forced q4 stay on M1N32.
         shape = v4_144_gqa6_wavegroup_requested ? PDMQ_SHAPE_M1N32 :
             (v4_144_pv4_requested && v4_144_draft_v_cache_requested ? PDMQ_SHAPE_M2N32 : PDMQ_SHAPE_M1N32);
+    }
+
+    if (!shape_env_set && !pv_rows_env_set && role_hint != PDMQ_ROLE_PREFILL) {
+        shape = pdmq_decode_stage_select_shape(shape, nq);
     }
 
     // m8n32 is a useful shallow/promptfill GQA2 shape, but deep pp2048
@@ -4639,20 +5055,25 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         gqa1_splitk_auto_v && !plan.kshared && nq <= 8 && nk >= gqa1_splitk_min_nk;
     const bool gqa6_splitk_auto = gqa1_splitk_auto_enabled && !gqax_splitk_env_set && request_gqa6 &&
         qwen27b_gqa6_policy_requested && gqa1_splitk_auto_v && !plan.kshared && nq <= 4 && nk >= gqa1_splitk_min_nk;
-    if (gqa1_splitk_auto || gqa6_splitk_auto) {
+    const bool p16_streamk_auto = p16_streamk_auto_enabled();
+    if (!p16_streamk_auto && (gqa1_splitk_auto || gqa6_splitk_auto)) {
         gqax_splitk_requested = 32;
     }
-    const bool gqax_splitk_roof_cap = ggml_cuda_rocm_packed16_dot4_mmq_gqax_splitk_roof_cap();
-    const bool gqax_splitk_compact_empty = ggml_cuda_rocm_packed16_dot4_mmq_gqax_splitk_compact_empty();
-    const int gqax_splitk_roof = pdmq_splitk_roof_pow2(nk);
-    const int gqax_splitk_effective = gqax_splitk_roof_cap
-        ? (gqax_splitk_requested < gqax_splitk_roof ? gqax_splitk_requested : gqax_splitk_roof)
-        : gqax_splitk_requested;
-    const int gqax_k_blocks_total_raw = CEIL_DIV(nk, launch_bn);
-    const int gqax_k_blocks_total = gqax_k_blocks_total_raw > 0 ? gqax_k_blocks_total_raw : 1;
-    const int gqax_splitk_active_raw = (gqax_splitk_compact_empty && gqax_splitk_effective > gqax_k_blocks_total)
-        ? gqax_k_blocks_total
-        : gqax_splitk_effective;
+    const bool v4_decode_splitk_user_set = v4_decode_splitk_env && *v4_decode_splitk_env;
+    if (role_hint != PDMQ_ROLE_PREFILL && !gqax_splitk_env_set && !qblock_splitk_env_set && !v4_decode_splitk_user_set && !p16_streamk_auto) {
+        gqax_splitk_requested = pdmq_decode_stage_split_select(gqax_splitk_requested, role_hint, nq, nk, V->type, plan.v_path);
+    }
+    if (pdmq_decode_stage_log_enabled() && role_hint != PDMQ_ROLE_PREFILL) {
+        const char * stage_shape_env = nullptr;
+        const bool stage_shape_explicit = pdmq_decode_stage_shape_env(nq, &stage_shape_env);
+        GGML_UNUSED(stage_shape_env);
+        fprintf(stderr,
+            "PDMQ_DECODE_STAGE_POLICY: auto=%d role=%s shape=%s nq=%d nk=%d V=%s vpath=%s gqa_request=%d split_k_requested=%d explicit_shape=%d staged_shape=%d explicit_split=%d v4_split_user_set=%d\n",
+            pdmq_decode_stage_policy_active(role_hint, nq, V->type, plan.v_path) ? 1 : 0, pdmq_role_name(role_hint), pdmq_shape_name(shape), nq, nk,
+            ggml_type_name(V->type), pdmq_v_path_name(plan.v_path), requested_gqa_group, gqax_splitk_requested,
+            shape_env_set ? 1 : 0, stage_shape_explicit ? 1 : 0, (gqax_splitk_env_set || qblock_splitk_env_set) ? 1 : 0,
+            v4_decode_splitk_user_set ? 1 : 0);
+    }
     plan.gqa_group = is_gqa6 ? 6 : (is_gqa4 ? 4 : ((is_gqa2 || is_gqa2_xqa) ? 2 : 1));
 
     const int groups_per_kv = CEIL_DIV(gqa_ratio, plan.gqa_group);
@@ -4703,6 +5124,26 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         nq == 1 && shape == PDMQ_SHAPE_M1N32;
     const bool gqa6_splitk_supported = gqa6_q4_splitk_supported || gqa6_v4_direct_splitk_supported;
     const bool gqax_splitk_supported = gqa1_splitk_supported || gqa2_splitk_supported || gqa2x_splitk_supported || gqa4_splitk_supported || gqa6_splitk_supported;
+    const bool p16_streamk_override_allowed = p16_streamk_auto && !gqax_splitk_env_set && !qblock_splitk_env_set;
+    if (p16_streamk_override_allowed && gqax_splitk_supported) {
+        const p16_streamk_plan streamk_auto_plan = p16_streamk_plan_for_shape(
+            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, launch_bn,
+            gqax_splitk_requested, true);
+        if (streamk_auto_plan.supported) {
+            gqax_splitk_requested = streamk_auto_plan.supported_splits;
+        }
+    }
+    const bool gqax_splitk_roof_cap = ggml_cuda_rocm_packed16_dot4_mmq_gqax_splitk_roof_cap();
+    const bool gqax_splitk_compact_empty = ggml_cuda_rocm_packed16_dot4_mmq_gqax_splitk_compact_empty();
+    const int gqax_splitk_roof = pdmq_splitk_roof_pow2(nk);
+    const int gqax_splitk_effective = gqax_splitk_roof_cap
+        ? (gqax_splitk_requested < gqax_splitk_roof ? gqax_splitk_requested : gqax_splitk_roof)
+        : gqax_splitk_requested;
+    const int gqax_k_blocks_total_raw = CEIL_DIV(nk, launch_bn);
+    const int gqax_k_blocks_total = gqax_k_blocks_total_raw > 0 ? gqax_k_blocks_total_raw : 1;
+    const int gqax_splitk_active_raw = (gqax_splitk_compact_empty && gqax_splitk_effective > gqax_k_blocks_total)
+        ? gqax_k_blocks_total
+        : gqax_splitk_effective;
     const bool gqax_splitk_require = []() {
         const char * v = getenv("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_GQAX_SPLITK_REQUIRE");
         return v && atoi(v) != 0;
@@ -4781,6 +5222,107 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         (is_gqa2 || is_gqa2_xqa || is_gqa4 || is_gqa6 || is_gqa1_splitk) ? grid_y_grouped : n_heads_q,
         grid_z);
 
+    if (p16_streamk_plan_log_enabled()) {
+        const p16_streamk_plan streamk_plan = p16_streamk_plan_for_shape(
+            nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch, launch_bn,
+            is_gqax_splitk ? gqax_splitk_active : 1, gqax_splitk_supported);
+        const char * streamk_variant_name =
+            is_gqa1_splitk ? "GQA1_SPLITK" :
+            (is_gqa2_splitk ? "GQA2_SPLITK" :
+            (is_gqa2_xqa_splitk ? "GQA2X_SPLITK" :
+            (is_gqa4_splitk ? "GQA4_SPLITK" :
+            (is_gqa6_splitk ? "GQA6_SPLITK" :
+            (is_gqa4 ? "GQA4" :
+            (is_gqa6 ? "GQA6" :
+            (is_gqa2_xqa ? "GQA2X" :
+            (is_gqa2 ? "GQA2" : "GQA1"))))))));
+        fprintf(stderr,
+            "P16_STREAMK_PLAN: backend=pdmq node=%s layer=%d graph_inst=%d role=%s variant=%s shape=%s "
+            "nq=%d nk=%d nk_storage=%d hq=%d hk=%d gqa_ratio=%d gqa_group=%d gqa_request=%d batch=%d "
+            "m_eff=%d m_tile=%d base_ctas=%d compute_units=%d resident_ctas_per_cu=%d target_ctas=%d "
+            "requested_splits=%d supported_splits=%d current_split_k=%d split_len_tokens=%d max_splits=%d min_nk=%d "
+            "partial_o_bytes=%zu partial_meta_bytes=%zu route_split_supported=%d supported=%d reason=%s "
+            "split_k_requested=%d split_k_effective=%d split_k_active_raw=%d split_k_active=%d k_shards_per_q_stage=%d "
+            "q_stage=%s vpath=%s V=%s kshared=%d grid=(%u,%u,%u)\n",
+            pdmq_fattn_node_name(dst), pdmq_layer_index, fa_inst_i32,
+            pdmq_role_name(plan.role), streamk_variant_name, pdmq_shape_name(plan.shape),
+            nq, nk, nk_storage, n_heads_q, n_heads_k, gqa_ratio, plan.gqa_group, plan.requested_gqa_group, batch,
+            streamk_plan.m_effective, streamk_plan.m_tile, streamk_plan.base_ctas, streamk_plan.compute_units,
+            streamk_plan.resident_ctas_per_cu, streamk_plan.target_ctas,
+            streamk_plan.requested_splits, streamk_plan.supported_splits, streamk_plan.current_splits,
+            streamk_plan.split_len_tokens, streamk_plan.max_splits, streamk_plan.min_nk,
+            streamk_plan.partial_o_bytes, streamk_plan.partial_meta_bytes,
+            gqax_splitk_supported ? 1 : 0, streamk_plan.supported ? 1 : 0, streamk_plan.reason,
+            gqax_splitk_requested, gqax_splitk_effective, gqax_splitk_active_raw, gqax_splitk_active,
+            dp16_k_shards_per_q_stage, dp16_fa_q_stage_name(q_stage), pdmq_v_path_name(plan.v_path),
+            ggml_type_name(V->type), kshared ? 1 : 0, grid.x, grid.y, grid.z);
+    }
+
+    if (active_pages_prefill_env && active_pages_prefill_trace) {
+        const int skipped_capacity_tokens = active_pages_prefill_candidate ? nk_storage - nk : 0;
+        const int skipped_capacity_blocks = active_pages_prefill_candidate ?
+            (CEIL_DIV(nk_storage, launch_bn) - CEIL_DIV(nk, launch_bn)) : 0;
+        fprintf(stderr,
+            "GGML_CUDA_ROCM_PACKED16_PREFILL_ACTIVE_PAGES_TRACE: backend=pdmq active=%d reason=%s node=%s "
+            "nq=%d nk_storage=%d nk_launch=%d valid_n_kv=%d q_offset=%d implicit_q_offset=%d flags=%d "
+            "kv_capacity=%u launch_bm=%d launch_bn=%d skipped_capacity_tokens=%d skipped_capacity_blocks=%d grid=(%u,%u,%u)\n",
+            active_pages_prefill_candidate ? 1 : 0, active_pages_prefill_reason, pdmq_fattn_node_name(dst),
+            nq, nk_storage, nk, implicit_n_kv, q_offset, implicit_q_offset, implicit_flags,
+            pdmq_k_kv_capacity, launch_bm, launch_bn, skipped_capacity_tokens, skipped_capacity_blocks,
+            (unsigned) grid.x, (unsigned) grid.y, (unsigned) grid.z);
+    }
+
+    const char * fa_block_meta_trace_env = getenv("GGML_CUDA_FA_BLOCK_META_TRACE");
+    if (fa_block_meta_trace_env && atoi(fa_block_meta_trace_env) != 0 &&
+            (implicit_flags & GGML_CUDA_FA_BLOCK_META_FLAG_CAUSAL) != 0) {
+        static int block_meta_trace_count = 0;
+        const char * fa_block_meta_trace_limit_env = getenv("GGML_CUDA_FA_BLOCK_META_TRACE_LIMIT");
+        const int block_meta_trace_limit = fa_block_meta_trace_limit_env && *fa_block_meta_trace_limit_env ? atoi(fa_block_meta_trace_limit_env) : 64;
+        if (block_meta_trace_count < block_meta_trace_limit) {
+            block_meta_trace_count++;
+            const uint32_t valid_n_kv_u32 = implicit_n_kv > 0 ? (uint32_t) implicit_n_kv : 0u;
+            const uint32_t q_tokens_u32 = nq > 0 ? (uint32_t) nq : 0u;
+            const ggml_cuda_fa_block_meta_v1 meta = ggml_cuda_fa_block_meta_make_legacy_causal(
+                valid_n_kv_u32, q_tokens_u32, implicit_q_offset, (uint32_t) implicit_flags,
+                (uint32_t) launch_bm, (uint32_t) launch_bn);
+            ggml_cuda_fa_block_plan_counts_v1 counts = {};
+            const ggml_cuda_fa_block_meta_status st = ggml_cuda_fa_block_meta_plan_all_counts(meta, &counts);
+            const unsigned long long head_groups = (unsigned long long) batch *
+                (unsigned long long) n_heads_k * (unsigned long long) CEIL_DIV(gqa_ratio, plan.gqa_group) *
+                (unsigned long long) (is_gqax_splitk ? gqax_splitk_active : 1);
+            const char * pdmq_block_meta_variant_name = "GQA1";
+            if (is_gqa1_splitk) {
+                pdmq_block_meta_variant_name = "GQA1_SPLITK";
+            } else if (is_gqa2_splitk) {
+                pdmq_block_meta_variant_name = "GQA2_SPLITK";
+            } else if (is_gqa2_xqa_splitk) {
+                pdmq_block_meta_variant_name = "GQA2X_SPLITK";
+            } else if (is_gqa4_splitk) {
+                pdmq_block_meta_variant_name = "GQA4_SPLITK";
+            } else if (is_gqa6_splitk) {
+                pdmq_block_meta_variant_name = "GQA6_SPLITK";
+            } else if (is_gqa4) {
+                pdmq_block_meta_variant_name = "GQA4";
+            } else if (is_gqa6) {
+                pdmq_block_meta_variant_name = "GQA6";
+            } else if (is_gqa2_xqa) {
+                pdmq_block_meta_variant_name = "GQA2X";
+            } else if (is_gqa2) {
+                pdmq_block_meta_variant_name = "GQA2";
+            }
+            fprintf(stderr,
+                "GGML_CUDA_FA_BLOCK_META_TRACE: backend=pdmq route=%s status=%u node=%s shape=%s nq=%d nk=%d valid_n_kv=%d q_offset=%d flags=%d "
+                "q_block=%d k_block=%d q_blocks=%u k_blocks=%u head_groups=%llu per_group_full=%u per_group_edge_front=%u "
+                "per_group_edge_back=%u per_group_skipped=%u per_group_padded_refs=%u total_full=%llu total_edge=%llu total_skipped=%llu\n",
+                pdmq_block_meta_variant_name, (unsigned) st, pdmq_fattn_node_name(dst), pdmq_shape_name(shape), nq, nk, implicit_n_kv, implicit_q_offset, implicit_flags,
+                launch_bm, launch_bn, counts.q_blocks, counts.k_blocks, head_groups,
+                counts.full_tiles, counts.edge_front_tiles, counts.edge_back_tiles, counts.skipped_tiles, counts.padded_tile_refs,
+                (unsigned long long) counts.full_tiles * head_groups,
+                (unsigned long long) (counts.edge_front_tiles + counts.edge_back_tiles) * head_groups,
+                (unsigned long long) counts.skipped_tiles * head_groups);
+        }
+    }
+
     if (dp16_trace_enabled()) {
         dp16_problem dp_problem = dp16_problem_init(DP16_OP_FA_QKPV);
         dp_problem.m = nq;
@@ -4845,6 +5387,10 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     }
 
     const bool qblock_txn_tail_page_consumer_req = []() {
+        const char * prod = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION");
+        if (prod && atoi(prod) != 0) {
+            return true;
+        }
         const char * v = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_CONSUMER");
         return v && atoi(v) != 0;
     }();
@@ -4856,6 +5402,55 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         qblock_tail_page_consumer_reason = "no_registered_map";
         if (qblock_tail_page_map.active) {
             qblock_tail_page_consumer_reason = "ok";
+            const uint64_t tail_end = uint64_t(qblock_tail_page_map.logical_base_token) + uint64_t(qblock_tail_page_map.valid_tail_tokens);
+            const uint64_t capacity_pages = uint64_t(pdmq_k_kv_capacity) / uint64_t(MTP_V4_144_PAGE_TOKENS);
+            const auto tail_page_required_pages = [&]() -> uint32_t {
+                if (qblock_tail_page_map.page_tokens == 0 || qblock_tail_page_map.valid_tail_tokens == 0) {
+                    return 0;
+                }
+                return (qblock_tail_page_map.valid_tail_tokens + qblock_tail_page_map.page_tokens - 1u) / qblock_tail_page_map.page_tokens;
+            };
+            const auto tail_page_required_pages_valid = [&](const uint32_t required_pages) {
+                return required_pages > 0 && required_pages <= qblock_tail_page_map.block_table_pages &&
+                    required_pages <= (uint32_t) DP16_FA_QBLOCK_TAIL_PAGE_MAX_PAGES;
+            };
+            const auto tail_page_has_visible_noncanonical_overlay = [&]() {
+                const uint32_t required_pages = tail_page_required_pages();
+                if (!tail_page_required_pages_valid(required_pages)) {
+                    return true;
+                }
+                for (uint32_t lp = 0; lp < required_pages; ++lp) {
+                    const int32_t physical_page = qblock_tail_page_map.block_table[lp];
+                    if (physical_page < 0) {
+                        return true;
+                    }
+                    if ((uint64_t) physical_page * (uint64_t) qblock_tail_page_map.page_tokens >= (uint64_t) nk) {
+                        continue;
+                    }
+                    const uint32_t logical_page = (qblock_tail_page_map.logical_base_token + lp * qblock_tail_page_map.page_tokens) / qblock_tail_page_map.page_tokens;
+                    if ((uint32_t) physical_page != logical_page) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+            const auto tail_page_is_visible_identity_map = [&]() {
+                const uint32_t required_pages = tail_page_required_pages();
+                if (!tail_page_required_pages_valid(required_pages)) {
+                    return false;
+                }
+                for (uint32_t lp = 0; lp < required_pages; ++lp) {
+                    const int32_t physical_page = qblock_tail_page_map.block_table[lp];
+                    if (physical_page < 0 || (uint64_t) physical_page * (uint64_t) qblock_tail_page_map.page_tokens >= (uint64_t) nk) {
+                        return false;
+                    }
+                    const uint32_t logical_page = (qblock_tail_page_map.logical_base_token + lp * qblock_tail_page_map.page_tokens) / qblock_tail_page_map.page_tokens;
+                    if ((uint32_t) physical_page != logical_page) {
+                        return false;
+                    }
+                }
+                return true;
+            };
             if (K->type != GGML_TYPE_I32 || !k_persistent_i32 || pdmq_k_format != GGML_CUDA_PDMQ_K_FORMAT_PACKED16_Q8_272) {
                 qblock_tail_page_consumer_reason = "not_packed16_q8_k";
             } else if (V->type != GGML_TYPE_V4_K16D16_144 || !v4_k16d16_144_persistent || !directv || stage_v) {
@@ -4864,14 +5459,18 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
                 qblock_tail_page_consumer_reason = "bad_page_tokens";
             } else if (qblock_tail_page_map.block_table_pages > (uint32_t) DP16_FA_QBLOCK_TAIL_PAGE_MAX_PAGES) {
                 qblock_tail_page_consumer_reason = "block_table_too_large";
-            } else if (qblock_tail_page_map.logical_base_token + qblock_tail_page_map.valid_tail_tokens > (uint32_t) nk) {
+            } else if (tail_end <= uint64_t(qblock_tail_page_map.logical_base_token) || tail_end > uint64_t(nk)) {
                 qblock_tail_page_consumer_reason = "tail_not_visible_in_current_fa";
-            } else if (qblock_tail_page_map.physical_pages == 0 || qblock_tail_page_map.physical_pages > pdmq_k_kv_capacity / MTP_V4_144_PAGE_TOKENS) {
+            } else if (qblock_tail_page_map.physical_pages == 0 || uint64_t(qblock_tail_page_map.physical_pages) > capacity_pages) {
                 qblock_tail_page_consumer_reason = "bad_physical_pages";
             } else if ((qblock_tail_page_map.flags & GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_SCRATCH_OVERLAY) != 0 &&
-                    qblock_tail_page_map.block_table[0] >= 0 &&
-                    qblock_tail_page_map.block_table[0] * (int) qblock_tail_page_map.page_tokens < nk) {
+                    tail_page_has_visible_noncanonical_overlay()) {
                 qblock_tail_page_consumer_reason = "scratch_page_visible";
+            } else if ((qblock_tail_page_map.flags & GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_FLAG_OWNED_TAIL_WRITE) != 0 &&
+                    tail_page_has_visible_noncanonical_overlay()) {
+                qblock_tail_page_consumer_reason = "owned_page_visible";
+            } else if (tail_page_is_visible_identity_map()) {
+                qblock_tail_page_consumer_reason = "identity_tail_no_table";
             } else {
                 qblock_program.tail_page_mode = DP16_FA_QBLOCK_TAIL_PAGE_TABLE;
                 qblock_program.tail_page_logical_base_token = (int) qblock_tail_page_map.logical_base_token;
@@ -4886,9 +5485,40 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
             }
         }
     }
-    const bool qblock_tail_page_dispatch_bound = qblock_inst && qblock_program.enabled &&
+    // Production dispatch bind means this FA launch actually uses tail page-table addressing.
+    // Do not require QBlock row-program enablement here: non-QBlock PDMQ consumers still
+    // route K/V loads through dp16_fa_qblock_tail_page_physical_k() when tail_page_mode=TABLE.
+    const bool qblock_tail_page_dispatch_bound =
         qblock_tail_page_consumer_bound && dp16_fa_qblock_tail_page_consumer_active(qblock_program);
-    if (qblock_tail_page_dispatch_bound) {
+    const bool qblock_tail_page_logical_slot_audit = []() {
+        const char * v = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TAIL_PAGE_LOGICAL_SLOT_AUDIT");
+        return v && atoi(v) != 0;
+    }();
+    const bool qblock_tail_page_dispatch_record_req = [qblock_tail_page_logical_slot_audit]() {
+        const char * envs[] = {
+            "GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_DISPATCH_ENABLE",
+            "GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_DISPATCH_TRACE",
+            "GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_CONSUMER_TRACE",
+            "GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_REGISTRY_TRACE",
+            "GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_PROOF",
+            "GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_ROUTE_COMPLETE_TRACE",
+            "GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE_PLAN_PROOF",
+            "GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE_LIVE_WINDOW_PROOF",
+            "GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE_EXCLUSIVE",
+            "GGML_CUDA_ROCM_MTP_QBLOCK_PAGED_ATTENTION_OWNED_TAIL_WRITE_EXCLUSIVE_TRACE",
+        };
+        if (qblock_tail_page_logical_slot_audit) {
+            return true;
+        }
+        for (const char * name : envs) {
+            const char * v = getenv(name);
+            if (v && atoi(v) != 0) {
+                return true;
+            }
+        }
+        return false;
+    }();
+    if (qblock_tail_page_dispatch_bound && qblock_tail_page_dispatch_record_req) {
         llama_kv_cache_record_mtp_qblock_tail_page_dispatch_bind(
             K ? K->data : nullptr,
             &qblock_tail_page_map,
@@ -4901,6 +5531,89 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         llama_kv_cache_record_mtp_qblock_tail_page_consumer_miss((uint32_t) nk, qblock_tail_page_consumer_reason);
     }
 
+    if (qblock_tail_page_logical_slot_audit && (qblock_txn_tail_page_consumer_req || qblock_tail_page_map.active)) {
+        const uint64_t audit_tail_end = uint64_t(qblock_tail_page_map.logical_base_token) + uint64_t(qblock_tail_page_map.valid_tail_tokens);
+        uint64_t audit_first_physical_slot = 0;
+        uint64_t audit_last_physical_slot = 0;
+        uint64_t audit_min_physical_slot = 0;
+        uint64_t audit_max_physical_slot = 0;
+        uint32_t audit_canonical_tokens = 0;
+        uint32_t audit_remap_tokens = 0;
+        uint32_t audit_visible_noncanonical_tokens = 0;
+        uint32_t audit_bad_slots = 0;
+        uint32_t audit_samples = 0;
+        if (qblock_tail_page_consumer_bound && qblock_tail_page_map.page_tokens != 0) {
+            for (uint32_t rel = 0; rel < qblock_tail_page_map.valid_tail_tokens; ++rel) {
+                const uint32_t logical_token = qblock_tail_page_map.logical_base_token + rel;
+                const uint32_t logical_page = rel / qblock_tail_page_map.page_tokens;
+                const uint32_t slot = rel - logical_page * qblock_tail_page_map.page_tokens;
+                if (logical_page >= qblock_tail_page_map.block_table_pages ||
+                        logical_page >= GGML_CUDA_MTP_QBLOCK_TAIL_PAGE_MAP_MAX_PAGES) {
+                    ++audit_bad_slots;
+                    continue;
+                }
+                const int32_t physical_page_i32 = qblock_tail_page_map.block_table[logical_page];
+                if (physical_page_i32 < 0 || (uint32_t) physical_page_i32 >= qblock_tail_page_map.physical_pages) {
+                    ++audit_bad_slots;
+                    continue;
+                }
+                const uint64_t physical_slot = uint64_t((uint32_t) physical_page_i32) * uint64_t(qblock_tail_page_map.page_tokens) + uint64_t(slot);
+                if (audit_samples == 0) {
+                    audit_first_physical_slot = physical_slot;
+                    audit_min_physical_slot = physical_slot;
+                    audit_max_physical_slot = physical_slot;
+                } else {
+                    audit_min_physical_slot = physical_slot < audit_min_physical_slot ? physical_slot : audit_min_physical_slot;
+                    audit_max_physical_slot = physical_slot > audit_max_physical_slot ? physical_slot : audit_max_physical_slot;
+                }
+                audit_last_physical_slot = physical_slot;
+                ++audit_samples;
+                if (physical_slot == uint64_t(logical_token)) {
+                    ++audit_canonical_tokens;
+                } else {
+                    ++audit_remap_tokens;
+                    if (physical_slot < uint64_t(nk)) {
+                        ++audit_visible_noncanonical_tokens;
+                    }
+                }
+            }
+        }
+        fprintf(stderr,
+            "MTP_QBLOCK_LOGICAL_SLOT_AUDIT: node=%s layer=%d graph_inst=%d requested=%d registered=%d bound=%d active=%d tail_dispatch_bound=%d reason=%s logical_base=%u valid_tail=%u tail_end=%llu page_tokens=%u physical_pages=%u table_pages=%u table0=%d table1=%d table2=%d table3=%d flags=0x%x generation=%llu nk=%d capacity=%u samples=%u first_logical=%u last_logical=%u first_physical_slot=%llu last_physical_slot=%llu min_physical_slot=%llu max_physical_slot=%llu canonical_tokens=%u remap_tokens=%u visible_noncanonical_tokens=%u bad_slots=%u\n",
+            pdmq_fattn_node_name(dst), pdmq_layer_index, fa_inst_i32,
+            qblock_txn_tail_page_consumer_req ? 1 : 0,
+            qblock_tail_page_map.active ? 1 : 0,
+            qblock_tail_page_consumer_bound ? 1 : 0,
+            dp16_fa_qblock_tail_page_consumer_active(qblock_program) ? 1 : 0,
+            qblock_tail_page_dispatch_bound ? 1 : 0,
+            qblock_tail_page_consumer_reason,
+            qblock_tail_page_map.logical_base_token,
+            qblock_tail_page_map.valid_tail_tokens,
+            (unsigned long long) audit_tail_end,
+            qblock_tail_page_map.page_tokens,
+            qblock_tail_page_map.physical_pages,
+            qblock_tail_page_map.block_table_pages,
+            qblock_tail_page_map.block_table[0],
+            qblock_tail_page_map.block_table[1],
+            qblock_tail_page_map.block_table[2],
+            qblock_tail_page_map.block_table[3],
+            qblock_tail_page_map.flags,
+            (unsigned long long) qblock_tail_page_map.generation,
+            nk,
+            pdmq_k_kv_capacity,
+            audit_samples,
+            qblock_tail_page_map.logical_base_token,
+            qblock_tail_page_map.valid_tail_tokens > 0 ? (uint32_t) (audit_tail_end - 1u) : qblock_tail_page_map.logical_base_token,
+            (unsigned long long) audit_first_physical_slot,
+            (unsigned long long) audit_last_physical_slot,
+            (unsigned long long) audit_min_physical_slot,
+            (unsigned long long) audit_max_physical_slot,
+            audit_canonical_tokens,
+            audit_remap_tokens,
+            audit_visible_noncanonical_tokens,
+            audit_bad_slots);
+    }
+
     const bool qblock_tail_page_consumer_trace = []() {
         const char * trace = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_CONSUMER_TRACE");
         if (trace && atoi(trace) != 0) {
@@ -4911,7 +5624,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     }();
     if (qblock_tail_page_consumer_trace && (qblock_txn_tail_page_consumer_req || qblock_tail_page_map.active)) {
         fprintf(stderr,
-            "MTP_QBLOCK_TXN_TAIL_PAGE_CONSUMER: node=%s layer=%d requested=%d registered=%d bound=%d active=%d tail_dispatch_bound=%d reason=%s logical_base=%u valid_tail=%u page_tokens=%u physical_pages=%u table_pages=%u table0=%d nk=%d capacity=%u k_format=%s vpath=%s\n",
+            "MTP_QBLOCK_TXN_TAIL_PAGE_CONSUMER: node=%s layer=%d requested=%d registered=%d bound=%d active=%d tail_dispatch_bound=%d reason=%s logical_base=%u valid_tail=%u page_tokens=%u physical_pages=%u table_pages=%u table0=%d generation=%llu nk=%d capacity=%u k_format=%s vpath=%s\n",
             pdmq_fattn_node_name(dst), pdmq_layer_index,
             qblock_txn_tail_page_consumer_req ? 1 : 0,
             qblock_tail_page_map.active ? 1 : 0,
@@ -4925,6 +5638,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
             qblock_tail_page_map.physical_pages,
             qblock_tail_page_map.block_table_pages,
             qblock_tail_page_map.block_table[0],
+            (unsigned long long) qblock_tail_page_map.generation,
             nk,
             pdmq_k_kv_capacity,
             ggml_cuda_pdmq_k_format_name(pdmq_k_format),
@@ -5215,6 +5929,154 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         fprintf(stderr, "]\n");
     }
 
+    if (pdmq_qblock_consumer_read_mode_trace_enabled()) {
+        const uint64_t read_mode_tail_end = uint64_t(qblock_tail_page_map.logical_base_token) + uint64_t(qblock_tail_page_map.valid_tail_tokens);
+        const bool tail_page_read = qblock_tail_page_dispatch_bound && qblock_program.tail_page_mode == DP16_FA_QBLOCK_TAIL_PAGE_TABLE;
+        fprintf(stderr,
+                "MTP_QBLOCK_CONSUMER_READ_MODE: backend=rocm_packed16_dot4_mmq read_mode=%s node=%s layer=%d graph_inst=%d variant=%s shape=%s role=%s nq=%d nk=%d hq=%d hk=%d gqa_ratio=%d gqa_group=%d split_k=%d k_shards_per_q_stage=%d q_stage=%s vpath=%s K=%s k_format=%s V=%s qblock=%d qprog=%d directv=%d stage_v=%d raw_lds_q4=%d kshared=%d pv_wmma=%d pv_i8_wmma=%d pv_i4_wmma=%d pvblock_exact=%d consumer_requested=%d map_active=%d bound=%d tail_dispatch_bound=%d reason=%s tail_logical_base=%u tail_valid_tail=%u tail_end=%llu table_pages=%u table0=%d flags=0x%x generation=%llu physical_pages=%u capacity=%u\n",
+                tail_page_read ? "tail_page" : "canonical",
+                pdmq_fattn_node_name(dst),
+                pdmq_layer_index,
+                fa_inst_i32,
+                pdmq_variant_name,
+                pdmq_shape_name(plan.shape),
+                pdmq_role_name(plan.role),
+                nq,
+                nk,
+                n_heads_q,
+                n_heads_k,
+                gqa_ratio,
+                plan.gqa_group,
+                is_gqax_splitk ? gqax_splitk_active : 0,
+                dp16_k_shards_per_q_stage,
+                dp16_fa_q_stage_name(q_stage),
+                pdmq_v_path_name(plan.v_path),
+                ggml_type_name(K->type),
+                ggml_cuda_pdmq_k_format_name(pdmq_k_format),
+                ggml_type_name(V->type),
+                qblock_inst ? 1 : 0,
+                qblock_program.enabled,
+                directv ? 1 : 0,
+                stage_v ? 1 : 0,
+                raw_lds_q4 ? 1 : 0,
+                kshared ? 1 : 0,
+                pdmq_pv_wmma_active ? 1 : 0,
+                pdmq_pv_i8_wmma_active ? 1 : 0,
+                pdmq_pv_i4_wmma_active ? 1 : 0,
+                qblock_program.pvblock_mode == DP16_FA_QBLOCK_PVBLOCK_EXACT_SCALAR ? 1 : 0,
+                qblock_txn_tail_page_consumer_req ? 1 : 0,
+                qblock_tail_page_map.active ? 1 : 0,
+                qblock_tail_page_consumer_bound ? 1 : 0,
+                qblock_tail_page_dispatch_bound ? 1 : 0,
+                qblock_tail_page_consumer_reason,
+                qblock_tail_page_map.logical_base_token,
+                qblock_tail_page_map.valid_tail_tokens,
+                (unsigned long long) read_mode_tail_end,
+                qblock_tail_page_map.block_table_pages,
+                qblock_tail_page_map.block_table[0],
+                qblock_tail_page_map.flags,
+                (unsigned long long) qblock_tail_page_map.generation,
+                qblock_tail_page_map.physical_pages,
+                pdmq_k_kv_capacity);
+    }
+
+    if (pdmq_qblock_tail_page_age_out_trace_enabled()) {
+        const int watch_min_idx = pdmq_qblock_tail_page_age_out_trace_min_idx();
+        const int watch_max_idx = pdmq_qblock_tail_page_age_out_trace_max_idx();
+        const bool has_watch = watch_max_idx >= 0 && watch_max_idx > watch_min_idx;
+        const uint64_t watch_begin = watch_min_idx > 0 ? uint64_t(watch_min_idx) : 0;
+        const uint64_t watch_end = has_watch ? uint64_t(watch_max_idx) : watch_begin;
+        const uint64_t nk_u64 = nk > 0 ? uint64_t(nk) : 0;
+        const uint64_t tail_begin = uint64_t(qblock_tail_page_map.logical_base_token);
+        const uint64_t tail_end = tail_begin + uint64_t(qblock_tail_page_map.valid_tail_tokens);
+        const bool tail_page_read = qblock_tail_page_dispatch_bound && qblock_program.tail_page_mode == DP16_FA_QBLOCK_TAIL_PAGE_TABLE;
+        const bool visible = has_watch && watch_begin < nk_u64;
+        const uint64_t visible_end = visible ? pdmq_qblock_u64_min(watch_end, nk_u64) : watch_begin;
+        const uint64_t visible_tokens = visible_end > watch_begin ? visible_end - watch_begin : 0;
+        const bool map_covers_tail = qblock_tail_page_map.active && qblock_tail_page_map.valid_tail_tokens > 0 && tail_end > tail_begin;
+        uint64_t covered_tokens = 0;
+        uint64_t aged_out_tokens = 0;
+        uint64_t after_tail_tokens = 0;
+        if (visible_tokens > 0 && tail_page_read && map_covers_tail) {
+            const uint64_t cover_begin = pdmq_qblock_u64_max(watch_begin, tail_begin);
+            const uint64_t cover_end = pdmq_qblock_u64_min(visible_end, tail_end);
+            if (cover_end > cover_begin) {
+                covered_tokens = cover_end - cover_begin;
+            }
+            if (watch_begin < tail_begin) {
+                const uint64_t aged_end = pdmq_qblock_u64_min(visible_end, tail_begin);
+                if (aged_end > watch_begin) {
+                    aged_out_tokens = aged_end - watch_begin;
+                }
+            }
+            if (visible_end > tail_end) {
+                const uint64_t after_begin = pdmq_qblock_u64_max(watch_begin, tail_end);
+                if (visible_end > after_begin) {
+                    after_tail_tokens = visible_end - after_begin;
+                }
+            }
+        }
+        const char * age_status = "no_watch";
+        const char * age_reason = "missing_watch_range";
+        if (!has_watch) {
+            age_status = "no_watch";
+            age_reason = "missing_watch_range";
+        } else if (!visible || visible_tokens == 0) {
+            age_status = "not_visible";
+            age_reason = "watch_not_in_nk";
+        } else if (!tail_page_read || !map_covers_tail) {
+            age_status = "no_map";
+            age_reason = qblock_tail_page_consumer_reason;
+        } else if (aged_out_tokens > 0) {
+            age_status = "aged_out";
+            age_reason = covered_tokens > 0 ? "watch_partially_before_tail" : "watch_before_tail";
+        } else if (after_tail_tokens > 0) {
+            age_status = "after_tail";
+            age_reason = covered_tokens > 0 ? "watch_partially_after_tail" : "watch_after_tail";
+        } else {
+            age_status = "covered";
+            age_reason = "watch_in_tail";
+        }
+        fprintf(stderr,
+                "MTP_QBLOCK_TAIL_PAGE_AGE_OUT: backend=rocm_packed16_dot4_mmq status=%s read_mode=%s reason=%s consumer_reason=%s node=%s layer=%d graph_inst=%d variant=%s shape=%s role=%s nq=%d nk=%d hq=%d hk=%d gqa_ratio=%d gqa_group=%d watch_min=%d watch_max=%d watch_begin=%llu watch_end=%llu visible_end=%llu visible_tokens=%llu covered_tokens=%llu aged_out_tokens=%llu after_tail_tokens=%llu map_active=%d bound=%d tail_dispatch_bound=%d tail_logical_base=%u tail_valid_tail=%u tail_end=%llu table_pages=%u table0=%d flags=0x%x generation=%llu physical_pages=%u capacity=%u\n",
+                age_status,
+                tail_page_read ? "tail_page" : "canonical",
+                age_reason,
+                qblock_tail_page_consumer_reason,
+                pdmq_fattn_node_name(dst),
+                pdmq_layer_index,
+                fa_inst_i32,
+                pdmq_variant_name,
+                pdmq_shape_name(plan.shape),
+                pdmq_role_name(plan.role),
+                nq,
+                nk,
+                n_heads_q,
+                n_heads_k,
+                gqa_ratio,
+                plan.gqa_group,
+                watch_min_idx,
+                watch_max_idx,
+                (unsigned long long) watch_begin,
+                (unsigned long long) watch_end,
+                (unsigned long long) visible_end,
+                (unsigned long long) visible_tokens,
+                (unsigned long long) covered_tokens,
+                (unsigned long long) aged_out_tokens,
+                (unsigned long long) after_tail_tokens,
+                qblock_tail_page_map.active ? 1 : 0,
+                qblock_tail_page_consumer_bound ? 1 : 0,
+                qblock_tail_page_dispatch_bound ? 1 : 0,
+                qblock_tail_page_map.logical_base_token,
+                qblock_tail_page_map.valid_tail_tokens,
+                (unsigned long long) tail_end,
+                qblock_tail_page_map.block_table_pages,
+                qblock_tail_page_map.block_table[0],
+                qblock_tail_page_map.flags,
+                (unsigned long long) qblock_tail_page_map.generation,
+                qblock_tail_page_map.physical_pages,
+                pdmq_k_kv_capacity);
+    }
 
     if (pdmq_verbose) {
         fprintf(stderr,

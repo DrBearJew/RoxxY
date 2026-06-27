@@ -45,6 +45,7 @@ enum dp16_op {
 #define DP16_ROUTE_FA_Q8K_DOT4_KQ                  "rocm_q8k_dot4_kq"
 #define DP16_ROUTE_FA_Q8K_DOT4_PACKED16_VEC        "rocm_q8k_dot4_packed16_vec"
 #define DP16_ROUTE_FA_PACKED16_WMMA_TILE           "rocm_packed16_wmma_tile"
+#define DP16_ROUTE_FA_PACKED16_I8MMA_QK            "rocm_packed16_i8mma_qk"
 #define DP16_ROUTE_FA1_VEC_FALLBACK                "rocm_fattn_vec"
 #define DP16_ROUTE_MMVQ_Q8_DOT4                    "rocm_q8_dot4_mmvq"
 #define DP16_ROUTE_MMVQ_PACKED16_DOT4              "rocm_packed16_dot4_mmvq"

@@ -60,6 +60,16 @@ static ggml_type llm_graph_kq_mask_type(const llama_cparams & cparams) {
     return llm_graph_use_f16_fa_kq_mask(cparams) ? GGML_TYPE_F16 : GGML_TYPE_F32;
 }
 
+static bool llm_graph_packed16_wmma_impl_autoset() {
+    const char * autoset = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL_AUTOSET");
+    return autoset && atoi(autoset) != 0;
+}
+
+static bool llm_graph_packed16_wmma_impl_explicit_dbv() {
+    const char * impl = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL");
+    return impl && *impl && !llm_graph_packed16_wmma_impl_autoset() && strstr(impl, "pvwmma_dbv") != nullptr;
+}
+
 static bool llm_graph_use_implicit_causal_fa_mask(const llama_cparams & cparams) {
     if (!cparams.causal_attn) {
         return false;
@@ -69,16 +79,32 @@ static bool llm_graph_use_implicit_causal_fa_mask(const llama_cparams & cparams)
         return false;
     }
 
-    // The metadata is currently consumed only by the packed16 DBV PWMMA route.
-    // Require explicit route selection so generic F16 FA cannot silently ignore
-    // a null dense mask.
+    // The metadata is currently consumed only by metadata-aware packed16 FA
+    // routes. An explicit non-DBV WMMA route must keep the dense mask. Autoset
+    // routes are checked later against the selector's DBV threshold.
     const char * impl = getenv("GGML_CUDA_ROCM_PACKED16_WMMA_IMPL");
-    if (!impl || strstr(impl, "pvwmma_dbv") == nullptr) {
+    if (impl && *impl && !llm_graph_packed16_wmma_impl_autoset() && strstr(impl, "pvwmma_dbv") == nullptr) {
         return false;
     }
 
     const char * packed16 = getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE");
     return packed16 && atoi(packed16) != 0;
+}
+
+static bool llm_graph_implicit_causal_fa_mask_route_safe(const int32_t meta[4]) {
+    if (meta == nullptr || (meta[2] & 1) == 0 || meta[0] <= 0) {
+        return false;
+    }
+    if (llm_graph_packed16_wmma_impl_explicit_dbv()) {
+        return true;
+    }
+
+    // Keep graph-level null-mask metadata aligned with the packed16 autoset
+    // selector in ggml-cuda/fattn.cu: BM64 DBV is selected only for nk >= 1024;
+    // early prefill chunks such as nk=512 must retain a real dense mask because
+    // autoset can still choose bm32_regout_directv, which does not consume this
+    // metadata.
+    return meta[0] >= 1024;
 }
 
 static bool llm_graph_trace_implicit_causal_fa_mask() {
@@ -723,6 +749,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
         res &= params.cparams.flash_attn;
         res &= llm_graph_use_implicit_causal_fa_mask(params.cparams);
         res &= mctx->get_implicit_causal_mask_meta(&params.ubatch, params.cparams.causal_attn, meta);
+        res &= llm_graph_implicit_causal_fa_mask_route_safe(meta);
         res &= memcmp(meta, self_kq_mask_meta, sizeof(meta)) == 0;
     } else {
         res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
@@ -937,6 +964,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
         res &= params.cparams.flash_attn;
         res &= llm_graph_use_implicit_causal_fa_mask(params.cparams);
         res &= mctx->get_attn()->get_implicit_causal_mask_meta(&params.ubatch, params.cparams.causal_attn, meta);
+        res &= llm_graph_implicit_causal_fa_mask_route_safe(meta);
         res &= memcmp(meta, inp_attn->self_kq_mask_meta, sizeof(meta)) == 0;
     } else {
         res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
@@ -1139,6 +1167,7 @@ void llm_graph_result::reset() {
     t_embd          = nullptr;
     t_embd_pooled   = nullptr;
     t_h_pre_norm    = nullptr;
+    t_jetspec_target_hidden_taps = nullptr;
     t_mtp_h_capture = nullptr;
     t_mtp_out       = nullptr;
     t_sampled.clear();
@@ -1185,6 +1214,9 @@ void llm_graph_result::set_outputs() {
     }
     if (t_h_pre_norm != nullptr) {
         ggml_set_output(t_h_pre_norm);
+    }
+    if (t_jetspec_target_hidden_taps != nullptr) {
+        ggml_set_output(t_jetspec_target_hidden_taps);
     }
     if (t_mtp_h_capture != nullptr) {
         ggml_set_output(t_mtp_h_capture);
@@ -2826,7 +2858,8 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         bool use_implicit_causal_mask =
             cparams.flash_attn &&
             llm_graph_use_implicit_causal_fa_mask(cparams) &&
-            mctx_cur->get_implicit_causal_mask_meta(&ubatch, cparams.causal_attn, causal_meta);
+            mctx_cur->get_implicit_causal_mask_meta(&ubatch, cparams.causal_attn, causal_meta) &&
+            llm_graph_implicit_causal_fa_mask_route_safe(causal_meta);
 
         if (!use_implicit_causal_mask && reserve_synthetic_implicit_causal_fa_mask &&
                 cparams.flash_attn &&
@@ -2843,8 +2876,10 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
                 causal_meta[1] = (int32_t) (n_kv - ubatch.n_tokens);
                 causal_meta[2] = 1;
                 causal_meta[3] = 0;
-                use_implicit_causal_mask = true;
-                synthetic_implicit_causal_mask = true;
+                if (llm_graph_implicit_causal_fa_mask_route_safe(causal_meta)) {
+                    use_implicit_causal_mask = true;
+                    synthetic_implicit_causal_mask = true;
+                }
             }
         }
 

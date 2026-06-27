@@ -1,0 +1,41 @@
+{
+  "root_token": 7,
+  "budget": 7,
+  "past_len": 2,
+  "hidden_width": 3,
+  "pre_committed_token_ids": [5, 6, 7],
+  "pre_hidden_cache": [
+    [5, 5, 5],
+    [6, 6, 6]
+  ],
+  "topk_by_depth": [
+    [
+      {"token": 11, "logprob": -0.1, "rank": 0},
+      {"token": 12, "logprob": -0.3, "rank": 1}
+    ],
+    [
+      {"token": 21, "logprob": -0.2, "rank": 0},
+      {"token": 22, "logprob": -0.4, "rank": 1}
+    ],
+    [
+      {"token": 31, "logprob": -0.5, "rank": 0},
+      {"token": 32, "logprob": -0.6, "rank": 1}
+    ]
+  ],
+  "target_argmax_by_node": [11, 22, 31, 777, 999, 888, 666],
+  "expected_accept": {
+    "accepted_path": [0, 1, 4],
+    "acceptance_length": 2,
+    "correction_token": 999
+  },
+  "node_hidden_rows": {
+    "0": [70, 71, 72],
+    "1": [110, 111, 112],
+    "2": [12000, 12000, 12000],
+    "3": [21000, 21000, 21000],
+    "4": [220, 221, 222],
+    "5": [31000, 31000, 31000],
+    "6": [32000, 32000, 32000]
+  },
+  "rejected_sentinels": [12000, 21000, 31000, 32000]
+}

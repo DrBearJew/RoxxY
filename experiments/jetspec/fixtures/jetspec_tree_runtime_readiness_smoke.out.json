@@ -1,0 +1,445 @@
+{
+  "accept": {
+    "acceptance_length": 2,
+    "acceptance_length_excludes_root": true,
+    "accepted_draft_tokens": [
+      11,
+      22
+    ],
+    "accepted_path": [
+      0,
+      1,
+      4
+    ],
+    "accepted_path_root_inclusive": true,
+    "correction_token": 99,
+    "correction_token_source": "target_greedy_at_last_accepted_node",
+    "duplicate_child_policy": {
+      "deterministic": true,
+      "duplicates": [],
+      "policy": "later_child_overwrites_earlier"
+    },
+    "target_argmax_by_node": [
+      11,
+      22,
+      77,
+      88,
+      99
+    ]
+  },
+  "commit": {
+    "accepted_draft_tokens": [
+      11,
+      22
+    ],
+    "accepted_path": [
+      0,
+      1,
+      4
+    ],
+    "appended_node_indices": [
+      0,
+      1,
+      4
+    ],
+    "committed_append_tokens": [
+      11,
+      22,
+      99
+    ],
+    "correction_hidden_appended": false,
+    "correction_token": 99,
+    "discarded_node_indices": [
+      2,
+      3
+    ],
+    "invariants": {
+      "appended_rows_are_root_plus_accepted_nodes": true,
+      "correction_has_no_hidden_until_next_round": true,
+      "post_hidden_trails_committed_by_one": true,
+      "pre_hidden_trails_committed_by_one": true
+    },
+    "post_committed_len": 6,
+    "post_hidden_cache": [
+      [
+        7.0,
+        7.1,
+        7.2
+      ],
+      [
+        8.0,
+        8.1,
+        8.2
+      ],
+      [
+        10.0,
+        10.1,
+        10.2
+      ],
+      [
+        11.0,
+        11.1,
+        11.2
+      ],
+      [
+        22.0,
+        22.1,
+        22.2
+      ]
+    ],
+    "post_hidden_len": 5,
+    "pre_committed_len": 3,
+    "pre_hidden_len": 2
+  },
+  "gather": {
+    "accepted_path": [
+      0,
+      1,
+      4
+    ],
+    "contract": "max_len + accepted_path",
+    "max_len": 100,
+    "positions": [
+      100,
+      101,
+      104
+    ]
+  },
+  "mask": {
+    "additive_mask_tokens": [
+      "-inf",
+      "0"
+    ],
+    "ancestor": [
+      [
+        true,
+        false,
+        false,
+        false,
+        false
+      ],
+      [
+        true,
+        true,
+        false,
+        false,
+        false
+      ],
+      [
+        true,
+        false,
+        true,
+        false,
+        false
+      ],
+      [
+        true,
+        true,
+        false,
+        true,
+        false
+      ],
+      [
+        true,
+        true,
+        false,
+        false,
+        true
+      ]
+    ],
+    "bucket_size": 8,
+    "bucketed_qq_bias": [
+      [
+        "0",
+        "-inf",
+        "-inf",
+        "-inf",
+        "-inf",
+        "-inf",
+        "-inf",
+        "-inf"
+      ],
+      [
+        "0",
+        "0",
+        "-inf",
+        "-inf",
+        "-inf",
+        "-inf",
+        "-inf",
+        "-inf"
+      ],
+      [
+        "0",
+        "-inf",
+        "0",
+        "-inf",
+        "-inf",
+        "-inf",
+        "-inf",
+        "-inf"
+      ],
+      [
+        "0",
+        "0",
+        "-inf",
+        "0",
+        "-inf",
+        "-inf",
+        "-inf",
+        "-inf"
+      ],
+      [
+        "0",
+        "0",
+        "-inf",
+        "-inf",
+        "0",
+        "-inf",
+        "-inf",
+        "-inf"
+      ],
+      [
+        "-inf",
+        "-inf",
+        "-inf",
+        "-inf",
+        "-inf",
+        "0",
+        "-inf",
+        "-inf"
+      ],
+      [
+        "-inf",
+        "-inf",
+        "-inf",
+        "-inf",
+        "-inf",
+        "-inf",
+        "0",
+        "-inf"
+      ],
+      [
+        "-inf",
+        "-inf",
+        "-inf",
+        "-inf",
+        "-inf",
+        "-inf",
+        "-inf",
+        "0"
+      ]
+    ],
+    "other_sequence_tree_bias": [
+      [
+        "-inf",
+        "-inf"
+      ],
+      [
+        "-inf",
+        "-inf"
+      ],
+      [
+        "-inf",
+        "-inf"
+      ],
+      [
+        "-inf",
+        "-inf"
+      ],
+      [
+        "-inf",
+        "-inf"
+      ]
+    ],
+    "other_sequence_tree_cols": 2,
+    "other_sequence_tree_cols_hidden": true,
+    "past_len": 3,
+    "prefix_visible_to_all": true,
+    "qq_bias": [
+      [
+        "0",
+        "-inf",
+        "-inf",
+        "-inf",
+        "-inf"
+      ],
+      [
+        "0",
+        "0",
+        "-inf",
+        "-inf",
+        "-inf"
+      ],
+      [
+        "0",
+        "-inf",
+        "0",
+        "-inf",
+        "-inf"
+      ],
+      [
+        "0",
+        "0",
+        "-inf",
+        "0",
+        "-inf"
+      ],
+      [
+        "0",
+        "0",
+        "-inf",
+        "-inf",
+        "0"
+      ]
+    ],
+    "siblings_descendants_rejected_hidden": true,
+    "tree_visibility": "ancestor_only_self_included",
+    "verify_allowed_mask": [
+      [
+        true,
+        true,
+        true,
+        true,
+        false,
+        false,
+        false,
+        false
+      ],
+      [
+        true,
+        true,
+        true,
+        true,
+        true,
+        false,
+        false,
+        false
+      ],
+      [
+        true,
+        true,
+        true,
+        true,
+        false,
+        true,
+        false,
+        false
+      ],
+      [
+        true,
+        true,
+        true,
+        true,
+        true,
+        false,
+        true,
+        false
+      ],
+      [
+        true,
+        true,
+        true,
+        true,
+        true,
+        false,
+        false,
+        true
+      ]
+    ]
+  },
+  "ok": true,
+  "readiness_boundary": {
+    "draft_head_graph_executed": false,
+    "draft_tokens_emitted": false,
+    "kv_cache_mutated": false,
+    "llama_context_runtime_instantiated": false,
+    "no_draft_runtime_execution": true,
+    "preview_gguf_runtime_supported": false,
+    "runtime_supported": false,
+    "server_route_added": false
+  },
+  "runtime_readiness_contract": {
+    "accept_abi": "root_inclusive_path_length_excludes_root",
+    "commit_abi": "[accepted draft tokens | correction]",
+    "draft_tree_abi": "token_ids,parent_indices,depth,num_nodes,parent_before_child",
+    "gather_abi": "max_len + accepted_path",
+    "hidden_kv_commit_abi": "[root | accepted] only",
+    "mask_abi": "prefix_visible_and_tree_ancestor_only",
+    "rejected_tree_nodes_unreachable_after_commit": true,
+    "topk_build_abi": "full_vocab_softmax_logprobs_no_topk_renormalization"
+  },
+  "status": "tree_runtime_readiness_verified_not_executed",
+  "topk": {
+    "renormalize_topk": false,
+    "rows": [
+      {
+        "candidate_count": 2,
+        "depth": 1,
+        "prob_sum": 0.35,
+        "prob_sum_lt_one": true,
+        "source": "full_vocab_softmax"
+      },
+      {
+        "candidate_count": 2,
+        "depth": 2,
+        "prob_sum": 0.15000000000000002,
+        "prob_sum_lt_one": true,
+        "source": "full_vocab_softmax"
+      }
+    ],
+    "source": "full_vocab_softmax"
+  },
+  "tree": {
+    "budget": 5,
+    "cum_logprob": [
+      0.0,
+      -1.6094379124341003,
+      -1.8971199848858813,
+      -3.9120230054281455,
+      -4.605170185988091
+    ],
+    "depth": [
+      0,
+      1,
+      1,
+      2,
+      2
+    ],
+    "max_depth": 2,
+    "num_nodes": 5,
+    "num_nodes_lte_budget": true,
+    "parent_before_child": true,
+    "parent_indices": [
+      -1,
+      0,
+      0,
+      1,
+      1
+    ],
+    "rank": [
+      -1,
+      0,
+      1,
+      0,
+      1
+    ],
+    "root_depth": 0,
+    "root_parent": -1,
+    "token_ids": [
+      10,
+      11,
+      12,
+      21,
+      22
+    ]
+  },
+  "upstream_contract_refs": [
+    "DraftTree",
+    "build_from_topk/AccumLogP",
+    "build_ancestor_matrix",
+    "tree_accept",
+    "PagedKVCache.gather max_len + accepted_path",
+    "paged_tree_attn qq_bias"
+  ]
+}

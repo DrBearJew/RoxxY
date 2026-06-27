@@ -1,0 +1,1087 @@
+{
+  "namespace_rule": "prefix HF safetensors tensor names with draft.",
+  "notes": [
+    "Provisional names only; do not wire into GGUF writer/loader without review.",
+    "Target embed_tokens and lm_head are intentionally absent from this draft head and must be shared from the target model at runtime.",
+    "All tensors observed BF16 in the source safetensors header."
+  ],
+  "required_runtime_target_features": {
+    "block_size": 16,
+    "draft_depth": 15,
+    "mask_token_id": 248070,
+    "requires_target_embeddings": true,
+    "requires_target_lm_head": true,
+    "target_layer_ids": [
+      1,
+      10,
+      19,
+      28,
+      37
+    ]
+  },
+  "schema": "llama.cpp.experiments.jetspec.tensor_map.v1",
+  "source_manifest": "experiments/jetspec/manifests/JetSpec_jetspec-Qwen3.6-35B-A3B_main.manifest.json",
+  "source_model_sha": "ffb38cf9917e0f426ab1b21d745e859f7788e467",
+  "source_repo": "JetSpec/jetspec-Qwen3.6-35B-A3B",
+  "status": "draft-inert-not-runtime",
+  "tensors": [
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.fc.weight",
+      "group": "fc",
+      "hf_name": "fc.weight",
+      "nbytes": 41943040,
+      "numel": 20971520,
+      "shape": [
+        2048,
+        10240
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.hidden_norm.weight",
+      "group": "hidden_norm",
+      "hf_name": "hidden_norm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.0.input_layernorm.weight",
+      "group": "layers.0.input_layernorm",
+      "hf_name": "layers.0.input_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.0.mlp.down_proj.weight",
+      "group": "layers.0.mlp",
+      "hf_name": "layers.0.mlp.down_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        2048,
+        6144
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.0.mlp.gate_proj.weight",
+      "group": "layers.0.mlp",
+      "hf_name": "layers.0.mlp.gate_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.0.mlp.up_proj.weight",
+      "group": "layers.0.mlp",
+      "hf_name": "layers.0.mlp.up_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.0.post_attention_layernorm.weight",
+      "group": "layers.0.post_attention_layernorm",
+      "hf_name": "layers.0.post_attention_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.0.self_attn.k_norm.weight",
+      "group": "layers.0.self_attn",
+      "hf_name": "layers.0.self_attn.k_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.0.self_attn.k_proj.weight",
+      "group": "layers.0.self_attn",
+      "hf_name": "layers.0.self_attn.k_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.0.self_attn.o_proj.weight",
+      "group": "layers.0.self_attn",
+      "hf_name": "layers.0.self_attn.o_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        2048,
+        4096
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.0.self_attn.q_norm.weight",
+      "group": "layers.0.self_attn",
+      "hf_name": "layers.0.self_attn.q_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.0.self_attn.q_proj.weight",
+      "group": "layers.0.self_attn",
+      "hf_name": "layers.0.self_attn.q_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        4096,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.0.self_attn.v_proj.weight",
+      "group": "layers.0.self_attn",
+      "hf_name": "layers.0.self_attn.v_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.1.input_layernorm.weight",
+      "group": "layers.1.input_layernorm",
+      "hf_name": "layers.1.input_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.1.mlp.down_proj.weight",
+      "group": "layers.1.mlp",
+      "hf_name": "layers.1.mlp.down_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        2048,
+        6144
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.1.mlp.gate_proj.weight",
+      "group": "layers.1.mlp",
+      "hf_name": "layers.1.mlp.gate_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.1.mlp.up_proj.weight",
+      "group": "layers.1.mlp",
+      "hf_name": "layers.1.mlp.up_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.1.post_attention_layernorm.weight",
+      "group": "layers.1.post_attention_layernorm",
+      "hf_name": "layers.1.post_attention_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.1.self_attn.k_norm.weight",
+      "group": "layers.1.self_attn",
+      "hf_name": "layers.1.self_attn.k_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.1.self_attn.k_proj.weight",
+      "group": "layers.1.self_attn",
+      "hf_name": "layers.1.self_attn.k_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.1.self_attn.o_proj.weight",
+      "group": "layers.1.self_attn",
+      "hf_name": "layers.1.self_attn.o_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        2048,
+        4096
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.1.self_attn.q_norm.weight",
+      "group": "layers.1.self_attn",
+      "hf_name": "layers.1.self_attn.q_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.1.self_attn.q_proj.weight",
+      "group": "layers.1.self_attn",
+      "hf_name": "layers.1.self_attn.q_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        4096,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.1.self_attn.v_proj.weight",
+      "group": "layers.1.self_attn",
+      "hf_name": "layers.1.self_attn.v_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.2.input_layernorm.weight",
+      "group": "layers.2.input_layernorm",
+      "hf_name": "layers.2.input_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.2.mlp.down_proj.weight",
+      "group": "layers.2.mlp",
+      "hf_name": "layers.2.mlp.down_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        2048,
+        6144
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.2.mlp.gate_proj.weight",
+      "group": "layers.2.mlp",
+      "hf_name": "layers.2.mlp.gate_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.2.mlp.up_proj.weight",
+      "group": "layers.2.mlp",
+      "hf_name": "layers.2.mlp.up_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.2.post_attention_layernorm.weight",
+      "group": "layers.2.post_attention_layernorm",
+      "hf_name": "layers.2.post_attention_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.2.self_attn.k_norm.weight",
+      "group": "layers.2.self_attn",
+      "hf_name": "layers.2.self_attn.k_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.2.self_attn.k_proj.weight",
+      "group": "layers.2.self_attn",
+      "hf_name": "layers.2.self_attn.k_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.2.self_attn.o_proj.weight",
+      "group": "layers.2.self_attn",
+      "hf_name": "layers.2.self_attn.o_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        2048,
+        4096
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.2.self_attn.q_norm.weight",
+      "group": "layers.2.self_attn",
+      "hf_name": "layers.2.self_attn.q_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.2.self_attn.q_proj.weight",
+      "group": "layers.2.self_attn",
+      "hf_name": "layers.2.self_attn.q_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        4096,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.2.self_attn.v_proj.weight",
+      "group": "layers.2.self_attn",
+      "hf_name": "layers.2.self_attn.v_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.3.input_layernorm.weight",
+      "group": "layers.3.input_layernorm",
+      "hf_name": "layers.3.input_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.3.mlp.down_proj.weight",
+      "group": "layers.3.mlp",
+      "hf_name": "layers.3.mlp.down_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        2048,
+        6144
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.3.mlp.gate_proj.weight",
+      "group": "layers.3.mlp",
+      "hf_name": "layers.3.mlp.gate_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.3.mlp.up_proj.weight",
+      "group": "layers.3.mlp",
+      "hf_name": "layers.3.mlp.up_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.3.post_attention_layernorm.weight",
+      "group": "layers.3.post_attention_layernorm",
+      "hf_name": "layers.3.post_attention_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.3.self_attn.k_norm.weight",
+      "group": "layers.3.self_attn",
+      "hf_name": "layers.3.self_attn.k_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.3.self_attn.k_proj.weight",
+      "group": "layers.3.self_attn",
+      "hf_name": "layers.3.self_attn.k_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.3.self_attn.o_proj.weight",
+      "group": "layers.3.self_attn",
+      "hf_name": "layers.3.self_attn.o_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        2048,
+        4096
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.3.self_attn.q_norm.weight",
+      "group": "layers.3.self_attn",
+      "hf_name": "layers.3.self_attn.q_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.3.self_attn.q_proj.weight",
+      "group": "layers.3.self_attn",
+      "hf_name": "layers.3.self_attn.q_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        4096,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.3.self_attn.v_proj.weight",
+      "group": "layers.3.self_attn",
+      "hf_name": "layers.3.self_attn.v_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.4.input_layernorm.weight",
+      "group": "layers.4.input_layernorm",
+      "hf_name": "layers.4.input_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.4.mlp.down_proj.weight",
+      "group": "layers.4.mlp",
+      "hf_name": "layers.4.mlp.down_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        2048,
+        6144
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.4.mlp.gate_proj.weight",
+      "group": "layers.4.mlp",
+      "hf_name": "layers.4.mlp.gate_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.4.mlp.up_proj.weight",
+      "group": "layers.4.mlp",
+      "hf_name": "layers.4.mlp.up_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.4.post_attention_layernorm.weight",
+      "group": "layers.4.post_attention_layernorm",
+      "hf_name": "layers.4.post_attention_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.4.self_attn.k_norm.weight",
+      "group": "layers.4.self_attn",
+      "hf_name": "layers.4.self_attn.k_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.4.self_attn.k_proj.weight",
+      "group": "layers.4.self_attn",
+      "hf_name": "layers.4.self_attn.k_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.4.self_attn.o_proj.weight",
+      "group": "layers.4.self_attn",
+      "hf_name": "layers.4.self_attn.o_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        2048,
+        4096
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.4.self_attn.q_norm.weight",
+      "group": "layers.4.self_attn",
+      "hf_name": "layers.4.self_attn.q_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.4.self_attn.q_proj.weight",
+      "group": "layers.4.self_attn",
+      "hf_name": "layers.4.self_attn.q_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        4096,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.4.self_attn.v_proj.weight",
+      "group": "layers.4.self_attn",
+      "hf_name": "layers.4.self_attn.v_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.5.input_layernorm.weight",
+      "group": "layers.5.input_layernorm",
+      "hf_name": "layers.5.input_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.5.mlp.down_proj.weight",
+      "group": "layers.5.mlp",
+      "hf_name": "layers.5.mlp.down_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        2048,
+        6144
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.5.mlp.gate_proj.weight",
+      "group": "layers.5.mlp",
+      "hf_name": "layers.5.mlp.gate_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.5.mlp.up_proj.weight",
+      "group": "layers.5.mlp",
+      "hf_name": "layers.5.mlp.up_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.5.post_attention_layernorm.weight",
+      "group": "layers.5.post_attention_layernorm",
+      "hf_name": "layers.5.post_attention_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.5.self_attn.k_norm.weight",
+      "group": "layers.5.self_attn",
+      "hf_name": "layers.5.self_attn.k_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.5.self_attn.k_proj.weight",
+      "group": "layers.5.self_attn",
+      "hf_name": "layers.5.self_attn.k_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.5.self_attn.o_proj.weight",
+      "group": "layers.5.self_attn",
+      "hf_name": "layers.5.self_attn.o_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        2048,
+        4096
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.5.self_attn.q_norm.weight",
+      "group": "layers.5.self_attn",
+      "hf_name": "layers.5.self_attn.q_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.5.self_attn.q_proj.weight",
+      "group": "layers.5.self_attn",
+      "hf_name": "layers.5.self_attn.q_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        4096,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.5.self_attn.v_proj.weight",
+      "group": "layers.5.self_attn",
+      "hf_name": "layers.5.self_attn.v_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.6.input_layernorm.weight",
+      "group": "layers.6.input_layernorm",
+      "hf_name": "layers.6.input_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.6.mlp.down_proj.weight",
+      "group": "layers.6.mlp",
+      "hf_name": "layers.6.mlp.down_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        2048,
+        6144
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.6.mlp.gate_proj.weight",
+      "group": "layers.6.mlp",
+      "hf_name": "layers.6.mlp.gate_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.6.mlp.up_proj.weight",
+      "group": "layers.6.mlp",
+      "hf_name": "layers.6.mlp.up_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.6.post_attention_layernorm.weight",
+      "group": "layers.6.post_attention_layernorm",
+      "hf_name": "layers.6.post_attention_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.6.self_attn.k_norm.weight",
+      "group": "layers.6.self_attn",
+      "hf_name": "layers.6.self_attn.k_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.6.self_attn.k_proj.weight",
+      "group": "layers.6.self_attn",
+      "hf_name": "layers.6.self_attn.k_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.6.self_attn.o_proj.weight",
+      "group": "layers.6.self_attn",
+      "hf_name": "layers.6.self_attn.o_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        2048,
+        4096
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.6.self_attn.q_norm.weight",
+      "group": "layers.6.self_attn",
+      "hf_name": "layers.6.self_attn.q_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.6.self_attn.q_proj.weight",
+      "group": "layers.6.self_attn",
+      "hf_name": "layers.6.self_attn.q_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        4096,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.6.self_attn.v_proj.weight",
+      "group": "layers.6.self_attn",
+      "hf_name": "layers.6.self_attn.v_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.7.input_layernorm.weight",
+      "group": "layers.7.input_layernorm",
+      "hf_name": "layers.7.input_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.7.mlp.down_proj.weight",
+      "group": "layers.7.mlp",
+      "hf_name": "layers.7.mlp.down_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        2048,
+        6144
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.7.mlp.gate_proj.weight",
+      "group": "layers.7.mlp",
+      "hf_name": "layers.7.mlp.gate_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.7.mlp.up_proj.weight",
+      "group": "layers.7.mlp",
+      "hf_name": "layers.7.mlp.up_proj.weight",
+      "nbytes": 25165824,
+      "numel": 12582912,
+      "shape": [
+        6144,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.7.post_attention_layernorm.weight",
+      "group": "layers.7.post_attention_layernorm",
+      "hf_name": "layers.7.post_attention_layernorm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.7.self_attn.k_norm.weight",
+      "group": "layers.7.self_attn",
+      "hf_name": "layers.7.self_attn.k_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.7.self_attn.k_proj.weight",
+      "group": "layers.7.self_attn",
+      "hf_name": "layers.7.self_attn.k_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.7.self_attn.o_proj.weight",
+      "group": "layers.7.self_attn",
+      "hf_name": "layers.7.self_attn.o_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        2048,
+        4096
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.7.self_attn.q_norm.weight",
+      "group": "layers.7.self_attn",
+      "hf_name": "layers.7.self_attn.q_norm.weight",
+      "nbytes": 256,
+      "numel": 128,
+      "shape": [
+        128
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.7.self_attn.q_proj.weight",
+      "group": "layers.7.self_attn",
+      "hf_name": "layers.7.self_attn.q_proj.weight",
+      "nbytes": 16777216,
+      "numel": 8388608,
+      "shape": [
+        4096,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.layers.7.self_attn.v_proj.weight",
+      "group": "layers.7.self_attn",
+      "hf_name": "layers.7.self_attn.v_proj.weight",
+      "nbytes": 2097152,
+      "numel": 1048576,
+      "shape": [
+        512,
+        2048
+      ]
+    },
+    {
+      "dtype": "BF16",
+      "gguf_name": "draft.norm.weight",
+      "group": "norm",
+      "hf_name": "norm.weight",
+      "nbytes": 4096,
+      "numel": 2048,
+      "shape": [
+        2048
+      ]
+    }
+  ]
+}

@@ -13,6 +13,41 @@ The `llama-server` application supports several implementations of speculative d
 A much smaller model (called the _draft model_) generates drafts.
 A draft model is the most used approach in speculative decoding.
 
+### JetSpec draft head (`draft-jetspec`, experimental)
+
+`draft-jetspec` is a staged, explicit-opt-in JetSpec integration route. It is
+not enabled by default and currently fails closed before generating drafts unless
+all JetSpec experimental gates and runtime contracts are satisfied.
+
+Required gate:
+
+```bash
+LLAMA_JETSPEC_EXPERIMENTAL=1 llama-server [...] --spec-type draft-jetspec --spec-draft-model <draft-head.gguf>
+```
+
+Preview/metadata-only JetSpec GGUF files remain non-runnable; the loader keeps
+`runtime_supported=false` and rejects them before graph execution. In the current
+bounded runtime slice, the route first runs a fail-closed draft-head/target
+binding preflight, then ingests target tap rows from the private P5B side
+channel, records a diagnostic hash, tracks private runtime-state/failure
+bookkeeping, records a P5O pre-round snapshot descriptor in `begin()`, builds
+a P5N transaction-plan scaffold for the next JetSpec round, records a P5P transient-reservation descriptor for `reserve_transient_tree_pages`, and records a P5Q tree-build descriptor for `build_tree`. The preflight
+checks the explicit draft context metadata/shape against the staged Qwen3.6
+JetSpec draft-head contract and requires the target tap count/width to match.
+The pre-round snapshot descriptor records the sequence id, prompt token count,
+prompt hash, and `snapshot_pre_round` hash; it still performs no reserve, no tree
+build, and no verify mask work. The transaction scaffold records the P5M phase
+order `snapshot_pre_round`, `reserve_transient_tree_pages`, `build_tree`,
+`build_verify_mask`, `accept_path`, `commit_tokens`,
+`commit_hidden_kv_survivors`, `discard_rejected_branches`, and
+`publish_post_commit_state`, plus rollback failpoints, but it does not publish
+state, mutate KV, dispatch CUDA, or execute the draft head. The P5P transient-reservation descriptor records descriptor-only reservation intent for `reserve_transient_tree_pages`, bounds the transient tree node budget by the staged draft block size, records `rollback_point=after_reserve`, and keeps `actual_pages_reserved=0`; it performs no real page reservation, no llama_kv_cache primitive, no tree build, no verify mask, no draft tokens, no CUDA, no server route, no public API, and no CMake wiring. The P5Q tree-build descriptor records descriptor-only tree ABI intent for `build_tree`, records `rollback_point=after_build_tree`, root parent `-1`, root depth `0`, planned tree node budget, and `actual_tree_nodes=0`; it performs no real tree build, no tree arrays, no verify mask, no accept path runtime, no draft tokens, no CUDA, no server route, no public API, and no CMake wiring. The route still
+emits no draft tokens and does not execute the draft head; it remains a no draft
+tokens route. Set `LLAMA_JETSPEC_TRACE=1`,
+`LLAMA_JETSPEC_TAP_TRACE=1`, or `LLAMA_JETSPEC_STATE_TRACE=1` to log captured
+target tap row counts, hashes, phase, failure state, pre-round snapshot readiness, pre-round snapshot hash, transaction plan readiness, transaction plan hash, transient reservation readiness, transient reservation hash, transient tree node budget, `actual_pages_reserved=0`, tree build descriptor readiness, tree build descriptor hash, planned tree node budget, and `actual_tree_nodes=0`.
+The current P5Q/P5P/P5O/P5N boundary is: no real reserve, no reserve, no real tree build, no tree arrays, no verify mask, no accept, no KV mutation, no publish, no draft tokens.
+
 ### n-gram Cache (`ngram-cache`)
 
 An n-gram is a sequence of n tokens. The n-gram cache implementation maintains statistics about short n-gram sequences.
@@ -108,7 +143,7 @@ If a draft model is combined with a draftless decoding the draftless decoding ha
 ### General Speculative Parameters
 
 ```
---spec-type [none|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]
+--spec-type [none|draft-jetspec|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]
                                         type of speculative decoding to use when no draft model is provided
                                         (default: none)
                                         (env: LLAMA_ARG_SPEC_TYPE)
@@ -198,6 +233,7 @@ Specifies a type of speculative decoding without draft model.
 | Type | Description |
 |------|-------------|
 | `none` | No speculative decoding (default) |
+| `draft-jetspec` | Experimental JetSpec draft-head route; explicit opt-in and fail-closed before runtime support |
 | `ngram-cache` | Use n-gram cache lookup |
 | `ngram-simple` | Use simple n-gram pattern matching |
 | `ngram-map-k` | Use n-gram pattern matching with n-gram-keys |

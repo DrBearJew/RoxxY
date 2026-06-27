@@ -13,6 +13,10 @@ bool qwen35moe_env_enabled(const char * name) {
     return env != nullptr && env[0] != '\0' && atoi(env) != 0;
 }
 
+bool qwen35moe_jetspec_target_hidden_tap_layer(int il) {
+    return il == 1 || il == 10 || il == 19 || il == 28 || il == 37;
+}
+
 
 bool qwen35moe_env_bool_default(const char * name, bool def) {
     const char * env = getenv(name);
@@ -589,6 +593,7 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     const int n_transformer_layers = n_layer - (int) hparams.nextn_predict_layers;
+    ggml_tensor * jetspec_target_hidden_taps = nullptr;
     for (int il = 0; il < n_transformer_layers; ++il) {
         ggml_tensor * inpSA = inpL;
 
@@ -633,10 +638,28 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
+        if (cparams.jetspec_target_hidden_taps && qwen35moe_jetspec_target_hidden_tap_layer(il)) {
+            ggml_tensor * tap = cur;
+            if (cparams.jetspec_target_hidden_taps_masked && inp_out_ids) {
+                tap = ggml_get_rows(ctx0, tap, inp_out_ids);
+                cb(tap, "jetspec_target_hidden_tap_masked", il);
+            }
+            jetspec_target_hidden_taps = jetspec_target_hidden_taps ? ggml_concat(ctx0, jetspec_target_hidden_taps, tap, 0) : tap;
+            cb(jetspec_target_hidden_taps, "jetspec_target_hidden_taps", il);
+        }
+
         // Input for next layer
         inpL = cur;
     }
     cur = inpL;
+
+    if (cparams.jetspec_target_hidden_taps) {
+        if (jetspec_target_hidden_taps == nullptr || jetspec_target_hidden_taps->ne[0] != 5 * (int64_t) hparams.n_embd) {
+            throw std::runtime_error("JetSpec target hidden taps require Qwen35MoE layers [1,10,19,28,37] with concat width 10240");
+        }
+        res->t_jetspec_target_hidden_taps = jetspec_target_hidden_taps;
+        ggml_build_forward_expand(gf, jetspec_target_hidden_taps);
+    }
 
     cb(cur, "h_pre_norm", -1);
     res->t_h_pre_norm = cur;

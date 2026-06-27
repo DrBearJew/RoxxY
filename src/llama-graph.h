@@ -788,8 +788,12 @@ struct llm_graph_params {
         }
 
         return
-            cparams.embeddings  == other.cparams.embeddings  &&
-            cparams.causal_attn == other.cparams.causal_attn &&
+            cparams.embeddings                        == other.cparams.embeddings                        &&
+            cparams.embeddings_pre_norm               == other.cparams.embeddings_pre_norm               &&
+            cparams.embeddings_pre_norm_masked        == other.cparams.embeddings_pre_norm_masked        &&
+            cparams.jetspec_target_hidden_taps        == other.cparams.jetspec_target_hidden_taps        &&
+            cparams.jetspec_target_hidden_taps_masked == other.cparams.jetspec_target_hidden_taps_masked &&
+            cparams.causal_attn                       == other.cparams.causal_attn                       &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -810,6 +814,7 @@ public:
     ggml_tensor * get_embd_pooled()   const { return t_embd_pooled; }
     ggml_tensor * get_h_pre_norm()    const { return t_h_pre_norm; }
     ggml_tensor * get_mtp_h_capture() const { return t_mtp_h_capture; }
+    ggml_tensor * get_jetspec_target_hidden_taps() const { return t_jetspec_target_hidden_taps; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -839,6 +844,7 @@ public:
     ggml_tensor * t_embd          = nullptr;
     ggml_tensor * t_embd_pooled   = nullptr;
     ggml_tensor * t_h_pre_norm    = nullptr; // [n_embd, n_outputs] hidden state before final output norm; generic extraction/debug path
+    ggml_tensor * t_jetspec_target_hidden_taps = nullptr; // P5B side channel: [5*n_embd, n_outputs|n_tokens]
 
     // MTP related inputs/outputs
     ggml_tensor * t_mtp_h_capture = nullptr; // [n_embd, n_tokens|n_outputs] materialized target hidden state for MTP draft input
