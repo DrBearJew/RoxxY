@@ -1,27 +1,37 @@
-# RoxxY — Packed K-cache FlashAttention for RDNA3
+# RoxxY — RDNA3 Packed-K FlashAttention
 
 ![RoxxY](assets/github-social-preview.jpg)
 
-RoxxY is the standalone GitHub home for this RDNA3-focused `llama.cpp` branch
-with packed K-cache FlashAttention. Clone this repository directly; it is no
-longer installed from `DrBearJew/llama.cpp`.
+AMD-first `llama.cpp` fork for RDNA3 / gfx1100.
 
-The normal path is simple: build the default branch, run `llama-server` or
-`llama-bench`, and let the route selector pick the default packed16 kernels
-automatically. Optional packed8/packed4 q4 K aliases are also available for
-q4-storage experiments.
+Focus: fast local Qwen/MTP inference with packed K-cache FlashAttention,
+PV4/V144 value-cache routing, and strict route canaries.
 
-Packed16 and packed8/packed4 q4 are **runtime K-cache layouts**, not new GGUF
-model formats. The default packed16 path stores K as I32 payload rows, with each
-32-bit word carrying four packed 8-bit K values. The optional q4 path stores the
-same kind of I32 payload rows with each 32-bit word carrying eight packed 4-bit
-K values. F16 scales remain separate in both cases.
+This is a runtime/cache-layout fork, not a new GGUF format. Use your normal GGUF
+models. RoxxY chooses the GPU K-cache layout at runtime.
 
----
+## 🎯 Project goals
 
-## Start here: recommended MTP server launch
+- Make RDNA3 consumer GPUs useful for long-context local inference.
+- Keep the default path simple: build, run, let the selector choose the fast route.
+- Use packed I32 K sidecars for FlashAttention instead of raw K cache tensors.
+- Keep experimental q4 K storage available without making it look faster than it is.
 
-Set your model path once, then run `llama-server` directly. For the measured Qwen3.6 27B Q4_K_M MTP speed profile, use the single PV4 opt-in and pure MTP, without `--spec-default`:
+## ✅ Recommended path
+
+For normal MTP runs, use:
+
+| Component | Recommendation | Why |
+|---|---|---|
+| K cache | default packed16/I32 | fastest validated prefill path |
+| V cache | `q4_0` | best measured speed/VRAM tradeoff |
+| MTP | `--spec-type draft-mtp` | active-RS pure MTP path |
+| PV4 | `GGML_CUDA_ROCM_V4_K16D16_144_PV4=1` | enables the current fast V route |
+
+Do **not** add `--cache-type-k` for the default path. K is selected by RoxxY's
+runtime layout. Pick V precision with `--cache-type-v`.
+
+## 🚀 Quick Start — Qwen3.6 27B MTP
 
 ```bash
 MODEL=/path/to/Qwen3.6-27B-Q4_K_M-mtp.gguf
@@ -40,100 +50,70 @@ GGML_CUDA_ROCM_V4_K16D16_144_PV4=1 \
   --spec-draft-prio 2 --spec-draft-prio-batch 2
 ```
 
-That is the pure-MTP active-RS path. The PV4 switch implies the internal V144/PV4, QBlock/PDMQ, QPack, packed16, and target-batch verifier backend stack. You do not need to set the historical long ROCm/MTP env stack.
+That command is the baseline. You do not need the old long ROCm/MTP env stack.
 
-`q4_0` is the recommended V-cache choice for the fast MTP path. `q8_0` and
-`f16` are supported higher-precision V-cache choices; they use more VRAM and
-remain slower than `q4_0` on the measured 27B MTP path.
+## 🧱 K-cache formats
 
-Do not add `--cache-type-k` for the default packed16/I32 path; K is selected by
-the RoxxY runtime layout. To test q4 K storage, set
-`GGML_CUDA_ROCM_PDMQ_K_FORMAT=packed8_q4`, `packed4_q4`, or `packed4` instead.
-`packed4` is a compatibility alias for the same 144B q4 layout as `packed8_q4`,
-not the reserved 80B q2 layout.
+| Name / setting | Row size at D=256 | Status | Notes |
+|---|---:|---|---|
+| default / `packed16_q8` | 272B | production default | fastest validated prefill route |
+| `GGML_CUDA_ROCM_PDMQ_K_FORMAT=packed8_q4` | 144B | operational | smaller K, expands q4→i8 before WMMA |
+| `packed4`, `packed4_q4`, `packed4_q4_144` | 144B | alias | same bytes and route as `packed8_q4` |
+| `packed4_q2` | 80B | reserved | q2/int2 idea, unsupported/fail-closed |
 
-Expected default packed16 K + q4_0 V evidence on the measured pure-MTP PV4 profile is approximately:
+Important: `packed4` does **not** mean the 80B q2 format. It is a compatibility
+alias for the working 144B q4 layout so users do not crash when trying it.
+
+Current q4 K storage is denser, but not faster on long prefill yet because it
+expands q4 K into i8 before using the existing i8 WMMA path.
+
+## 🎛️ V-cache choices
+
+| V cache | Use case | Notes |
+|---|---|---|
+| `q4_0` | recommended fast MTP default | fastest measured path |
+| `q8_0` | higher V precision | more VRAM, slower than q4_0 in measured profile |
+| `f16` | highest V precision | most VRAM, slower than q4_0 in measured profile |
+
+`q4_0` V is only for the `P @ V` side. QK uses the selected packed I32 K path.
+
+## 📊 Current smoke numbers
+
+Qwen3.6 27B Q4_K_M MTP, `llama-server`, `ctx=49152`, `tg128`, q4_0 V unless noted.
+
+| K / V path | Prompt tok/s | Decode tok/s | SHA | Notes |
+|---|---:|---:|---|---|
+| default packed16 K + q4_0 V | ~583–589 | ~33 | `33fc0c55` | headline prefill path |
+| packed8/packed4 q4 K + q4_0 V | ~560–566 | ~31 | `33fc0c55` | smaller K, not faster yet |
+| packed8/packed4 q4 K + q8_0 V | ~550 | ~39 | `33fc0c55` | faster decode, slower prefill |
+| packed8/packed4 q4 K + f16 V | ~551 | ~38 | `33fc0c55` | faster decode, slower prefill |
+
+Older 8k clean auto-table smoke: prompt ~744 tok/s, decode ~51 tok/s, SHA `4219d799`.
+
+## 🔎 Route canaries
+
+Default packed16 prefill should show:
 
 ```text
-8k/tg128 clean auto-table smoke: prompt ~744 tok/s, decode ~51.0 tok/s, SHA 4219d799
-32k/tg128 BM64-first prefill smoke: prompt ~589 tok/s, decode ~33.2 tok/s, SHA 33fc0c55
-n512 long decode smoke: ~42-43 tok/s, SHA 8d10ba2d
+selected=pwmma_bm64_i8qk_pvwmma_dbv ... K=I32 V=<value-type>
+FATTN COMPUTE SELECT selected=... name=rocm_packed16_wmma_tile
 ```
 
-Draft KV should be about 65 MiB at ctx 40960 before V144/PV4 physical route effects on the default packed16 path: packed16 K payload+scales around 42.5 MiB plus q4_0 logical V around 22.5 MiB. Optional q4 K storage is smaller per K row, but current prefill still uses an expand-to-i8 WMMA path and is not the headline speed baseline.
-
-Expected higher-precision typed-V evidence on the same direct/clean command,
-with only the V cache type changed, is approximately:
+q4 K storage should show:
 
 ```text
-q8_0: ~51-52 tok/s, draft acceptance around 399/565, no selected=587/588
-f16:  ~52 tok/s, draft acceptance around 399/565, no selected=587/588
+k_format=packed8_q4_144 selected=pwmma_bm64_i8qk_packed8_expand_pvwmma_dbv
 ```
 
-Route-log canaries should show `rocm_packed16_dot4_mmq` / `PDMQ2 ... K=i32
-V=q8_0 ... vpath=raw_lds_q8_0` or `V=f16 ... vpath=raw_lds_f16` for the
-small-Q typed-V path; the old `rocm_packed16_decode` lane is not the typed-V
-solution.
+Small-Q / MTP verification may use DOT4-MMQ/PDMQ:
 
----
+```text
+rocm_packed16_dot4_mmq / PDMQ2 ... K=i32 V=<value-type>
+```
 
-## Cache/layout notes — packed I32 FlashAttention
+If the log says raw `K=q8_0`, you are not on the packed I32 PDMQ path.
 
-Use the launch command above for normal MTP runs. The default rule is simple:
-**K uses RoxxY's packed16/I32 layout; V is the precision you choose.** Optional
-q4 K storage is selected with `GGML_CUDA_ROCM_PDMQ_K_FORMAT`.
-
-- Do **not** pass `--cache-type-k` for the default packed16/I32 path.
-- To test q4 K storage, set `GGML_CUDA_ROCM_PDMQ_K_FORMAT=packed8_q4`. The
-  aliases `packed4`, `packed4_q4`, and `packed4_q4_144` select the same 144B q4
-  layout. Explicit `packed4_q2` remains reserved/unsupported.
-- Pick V precision with `--cache-type-v`. For MTP, set `--cache-type-v-draft`
-  the same way when you want the draft context to match.
-- The selected packed K layout allocates the physical I32 K payload/scales
-  automatically.
-- Let the runtime selector choose the FlashAttention kernel; no route-forcing
-  environment variables are needed for normal use.
-
-| V cache | Use case | V storage | Contribution to K+V average |
-|---|---|---:|---:|
-| `q4_0` | Recommended fast MTP default | 4.5 bits/value | 2.25 bits |
-| `q8_0` | Higher V precision | 8.5 bits/value | 4.25 bits |
-| `f16` | Highest V precision | 16 bits/value | 8 bits |
-
-`q4_0` V is **not i16 V**. It stores packed q4 payload plus f16 scales for the
-`P @ V` side only; QK stays on the selected packed I32 PDMQ K path. Choosing
-`q8_0` or `f16` raises only the `P @ V` value format while keeping the same K
-layout selection. Default packed16-K + q8-V is about 17 bits per K+V pair.
-
-`tbq4_0`, `planar3_0`, and `iso3_0` are legacy/experimental V-format research,
-not proper starting options.
-
-Route evidence should look like this:
-
-- Normal long prefill on the default packed16 path usually selects the PWMMA
-  packed16/I32 family:
-
-  ```text
-  selected=pwmma_bm64_i8qk_pvwmma_dbv ... K=I32 V=<value-type>
-  FATTN COMPUTE SELECT selected=... name=rocm_packed16_wmma_tile
-  ```
-
-- Optional q4 K storage should show the packed8-expand route, even when selected
-  through the `packed4` alias:
-
-  ```text
-  k_format=packed8_q4_144 selected=pwmma_bm64_i8qk_packed8_expand_pvwmma_dbv
-  ```
-
-- Small-Q/MTP validation may select the DOT4-MMQ/PDMQ family:
-
-  ```text
-  rocm_packed16_dot4_mmq / PDMQ2 ... K=i32 V=<value-type>
-  ```
-
-If the FlashAttention log says raw `K=q8_0`, you are not validating the packed
-I32 PDMQ path. Packed16 and packed8/packed4 q4 should log `K=I32` plus the
-corresponding packed `k_format`.
+## Validation and benchmark notes
 
 ### Fast WikiText quality smoke
 
@@ -175,12 +155,7 @@ probe PASSED`. Evidence:
 
 ---
 
-## Quick start
-
-Build the branch, run a model, and let the branch pick the right packed route
-automatically. **No route-forcing env vars are needed for normal packed16 use.**
-Optional q4 K storage uses `GGML_CUDA_ROCM_PDMQ_K_FORMAT=packed8_q4` or the
-`packed4`/`packed4_q4` aliases.
+## Build from source
 
 You need a compatible GGUF model. The tested model families and example
 Hugging Face sources are listed below under [Tested models](#tested-models).
@@ -302,7 +277,7 @@ Model sources used during development include GGUF releases from
 
 ---
 
-## Build
+## Build details
 
 Standard ROCm build for gfx1100:
 
