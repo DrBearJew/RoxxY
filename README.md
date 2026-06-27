@@ -50,7 +50,6 @@ Expected q4 evidence on the measured pure-MTP PV4 profile is approximately:
 
 ```text
 8k/tg128 clean auto-table smoke: prompt ~744 tok/s, decode ~51.0 tok/s, SHA 4219d799
-32k/tg32 BM64-first prefill smoke: prompt ~577 tok/s, decode ~30.8 tok/s, SHA e6cf2710
 32k/tg128 BM64-first prefill smoke: prompt ~589 tok/s, decode ~33.2 tok/s, SHA 33fc0c55
 n512 long decode smoke: ~42-43 tok/s, SHA 8d10ba2d
 ```
@@ -212,10 +211,9 @@ Qwen3.6 27B Q4_K_M MTP, `llama-server`, `ctx=49152`, `--cache-type-v q4_0`, `--c
 
 | Prompt / predict | Route | Prompt tok/s | Decode tok/s | SHA |
 |---|---|---:|---:|---|
-| 32k / tg32 | PWMMA BM64 i8-QK PV-WMMA DBV | **577.02** | 30.76 | `e6cf2710` |
 | 32k / tg128 | PWMMA BM64 i8-QK PV-WMMA DBV | **589.43** | 33.17 | `33fc0c55` |
 
-Route evidence for both runs: `selected=pwmma_bm64_i8qk_pvwmma_dbv`, `desc_layout=0`, packed16/I32 K, q4 V, no BM32 prefill route selected. Draft acceptance is intentionally omitted from this headline table; these rows are route/hash/speed smoke tests, not acceptance-quality benchmarks.
+Route evidence: `selected=pwmma_bm64_i8qk_pvwmma_dbv`, `desc_layout=0`, packed16/I32 K, q4 V, no BM32 prefill route selected. Draft acceptance and very short tg32 runs are intentionally omitted from this headline table; these rows are route/hash/speed smoke tests, not acceptance-quality benchmarks.
 
 ### Historical llama-bench prefill (`nq > 1`)
 
