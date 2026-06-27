@@ -49,8 +49,10 @@ RoxxY packed16 runtime layout.
 Expected q4 evidence on the measured pure-MTP PV4 profile is approximately:
 
 ```text
-n128: ~53 tok/s, SHA accabc9a, draft acceptance around 96/121
-n512: ~42-43 tok/s, SHA 8d10ba2d, draft acceptance around 357/612
+8k/tg128 clean auto-table smoke: prompt ~744 tok/s, decode ~51.0 tok/s, SHA 4219d799
+32k/tg32 BM64-first prefill smoke: prompt ~577 tok/s, decode ~30.8 tok/s, SHA e6cf2710
+32k/tg128 BM64-first prefill smoke: prompt ~589 tok/s, decode ~33.2 tok/s, SHA 33fc0c55
+n512 long decode smoke: ~42-43 tok/s, SHA 8d10ba2d
 ```
 
 Draft KV should be about 65 MiB at ctx 40960 before V144/PV4 physical route effects: packed16 K payload+scales around 42.5 MiB plus q4_0 logical V around 22.5 MiB.
@@ -195,16 +197,27 @@ Benchmark prefill:
   -fa 1 -ngl 99 -p 512 -n 1
 ```
 
-On the benchmark system used for the results below, long-context runs are expected to use the automatic PWMMA BM64 i8-QK PV-WMMA DBV packed16 route for target Qwen shapes. Short pp512 historical measurements were around **2700 tok/s** on the prior BM32 reg-out route.
+On the benchmark system used for the results below, current packed16 auto starts row/default prefill on the PWMMA BM64 i8-QK PV-WMMA DBV route from `nk >= 512` for target Qwen shapes. Short pp512 historical measurements were around **2700 tok/s** on the prior BM32 reg-out route, which is now an opt-out/diagnostic comparison path.
 
 ---
 
 ## Headline results
 
-RX 7900 XTX / gfx1100, `llama-bench -fa 1 -ngl 99`. Record your ROCm
-and compiler versions when rerunning these numbers.
+RX 7900 XTX / gfx1100, `llama-bench -fa 1 -ngl 99` unless noted.
+Record your ROCm and compiler versions when rerunning these numbers.
 
-### Prefill (`nq > 1`)
+### Current long-context server smoke
+
+Qwen3.6 27B Q4_K_M MTP, `llama-server`, `ctx=49152`, `--cache-type-v q4_0`, `--cache-type-v-draft q4_0`, packed16/I32 K, production auto route on commit `0ea6db58e`.
+
+| Prompt / predict | Route | Prompt tok/s | Decode tok/s | SHA |
+|---|---|---:|---:|---|
+| 32k / tg32 | PWMMA BM64 i8-QK PV-WMMA DBV | **577.02** | 30.76 | `e6cf2710` |
+| 32k / tg128 | PWMMA BM64 i8-QK PV-WMMA DBV | **589.43** | 33.17 | `33fc0c55` |
+
+Route evidence for both runs: `selected=pwmma_bm64_i8qk_pvwmma_dbv`, `desc_layout=0`, packed16/I32 K, q4 V, no BM32 prefill route selected. Draft acceptance is intentionally omitted from this headline table; these rows are route/hash/speed smoke tests, not acceptance-quality benchmarks.
+
+### Historical llama-bench prefill (`nq > 1`)
 
 | Model | Route | pp512 | pp1024 | pp2048 | pp4096 |
 |---|---|---:|---:|---:|---:|
@@ -231,9 +244,9 @@ Decode uses DOT4 decode kernels, not the prefill WMMA kernels.
 
 ### What these numbers show
 
-- PWMMA BM64 i8-QK PV-WMMA DBV is the production auto packed16 prefill route for long-context target Qwen shapes once `nk >= 1024`; BM32 reg-out direct-V remains the short-context route.
-- DOT4-MMQ/PDMQ remains available for route-pinned validation, small-Q/MTP roles, and experimental V formats.
-- PWMMA BM32 reg-out direct-V remains the fastest measured short pp512 route in the listed table (+3.0% over DOT4-MMQ on 35B pp512 and +3.9% on 27B pp512), while DBV PV-WMMA is the promoted long-context route based on the follow-up 9B/27B long-context artifacts.
+- PWMMA BM64 i8-QK PV-WMMA DBV is the production auto packed16 prefill route for target Qwen row/default shapes from `nk >= 512`; the first long prefill chunk now goes BM64 DBV instead of BM32 direct-V.
+- DOT4-MMQ/PDMQ remains available for route-pinned validation, small-Q/MTP roles, decode, and experimental V formats.
+- PWMMA BM32 reg-out direct-V remains a historical/diagnostic short pp512 comparison route in the listed table (+3.0% over DOT4-MMQ on 35B pp512 and +3.9% on 27B pp512), while DBV PV-WMMA is the current auto prefill route.
 - A clean upstream q8_0 VEC FA baseline table is still TODO; current tables
   compare the packed16 route family and measured variants.
 
