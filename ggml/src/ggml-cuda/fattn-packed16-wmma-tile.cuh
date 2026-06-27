@@ -512,6 +512,28 @@ static __device__ __forceinline__ int pwmma_i8qk_packed8_word_as_i8x4(
     return static_cast<int>(packed_i8);
 }
 
+static __device__ __forceinline__ void pwmma_i8qk_packed8_word_as_i8x4_pair(
+        const int * __restrict__ k_payload, const size_t row, const int row_stride_i32, const int src_word,
+        int & lo_i8x4, int & hi_i8x4) {
+    const uint32_t src = static_cast<uint32_t>(k_payload[row * size_t(row_stride_i32) + size_t(src_word)]);
+    uint32_t lo = 0;
+    uint32_t hi = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int code = int((src >> (4 * i)) & 0x0fu);
+        const int8_t q = static_cast<int8_t>(code - 8);
+        lo |= uint32_t(uint8_t(q)) << (8 * i);
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int code = int((src >> (4 * (i + 4))) & 0x0fu);
+        const int8_t q = static_cast<int8_t>(code - 8);
+        hi |= uint32_t(uint8_t(q)) << (8 * i);
+    }
+    lo_i8x4 = static_cast<int>(lo);
+    hi_i8x4 = static_cast<int>(hi);
+}
+
 // ── Reference decode helpers (for debug checks) ──────────────────
 
 static __device__ __forceinline__ float pwmma_decode_k(
@@ -3013,31 +3035,30 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_row_lean_kernel(
             v_tile_f16_db[vbuf][c][dd] = (_Float16)pwmma_v_element<V_TYPE>(V, v_nb10, v_nb11, v_nb12, v_nb13, v_ne13, v_layout, k0 + c, hk, b, dd);
         }
         if constexpr (K_SHARED) {
-            for (int idx = threadIdx.x; idx < PWMMA_I8_KSHARED_I32_COUNT; idx += blockDim.x) {
-                const int c = idx / (PWMMA_D/4);
-                const int g = idx - c * (PWMMA_D/4);
-                if (c < valid_k) {
-                    const size_t row = k_head_base + size_t(k0) + size_t(c);
-                    if constexpr (PACKED8_K) {
-                        // packed8_q4_144 stores 8 signed-i4 codes per i32 word. Expand
-                        // once per K tile into the existing i8 WMMA shared-K layout:
-                        // four signed int8 lanes per i32 word, scale unchanged.
-                        const int d_base = g * 4;
-                        uint32_t packed_i8 = 0;
-                        #pragma unroll
-                        for (int i = 0; i < 4; ++i) {
-                            const int dd = d_base + i;
-                            const uint32_t src = static_cast<uint32_t>(k_payload[row * k_payload_row_stride_i32 + (dd >> 3)]);
-                            const int code = int((src >> (4 * (dd & 7))) & 0x0fu);
-                            const int8_t q = static_cast<int8_t>(code - 8);
-                            packed_i8 |= uint32_t(uint8_t(q)) << (8 * i);
-                        }
-                        k_i32_smem[idx] = static_cast<int>(packed_i8);
-                    } else {
-                        k_i32_smem[idx] = k_payload[row * k_payload_row_stride_i32 + g];
+            if constexpr (PACKED8_K) {
+                for (int idx = threadIdx.x; idx < BN_TILE * (PWMMA_D/8); idx += blockDim.x) {
+                    const int c = idx / (PWMMA_D/8);
+                    const int src_word = idx - c * (PWMMA_D/8);
+                    int lo_i8x4 = 0;
+                    int hi_i8x4 = 0;
+                    if (c < valid_k) {
+                        const size_t row = k_head_base + size_t(k0) + size_t(c);
+                        pwmma_i8qk_packed8_word_as_i8x4_pair(k_payload, row, k_payload_row_stride_i32, src_word, lo_i8x4, hi_i8x4);
                     }
-                } else {
-                    k_i32_smem[idx] = 0;
+                    int * dst_i8x4 = &k_i32_smem[c * (PWMMA_D/4) + src_word * 2];
+                    dst_i8x4[0] = lo_i8x4;
+                    dst_i8x4[1] = hi_i8x4;
+                }
+            } else {
+                for (int idx = threadIdx.x; idx < PWMMA_I8_KSHARED_I32_COUNT; idx += blockDim.x) {
+                    const int c = idx / (PWMMA_D/4);
+                    const int g = idx - c * (PWMMA_D/4);
+                    if (c < valid_k) {
+                        const size_t row = k_head_base + size_t(k0) + size_t(c);
+                        k_i32_smem[idx] = k_payload[row * k_payload_row_stride_i32 + g];
+                    } else {
+                        k_i32_smem[idx] = 0;
+                    }
                 }
             }
             for (int idx = threadIdx.x; idx < PWMMA_I8_KSHARED_SCALE_COUNT; idx += blockDim.x) {
@@ -3741,20 +3762,20 @@ static __global__ void packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_512t_wavegate_sta
         }
         if constexpr (K_SHARED) {
             if constexpr (PACKED8_K) {
-                for (int idx = threadIdx.x; idx < PWMMA_I8_KSHARED_I32_COUNT; idx += blockDim.x) {
-                    const int c = idx / (PWMMA_D/4);
-                    const int g = idx - c * (PWMMA_D/4);
+                for (int idx = threadIdx.x; idx < BN_TILE * (PWMMA_D/8); idx += blockDim.x) {
+                    const int c = idx / (PWMMA_D/8);
+                    const int src_word = idx - c * (PWMMA_D/8);
                     const bool k_valid = c < valid_k;
                     const int k_phys = DIRECT_ROW_KV ? (k0 + c) : (k_valid ? k_phys_tile[c] : -1);
+                    int lo_i8x4 = 0;
+                    int hi_i8x4 = 0;
                     if (k_valid && (DIRECT_ROW_KV || k_phys >= 0)) {
                         const size_t row = k_head_base + size_t(k_phys);
-                        // packed8_q4_144 stores 8 signed-i4 codes per i32 word. Expand
-                        // once per K tile into the existing i8 WMMA shared-K layout:
-                        // four signed int8 lanes per i32 word, scale unchanged.
-                        k_i32_smem[idx] = pwmma_i8qk_packed8_word_as_i8x4(k_payload, row, k_payload_row_stride_i32, g);
-                    } else {
-                        k_i32_smem[idx] = 0;
+                        pwmma_i8qk_packed8_word_as_i8x4_pair(k_payload, row, k_payload_row_stride_i32, src_word, lo_i8x4, hi_i8x4);
                     }
+                    int * dst_i8x4 = &k_i32_smem[c * (PWMMA_D/4) + src_word * 2];
+                    dst_i8x4[0] = lo_i8x4;
+                    dst_i8x4[1] = hi_i8x4;
                 }
             } else {
                 for (int idx = threadIdx.x; idx < BN_TILE * (PWMMA_D/16); idx += blockDim.x) {
@@ -6090,11 +6111,14 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
             const bool dbv_gqa3_rph32_requested = ggml_cuda_rocm_env_i32("GGML_CUDA_ROCM_PACKED16_DBV_GQA3_RPH32", 0) != 0;
             const bool dbv_prod_specialization_ok = (impl == 16 || dbv_kshared_active) && !streamk_active && !debug_qk_active &&
                 !profile_enabled && !live_dot4_shadow;
+            const bool dbv_direct_row_specialization_ok = (impl == 16 || impl == 17) && !streamk_active && !debug_qk_active &&
+                !profile_enabled && !live_dot4_shadow;
             const bool dbv_row_layout = packed16_desc.layout_kind == DP16_PACKED_I8_LAYOUT_ROW &&
                 packed16_desc.scale_layout == DP16_PACKED_I8_SCALE_LAYOUT_ROW;
-            const bool dbv_direct_row_kv_active = dbv_prod_specialization_ok && impl == 16 && !dbv_kshared_active &&
-                !partial_mode_active && k_payload_packed16 && !k_payload_packed8 && dbv_row_layout && dbv_page_map.active == 0 &&
-                ggml_cuda_rocm_env_i32("GGML_CUDA_ROCM_PACKED16_DBV_DIRECT_ROW_KV", 1) != 0;
+            const bool dbv_direct_row_kv_active = dbv_direct_row_specialization_ok && !dbv_kshared_active && !partial_mode_active &&
+                dbv_page_map.active == 0 && ggml_cuda_rocm_env_i32("GGML_CUDA_ROCM_PACKED16_DBV_DIRECT_ROW_KV", 1) != 0 &&
+                ((impl == 16 && k_payload_packed16 && !k_payload_packed8 && dbv_row_layout) ||
+                 (impl == 17 && k_payload_packed8));
             const bool dbv_gqa2_active = dbv_prod_specialization_ok && !dbv_gqa6_rph32_requested && !dbv_kblock_cascade_requested && !dbv_gqa3_rph32_requested && !dbv_gqa6_kshared_requested && !dbv_kshared_active && gqa_ratio >= 2 &&
                 ggml_cuda_rocm_env_i32("GGML_CUDA_ROCM_PACKED16_DBV_GQA2", 0) != 0;
             // Demoted 2026-06-27: total192 attempts are correctness-clean but too slow.
@@ -6215,8 +6239,8 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
         debug_qk_active ? debug_l.get() : nullptr, \
         debug_qk_active ? debug_alpha.get() : nullptr, \
         debug_qtile, debug_hq, debug_b, debug_kt, dbv_implicit_n_kv, dbv_implicit_q_offset, dbv_implicit_flags)
-#define LAUNCH_BM64_I8QK_DBV_DIRECT_ROW(VT) \
-    packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_row_lean_kernel<VT, false, false, false, false, false, false><<<dbv_grid, block512, 0, stream>>>( \
+#define LAUNCH_BM64_I8QK_DBV_DIRECT_ROW(VT, PACKED8V) \
+    packed16_wmma_tile_bm64_i8qk_pvwmma_dbv_row_lean_kernel<VT, PACKED8V, false, false, false, false, false><<<dbv_grid, block512, (PACKED8V ? PWMMA_I8_KSHARED_SMEM_BYTES : 0), stream>>>( \
         (const float*)Q->data, (const char*)V->data, (float*)dst->data, \
         Q->nb[1], Q->nb[2], Q->nb[3], V->nb[0], V->nb[1], V->nb[2], V->nb[3], v_ne13, \
         v_layout, \
@@ -6380,7 +6404,8 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
     else if (dbv_single_vbuf_active) { LAUNCH_BM64_I8QK_DBV_SINGLE_VBUF(VT, false); } \
     else if (dbv_lean_active && dbv_kshared_active) { LAUNCH_BM64_I8QK_DBV_LEAN(VT, true); } \
     else if (dbv_lean_active) { LAUNCH_BM64_I8QK_DBV_LEAN(VT, false); } \
-    else if (dbv_direct_row_kv_active) { LAUNCH_BM64_I8QK_DBV_DIRECT_ROW(VT); } \
+    else if (dbv_direct_row_kv_active && impl == 17) { LAUNCH_BM64_I8QK_DBV_DIRECT_ROW(VT, true); } \
+    else if (dbv_direct_row_kv_active) { LAUNCH_BM64_I8QK_DBV_DIRECT_ROW(VT, false); } \
     else if (impl == 17) { LAUNCH_BM64_I8QK_DBV(VT, true, false); } \
     else if (impl == 19) { LAUNCH_BM64_I8QK_DBV(VT, false, true); } \
     else { LAUNCH_BM64_I8QK_DBV(VT, false, false); } \
