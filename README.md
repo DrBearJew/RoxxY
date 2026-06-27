@@ -103,28 +103,16 @@ checks, not a full benchmark suite.
 
 Older 8k clean auto-table smoke: prompt ~744 tok/s, decode ~51 tok/s, SHA `4219d799`.
 
-## 🔎 Route canaries
+## 🛣️ Roadmap
 
-Default packed16 prefill should show:
-
-```text
-selected=pwmma_bm64_i8qk_pvwmma_dbv ... K=I32 V=<value-type>
-FATTN COMPUTE SELECT selected=... name=rocm_packed16_wmma_tile
-```
-
-q4 K storage should show:
-
-```text
-k_format=packed8_q4_144 selected=pwmma_bm64_i8qk_packed8_expand_pvwmma_dbv
-```
-
-Small-Q / MTP verification may use DOT4-MMQ/PDMQ:
-
-```text
-rocm_packed16_dot4_mmq / PDMQ2 ... K=i32 V=<value-type>
-```
-
-If the log says raw `K=q8_0`, you are not on the packed I32 PDMQ path.
+1. **Paged Attention for long context throughput.** This is the top priority: make
+   the packed-K path work efficiently with paged attention so long-context runs
+   keep throughput instead of falling off as context grows.
+2. **Improve packed8.** The compact q4 K path is operational, but it still expands
+   into the existing i8 WMMA route. The next step is making packed8 faster, not
+   just smaller.
+3. **Gemma support.** Add and validate the model-specific plumbing needed for
+   Gemma-family runs.
 
 ## Validation and benchmark notes
 
