@@ -4367,10 +4367,10 @@ static inline int pdmq_decode_stage_split_select(
         (v_type == GGML_TYPE_F16  && v_path == PDMQ_V_RAW_LDS_F16);
 
     // Production V4/PV4 decode defaults to split-8 today. The staged table is
-    // default-off and follows measured n128 prompt buckets: prompt_n≈4001 liked
-    // split32, prompt_n≈7734 liked split16, prompt_n≈15468 liked split32,
-    // prompt_n≈30936 liked split64. Intermediate envs keep the table sweepable
-    // without changing default runtime.
+    // default-off and follows measured n128 prompt buckets. Fresh 9B pp8k
+    // exact-old controls now favor split32 at nk≈8K; larger buckets already
+    // used split32/split64. Intermediate envs keep the table sweepable without
+    // changing unrelated runtime.
     if (v4_direct && role == PDMQ_ROLE_DECODE && nq <= 1) {
         if (nk >= 32768) {
             return pdmq_decode_stage_env_int("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SPLITK_NK32768", 64);
@@ -4382,7 +4382,7 @@ static inline int pdmq_decode_stage_split_select(
             return pdmq_decode_stage_env_int("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SPLITK_NK12288", 32);
         }
         if (nk >= 6144) {
-            return pdmq_decode_stage_env_int("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SPLITK_NK6144", 16);
+            return pdmq_decode_stage_env_int("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SPLITK_NK6144", 32);
         }
         if (nk >= 4096) {
             return pdmq_decode_stage_env_int("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SPLITK_NK4096", 32);
