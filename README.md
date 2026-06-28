@@ -274,8 +274,10 @@ Decode uses DOT4 decode kernels, not the prefill WMMA kernels.
 Model sources used during development include GGUF releases from
 [llmfan46](https://huggingface.co/llmfan46),
 [HauhauCS](https://huggingface.co/HauhauCS),
-[havenoammo](https://huggingface.co/havenoammo), and
-[Radamanthys11](https://huggingface.co/Radamanthys11).
+[havenoammo](https://huggingface.co/havenoammo),
+[Radamanthys11](https://huggingface.co/Radamanthys11),
+[unsloth](https://huggingface.co/unsloth), and
+[mradermacher](https://huggingface.co/mradermacher).
 
 ---
 
