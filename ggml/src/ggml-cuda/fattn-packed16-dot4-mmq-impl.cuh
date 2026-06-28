@@ -4847,11 +4847,11 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         // opt-in diagnostic path rather than the QBlock/DOT4 promotion route.
         shape = pdmq_select_qwen35_gqa6_qblock_shape(nq, qblock_tetris_shape_policy_requested);
     } else if (qwen35_gqa8_v4_qblock_smallq) {
-        // Qwen3.6-35B GQA8 QBlock verify is latency-bound at nq<=4. The generic
-        // QBlock M8N32 policy over-activates qprog rows and measured ~35 tok/s
-        // on 8k-prompt MTP; M1N32 keeps one live verifier row per launch and
-        // measured ~56 tok/s in the same route diagnostic.
-        shape = PDMQ_SHAPE_M1N32;
+        // Qwen3.6-35B GQA8 QBlock verify needs enough live rows to verify the
+        // target + draft rows.  Keep nq<=2 on the old single-row fallback, but
+        // use M4N32 for nq=3/4 so nmax2/3 do not silently collapse to a
+        // target-only qprogram.
+        shape = nq >= 3 ? PDMQ_SHAPE_M4N32 : PDMQ_SHAPE_M1N32;
     }
 
     const bool v4_144_pv4_requested = V->type == GGML_TYPE_V4_K16D16_144 && pdmq_v4_144_pv4_requested();
@@ -6700,7 +6700,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     //   - GQA6 split-K, V=q4_0, raw_lds_q4, M2N32 (qblock nq=2/4)
     //   - GQA6 split-K, V=q4_0, raw_lds_q4, M1N32 (row-serial decode oracle)
     //   - GQA6 non-split, V=q4_0, raw_lds_q4, M1N32 (decode fallback/oracle)
-    //   - GQA1 non-split, V=q4_0, raw_lds_q4, M1/M2/M8N32 and M16N16 (warmup / normal prefill)
+    //   - GQA1 non-split, V=q4_0/V144, M1/M2/M4/M8N32 and M16N16 (decode / QBlock / warmup / normal prefill)
 #if PDMQ_COMPILE_V4_ANY
     const bool debug_v4_144_cell = PDMQ_COMPILE_V4_144 && V->type == GGML_TYPE_V4_K16D16_144 && v4_k16d16_144_persistent && !raw_lds && !kshared;
     const bool debug_v4_cell = debug_v4_144_cell;
@@ -6731,14 +6731,16 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
 
     const bool debug_gqa1_cell = !is_gqa2 && !is_gqa2_xqa && !is_gqa4 && !is_gqa6 && !is_gqax_splitk;
     if (debug_gqa1_cell) {
-        if (shape != PDMQ_SHAPE_M1N32 && shape != PDMQ_SHAPE_M2N32 && shape != PDMQ_SHAPE_M8N32 && shape != PDMQ_SHAPE_M16N16) {
-            GGML_ABORT("PDMQ QWEN35_DEBUG_ONLY GQA1 supports only M1N32/M2N32/M8N32/M16N16, got shape=%s", pdmq_shape_name(shape));
+        if (shape != PDMQ_SHAPE_M1N32 && shape != PDMQ_SHAPE_M2N32 && shape != PDMQ_SHAPE_M4N32 && shape != PDMQ_SHAPE_M8N32 && shape != PDMQ_SHAPE_M16N16) {
+            GGML_ABORT("PDMQ QWEN35_DEBUG_ONLY GQA1 supports only M1N32/M2N32/M4N32/M8N32/M16N16, got shape=%s", pdmq_shape_name(shape));
         }
 #define PDMQ_LAUNCH_DEBUG_GQA1(VT, CAUSAL, RAW_Q4) do { \
             if (shape == PDMQ_SHAPE_M1N32) { \
                 PDMQ_LAUNCH_SHAPE(VT, PDMQ_BM_DECODE32, PDMQ_BN_DECODE32, CAUSAL, false, RAW_Q4, false); \
             } else if (shape == PDMQ_SHAPE_M2N32) { \
                 PDMQ_LAUNCH_SHAPE(VT, PDMQ_BM_VERIFY2_32, PDMQ_BN_VERIFY2_32, CAUSAL, false, RAW_Q4, false); \
+            } else if (shape == PDMQ_SHAPE_M4N32) { \
+                PDMQ_LAUNCH_SHAPE(VT, PDMQ_BM_VERIFY4_32, PDMQ_BN_VERIFY4_32, CAUSAL, false, RAW_Q4, false); \
             } else if (shape == PDMQ_SHAPE_M8N32) { \
                 PDMQ_LAUNCH_SHAPE(VT, PDMQ_BM_SMALL, PDMQ_BN_SMALL, CAUSAL, false, RAW_Q4, false); \
             } else { \
