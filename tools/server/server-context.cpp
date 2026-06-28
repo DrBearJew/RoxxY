@@ -1019,6 +1019,18 @@ static bool mtp_qblock_verify_disabled() {
     return env && atoi(env) != 0;
 }
 
+static int mtp_qblock_max_nq() {
+    const char * env = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_MAX_NQ");
+    if (!env || env[0] == '\0') {
+        env = getenv("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ");
+    }
+    if (!env || env[0] == '\0') {
+        return 8;
+    }
+    const int max_nq = atoi(env);
+    return max_nq < 2 ? 2 : max_nq;
+}
+
 static int mtp_prefix_accepted_row_commit_verify_slots() {
     if (!mtp_prefix_accepted_row_only_commit_enabled()) {
         return 0;
@@ -6411,6 +6423,7 @@ private:
                 const bool mtp_qblock_target_verify_active =
                     mtp_target_verify_slots > 0 &&
                     mtp_qblock_verify_rows_in_view == n_tokens &&
+                    mtp_qblock_verify_rows_in_view <= mtp_qblock_max_nq() &&
                     !mtp_qblock_verify_disabled();
                 const size_t mtp_actmat_qpacket_desc_rows = mtp_target_verify_slot_ptrs.size() == 1 ?
                     mtp_target_verify_slot_ptrs.front()->spec_i_batch.size() : 0;

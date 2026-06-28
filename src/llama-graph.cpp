@@ -39,6 +39,18 @@ static bool llm_graph_mtp_fa_enabled_default() {
     return true;
 }
 
+static int llm_graph_mtp_qblock_max_nq() {
+    const char * env = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_MAX_NQ");
+    if (!env || env[0] == '\0') {
+        env = getenv("GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ");
+    }
+    if (!env || env[0] == '\0') {
+        return 8;
+    }
+    const int max_nq = atoi(env);
+    return max_nq < 2 ? 2 : max_nq;
+}
+
 static bool llm_graph_use_f16_fa_kq_mask(const llama_cparams & cparams) {
     // Default-off because this tree previously saw all-NaN logits when F16 KQ masks
     // were allocated without type-correct host writes. Enable only for explicit probes.
@@ -2527,9 +2539,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 const char * env = getenv("LLAMA_MTP_QBLOCK_DISABLE");
                 return env && atoi(env) != 0;
             }();
-            const bool qblock_active = !qblock_disabled &&
-                (gtype == LLM_GRAPH_TYPE_DECODER_PREFIX_VERIFY || qblock_target_verify_active);
             const int64_t n_query = q->ne[1];
+            const bool qblock_active = !qblock_disabled &&
+                (gtype == LLM_GRAPH_TYPE_DECODER_PREFIX_VERIFY || qblock_target_verify_active) &&
+                n_query <= llm_graph_mtp_qblock_max_nq();
             if (qblock_active && n_query > 1) {
                 ggml_flash_attn_ext_set_instruction(cur, GGML_FATTN_INST_MTP_QBLOCK_VERIFY_QK);
             } else if (n_query > 1) {
@@ -2554,10 +2567,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
             ggml_fattn_instruction inst = GGML_FATTN_INST_NONE;
             const char * inst_reason = "upstream_like_none";
-            const bool qblock_active = []() {
+            const bool qblock_requested = []() {
                 const char * env = getenv("LLAMA_MTP_QBLOCK_ACTIVE");
                 return env && atoi(env) != 0;
             }();
+            const bool qblock_active = qblock_requested && ubatch.n_tokens <= (uint32_t) llm_graph_mtp_qblock_max_nq();
 
             const bool scalar_mtp_decode_shape = ubatch.n_tokens == 1 && n_outputs > 0;
             const bool real_mtp_token_decode =
@@ -2637,7 +2651,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 } else if (strcmp(force, "verify") == 0 && ubatch.n_tokens > 1 && n_outputs > 0) {
                     inst = GGML_FATTN_INST_MTP_VERIFY_QK;
                     inst_reason = "forced_verify";
-                } else if (strcmp(force, "qblock") == 0 && ubatch.n_tokens > 1 && n_outputs > 0) {
+                } else if (strcmp(force, "qblock") == 0 && ubatch.n_tokens > 1 && n_outputs > 0 && ubatch.n_tokens <= (uint32_t) llm_graph_mtp_qblock_max_nq()) {
                     inst = GGML_FATTN_INST_MTP_QBLOCK_VERIFY_QK;
                     inst_reason = "forced_qblock_verify";
                 } else if (strcmp(force, "none") == 0) {

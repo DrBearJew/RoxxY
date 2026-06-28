@@ -247,7 +247,7 @@ Sibling-row proof runs should use `scripts/hip/run-mtp-qblock-sibling-proof.py`.
 | `GGML_CUDA_ROCM_PACKED16_FA2_VEC` | `0` | experimental/global | backend | Legacy/global packed16 FA2 VEC opt-in for packed16 K + q4_0 V. Do not use as QBlock promotion evidence; prefer `GGML_CUDA_ROCM_MTP_QBLOCK_VEC` for QBlock-scoped validation. |
 | `GGML_CUDA_ROCM_PACKED16_FA2_VEC_COLS` | auto | candidate/smoke | backend | Packed16 VEC columns per block. For `MTP_QBLOCK_VERIFY_QK` with `GGML_CUDA_ROCM_MTP_QBLOCK_VEC=1`, `4/8/16` are QBlock-scoped candidates and `1` is the bit-exact smoke baseline; outside QBlock, multi-col values remain unsafe probe-only. |
 | `GGML_CUDA_ROCM_MTP_VERIFY_SMALLQ_PDMQ` | route-dependent | standard | backend | Small-Q PDMQ verify selection. |
-| `GGML_CUDA_ROCM_MTP_QBLOCK_MAX_NQ` | `8` | standard | backend | QBlock max FA rows; falls back to `GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ` when set. |
+| `GGML_CUDA_ROCM_MTP_QBLOCK_MAX_NQ` | `8` | standard | graph/server/backend | QBlock max FA rows; falls back to `GGML_CUDA_ROCM_SMALL_VERIFY_MAX_NQ` when set. Graph/server stamping must fail open to regular verify above this cap, before backend route selection. |
 | `GGML_CUDA_ROCM_MTP_QBLOCK_SHAPE` | auto | shape override | backend | Explicit compact shapes: `1x32`, `2x32`, `4x32`, `8x32`, `16x16`. Artifact name must include forced shape. |
 | `GGML_CUDA_ROCM_MTP_QBLOCK_SHAPE_POLICY` | `safe` | experimental | backend | `tetris`/fit policies. Not a promotion gate alone. |
 | `GGML_CUDA_ROCM_MTP_QBLOCK_GQA_GROUP` | auto/`1` in strict GQA1 route | shape/dataflow | backend | Allowed values currently `1`, `2`, `4`, `6`. Must be artifact-visible. |
