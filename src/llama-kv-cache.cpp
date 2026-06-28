@@ -98,9 +98,14 @@ static bool llama_mtp_qblock_paged_attention_owned_tail_write_enabled() {
     return llama_mtp_qblock_paged_attention_enabled() && owned && atoi(owned) != 0;
 }
 
+static bool llama_mtp_qblock_dbv_paged_attention_suppress_full_map_publish_enabled() {
+    const char * suppress = getenv("GGML_CUDA_ROCM_PACKED16_DBV_PAGED_ATTENTION_SUPPRESS_FULL_MAP_PUBLISH");
+    return suppress && atoi(suppress) != 0;
+}
+
 static bool llama_mtp_qblock_dbv_paged_attention_enabled() {
     const char * paged = getenv("GGML_CUDA_ROCM_PACKED16_DBV_PAGED_ATTENTION");
-    return paged && atoi(paged) != 0;
+    return paged && atoi(paged) != 0 && !llama_mtp_qblock_dbv_paged_attention_suppress_full_map_publish_enabled();
 }
 
 static int llama_mtp_qblock_env_int(const char * name, int def) {

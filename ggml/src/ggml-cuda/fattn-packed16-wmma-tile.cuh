@@ -5579,6 +5579,8 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
     const int dbv_paged_attention_min_nq = dbv_paged_attention_min_nq_env < 1 ? 1 : dbv_paged_attention_min_nq_env;
     const bool dbv_paged_attention_requested = impl_dbv && nq >= dbv_paged_attention_min_nq &&
         ggml_cuda_rocm_env_i32("GGML_CUDA_ROCM_PACKED16_DBV_PAGED_ATTENTION", 0) != 0;
+    const bool dbv_paged_attention_require_full_map = dbv_paged_attention_requested &&
+        ggml_cuda_rocm_env_i32("GGML_CUDA_ROCM_PACKED16_DBV_PAGED_ATTENTION_REQUIRE_FULL_MAP", 1) != 0;
     if (dbv_paged_attention_requested) {
         ggml_cuda_mtp_qblock_full_page_map_v1 registered_map = {};
         llama_kv_cache_get_mtp_qblock_full_page_map(K->data, &registered_map);
@@ -5634,10 +5636,15 @@ static void ggml_cuda_flash_attn_ext_packed16_wmma_tile(
                         registered_map.debug_first_pages[0], registered_map.debug_first_pages[1], registered_map.debug_first_pages[2], registered_map.debug_first_pages[3],
                         nk, active_logical_n_kv, packed_head_capacity);
             }
-        } else if (ggml_cuda_rocm_env_i32("GGML_CUDA_ROCM_PACKED16_DBV_PAGED_ATTENTION_TRACE", 0) != 0) {
-            fprintf(stderr,
-                    "PWMMA DBV PAGE_ATTENTION_SKIP: reason=no_registered_full_map nk=%d active_n_kv=%u capacity=%d\n",
-                    nk, active_logical_n_kv, packed_head_capacity);
+        } else {
+            if (dbv_paged_attention_require_full_map) {
+                GGML_ABORT("GGML_CUDA_ROCM_PACKED16_DBV_PAGED_ATTENTION rejected: requires_full_current_k_page_table");
+            }
+            if (ggml_cuda_rocm_env_i32("GGML_CUDA_ROCM_PACKED16_DBV_PAGED_ATTENTION_TRACE", 0) != 0) {
+                fprintf(stderr,
+                        "PWMMA DBV PAGE_ATTENTION_SKIP: reason=no_registered_full_map nk=%d active_n_kv=%u capacity=%d\n",
+                        nk, active_logical_n_kv, packed_head_capacity);
+            }
         }
     }
 
