@@ -82,6 +82,35 @@ static bool llm_graph_packed16_wmma_impl_explicit_dbv() {
     return impl && *impl && !llm_graph_packed16_wmma_impl_autoset() && strstr(impl, "pvwmma_dbv") != nullptr;
 }
 
+static bool llm_graph_pdmq_compressed_k_cache_enabled() {
+    // Storage-format agnostic: this covers PDMQ packed16_q8, packed8_q4,
+    // and future compressed-K sidecar formats. The PACKED16_DISABLE name is a
+    // legacy global off-switch for the whole PDMQ sidecar family.
+    const char * packed16_disabled = getenv("GGML_CUDA_ROCM_PACKED16_DISABLE");
+    if (packed16_disabled && atoi(packed16_disabled) != 0) {
+        return false;
+    }
+
+    const char * pdmq_format = getenv("GGML_CUDA_ROCM_PDMQ_K_FORMAT");
+    if (pdmq_format && (strcmp(pdmq_format, "none") == 0 || strcmp(pdmq_format, "NONE") == 0)) {
+        return false;
+    }
+
+    const char * pdmq = getenv("GGML_CUDA_ROCM_PDMQ_K_CACHE");
+    if (!pdmq) {
+        pdmq = getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE"); // legacy alias
+    }
+    if (pdmq) {
+        return atoi(pdmq) != 0;
+    }
+
+#ifdef GGML_USE_HIP
+    return true;
+#else
+    return false;
+#endif
+}
+
 static bool llm_graph_use_implicit_causal_fa_mask(const llama_cparams & cparams) {
     if (!cparams.causal_attn) {
         return false;
@@ -99,8 +128,7 @@ static bool llm_graph_use_implicit_causal_fa_mask(const llama_cparams & cparams)
         return false;
     }
 
-    const char * packed16 = getenv("GGML_CUDA_ROCM_Q8K_DOT4_PACKED16_K_CACHE");
-    return packed16 && atoi(packed16) != 0;
+    return llm_graph_pdmq_compressed_k_cache_enabled();
 }
 
 static bool llm_graph_implicit_causal_fa_mask_route_safe(const int32_t meta[4]) {
