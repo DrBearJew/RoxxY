@@ -47,6 +47,10 @@ struct dp16_fa_qblock_program {
     int head_slot_delta[DP16_FA_QBLOCK_MAX_HEAD_SLOTS];
     int rowmap_mode;
     int q_precision_mode;
+    // Plain MTP verifier rows use the graph/mask tensor contract. Only enable
+    // backend-local tree visibility when explicit QBlock op metadata supplies
+    // row parent/tree data; default linear rows must match legacy GQA1/GQA6.
+    int local_tree_mask_mode;
 
     int k_tile;
     int split_k;
@@ -332,6 +336,7 @@ static __host__ __device__ __forceinline__ dp16_fa_qblock_program dp16_fa_qblock
     p.gqa_group      = gqa_group;
     p.rowmap_mode    = DP16_FA_QBLOCK_ROWMAP_IDENTITY;
     p.q_precision_mode = DP16_FA_QBLOCK_Q_PRECISION_QPACK;
+    p.local_tree_mask_mode = 0;
     for (int i = 0; i < DP16_FA_QBLOCK_MAX_ROWS; ++i) {
         const bool live = i < rows_per_cta;
         p.row_q_delta[i] = i;
@@ -589,6 +594,7 @@ static inline void dp16_fa_qblock_program_apply_op_metadata(
     }
 
     const int rows = n_meta_rows < program.rows_per_cta ? n_meta_rows : program.rows_per_cta;
+    program.local_tree_mask_mode = rows > 0 ? 1 : program.local_tree_mask_mode;
     for (int r = 0; r < rows && r < DP16_FA_QBLOCK_MAX_ROWS; ++r) {
         const uint32_t base = (uint32_t) r * 17u;
         program.row_parent[r]         = dp16_fa_qblock_meta_decode_signed5(dp16_fa_qblock_meta_get_bits(words, base +  0u, 5u));

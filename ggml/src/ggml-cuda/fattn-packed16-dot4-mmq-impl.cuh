@@ -2458,7 +2458,7 @@ static __global__ __launch_bounds__(PDMQ_THREADS, 1) void packed16_dot4_mmq_gqax
             if constexpr (CAUSAL_MASK) {
                 valid = valid && (k <= q_offset + q);
             }
-            if (valid && qblock_program.enabled) {
+            if (valid && qblock_program.enabled && qblock_program.local_tree_mask_mode) {
                 valid = dp16_fa_qblock_program_tree_allows_local_k(qblock_program, qr, k - (q_offset + q0));
             }
             float mask_bias = 0.0f;
@@ -5032,7 +5032,8 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     const bool gqa2_supported = gqa2_xqa_supported || gqa2_legacy_supported || gqa2_splitk_plan_supported;
     const bool gqa4_non_split_supported = false;
     const bool gqa4_splitk_plan_v =
-        V->type == GGML_TYPE_Q4_0 && plan.v_path == PDMQ_V_RAW_LDS_Q4;
+        (V->type == GGML_TYPE_Q4_0 && plan.v_path == PDMQ_V_RAW_LDS_Q4) ||
+        (V->type == GGML_TYPE_V4_K16D16_144 && plan.v_path == PDMQ_V_V4_K16D16_144);
     const bool gqa4_splitk_plan_supported = request_gqa4 && gqax_splitk_requested > 1 &&
         (shape == PDMQ_SHAPE_M1N32 || shape == PDMQ_SHAPE_M2N32 || shape == PDMQ_SHAPE_M4N32 ||
          shape == PDMQ_SHAPE_M8N32) &&
@@ -5158,7 +5159,9 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     const bool gqa2_splitk_supported = is_gqa2 && !kshared && nq <= 8 &&
         raw_lds && (V->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_F16);
     const bool gqa2x_splitk_supported = is_gqa2_xqa && raw_lds_q4 && !kshared;
-    const bool gqa4_splitk_supported = is_gqa4 && !kshared && raw_lds_q4 && V->type == GGML_TYPE_Q4_0 &&
+    const bool gqa4_splitk_supported = is_gqa4 && !kshared &&
+        ((raw_lds_q4 && V->type == GGML_TYPE_Q4_0) ||
+         (v4_k16d16_144_persistent && directv && !raw_lds && V->type == GGML_TYPE_V4_K16D16_144)) &&
         n_heads_q == 16 && n_heads_k == 4 && gqa_ratio == 4 && nq <= 8;
     const bool gqa6_q4_splitk_supported = is_gqa6 && !kshared && raw_lds_q4 && V->type == GGML_TYPE_Q4_0 &&
         n_heads_q == 24 && n_heads_k == 4 && gqa_ratio == 6 &&
@@ -6516,7 +6519,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
 } while (0)
 
 #define PDMQ_LAUNCH_GQAX_SPLITK_SHAPE_DIRECTV(GROUP_VAL, VT, BM_VAL, BN_VAL, CAUSAL, PM, PL, PO) do { \
-    if constexpr (GROUP_VAL == 1 || (GROUP_VAL == 6 && VT == PACKED16_DOT4_MMQ_V4_K16D16_144)) { \
+    if constexpr (GROUP_VAL == 1 || ((GROUP_VAL == 4 || GROUP_VAL == 6) && VT == PACKED16_DOT4_MMQ_V4_K16D16_144)) { \
         if (pdmq_pvblock_exact_active) { \
             packed16_dot4_mmq_gqax_kernel<VT, BM_VAL, BN_VAL, PDMQ_D, CAUSAL, false, false, false, GROUP_VAL, false, false, true, false, false, PDMQ_COMPILE_PVBLOCK_EXACT><<<grid, block, 0, stream>>>( \
                 (const float *) Q->data, (const char *) V->data, (const half *) (v4_tail ? v4_tail->data : nullptr), (float *) dst->data, PM, PL, PO, \
@@ -6889,8 +6892,14 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         ggml_cuda_pool_alloc<float> partial_m(pool, partial_rows);
         ggml_cuda_pool_alloc<float> partial_l(pool, partial_rows);
         ggml_cuda_pool_alloc<float> partial_out(pool, partial_rows * size_t(PDMQ_D));
-        {
-            GGML_ABORT("PDMQ QWEN35_DEBUG_ONLY GQA4 split-K is enabled only for persistent V4_144 PV-WMMA candidates");
+        if (debug_v4_144_cell) {
+            if (assume_causal) {
+                PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_DIRECTV(4, PACKED16_DOT4_MMQ_V4_K16D16_144, true, partial_m.get(), partial_l.get(), partial_out.get());
+            } else {
+                PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_DIRECTV(4, PACKED16_DOT4_MMQ_V4_K16D16_144, false, partial_m.get(), partial_l.get(), partial_out.get());
+            }
+        } else {
+            GGML_ABORT("PDMQ QWEN35_DEBUG_ONLY GQA4 split-K is enabled only for persistent V4_144 candidates");
         }
         const size_t merge_elems = size_t(batch) * size_t(nq) * size_t(n_heads_q) * size_t(PDMQ_D);
         const int merge_blocks = (int) ((merge_elems + size_t(PDMQ_THREADS) - 1) / size_t(PDMQ_THREADS));
