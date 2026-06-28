@@ -5033,6 +5033,8 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     const bool gqa4_non_split_supported = false;
     const bool gqa4_splitk_plan_v =
         (V->type == GGML_TYPE_Q4_0 && plan.v_path == PDMQ_V_RAW_LDS_Q4) ||
+        (V->type == GGML_TYPE_Q8_0 && plan.v_path == PDMQ_V_RAW_LDS_Q8_0) ||
+        (V->type == GGML_TYPE_F16  && plan.v_path == PDMQ_V_RAW_LDS_F16) ||
         (V->type == GGML_TYPE_V4_K16D16_144 && plan.v_path == PDMQ_V_V4_K16D16_144);
     const bool gqa4_splitk_plan_supported = request_gqa4 && gqax_splitk_requested > 1 &&
         (shape == PDMQ_SHAPE_M1N32 || shape == PDMQ_SHAPE_M2N32 || shape == PDMQ_SHAPE_M4N32 ||
@@ -5160,7 +5162,7 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         raw_lds && (V->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_F16);
     const bool gqa2x_splitk_supported = is_gqa2_xqa && raw_lds_q4 && !kshared;
     const bool gqa4_splitk_supported = is_gqa4 && !kshared &&
-        ((raw_lds_q4 && V->type == GGML_TYPE_Q4_0) ||
+        ((raw_lds && (V->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_F16)) ||
          (v4_k16d16_144_persistent && directv && !raw_lds && V->type == GGML_TYPE_V4_K16D16_144)) &&
         n_heads_q == 16 && n_heads_k == 4 && gqa_ratio == 4 && nq <= 8;
     const bool gqa6_q4_splitk_supported = is_gqa6 && !kshared && raw_lds_q4 && V->type == GGML_TYPE_Q4_0 &&
@@ -5183,9 +5185,15 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     const bool gqax_splitk_roof_cap = ggml_cuda_rocm_packed16_dot4_mmq_gqax_splitk_roof_cap();
     const bool gqax_splitk_compact_empty = ggml_cuda_rocm_packed16_dot4_mmq_gqax_splitk_compact_empty();
     const int gqax_splitk_roof = pdmq_splitk_roof_pow2(nk);
-    const int gqax_splitk_effective = gqax_splitk_roof_cap
+    int gqax_splitk_effective = gqax_splitk_roof_cap
         ? (gqax_splitk_requested < gqax_splitk_roof ? gqax_splitk_requested : gqax_splitk_roof)
         : gqax_splitk_requested;
+    // Raw q8 QBlock verify is hash-clean at split4; split2/8/16 can drift from
+    // the non-split GQA1 baseline due split-merge reduction order. Normalize
+    // only QBlock rows here so non-MTP/direct decode policy remains untouched.
+    if (qblock_inst && raw_lds_q8 && gqax_splitk_effective > 1) {
+        gqax_splitk_effective = 4;
+    }
     const int gqax_k_blocks_total_raw = CEIL_DIV(nk, launch_bn);
     const int gqax_k_blocks_total = gqax_k_blocks_total_raw > 0 ? gqax_k_blocks_total_raw : 1;
     const int gqax_splitk_active_raw = (gqax_splitk_compact_empty && gqax_splitk_effective > gqax_k_blocks_total)
@@ -6451,7 +6459,9 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
 } while (0)
 
 #define PDMQ_LAUNCH_GQAX_SPLITK_SHAPE(GROUP_VAL, VT, BM_VAL, BN_VAL, CAUSAL, RAW_LDS_Q4_VAL, PM, PL, PO) do { \
-    if constexpr (GROUP_VAL == 1 || ((GROUP_VAL == 2 || GROUP_VAL == 4 || GROUP_VAL == 6) && VT == PACKED16_DOT4_MMQ_V_Q4_0)) { \
+    if constexpr (GROUP_VAL == 1 || \
+            (GROUP_VAL == 4 && (VT == PACKED16_DOT4_MMQ_V_Q4_0 || VT == PACKED16_DOT4_MMQ_V_Q8_0 || VT == PACKED16_DOT4_MMQ_V_F16)) || \
+            ((GROUP_VAL == 2 || GROUP_VAL == 6) && VT == PACKED16_DOT4_MMQ_V_Q4_0)) { \
         if (pdmq_pvblock_exact_active) { \
             if (v4_k16d16_oracle) { \
                 packed16_dot4_mmq_gqax_kernel<VT, BM_VAL, BN_VAL, PDMQ_D, CAUSAL, false, RAW_LDS_Q4_VAL, false, GROUP_VAL, false, false, true, false, false, PDMQ_COMPILE_PVBLOCK_EXACT, true><<<grid, block, 0, stream>>>( \
@@ -6758,10 +6768,12 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
     const bool debug_raw_typed_v_cell =
         (V->type == GGML_TYPE_Q8_0 && raw_lds_q8) ||
         (V->type == GGML_TYPE_F16  && raw_lds_f16);
+    const bool debug_stage_typed_v_cell =
+        (V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_F16) && stage_v && !raw_lds;
     const bool debug_raw_q4_cell = V->type == GGML_TYPE_Q4_0 && raw_lds_q4;
-    if (!debug_v4_cell && !debug_raw_q4_cell && !debug_raw_typed_v_cell) {
-        GGML_ABORT("PDMQ QWEN35_DEBUG_ONLY supports only V=q4_0 raw_lds_q4, V=q8_0 raw_lds_q8_0, V=f16 raw_lds_f16, or scalar persistent V4 K16D16 GQA1/GQA6; variant=%s V=%s raw_lds_q4=%d raw_lds_q8=%d raw_lds_f16=%d kshared=%d vpath=%s",
-                   pdmq_variant_name, ggml_type_name(V->type), raw_lds_q4 ? 1 : 0, raw_lds_q8 ? 1 : 0, raw_lds_f16 ? 1 : 0, kshared ? 1 : 0, pdmq_v_path_name(plan.v_path));
+    if (!debug_v4_cell && !debug_raw_q4_cell && !debug_raw_typed_v_cell && !debug_stage_typed_v_cell) {
+        GGML_ABORT("PDMQ QWEN35_DEBUG_ONLY supports only V=q4_0 raw_lds_q4, V=q8_0 raw_lds_q8_0/stage_f32, V=f16 raw_lds_f16/stage_f32, or scalar persistent V4 K16D16 GQA1/GQA6; variant=%s V=%s raw_lds_q4=%d raw_lds_q8=%d raw_lds_f16=%d stage_v=%d kshared=%d vpath=%s",
+                   pdmq_variant_name, ggml_type_name(V->type), raw_lds_q4 ? 1 : 0, raw_lds_q8 ? 1 : 0, raw_lds_f16 ? 1 : 0, stage_v ? 1 : 0, kshared ? 1 : 0, pdmq_v_path_name(plan.v_path));
     }
     if (!debug_v4_cell && kshared) {
         GGML_ABORT("PDMQ QWEN35_DEBUG_ONLY disables kshared cells; variant=%s V=%s vpath=%s",
@@ -6781,47 +6793,63 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         if (shape != PDMQ_SHAPE_M1N32 && shape != PDMQ_SHAPE_M2N32 && shape != PDMQ_SHAPE_M4N32 && shape != PDMQ_SHAPE_M8N32 && shape != PDMQ_SHAPE_M16N16) {
             GGML_ABORT("PDMQ QWEN35_DEBUG_ONLY GQA1 supports only M1N32/M2N32/M4N32/M8N32/M16N16, got shape=%s", pdmq_shape_name(shape));
         }
-#define PDMQ_LAUNCH_DEBUG_GQA1(VT, CAUSAL, RAW_Q4) do { \
+#define PDMQ_LAUNCH_DEBUG_GQA1(VT, CAUSAL, STAGEV, RAW_Q4) do { \
             if (shape == PDMQ_SHAPE_M1N32) { \
-                PDMQ_LAUNCH_SHAPE(VT, PDMQ_BM_DECODE32, PDMQ_BN_DECODE32, CAUSAL, false, RAW_Q4, false); \
+                PDMQ_LAUNCH_SHAPE(VT, PDMQ_BM_DECODE32, PDMQ_BN_DECODE32, CAUSAL, STAGEV, RAW_Q4, false); \
             } else if (shape == PDMQ_SHAPE_M2N32) { \
-                PDMQ_LAUNCH_SHAPE(VT, PDMQ_BM_VERIFY2_32, PDMQ_BN_VERIFY2_32, CAUSAL, false, RAW_Q4, false); \
+                PDMQ_LAUNCH_SHAPE(VT, PDMQ_BM_VERIFY2_32, PDMQ_BN_VERIFY2_32, CAUSAL, STAGEV, RAW_Q4, false); \
             } else if (shape == PDMQ_SHAPE_M4N32) { \
-                PDMQ_LAUNCH_SHAPE(VT, PDMQ_BM_VERIFY4_32, PDMQ_BN_VERIFY4_32, CAUSAL, false, RAW_Q4, false); \
+                PDMQ_LAUNCH_SHAPE(VT, PDMQ_BM_VERIFY4_32, PDMQ_BN_VERIFY4_32, CAUSAL, STAGEV, RAW_Q4, false); \
             } else if (shape == PDMQ_SHAPE_M8N32) { \
-                PDMQ_LAUNCH_SHAPE(VT, PDMQ_BM_SMALL, PDMQ_BN_SMALL, CAUSAL, false, RAW_Q4, false); \
+                PDMQ_LAUNCH_SHAPE(VT, PDMQ_BM_SMALL, PDMQ_BN_SMALL, CAUSAL, STAGEV, RAW_Q4, false); \
             } else { \
-                PDMQ_LAUNCH_SHAPE(VT, PDMQ_BM_PREFILL, PDMQ_BN_PREFILL, CAUSAL, false, RAW_Q4, false); \
+                PDMQ_LAUNCH_SHAPE(VT, PDMQ_BM_PREFILL, PDMQ_BN_PREFILL, CAUSAL, STAGEV, RAW_Q4, false); \
             } \
         } while (0)
 #if PDMQ_COMPILE_V4_ANY
         if (debug_v4_144_cell) {
             if (assume_causal) {
-                PDMQ_LAUNCH_DEBUG_GQA1(PACKED16_DOT4_MMQ_V4_K16D16_144, true, false);
+                PDMQ_LAUNCH_DEBUG_GQA1(PACKED16_DOT4_MMQ_V4_K16D16_144, true, false, false);
             } else {
-                PDMQ_LAUNCH_DEBUG_GQA1(PACKED16_DOT4_MMQ_V4_K16D16_144, false, false);
+                PDMQ_LAUNCH_DEBUG_GQA1(PACKED16_DOT4_MMQ_V4_K16D16_144, false, false, false);
             }
         } else
 #endif
         {
             if (V->type == GGML_TYPE_Q8_0) {
-                if (assume_causal) {
-                    PDMQ_LAUNCH_DEBUG_GQA1(PACKED16_DOT4_MMQ_V_Q8_0, true, true);
+                if (debug_stage_typed_v_cell) {
+                    if (assume_causal) {
+                        PDMQ_LAUNCH_DEBUG_GQA1(PACKED16_DOT4_MMQ_V_Q8_0, true, true, false);
+                    } else {
+                        PDMQ_LAUNCH_DEBUG_GQA1(PACKED16_DOT4_MMQ_V_Q8_0, false, true, false);
+                    }
                 } else {
-                    PDMQ_LAUNCH_DEBUG_GQA1(PACKED16_DOT4_MMQ_V_Q8_0, false, true);
+                    if (assume_causal) {
+                        PDMQ_LAUNCH_DEBUG_GQA1(PACKED16_DOT4_MMQ_V_Q8_0, true, false, true);
+                    } else {
+                        PDMQ_LAUNCH_DEBUG_GQA1(PACKED16_DOT4_MMQ_V_Q8_0, false, false, true);
+                    }
                 }
             } else if (V->type == GGML_TYPE_F16) {
-                if (assume_causal) {
-                    PDMQ_LAUNCH_DEBUG_GQA1(PACKED16_DOT4_MMQ_V_F16, true, true);
+                if (debug_stage_typed_v_cell) {
+                    if (assume_causal) {
+                        PDMQ_LAUNCH_DEBUG_GQA1(PACKED16_DOT4_MMQ_V_F16, true, true, false);
+                    } else {
+                        PDMQ_LAUNCH_DEBUG_GQA1(PACKED16_DOT4_MMQ_V_F16, false, true, false);
+                    }
                 } else {
-                    PDMQ_LAUNCH_DEBUG_GQA1(PACKED16_DOT4_MMQ_V_F16, false, true);
+                    if (assume_causal) {
+                        PDMQ_LAUNCH_DEBUG_GQA1(PACKED16_DOT4_MMQ_V_F16, true, false, true);
+                    } else {
+                        PDMQ_LAUNCH_DEBUG_GQA1(PACKED16_DOT4_MMQ_V_F16, false, false, true);
+                    }
                 }
             } else {
 #if PDMQ_COMPILE_LEGACY_Q4V
                 if (assume_causal) {
-                    PDMQ_LAUNCH_DEBUG_GQA1(PACKED16_DOT4_MMQ_V_Q4_0, true, true);
+                    PDMQ_LAUNCH_DEBUG_GQA1(PACKED16_DOT4_MMQ_V_Q4_0, true, false, true);
                 } else {
-                    PDMQ_LAUNCH_DEBUG_GQA1(PACKED16_DOT4_MMQ_V_Q4_0, false, true);
+                    PDMQ_LAUNCH_DEBUG_GQA1(PACKED16_DOT4_MMQ_V_Q4_0, false, false, true);
                 }
 #else
                 GGML_ABORT("PDMQ legacy V=q4_0 GQA1 cells are not compiled; set -DGGML_HIP_PDMQ_COMPILE_LEGACY_Q4V=ON for debug builds");
@@ -6898,8 +6926,28 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
             } else {
                 PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE_DIRECTV(4, PACKED16_DOT4_MMQ_V4_K16D16_144, false, partial_m.get(), partial_l.get(), partial_out.get());
             }
+        } else if (V->type == GGML_TYPE_Q8_0) {
+            if (assume_causal) {
+                PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE(4, PACKED16_DOT4_MMQ_V_Q8_0, true, partial_m.get(), partial_l.get(), partial_out.get());
+            } else {
+                PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE(4, PACKED16_DOT4_MMQ_V_Q8_0, false, partial_m.get(), partial_l.get(), partial_out.get());
+            }
+        } else if (V->type == GGML_TYPE_F16) {
+            if (assume_causal) {
+                PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE(4, PACKED16_DOT4_MMQ_V_F16, true, partial_m.get(), partial_l.get(), partial_out.get());
+            } else {
+                PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE(4, PACKED16_DOT4_MMQ_V_F16, false, partial_m.get(), partial_l.get(), partial_out.get());
+            }
         } else {
-            GGML_ABORT("PDMQ QWEN35_DEBUG_ONLY GQA4 split-K is enabled only for persistent V4_144 candidates");
+#if PDMQ_COMPILE_LEGACY_Q4V
+            if (assume_causal) {
+                PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE(4, PACKED16_DOT4_MMQ_V_Q4_0, true, partial_m.get(), partial_l.get(), partial_out.get());
+            } else {
+                PDMQ_LAUNCH_GQAX_SPLITK_BY_SHAPE(4, PACKED16_DOT4_MMQ_V_Q4_0, false, partial_m.get(), partial_l.get(), partial_out.get());
+            }
+#else
+            GGML_ABORT("PDMQ GQA4 legacy V=q4_0 split-K cells require -DGGML_HIP_PDMQ_COMPILE_LEGACY_Q4V=ON; PV4/V144 is the standard q4 V path");
+#endif
         }
         const size_t merge_elems = size_t(batch) * size_t(nq) * size_t(n_heads_q) * size_t(PDMQ_D);
         const int merge_blocks = (int) ((merge_elems + size_t(PDMQ_THREADS) - 1) / size_t(PDMQ_THREADS));
