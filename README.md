@@ -63,22 +63,15 @@ so QBlock verification stays on the validated fast path.
 
 ## 🧱 K-cache formats
 
-| Name / setting | Row size at D=256 | Status | Notes |
-|---|---:|---|---|
-| default / omit `--cache-type-k` / `packed16_q8` | 272B | production default | fastest validated prefill route |
-| `--cache-type-k q8_0` | 144B | operational | maps to compact q4 PDMQ K storage |
-| `--cache-type-k q4_0` | 144B | operational | maps to compact q4 PDMQ K storage |
-| `GGML_CUDA_ROCM_PDMQ_K_FORMAT=packed8_q4` | 144B | operational | explicit env selector for same q4 layout |
-| `packed4`, `packed4_q4`, `packed4_q4_144` | 144B | alias | same bytes and route as `packed8_q4` |
-| `packed4_q2` | 80B | reserved | q2/int2 idea, unsupported/fail-closed |
+| Setting | Use case | Notes |
+|---|---|---|
+| omit `--cache-type-k` | recommended default | fastest validated prefill route |
+| `--cache-type-k q8_0` | compact K cache | smaller K cache, compatibility spelling |
+| `--cache-type-k q4_0` | compact K cache | same compact route, explicit q4 spelling |
 
-Important: `--cache-type-k q8_0` and `--cache-type-k q4_0` in RoxxY both select
-the compact packed q4 PDMQ K layout. They do not select a legacy raw K-cache
-tensor. `packed4` does **not** mean the 80B q2 format; it is a compatibility
-alias for the working 144B q4 layout.
-
-Current q4 K storage is denser, but not faster on long prefill yet because it
-expands q4 K into i8 before using the existing i8 WMMA path.
+For most users, omit `--cache-type-k`. Use one of the compact K-cache options
+only when you want the smaller K cache and have validated the route for your
+model/context.
 
 ## 🎛️ V-cache choices
 
@@ -99,7 +92,7 @@ checks, not a full benchmark suite.
 | K selection | V selection | Prompt tok/s | Decode tok/s | SHA | Notes |
 |---|---|---:|---:|---|---|
 | omit `--cache-type-k` → packed16/I32 | `q4_0` | ~583–589 | ~33 | `33fc0c55` | headline prefill path |
-| `--cache-type-k q8_0` / `--cache-type-k q4_0` / `packed8_q4` / `packed4` → q4 K | `q4_0` | ~560–566 | ~31 | `33fc0c55` | smaller K, not faster yet |
+| `--cache-type-k q8_0` or `--cache-type-k q4_0` → compact K | `q4_0` | ~560–566 | ~31 | `33fc0c55` | smaller K, not faster yet |
 | q4 K | `q8_0` | ~550 | ~39 | `33fc0c55` | faster decode, slower prefill |
 | q4 K | `f16` | ~551 | ~38 | `33fc0c55` | faster decode, slower prefill |
 
