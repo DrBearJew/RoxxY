@@ -2583,22 +2583,29 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             }();
             const bool packed16_mtp_v =
                 v_for_fa->type == GGML_TYPE_Q4_0 ||
+                v_for_fa->type == GGML_TYPE_Q8_0 ||
+                v_for_fa->type == GGML_TYPE_F16 ||
                 v_for_fa->type == GGML_TYPE_V4_K16D16_144;
+            const bool packed16_mtp_small_verify_v =
+                v_for_fa->type == GGML_TYPE_Q4_0 ||
+                v_for_fa->type == GGML_TYPE_V4_K16D16_144 ||
+                ((v_for_fa->type == GGML_TYPE_Q8_0 || v_for_fa->type == GGML_TYPE_F16) &&
+                 ubatch.n_tokens <= (uint32_t) llm_graph_mtp_qblock_max_nq());
             const bool packed16_mtp_draft_decode =
                 real_mtp_token_decode && !packed16_mtp_disabled &&
                 q->ne[0] == 256 && v_for_fa->ne[0] == 256 &&
                 k->type == GGML_TYPE_I32 && packed16_mtp_v;
-            const bool packed16_mtp_q4_batched =
+            const bool packed16_mtp_batched =
                 !packed16_mtp_disabled && ubatch.n_tokens > 1 &&
                 q->ne[0] == 256 && v_for_fa->ne[0] == 256 &&
-                k->type == GGML_TYPE_I32 && packed16_mtp_v;
+                k->type == GGML_TYPE_I32 && packed16_mtp_small_verify_v;
 
             if (packed16_mtp_draft_decode) {
                 // Persistent packed16 source-K MTP draft decode, when present,
                 // is a real scalar token-mode decode carrying inp->h.
                 inst = GGML_FATTN_INST_MTP_DRAFT_DECODE_QK;
                 inst_reason = "auto_packed16_mtp_draft_decode";
-            } else if (packed16_mtp_q4_batched && (n_outputs > 0 || qblock_active)) {
+            } else if (packed16_mtp_batched && (n_outputs > 0 || qblock_active)) {
                 // Persistent packed16 q4 MTP verify is a validated PDMQ lane.
                 // Legacy MTP/probe graph QBlock routing still uses
                 // LLAMA_MTP_QBLOCK_ACTIVE for no-output row-program experiments.
