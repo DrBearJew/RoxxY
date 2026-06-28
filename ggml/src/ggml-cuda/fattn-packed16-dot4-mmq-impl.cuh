@@ -4383,12 +4383,18 @@ static inline int pdmq_decode_stage_split_select(
         if (nk >= 4096) {
             return pdmq_decode_stage_env_int("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SPLITK_NK4096", 32);
         }
-        // A pp2048 decode step reaches nk≈2304. Leaving V4 direct decode at
-        // splitK=1 there routes through the scalar direct-V subpath and tanks
-        // target-only tg32 throughput. Use the same conservative split-8 floor
-        // as the V4 auto candidate once the K span is at least 2K tokens.
+        // Short target-only decode spans below 4K also suffer when V4 direct
+        // decode stays at splitK=1. Server pp512/pp1024/pp2048 map to nk≈768,
+        // 1280, and 2304 respectively; split-8 keeps the GQA6 split route and
+        // wins those tg32 gates without changing hashes.
         if (nk >= 2048) {
             return pdmq_decode_stage_env_int("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SPLITK_NK2048", 8);
+        }
+        if (nk >= 1024) {
+            return pdmq_decode_stage_env_int("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SPLITK_NK1024", 8);
+        }
+        if (nk >= 512) {
+            return pdmq_decode_stage_env_int("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SPLITK_NK512", 8);
         }
         return current;
     }
