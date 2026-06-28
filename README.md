@@ -266,6 +266,7 @@ Decode uses DOT4 decode kernels, not the prefill WMMA kernels.
 |---|---|---|
 | Qwen3.6 35B-A3B MoE GGUF | Tested | Main 35B benchmark target |
 | Qwen3.6 27B MTP GGUF | Tested | MTP + packed16 route target |
+| Qwen3.6 9B MTP GGUF | Tested | 9B MTP route target; V4/q8_0/f16 V-cache paths validated |
 | Other Qwen GGUFs | Unknown | May work if shapes and cache assumptions match |
 | Llama-family GGUFs | Untested | Not the target of this branch |
 | Other MoE families | Untested | GQA/MoE assumptions may differ |
