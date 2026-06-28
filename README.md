@@ -63,13 +63,14 @@ so QBlock verification stays on the validated fast path.
 
 ## 🧱 K-cache formats
 
-| Setting | Use case | Notes |
-|---|---|---|
-| omit `--cache-type-k` | recommended default | fastest validated prefill route |
-| `--cache-type-k q8_0` | compact K cache | smaller K cache, compatibility spelling |
-| `--cache-type-k q4_0` | compact K cache | same compact route, explicit q4 spelling |
+| Name | Setting | K row size at D=256 | Use case | Notes |
+|---|---|---:|---|---|
+| packed16 | omit `--cache-type-k` | 272B | recommended default | same K row size class as f16; fastest validated prefill route |
+| packed8 | `--cache-type-k q8_0` | 144B | compact K cache | smaller K cache, compatibility spelling |
+| packed8 | `--cache-type-k q4_0` | 144B | compact K cache | same compact route, explicit q4 spelling |
 
-For most users, omit `--cache-type-k`. Use one of the compact K-cache options
+For most users, omit `--cache-type-k`. It uses the 272B default K cache, which
+has the same row-size class as f16 K. Use one of the compact 144B K-cache options
 only when you want the smaller K cache and have validated the route for your
 model/context.
 
@@ -91,8 +92,8 @@ checks, not a full benchmark suite.
 
 | K selection | V selection | Prompt tok/s | Decode tok/s | SHA | Notes |
 |---|---|---:|---:|---|---|
-| omit `--cache-type-k` → packed16/I32 | `q4_0` | ~583–589 | ~33 | `33fc0c55` | headline prefill path |
-| `--cache-type-k q8_0` or `--cache-type-k q4_0` → compact K | `q4_0` | ~560–566 | ~31 | `33fc0c55` | smaller K, not faster yet |
+| omit `--cache-type-k` → packed16 / 272B K | `q4_0` | ~583–589 | ~33 | `33fc0c55` | headline prefill path |
+| `--cache-type-k q8_0` or `--cache-type-k q4_0` → packed8 / 144B K | `q4_0` | ~560–566 | ~31 | `33fc0c55` | smaller K, not faster yet |
 | q4 K | `q8_0` | ~550 | ~39 | `33fc0c55` | faster decode, slower prefill |
 | q4 K | `f16` | ~551 | ~38 | `33fc0c55` | faster decode, slower prefill |
 
