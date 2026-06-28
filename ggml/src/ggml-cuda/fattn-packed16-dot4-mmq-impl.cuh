@@ -4847,11 +4847,11 @@ void ggml_cuda_flash_attn_ext_packed16_dot4_mmq(
         // opt-in diagnostic path rather than the QBlock/DOT4 promotion route.
         shape = pdmq_select_qwen35_gqa6_qblock_shape(nq, qblock_tetris_shape_policy_requested);
     } else if (qwen35_gqa8_v4_qblock_smallq) {
-        // Qwen3.6-35B GQA8 QBlock verify needs enough live rows to verify the
-        // target + draft rows.  Keep nq<=2 on the old single-row fallback, but
-        // use M4N32 for nq=3/4 so nmax2/3 do not silently collapse to a
-        // target-only qprogram.
-        shape = nq >= 3 ? PDMQ_SHAPE_M4N32 : PDMQ_SHAPE_M1N32;
+        // Qwen3.6-35B nq3/4 full-row QBlock is semantically valid with M4N32,
+        // but loses the tg128 speed gate versus the prior target-only row path.
+        // Keep M1N32 as the production default; explicit shape envs can still
+        // exercise M4N32 for diagnostics.
+        shape = PDMQ_SHAPE_M1N32;
     }
 
     const bool v4_144_pv4_requested = V->type == GGML_TYPE_V4_K16D16_144 && pdmq_v4_144_pv4_requested();
