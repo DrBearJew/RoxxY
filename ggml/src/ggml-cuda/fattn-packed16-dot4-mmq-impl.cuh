@@ -4274,14 +4274,18 @@ static inline bool pdmq_decode_stage_auto_explicitly_disabled() {
     return env && *env && atoi(env) == 0;
 }
 
-static inline bool pdmq_decode_stage_v4_default_auto_enabled(
+static inline bool pdmq_decode_stage_default_auto_enabled(
         const pdmq_role role,
         const int nq,
         const ggml_type v_type,
         const pdmq_v_path v_path) {
-    return !pdmq_decode_stage_auto_explicitly_disabled() &&
-        v_type == GGML_TYPE_V4_K16D16_144 && v_path == PDMQ_V_V4_K16D16_144 &&
-        role == PDMQ_ROLE_DECODE && nq <= 1;
+    if (pdmq_decode_stage_auto_explicitly_disabled() || role != PDMQ_ROLE_DECODE || nq > 1) {
+        return false;
+    }
+    return (v_type == GGML_TYPE_V4_K16D16_144 && v_path == PDMQ_V_V4_K16D16_144) ||
+        (v_type == GGML_TYPE_Q4_0 && v_path == PDMQ_V_RAW_LDS_Q4) ||
+        (v_type == GGML_TYPE_Q8_0 && v_path == PDMQ_V_RAW_LDS_Q8_0) ||
+        (v_type == GGML_TYPE_F16 && v_path == PDMQ_V_RAW_LDS_F16);
 }
 
 static inline bool pdmq_decode_stage_policy_active(
@@ -4290,7 +4294,7 @@ static inline bool pdmq_decode_stage_policy_active(
         const ggml_type v_type,
         const pdmq_v_path v_path) {
     return pdmq_decode_stage_auto_enabled() ||
-        pdmq_decode_stage_v4_default_auto_enabled(role, nq, v_type, v_path);
+        pdmq_decode_stage_default_auto_enabled(role, nq, v_type, v_path);
 }
 
 static inline bool pdmq_decode_stage_log_enabled() {
@@ -4346,7 +4350,7 @@ static inline int pdmq_decode_stage_split_select(
         const ggml_type v_type,
         const pdmq_v_path v_path) {
     const bool stage_auto = pdmq_decode_stage_auto_enabled();
-    if (!stage_auto && !pdmq_decode_stage_v4_default_auto_enabled(role, nq, v_type, v_path)) {
+    if (!stage_auto && !pdmq_decode_stage_default_auto_enabled(role, nq, v_type, v_path)) {
         return current;
     }
 
@@ -4399,9 +4403,36 @@ static inline int pdmq_decode_stage_split_select(
         return current;
     }
 
-    // Raw-LDS q4/q8/f16 GQAX split-K historically jumps to split-32. Use a
-    // default-off coarser matrix for decode/verify to reduce tiny-shard merge and
-    // cache pressure while keeping unsupported shapes gated by existing support checks.
+    // Raw-LDS q4/q8/f16 decode is the non-V4 version of the same target-only
+    // path. Make single-token decode prod-auto too, while keeping multi-row
+    // verify rows behind explicit stage_auto.
+    if ((raw_q4 || raw_other) && role == PDMQ_ROLE_DECODE && nq <= 1) {
+        if (nk >= 32768) {
+            return pdmq_decode_stage_env_int("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SPLITK_NK32768", 16);
+        }
+        if (nk >= 16384) {
+            return pdmq_decode_stage_env_int("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SPLITK_NK16384", 8);
+        }
+        if (nk >= 8192) {
+            return pdmq_decode_stage_env_int("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SPLITK_NK8192", 4);
+        }
+        if (nk >= 4096) {
+            return pdmq_decode_stage_env_int("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SPLITK_NK4096", 2);
+        }
+        if (nk >= 2048) {
+            return pdmq_decode_stage_env_int("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SPLITK_NK2048", 8);
+        }
+        if (nk >= 1024) {
+            return pdmq_decode_stage_env_int("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SPLITK_NK1024", 8);
+        }
+        if (nk >= 512) {
+            return pdmq_decode_stage_env_int("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SPLITK_NK512", 8);
+        }
+        return current;
+    }
+
+    // Explicit stage_auto can still exercise the raw-LDS q4/q8/f16 matrix on
+    // multi-row verify paths; prod-auto intentionally does not touch those.
     if (stage_auto && (raw_q4 || raw_other) && role != PDMQ_ROLE_PREFILL && nq <= 8) {
         if (nk >= 32768) {
             return pdmq_decode_stage_env_int("GGML_CUDA_ROCM_PACKED16_DOT4_MMQ_DECODE_STAGE_SPLITK_NK32768", 16);
