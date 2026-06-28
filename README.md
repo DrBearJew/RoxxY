@@ -56,8 +56,10 @@ MODEL=/path/to/Qwen3.6-27B-Q4_K_M-mtp.gguf
   --spec-draft-prio 2 --spec-draft-prio-batch 2
 ```
 
-That command is the baseline. You do not need the old long ROCm/MTP env stack,
-and you do not need to enable PV4 manually.
+That command is the baseline for dense models on this build. Do not pass
+`--spec-default`: it enables the ngram speculative path, and ngram does not work
+correctly with this ROCm/MTP build. Keep `--spec-draft-n-max 4` for dense models
+so QBlock verification stays on the validated fast path.
 
 ## 🧱 K-cache formats
 
