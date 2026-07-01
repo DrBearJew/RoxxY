@@ -70,7 +70,7 @@ class P5ERuntimeStateTests(unittest.TestCase):
         self.assertIn("preview_not_allowed", text)
         self.assertIn("unsupported_runtime", text)
         self.assertIn("runtime_supported=false", text)
-        self.assertIn("throw std::runtime_error(\"unsupported_runtime: JetSpec P5A has no graph execution path\")", text)
+        self.assertIn("throw std::runtime_error(\"unsupported_runtime: JetSpec draft-head graph execution is not implemented\")", text)
 
     def test_docs_mark_state_only_no_draft_tokens(self) -> None:
         text = (REPO_ROOT / "docs/speculative.md").read_text(encoding="utf-8")

@@ -91,6 +91,42 @@ class DraftHeadLoaderPrototypeTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertTrue(any("jetspec.target_layer_ids" in error or "target_layer_ids" in error for error in result["errors"]))
 
+    def test_loader_fails_closed_for_required_metadata_drift(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="jetspec-loader-p1-test-") as tmp_s:
+            gguf = self._write_preview(tmp_s)
+            parsed = preview.parse_gguf(gguf)
+
+        cases = [
+            ("jetspec.requires_target_embeddings", False, "requires_target_embeddings"),
+            ("jetspec.requires_target_lm_head", False, "requires_target_lm_head"),
+            ("jetspec.causal_head", False, "causal_head"),
+            ("jetspec.experimental.runtime_supported", True, "runtime_supported"),
+        ]
+        for key, value, needle in cases:
+            with self.subTest(key=key):
+                tampered = copy.deepcopy(parsed)
+                tampered["metadata"][key]["value"] = value
+                result = loader.build_loader_plan_from_parsed(tampered)
+                self.assertFalse(result["ok"])
+                self.assertTrue(any(needle in error for error in result["errors"]), result["errors"])
+
+    def test_loader_fails_closed_for_head_dim_mismatch_and_missing_key(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="jetspec-loader-p1-test-") as tmp_s:
+            gguf = self._write_preview(tmp_s)
+            parsed = preview.parse_gguf(gguf)
+
+        mismatch = copy.deepcopy(parsed)
+        mismatch["metadata"]["jetspec.attention.value_length"]["value"] = 64
+        mismatch_result = loader.build_loader_plan_from_parsed(mismatch)
+        self.assertFalse(mismatch_result["ok"])
+        self.assertTrue(any("value_length" in error or "head_dim mismatch" in error for error in mismatch_result["errors"]))
+
+        missing = copy.deepcopy(parsed)
+        missing["metadata"].pop("jetspec.requires_target_lm_head")
+        missing_result = loader.build_loader_plan_from_parsed(missing)
+        self.assertFalse(missing_result["ok"])
+        self.assertTrue(any("jetspec.requires_target_lm_head" in error for error in missing_result["errors"]))
+
     def test_self_test_passes(self) -> None:
         result = loader.self_test()
 

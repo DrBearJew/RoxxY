@@ -1,0 +1,81 @@
+{
+  "descriptor_count": 10,
+  "descriptor_order": [
+    "p5o_pre_round_snapshot",
+    "p5n_transaction_plan",
+    "p5p_transient_reservation",
+    "p5q_tree_build",
+    "p5r_verify_mask",
+    "p5s_accept_path",
+    "p5t_token_commit",
+    "p5u_hidden_kv_survivor_commit",
+    "p5v_rejected_branch_discard",
+    "p5w_publish_gate"
+  ],
+  "errors": [],
+  "ok": true,
+  "prerequisite_edges": [
+    [
+      "p5o_pre_round_snapshot",
+      "p5n_transaction_plan"
+    ],
+    [
+      "p5n_transaction_plan",
+      "p5p_transient_reservation"
+    ],
+    [
+      "p5p_transient_reservation",
+      "p5q_tree_build"
+    ],
+    [
+      "p5q_tree_build",
+      "p5r_verify_mask"
+    ],
+    [
+      "p5r_verify_mask",
+      "p5s_accept_path"
+    ],
+    [
+      "p5s_accept_path",
+      "p5t_token_commit"
+    ],
+    [
+      "p5t_token_commit",
+      "p5u_hidden_kv_survivor_commit"
+    ],
+    [
+      "p5u_hidden_kv_survivor_commit",
+      "p5v_rejected_branch_discard"
+    ],
+    [
+      "p5v_rejected_branch_discard",
+      "p5w_publish_gate"
+    ]
+  ],
+  "runtime_boundary": {
+    "draft_head_graph_executed": false,
+    "draft_tokens_emitted": false,
+    "public_api_added": false,
+    "real_accept_executed": false,
+    "real_kv_mutated": false,
+    "real_publish_executed": false,
+    "real_token_commit_executed": false,
+    "real_tree_built": false,
+    "real_verify_mask_built": false,
+    "server_route_added": false
+  },
+  "runtime_executed": false,
+  "status": "descriptor_chain_verified_not_executed",
+  "zero_actuals_verified": [
+    "p5p_transient_reservation.actual_pages_reserved",
+    "p5q_tree_build.actual_tree_nodes",
+    "p5r_verify_mask.actual_verify_mask_entries",
+    "p5s_accept_path.actual_accepted_nodes",
+    "p5s_accept_path.correction_token_present",
+    "p5t_token_commit.actual_committed_tokens",
+    "p5u_hidden_kv_survivor_commit.actual_survivor_pages_committed",
+    "p5v_rejected_branch_discard.actual_pages_discarded",
+    "p5v_rejected_branch_discard.rejected_branch_pages_reachable_after_discard",
+    "p5w_publish_gate.actual_publish_visible_state"
+  ]
+}

@@ -19,6 +19,8 @@ class P5FLoaderGateProbeTests(unittest.TestCase):
         self.assertFalse(result["p5f_preflight_executed"])
         self.assertEqual(result["preview_metadata"]["tensor_count"], 0)
         self.assertTrue(result["preview_metadata"]["metadata_only"])
+        self.assertTrue(result["runtime_supported_true_negative"]["ok"], result["runtime_supported_true_negative"])
+        self.assertTrue(result["runtime_supported_true_negative"]["reject_before_optional_load_gate"])
 
     def test_contract_documents_remaining_live_preflight_blocker(self) -> None:
         result = probe_loader_gate(run_binary=False)
@@ -26,6 +28,7 @@ class P5FLoaderGateProbeTests(unittest.TestCase):
         self.assertIn("does not instantiate target/draft llama_context pair", result["limitations"])
         self.assertIn("does not execute common_speculative_jetspec_preflight", result["limitations"])
         self.assertIn("does not execute draft-head graph/tree/rollback runtime", result["limitations"])
+        self.assertEqual(result["runtime_supported_true_negative"]["name"], "runtime_supported_true_source_rejected")
 
 
 if __name__ == "__main__":

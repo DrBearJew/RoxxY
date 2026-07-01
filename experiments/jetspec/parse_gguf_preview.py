@@ -187,6 +187,79 @@ def _get(parsed: dict[str, Any], key: str) -> Any:
         raise GGUFParseError(f"missing required JetSpec metadata key: {key}") from exc
 
 
+def validate_tensor_payload_against_plan(parsed: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+    """Validate a parsed 91-tensor JetSpec GGUF payload table against the plan.
+
+    This is still no-model validation: it checks GGUF tensor-info names, shapes,
+    BF16 types, monotonic offsets, and file-size bounds without executing a draft
+    graph or inspecting tensor values.
+    """
+
+    errors: list[str] = []
+    planned = list(plan.get("tensors") or [])
+    parsed_tensors = list(parsed.get("tensors") or [])
+    proposed = plan.get("proposed_output") or {}
+
+    if parsed.get("tensor_count") != len(planned):
+        errors.append(f"tensor_count mismatch: parsed={parsed.get('tensor_count')} plan={len(planned)}")
+    if proposed.get("tensor_count") != len(planned):
+        errors.append(f"plan tensor_count mismatch: proposed={proposed.get('tensor_count')} tensors={len(planned)}")
+
+    expected_offset = 0
+    seen_names: set[str] = set()
+    checked: list[dict[str, Any]] = []
+    for index, tensor in enumerate(planned):
+        if index >= len(parsed_tensors):
+            errors.append(f"missing parsed tensor at index {index}: {tensor.get('gguf_name')}")
+            break
+        actual = parsed_tensors[index]
+        name = str(tensor.get("gguf_name"))
+        if actual.get("name") != name:
+            errors.append(f"tensor {index} name mismatch: parsed={actual.get('name')} plan={name}")
+        if name in seen_names:
+            errors.append(f"duplicate parsed tensor name: {name}")
+        seen_names.add(name)
+        shape = [int(x) for x in tensor.get("shape", [])]
+        if actual.get("shape") != shape:
+            errors.append(f"tensor {name} shape mismatch: parsed={actual.get('shape')} plan={shape}")
+        if actual.get("ggml_type") != GGML_TYPE_BF16:
+            errors.append(f"tensor {name} ggml_type must be BF16/{GGML_TYPE_BF16}, got {actual.get('ggml_type')}")
+        if actual.get("offset") != expected_offset:
+            errors.append(f"tensor {name} offset mismatch: parsed={actual.get('offset')} expected={expected_offset}")
+        nbytes = int(tensor.get("nbytes", -1))
+        if nbytes <= 0:
+            errors.append(f"tensor {name} has invalid nbytes={nbytes}")
+        checked.append({"name": name, "shape": shape, "offset": expected_offset, "nbytes": nbytes})
+        expected_offset += _pad(nbytes)
+
+    if len(parsed_tensors) > len(planned):
+        errors.append(f"parsed tensor table has extra entries: {len(parsed_tensors)} > {len(planned)}")
+
+    expected_payload_bytes = int(proposed.get("tensor_payload_bytes", expected_offset))
+    if expected_offset != expected_payload_bytes:
+        errors.append(f"payload byte total mismatch: offsets={expected_offset} proposed={expected_payload_bytes}")
+    expected_file_floor = int(parsed.get("data_start", 0)) + expected_offset
+    if int(parsed.get("file_size", 0)) < expected_file_floor:
+        errors.append(f"GGUF file is truncated: size={parsed.get('file_size')} required>={expected_file_floor}")
+
+    metadata_only = parsed.get("metadata", {}).get("jetspec.experimental.metadata_only", {}).get("value")
+    if metadata_only is not False:
+        errors.append("tensor payload GGUF must set jetspec.experimental.metadata_only=false")
+
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "status": "tensor_payload_plan_validated_no_runtime" if not errors else "tensor_payload_plan_invalid",
+        "tensor_count": parsed.get("tensor_count"),
+        "planned_tensor_count": len(planned),
+        "payload_bytes": expected_offset,
+        "expected_file_floor": expected_file_floor,
+        "checked_first": checked[:3],
+        "checked_last": checked[-3:],
+        "runtime_executed": False,
+    }
+
+
 def validate_jetspec_loader_contract(parsed: dict[str, Any], *, allow_tensor_payload: bool = False) -> dict[str, Any]:
     """Validate the future loader-visible JetSpec metadata contract."""
 
@@ -296,6 +369,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("gguf", nargs="?", type=pathlib.Path, help="GGUF preview to parse")
     parser.add_argument("--validate-jetspec-loader", action="store_true")
     parser.add_argument("--allow-tensor-payload", action="store_true", help="accept 91 tensor-info entries in addition to metadata-only previews")
+    parser.add_argument("--validate-tensor-payload-plan", type=pathlib.Path, help="validate parsed 91-tensor GGUF table against a conversion plan")
     parser.add_argument("--summary-only", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args(argv)
@@ -325,6 +399,13 @@ def main(argv: list[str]) -> int:
             }
         else:
             output = parsed
+        if args.validate_tensor_payload_plan is not None:
+            plan = json.loads(args.validate_tensor_payload_plan.read_text(encoding="utf-8"))
+            validation = validate_tensor_payload_against_plan(parsed, plan)
+            output = {"parsed": output, "validation": validation}
+            if not validation["ok"]:
+                print(json.dumps(output, indent=2, sort_keys=True))
+                return 1
         if args.validate_jetspec_loader:
             validation = validate_jetspec_loader_contract(parsed, allow_tensor_payload=args.allow_tensor_payload)
             output = {"parsed": output, "validation": validation}

@@ -11,6 +11,7 @@
 #include "sampling.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstring>
 #include <iomanip>
@@ -18,6 +19,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
+#include <limits>
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
@@ -95,6 +97,58 @@ static constexpr const char * JETSPEC_TRANSIENT_RESERVATION_DESCRIPTOR = "transi
 static constexpr const char * JETSPEC_TREE_BUILD_PHASE = "build_tree";
 static constexpr const char * JETSPEC_TREE_BUILD_ROLLBACK_POINT = "after_build_tree";
 static constexpr const char * JETSPEC_TREE_BUILD_DESCRIPTOR = "tree_build_descriptor_only";
+static constexpr const char * JETSPEC_ROOT_TREE_RUNTIME_PHASE = "root_tree_runtime";
+static constexpr const char * JETSPEC_ROOT_VERIFY_MASK_RUNTIME_PHASE = "root_verify_mask_runtime";
+static constexpr const char * JETSPEC_ROOT_ANCHOR_ACCEPT_PATH_RUNTIME_PHASE = "root_anchor_accept_path_runtime";
+static constexpr const char * JETSPEC_ROOT_TOKEN_COMMIT_NOOP_RUNTIME_PHASE = "root_token_commit_noop_runtime";
+static constexpr const char * JETSPEC_ROOT_HIDDEN_KV_COMMIT_NOOP_RUNTIME_PHASE = "root_hidden_kv_commit_noop_runtime";
+static constexpr const char * JETSPEC_ROOT_REJECTED_BRANCH_DISCARD_NOOP_RUNTIME_PHASE = "root_rejected_branch_discard_noop_runtime";
+static constexpr const char * JETSPEC_ROOT_PUBLISH_GATE_NOOP_RUNTIME_PHASE = "root_publish_gate_noop_runtime";
+static constexpr const char * JETSPEC_TOPK_TREE_RUNTIME_PHASE = "topk_tree_runtime";
+static constexpr const char * JETSPEC_TOPK_VERIFY_MASK_RUNTIME_PHASE = "topk_verify_mask_runtime";
+static constexpr const char * JETSPEC_TOPK_ACCEPT_BOUNDARY_RUNTIME_PHASE = "topk_accept_boundary_runtime";
+static constexpr const char * JETSPEC_REAL_DRAFT_HEAD_CANARY_RUNTIME_PHASE = "real_draft_head_canary";
+static constexpr const char * JETSPEC_REAL_DRAFT_HEAD_LOGITS_CANARY_RUNTIME_PHASE = "real_draft_head_logits_canary";
+static constexpr const char * JETSPEC_REAL_DRAFT_HEAD_TOPK_CANDIDATE_RUNTIME_PHASE = "real_draft_head_topk_candidate_runtime";
+static constexpr const char * JETSPEC_REAL_DRAFT_HEAD_TOPK_TREE_RUNTIME_PHASE = "real_draft_head_topk_tree_runtime";
+static constexpr const char * JETSPEC_REAL_DRAFT_HEAD_TOPK_VERIFY_MASK_RUNTIME_PHASE = "real_draft_head_topk_verify_mask_runtime";
+static constexpr const char * JETSPEC_REAL_DRAFT_HEAD_TOPK_ACCEPT_BOUNDARY_RUNTIME_PHASE = "real_draft_head_topk_accept_boundary_runtime";
+static constexpr const char * JETSPEC_REAL_DRAFT_HEAD_TOPK_ACCEPT_PATH_DESCRIPTOR_RUNTIME_PHASE = "real_draft_head_topk_accept_path_descriptor_runtime";
+static constexpr const char * JETSPEC_REAL_DRAFT_HEAD_TOPK_TOKEN_COMMIT_NOOP_RUNTIME_PHASE = "real_draft_head_topk_token_commit_noop_runtime";
+static constexpr const char * JETSPEC_REAL_DRAFT_HEAD_TOPK_HIDDEN_KV_COMMIT_NOOP_RUNTIME_PHASE = "real_draft_head_topk_hidden_kv_commit_noop_runtime";
+static constexpr const char * JETSPEC_REAL_DRAFT_HEAD_TOPK_REJECTED_BRANCH_DISCARD_NOOP_RUNTIME_PHASE = "real_draft_head_topk_rejected_branch_discard_noop_runtime";
+static constexpr const char * JETSPEC_REAL_DRAFT_HEAD_TOPK_PUBLISH_GATE_NOOP_RUNTIME_PHASE = "real_draft_head_topk_publish_gate_noop_runtime";
+static constexpr const char * JETSPEC_REAL_DRAFT_HEAD_TOPK_TARGET_LOGITS_WALK_CANARY_RUNTIME_PHASE = "real_draft_head_topk_target_logits_walk_canary_runtime";
+static constexpr const char * JETSPEC_REAL_DRAFT_HEAD_TOPK_LOGITS_SOURCE = "draft_head_full_vocab_logits";
+static constexpr const char * JETSPEC_TARGET_LOGITS_SOURCE = "target_model_full_vocab_logits";
+static constexpr const char * JETSPEC_TARGET_LOGITS_WALK_ROW_SEMANTICS = "parent_position_scores_candidate_children";
+static constexpr const char * JETSPEC_ACCEPT_DECISION_SOURCE_TARGET_LOGITS_CANARY_ONLY = "target_logits_canary_only_no_accept";
+static constexpr const char * JETSPEC_REAL_DRAFT_HEAD_TOPK_RANK_SEMANTICS = "rank_stable_descending_logit";
+static constexpr const char * JETSPEC_SYNTHETIC_FULL_VOCAB_SOFTMAX = "synthetic_full_vocab_softmax";
+static constexpr const char * JETSPEC_ACCEPT_DECISION_SOURCE_NONE_NO_LOGITS = "none_no_logits";
+static constexpr const char * JETSPEC_ACCEPT_DECISION_SOURCE_NONE_NO_TARGET_LOGITS = "none_no_target_logits";
+static constexpr int32_t JETSPEC_TOPK_ABI_WIDTH = 2;
+static constexpr int32_t JETSPEC_TOPK_ABI_DEPTH = 1;
+static constexpr int32_t JETSPEC_TOPK_ABI_NODES = 3;
+static constexpr int32_t JETSPEC_TOPK_ABI_NON_ROOT_NODES = 2;
+static constexpr int32_t JETSPEC_TOPK_ABI_MASK_ENTRIES = 5;
+static constexpr const char * JETSPEC_VERIFY_MASK_PHASE = "build_verify_mask";
+static constexpr const char * JETSPEC_VERIFY_MASK_ROLLBACK_POINT = "after_verify_mask";
+static constexpr const char * JETSPEC_VERIFY_MASK_DESCRIPTOR = "verify_mask_descriptor_only";
+static constexpr const char * JETSPEC_ACCEPT_PATH_PHASE = "accept_path";
+static constexpr const char * JETSPEC_ACCEPT_PATH_ROLLBACK_POINT = "after_accept";
+static constexpr const char * JETSPEC_ACCEPT_PATH_DESCRIPTOR = "accept_path_descriptor_only";
+static constexpr const char * JETSPEC_TOKEN_COMMIT_PHASE = "commit_tokens";
+static constexpr const char * JETSPEC_TOKEN_COMMIT_ROLLBACK_POINT = "after_token_commit";
+static constexpr const char * JETSPEC_TOKEN_COMMIT_DESCRIPTOR = "token_commit_descriptor_only";
+static constexpr const char * JETSPEC_HIDDEN_KV_SURVIVOR_COMMIT_PHASE = "commit_hidden_kv_survivors";
+static constexpr const char * JETSPEC_HIDDEN_KV_SURVIVOR_COMMIT_ROLLBACK_POINT = "after_hidden_kv_commit";
+static constexpr const char * JETSPEC_HIDDEN_KV_SURVIVOR_COMMIT_DESCRIPTOR = "hidden_kv_survivor_commit_descriptor_only";
+static constexpr const char * JETSPEC_REJECTED_BRANCH_DISCARD_PHASE = "discard_rejected_branches";
+static constexpr const char * JETSPEC_REJECTED_BRANCH_DISCARD_ROLLBACK_POINT = "after_rejected_discard";
+static constexpr const char * JETSPEC_REJECTED_BRANCH_DISCARD_DESCRIPTOR = "rejected_branch_discard_descriptor_only";
+static constexpr const char * JETSPEC_PUBLISH_GATE_PHASE = "publish_post_commit_state";
+static constexpr const char * JETSPEC_PUBLISH_GATE_DESCRIPTOR = "publish_gate_descriptor_only";
 static constexpr int32_t JETSPEC_TREE_ROOT_PARENT = -1;
 static constexpr int32_t JETSPEC_TREE_ROOT_DEPTH = 0;
 
@@ -121,24 +175,44 @@ static bool common_speculative_jetspec_expect_meta_str(
     return true;
 }
 
+static bool common_speculative_jetspec_meta_i32(
+        const llama_model * model, const char * key, int32_t & out, std::string & reason, bool required = true) {
+    char value[128] = {};
+    const int32_t n = llama_model_meta_val_str(model, key, value, sizeof(value));
+    if (n < 0) {
+        if (!required) {
+            return false;
+        }
+        reason = std::string("missing metadata ") + key;
+        return false;
+    }
+    char * end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value || (end != nullptr && *end != '\0') || parsed < INT32_MIN || parsed > INT32_MAX) {
+        reason = std::string("invalid integer metadata ") + key + "=" + value;
+        return false;
+    }
+    out = (int32_t) parsed;
+    return true;
+}
+
 static bool common_speculative_jetspec_preflight(
         const common_params_speculative_draft & params, int32_t tap_count, int32_t tap_width, std::string & reason) {
-    if (params.ctx_tgt == nullptr || params.ctx_dft == nullptr) {
-        reason = "missing target or draft context";
+    if (params.ctx_tgt == nullptr) {
+        reason = "missing target context";
         return false;
     }
 
     const llama_model * model_tgt = llama_get_model(params.ctx_tgt);
-    const llama_model * model_dft = llama_get_model(params.ctx_dft);
+    const llama_model * model_dft = params.ctx_dft != nullptr ? llama_get_model(params.ctx_dft) : params.model;
     if (model_tgt == nullptr || model_dft == nullptr) {
         reason = "missing target or draft model";
         return false;
     }
 
     const llama_vocab * vocab_tgt = llama_model_get_vocab(model_tgt);
-    const llama_vocab * vocab_dft = llama_model_get_vocab(model_dft);
-    if (vocab_tgt == nullptr || vocab_dft == nullptr) {
-        reason = "missing target or draft vocab";
+    if (vocab_tgt == nullptr) {
+        reason = "missing target vocab";
         return false;
     }
 
@@ -149,16 +223,29 @@ static bool common_speculative_jetspec_preflight(
         return false;
     }
 
+    int32_t draft_vocab = 0;
+    if (!common_speculative_jetspec_meta_i32(model_dft, "jetspec.vocab_size", draft_vocab, reason)) {
+        return false;
+    }
+
+    int32_t target_layers = llama_model_n_layer(model_tgt);
+    int32_t target_nextn = 0;
+    std::string optional_reason;
+    if (common_speculative_jetspec_meta_i32(model_tgt, "qwen35moe.nextn_predict_layers", target_nextn, optional_reason, false) &&
+            target_nextn > 0 && target_layers - target_nextn == JETSPEC_QWEN36_TARGET_LAYERS) {
+        target_layers -= target_nextn;
+    }
+
     const int32_t target_hidden = llama_model_n_embd(model_tgt);
     if (!common_speculative_jetspec_expect_i32("target.n_embd", target_hidden, JETSPEC_QWEN36_TARGET_HIDDEN, reason) ||
-        !common_speculative_jetspec_expect_i32("target.n_layer", llama_model_n_layer(model_tgt), JETSPEC_QWEN36_TARGET_LAYERS, reason) ||
+        !common_speculative_jetspec_expect_i32("target.effective_n_layer", target_layers, JETSPEC_QWEN36_TARGET_LAYERS, reason) ||
         !common_speculative_jetspec_expect_i32("target.vocab", llama_vocab_n_tokens(vocab_tgt), JETSPEC_QWEN36_VOCAB_SIZE, reason) ||
         !common_speculative_jetspec_expect_i32("draft.n_ctx_train", llama_model_n_ctx_train(model_dft), JETSPEC_QWEN36_DRAFT_BLOCK_SIZE, reason) ||
         !common_speculative_jetspec_expect_i32("draft.n_embd", llama_model_n_embd(model_dft), JETSPEC_QWEN36_TARGET_HIDDEN, reason) ||
         !common_speculative_jetspec_expect_i32("draft.n_layer", llama_model_n_layer(model_dft), JETSPEC_QWEN36_DRAFT_LAYERS, reason) ||
         !common_speculative_jetspec_expect_i32("draft.n_head", llama_model_n_head(model_dft), JETSPEC_QWEN36_DRAFT_HEADS, reason) ||
         !common_speculative_jetspec_expect_i32("draft.n_head_kv", llama_model_n_head_kv(model_dft), JETSPEC_QWEN36_DRAFT_HEADS_KV, reason) ||
-        !common_speculative_jetspec_expect_i32("draft.vocab", llama_vocab_n_tokens(vocab_dft), JETSPEC_QWEN36_VOCAB_SIZE, reason) ||
+        !common_speculative_jetspec_expect_i32("draft.vocab", draft_vocab, JETSPEC_QWEN36_VOCAB_SIZE, reason) ||
         !common_speculative_jetspec_expect_i32("target_tap_count", tap_count, JETSPEC_QWEN36_TARGET_TAP_COUNT, reason) ||
         !common_speculative_jetspec_expect_i32("target_tap_width", tap_width, JETSPEC_QWEN36_TARGET_TAP_WIDTH, reason) ||
         !common_speculative_jetspec_expect_i32("target_tap_width_vs_target", tap_width, tap_count * target_hidden, reason)) {
@@ -535,8 +622,12 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 };
 
+static int32_t common_speculative_jetspec_real_draft_head_canary_eval(llama_context * ctx, llama_batch batch) {
+    return llama_decode(ctx, batch);
+}
+
 struct common_speculative_impl_draft_jetspec : public common_speculative_impl {
-    common_params_speculative_draft params; // reuses draft ctx_tgt/ctx_dft binding, no draft-head graph yet
+    common_params_speculative_draft params; // reuses draft ctx_tgt/ctx_dft binding; P5AI can create ctx_dft behind an explicit canary gate
 
     enum class jetspec_runtime_phase {
         waiting_for_target_taps,
@@ -546,6 +637,31 @@ struct common_speculative_impl_draft_jetspec : public common_speculative_impl {
         transaction_plan_scaffold_ready,
         transient_reservation_descriptor_ready,
         tree_build_descriptor_ready,
+        tree_build_runtime_ready,
+        verify_mask_runtime_ready,
+        verify_mask_descriptor_ready,
+        real_draft_head_canary_ready,
+        real_draft_head_logits_canary_ready,
+        real_draft_head_topk_candidate_ready,
+        real_draft_head_topk_tree_ready,
+        real_draft_head_topk_verify_mask_ready,
+        real_draft_head_topk_accept_boundary_ready,
+        real_draft_head_topk_accept_path_descriptor_ready,
+        real_draft_head_topk_token_commit_noop_ready,
+        real_draft_head_topk_hidden_kv_commit_noop_ready,
+        real_draft_head_topk_rejected_branch_discard_noop_ready,
+        real_draft_head_topk_publish_gate_noop_ready,
+        real_draft_head_topk_target_logits_walk_canary_ready,
+        accept_path_runtime_ready,
+        token_commit_runtime_ready,
+        hidden_kv_commit_runtime_ready,
+        rejected_branch_discard_runtime_ready,
+        publish_gate_runtime_ready,
+        accept_path_descriptor_ready,
+        token_commit_descriptor_ready,
+        hidden_kv_survivor_commit_descriptor_ready,
+        rejected_branch_discard_descriptor_ready,
+        publish_gate_descriptor_ready,
         disabled,
     };
 
@@ -558,6 +674,34 @@ struct common_speculative_impl_draft_jetspec : public common_speculative_impl {
         invalid_transaction_plan,
         invalid_transient_reservation_descriptor,
         invalid_tree_build_descriptor,
+        invalid_root_tree_runtime,
+        invalid_root_verify_mask_runtime,
+        invalid_verify_mask_descriptor,
+        invalid_root_anchor_accept_path_runtime,
+        invalid_root_token_commit_noop_runtime,
+        invalid_root_hidden_kv_commit_noop_runtime,
+        invalid_root_rejected_branch_discard_noop_runtime,
+        invalid_root_publish_gate_noop_runtime,
+        invalid_topk_tree_runtime,
+        invalid_topk_verify_mask_runtime,
+        invalid_topk_accept_boundary_runtime,
+        invalid_real_draft_head_canary_runtime,
+        invalid_real_draft_head_logits_canary_runtime,
+        invalid_real_draft_head_topk_candidate_runtime,
+        invalid_real_draft_head_topk_tree_runtime,
+        invalid_real_draft_head_topk_verify_mask_runtime,
+        invalid_real_draft_head_topk_accept_boundary_runtime,
+        invalid_real_draft_head_topk_accept_path_descriptor_runtime,
+        invalid_real_draft_head_topk_token_commit_noop_runtime,
+        invalid_real_draft_head_topk_hidden_kv_commit_noop_runtime,
+        invalid_real_draft_head_topk_rejected_branch_discard_noop_runtime,
+        invalid_real_draft_head_topk_publish_gate_noop_runtime,
+        invalid_real_draft_head_topk_target_logits_walk_canary_runtime,
+        invalid_accept_path_descriptor,
+        invalid_token_commit_descriptor,
+        invalid_hidden_kv_survivor_commit_descriptor,
+        invalid_rejected_branch_discard_descriptor,
+        invalid_publish_gate_descriptor,
     };
 
     struct jetspec_target_tap_row_state {
@@ -576,6 +720,33 @@ struct common_speculative_impl_draft_jetspec : public common_speculative_impl {
     size_t n_transaction_plan_scaffolds = 0;
     size_t n_transient_reservation_descriptors = 0;
     size_t n_tree_build_descriptors = 0;
+    size_t n_root_tree_runtime_builds = 0;
+    size_t n_root_verify_mask_runtime_builds = 0;
+    size_t n_root_anchor_accept_path_runtime_builds = 0;
+    size_t n_root_token_commit_noop_runtime_builds = 0;
+    size_t n_root_hidden_kv_commit_noop_runtime_builds = 0;
+    size_t n_root_rejected_branch_discard_noop_runtime_builds = 0;
+    size_t n_root_publish_gate_noop_runtime_builds = 0;
+    size_t n_topk_tree_runtime_builds = 0;
+    size_t n_topk_verify_mask_runtime_builds = 0;
+    size_t n_topk_accept_boundary_runtime_builds = 0;
+    size_t n_real_draft_head_canary_decodes = 0;
+    size_t n_real_draft_head_topk_candidate_runtime_builds = 0;
+    size_t n_real_draft_head_topk_tree_runtime_builds = 0;
+    size_t n_real_draft_head_topk_verify_mask_runtime_builds = 0;
+    size_t n_real_draft_head_topk_accept_boundary_runtime_builds = 0;
+    size_t n_real_draft_head_topk_accept_path_descriptor_runtime_builds = 0;
+    size_t n_real_draft_head_topk_token_commit_noop_runtime_builds = 0;
+    size_t n_real_draft_head_topk_hidden_kv_commit_noop_runtime_builds = 0;
+    size_t n_real_draft_head_topk_rejected_branch_discard_noop_runtime_builds = 0;
+    size_t n_real_draft_head_topk_publish_gate_noop_runtime_builds = 0;
+    size_t n_real_draft_head_topk_target_logits_walk_canary_builds = 0;
+    size_t n_verify_mask_descriptors = 0;
+    size_t n_accept_path_descriptors = 0;
+    size_t n_token_commit_descriptors = 0;
+    size_t n_hidden_kv_survivor_commit_descriptors = 0;
+    size_t n_rejected_branch_discard_descriptors = 0;
+    size_t n_publish_gate_descriptors = 0;
     size_t n_pre_round_snapshots = 0;
     uint64_t target_tap_hash_last = 0;
     uint64_t pre_round_snapshot_hash_last = 0;
@@ -583,18 +754,144 @@ struct common_speculative_impl_draft_jetspec : public common_speculative_impl {
     uint64_t transaction_plan_hash_last = 0;
     uint64_t transient_reservation_hash_last = 0;
     uint64_t tree_build_descriptor_hash_last = 0;
+    uint64_t root_tree_runtime_hash_last = 0;
+    uint64_t root_verify_mask_runtime_hash_last = 0;
+    uint64_t root_anchor_accept_path_runtime_hash_last = 0;
+    uint64_t root_token_commit_noop_runtime_hash_last = 0;
+    uint64_t root_hidden_kv_commit_noop_runtime_hash_last = 0;
+    uint64_t root_rejected_branch_discard_noop_runtime_hash_last = 0;
+    uint64_t root_publish_gate_noop_runtime_hash_last = 0;
+    uint64_t topk_tree_runtime_hash_last = 0;
+    uint64_t topk_verify_mask_runtime_hash_last = 0;
+    uint64_t topk_accept_boundary_runtime_hash_last = 0;
+    uint64_t real_draft_head_canary_hash_last = 0;
+    uint64_t real_draft_head_topk_candidate_hash_last = 0;
+    uint64_t real_draft_head_topk_tree_hash_last = 0;
+    uint64_t real_draft_head_topk_verify_mask_hash_last = 0;
+    uint64_t real_draft_head_topk_accept_boundary_hash_last = 0;
+    uint64_t real_draft_head_topk_accept_path_descriptor_hash_last = 0;
+    uint64_t real_draft_head_topk_token_commit_noop_hash_last = 0;
+    uint64_t real_draft_head_topk_hidden_kv_commit_noop_hash_last = 0;
+    uint64_t real_draft_head_topk_rejected_branch_discard_noop_hash_last = 0;
+    uint64_t real_draft_head_topk_publish_gate_noop_hash_last = 0;
+    uint64_t real_draft_head_topk_target_logits_walk_canary_hash_last = 0;
+    uint64_t verify_mask_descriptor_hash_last = 0;
+    uint64_t accept_path_descriptor_hash_last = 0;
+    uint64_t token_commit_descriptor_hash_last = 0;
+    uint64_t hidden_kv_survivor_commit_descriptor_hash_last = 0;
+    uint64_t rejected_branch_discard_descriptor_hash_last = 0;
+    uint64_t publish_gate_descriptor_hash_last = 0;
     int32_t target_tap_count_last = 0;
     int32_t target_tap_width_last = 0;
     int32_t pre_round_seq_id_last = -1;
     int32_t transient_reservation_seq_id_last = -1;
     int32_t tree_build_seq_id_last = -1;
+    int32_t root_tree_runtime_seq_id_last = -1;
+    int32_t root_verify_mask_runtime_seq_id_last = -1;
+    int32_t root_anchor_accept_path_runtime_seq_id_last = -1;
+    int32_t root_token_commit_noop_runtime_seq_id_last = -1;
+    int32_t root_hidden_kv_commit_noop_runtime_seq_id_last = -1;
+    int32_t root_rejected_branch_discard_noop_runtime_seq_id_last = -1;
+    int32_t root_publish_gate_noop_runtime_seq_id_last = -1;
+    int32_t topk_tree_runtime_seq_id_last = -1;
+    int32_t topk_verify_mask_runtime_seq_id_last = -1;
+    int32_t topk_accept_boundary_runtime_seq_id_last = -1;
+    int32_t real_draft_head_topk_candidate_seq_id_last = -1;
+    int32_t real_draft_head_topk_tree_seq_id_last = -1;
+    int32_t real_draft_head_topk_verify_mask_seq_id_last = -1;
+    int32_t real_draft_head_topk_accept_boundary_seq_id_last = -1;
+    int32_t real_draft_head_topk_accept_path_descriptor_seq_id_last = -1;
+    int32_t real_draft_head_topk_token_commit_noop_seq_id_last = -1;
+    int32_t real_draft_head_topk_hidden_kv_commit_noop_seq_id_last = -1;
+    int32_t real_draft_head_topk_rejected_branch_discard_noop_seq_id_last = -1;
+    int32_t real_draft_head_topk_publish_gate_noop_seq_id_last = -1;
+    int32_t real_draft_head_topk_target_logits_walk_canary_seq_id_last = -1;
+    int32_t verify_mask_seq_id_last = -1;
+    int32_t accept_path_seq_id_last = -1;
+    int32_t token_commit_seq_id_last = -1;
+    int32_t hidden_kv_survivor_commit_seq_id_last = -1;
+    int32_t rejected_branch_discard_seq_id_last = -1;
+    int32_t publish_gate_seq_id_last = -1;
     size_t pre_round_prompt_tokens_last = 0;
+    llama_token pre_round_root_token_last = -1;
     int32_t transient_reservation_node_budget_last = 0;
     int32_t transient_reservation_actual_pages_last = 0;
     int32_t tree_build_node_budget_last = 0;
     int32_t tree_build_root_parent_last = JETSPEC_TREE_ROOT_PARENT;
     int32_t tree_build_root_depth_last = JETSPEC_TREE_ROOT_DEPTH;
     int32_t tree_build_actual_nodes_last = 0;
+    int32_t topk_tree_width_last = 0;
+    int32_t topk_tree_depth_last = 0;
+    int32_t topk_tree_non_root_nodes_last = 0;
+    int32_t topk_accept_candidate_nodes_last = 0;
+    int32_t topk_accept_boundary_verified_edges_last = 0;
+    int32_t topk_actual_verified_logits_rows_last = 0;
+    int32_t real_draft_head_canary_ctx_present_last = 0;
+    int32_t real_draft_head_canary_decode_rc_last = 0;
+    int32_t real_draft_head_canary_input_rows_last = 0;
+    int32_t real_draft_head_canary_input_width_last = 0;
+    int32_t real_draft_head_canary_output_rows_last = 0;
+    int32_t real_draft_head_canary_output_width_last = 0;
+    int32_t real_draft_head_canary_logits_rows_last = 0;
+    int32_t real_draft_head_canary_topk_rows_last = 0;
+    int32_t real_draft_head_canary_topk_k_last = 0;
+    int32_t real_draft_head_canary_top1_id_last = -1;
+    int32_t real_draft_head_canary_top2_id_last = -1;
+    float real_draft_head_canary_top1_logit_last = 0.0f;
+    float real_draft_head_canary_top2_logit_last = 0.0f;
+    int32_t real_draft_head_topk_parent_node_last = -1;
+    int32_t real_draft_head_topk_candidate_nodes_last = 0;
+    int32_t real_draft_head_topk_verified_logits_rows_last = 0;
+    std::array<llama_token, JETSPEC_TOPK_ABI_WIDTH> real_draft_head_topk_candidate_ids = {};
+    std::array<float, JETSPEC_TOPK_ABI_WIDTH> real_draft_head_topk_candidate_logits = {};
+    int32_t real_draft_head_topk_tree_nodes_last = 0;
+    std::array<llama_token, JETSPEC_TOPK_ABI_NODES> real_draft_head_topk_tree_token_ids = {};
+    std::array<int32_t, JETSPEC_TOPK_ABI_NODES> real_draft_head_topk_tree_parent_indices = {};
+    std::array<int32_t, JETSPEC_TOPK_ABI_NODES> real_draft_head_topk_tree_depth = {};
+    std::array<int32_t, JETSPEC_TOPK_ABI_NODES> real_draft_head_topk_tree_rank = {};
+    std::array<float, JETSPEC_TOPK_ABI_NODES> real_draft_head_topk_tree_cum_logit = {};
+    int32_t real_draft_head_topk_verify_mask_entries_last = 0;
+    std::array<int32_t, JETSPEC_TOPK_ABI_MASK_ENTRIES> real_draft_head_topk_verify_mask_rows = {};
+    std::array<int32_t, JETSPEC_TOPK_ABI_MASK_ENTRIES> real_draft_head_topk_verify_mask_cols = {};
+    std::array<uint8_t, JETSPEC_TOPK_ABI_MASK_ENTRIES> real_draft_head_topk_verify_mask_values = {};
+    int32_t real_draft_head_topk_accept_candidate_nodes_last = 0;
+    int32_t real_draft_head_topk_accept_boundary_verified_edges_last = 0;
+    int32_t real_draft_head_topk_actual_verified_logits_rows_last = 0;
+    int32_t real_draft_head_topk_accept_path_len_last = 0;
+    int32_t real_draft_head_topk_actual_accepted_nodes_last = 0;
+    int32_t real_draft_head_topk_correction_token_present_last = 0;
+    int32_t real_draft_head_topk_accept_path_descriptor_candidate_nodes_last = 0;
+    int32_t real_draft_head_topk_accept_path_descriptor_verified_edges_last = 0;
+    int32_t real_draft_head_topk_accept_path_descriptor_len_last = 0;
+    int32_t real_draft_head_topk_accept_path_descriptor_actual_accepted_nodes_last = 0;
+    int32_t real_draft_head_topk_accept_path_descriptor_correction_token_present_last = 0;
+    int32_t real_draft_head_topk_target_logits_planned_rows_last = 0;
+    int32_t real_draft_head_topk_target_logits_actual_rows_walked_last = 0;
+    int32_t real_draft_head_topk_target_logits_batch_index_last = -1;
+    int32_t real_draft_head_topk_target_logits_pos_last = -1;
+    int32_t real_draft_head_topk_target_logits_seq_id_last = -1;
+    int32_t real_draft_head_topk_target_logits_width_last = 0;
+    int32_t real_draft_head_topk_target_logits_candidate_nodes_last = 0;
+    std::array<float, JETSPEC_TOPK_ABI_WIDTH> real_draft_head_topk_target_logits_candidate_scores = {};
+    std::array<llama_token, JETSPEC_QWEN36_DRAFT_BLOCK_SIZE> tree_token_ids = {};
+    std::array<int32_t, JETSPEC_QWEN36_DRAFT_BLOCK_SIZE> tree_parent_indices = {};
+    std::array<int32_t, JETSPEC_QWEN36_DRAFT_BLOCK_SIZE> tree_depth = {};
+    std::array<int32_t, JETSPEC_QWEN36_DRAFT_BLOCK_SIZE> tree_rank = {};
+    std::array<float, JETSPEC_QWEN36_DRAFT_BLOCK_SIZE> tree_cum_logprob = {};
+    std::array<int32_t, JETSPEC_QWEN36_DRAFT_BLOCK_SIZE * JETSPEC_QWEN36_DRAFT_BLOCK_SIZE> root_verify_mask_rows = {};
+    std::array<int32_t, JETSPEC_QWEN36_DRAFT_BLOCK_SIZE * JETSPEC_QWEN36_DRAFT_BLOCK_SIZE> root_verify_mask_cols = {};
+    std::array<uint8_t, JETSPEC_QWEN36_DRAFT_BLOCK_SIZE * JETSPEC_QWEN36_DRAFT_BLOCK_SIZE> root_verify_mask_values = {};
+    int32_t actual_verify_mask_entries_last = 0;
+    int32_t root_verified_anchor_last = 0;
+    int32_t accept_path_len_last = 0;
+    int32_t actual_accepted_nodes_last = 0;
+    int32_t correction_token_present_last = 0;
+    int32_t actual_committed_tokens_last = 0;
+    int32_t actual_survivor_pages_committed_last = 0;
+    int32_t actual_pages_discarded_last = 0;
+    int32_t rejected_branch_pages_reachable_after_discard_last = 0;
+    int32_t actual_publish_visible_state_last = 0;
+    int32_t root_runtime_ready_for_real_test_last = 0;
     int32_t transaction_plan_phase_count_last = 0;
     int32_t transaction_plan_rollback_count_last = 0;
     jetspec_runtime_phase runtime_phase = jetspec_runtime_phase::waiting_for_target_taps;
@@ -604,7 +901,57 @@ struct common_speculative_impl_draft_jetspec : public common_speculative_impl {
     bool transaction_plan_ready = false;
     bool transient_reservation_ready = false;
     bool tree_build_descriptor_ready = false;
+    bool root_tree_runtime_ready = false;
+    bool root_verify_mask_runtime_ready = false;
+    bool root_anchor_accept_path_runtime_ready = false;
+    bool root_token_commit_noop_runtime_ready = false;
+    bool root_hidden_kv_commit_noop_runtime_ready = false;
+    bool root_rejected_branch_discard_noop_runtime_ready = false;
+    bool root_publish_gate_noop_runtime_ready = false;
+    bool topk_tree_runtime_ready = false;
+    bool topk_verify_mask_runtime_ready = false;
+    bool topk_accept_boundary_runtime_ready = false;
+    bool real_draft_head_canary_ready = false;
+    bool real_draft_head_logits_canary_ready = false;
+    bool real_draft_head_topk_candidate_runtime_ready = false;
+    bool real_draft_head_topk_tree_runtime_ready = false;
+    bool real_draft_head_topk_verify_mask_runtime_ready = false;
+    bool real_draft_head_topk_accept_boundary_runtime_ready = false;
+    bool real_draft_head_topk_accept_path_descriptor_runtime_ready = false;
+    bool real_draft_head_topk_token_commit_noop_runtime_ready = false;
+    bool real_draft_head_topk_hidden_kv_commit_noop_runtime_ready = false;
+    bool real_draft_head_topk_rejected_branch_discard_noop_runtime_ready = false;
+    bool real_draft_head_topk_publish_gate_noop_runtime_ready = false;
+    bool real_draft_head_topk_target_logits_walk_canary_ready = false;
+    bool verify_mask_descriptor_ready = false;
+    bool accept_path_descriptor_ready = false;
+    bool token_commit_descriptor_ready = false;
+    bool hidden_kv_survivor_commit_descriptor_ready = false;
+    bool rejected_branch_discard_descriptor_ready = false;
+    bool publish_gate_descriptor_ready = false;
     bool trace_taps = false;
+    bool p5x_root_tree_enabled = false;
+    bool p5y_root_verify_mask_enabled = false;
+    bool p5z_root_anchor_accept_path_enabled = false;
+    bool p5aa_root_token_commit_noop_enabled = false;
+    bool p5ab_root_hidden_kv_commit_noop_enabled = false;
+    bool p5ac_root_rejected_branch_discard_noop_enabled = false;
+    bool p5ad_root_publish_gate_noop_enabled = false;
+    bool p5ae_topk_tree_enabled = false;
+    bool p5af_topk_verify_mask_enabled = false;
+    bool p5ag_topk_accept_boundary_enabled = false;
+    bool p5ai_real_draft_head_canary_enabled = false;
+    bool p5aj_real_draft_head_logits_canary_enabled = false;
+    bool p5ak_real_draft_head_topk_candidate_enabled = false;
+    bool p5al_real_draft_head_topk_tree_enabled = false;
+    bool p5am_real_draft_head_topk_verify_mask_enabled = false;
+    bool p5an_real_draft_head_topk_accept_boundary_enabled = false;
+    bool p5ao_real_draft_head_topk_accept_path_descriptor_enabled = false;
+    bool p5ap_real_draft_head_topk_token_commit_noop_enabled = false;
+    bool p5aq_real_draft_head_topk_hidden_kv_commit_noop_enabled = false;
+    bool p5ar_real_draft_head_topk_rejected_branch_discard_noop_enabled = false;
+    bool p5as_real_draft_head_topk_publish_gate_noop_enabled = false;
+    bool p5av_real_draft_head_topk_target_logits_walk_canary_enabled = false;
 
     static const char * jetspec_runtime_phase_name(jetspec_runtime_phase phase) {
         switch (phase) {
@@ -612,10 +959,35 @@ struct common_speculative_impl_draft_jetspec : public common_speculative_impl {
             case jetspec_runtime_phase::waiting_for_pre_round_snapshot:  return "waiting_for_pre_round_snapshot";
             case jetspec_runtime_phase::pre_round_snapshot_ready:        return "pre_round_snapshot_ready";
             case jetspec_runtime_phase::target_taps_captured:           return "target_taps_captured";
-            case jetspec_runtime_phase::transaction_plan_scaffold_ready:        return "transaction_plan_scaffold_ready";
-            case jetspec_runtime_phase::transient_reservation_descriptor_ready: return "transient_reservation_descriptor_ready";
-            case jetspec_runtime_phase::tree_build_descriptor_ready:            return "tree_build_descriptor_ready";
-            case jetspec_runtime_phase::disabled:                              return "disabled";
+            case jetspec_runtime_phase::transaction_plan_scaffold_ready:             return "transaction_plan_scaffold_ready";
+            case jetspec_runtime_phase::transient_reservation_descriptor_ready:      return "transient_reservation_descriptor_ready";
+            case jetspec_runtime_phase::tree_build_descriptor_ready:                 return "tree_build_descriptor_ready";
+            case jetspec_runtime_phase::tree_build_runtime_ready:                    return "tree_build_runtime_ready";
+            case jetspec_runtime_phase::verify_mask_runtime_ready:                   return "verify_mask_runtime_ready";
+            case jetspec_runtime_phase::verify_mask_descriptor_ready:                return "verify_mask_descriptor_ready";
+            case jetspec_runtime_phase::real_draft_head_canary_ready:                return "real_draft_head_canary_ready";
+            case jetspec_runtime_phase::real_draft_head_logits_canary_ready:         return "real_draft_head_logits_canary_ready";
+            case jetspec_runtime_phase::real_draft_head_topk_candidate_ready:        return "real_draft_head_topk_candidate_ready";
+            case jetspec_runtime_phase::real_draft_head_topk_tree_ready:             return "real_draft_head_topk_tree_ready";
+            case jetspec_runtime_phase::real_draft_head_topk_verify_mask_ready:      return "real_draft_head_topk_verify_mask_ready";
+            case jetspec_runtime_phase::real_draft_head_topk_accept_boundary_ready:  return "real_draft_head_topk_accept_boundary_ready";
+            case jetspec_runtime_phase::real_draft_head_topk_accept_path_descriptor_ready: return "real_draft_head_topk_accept_path_descriptor_ready";
+            case jetspec_runtime_phase::real_draft_head_topk_token_commit_noop_ready: return "real_draft_head_topk_token_commit_noop_ready";
+            case jetspec_runtime_phase::real_draft_head_topk_hidden_kv_commit_noop_ready: return "real_draft_head_topk_hidden_kv_commit_noop_ready";
+            case jetspec_runtime_phase::real_draft_head_topk_rejected_branch_discard_noop_ready: return "real_draft_head_topk_rejected_branch_discard_noop_ready";
+            case jetspec_runtime_phase::real_draft_head_topk_publish_gate_noop_ready: return "real_draft_head_topk_publish_gate_noop_ready";
+            case jetspec_runtime_phase::real_draft_head_topk_target_logits_walk_canary_ready: return "real_draft_head_topk_target_logits_walk_canary_ready";
+            case jetspec_runtime_phase::accept_path_runtime_ready:                   return "accept_path_runtime_ready";
+            case jetspec_runtime_phase::token_commit_runtime_ready:                  return "token_commit_runtime_ready";
+            case jetspec_runtime_phase::hidden_kv_commit_runtime_ready:              return "hidden_kv_commit_runtime_ready";
+            case jetspec_runtime_phase::rejected_branch_discard_runtime_ready:        return "rejected_branch_discard_runtime_ready";
+            case jetspec_runtime_phase::publish_gate_runtime_ready:                   return "publish_gate_runtime_ready";
+            case jetspec_runtime_phase::accept_path_descriptor_ready:                return "accept_path_descriptor_ready";
+            case jetspec_runtime_phase::token_commit_descriptor_ready:               return "token_commit_descriptor_ready";
+            case jetspec_runtime_phase::hidden_kv_survivor_commit_descriptor_ready:  return "hidden_kv_survivor_commit_descriptor_ready";
+            case jetspec_runtime_phase::rejected_branch_discard_descriptor_ready:    return "rejected_branch_discard_descriptor_ready";
+            case jetspec_runtime_phase::publish_gate_descriptor_ready:               return "publish_gate_descriptor_ready";
+            case jetspec_runtime_phase::disabled:                                   return "disabled";
         }
         return "unknown";
     }
@@ -627,9 +999,37 @@ struct common_speculative_impl_draft_jetspec : public common_speculative_impl {
             case jetspec_runtime_failure::invalid_binding:          return "invalid_binding";
             case jetspec_runtime_failure::invalid_target_taps:        return "invalid_target_taps";
             case jetspec_runtime_failure::invalid_pre_round_snapshot: return "invalid_pre_round_snapshot";
-            case jetspec_runtime_failure::invalid_transaction_plan:                    return "invalid_transaction_plan";
-            case jetspec_runtime_failure::invalid_transient_reservation_descriptor:     return "invalid_transient_reservation_descriptor";
-            case jetspec_runtime_failure::invalid_tree_build_descriptor:                return "invalid_tree_build_descriptor";
+            case jetspec_runtime_failure::invalid_transaction_plan:                         return "invalid_transaction_plan";
+            case jetspec_runtime_failure::invalid_transient_reservation_descriptor:          return "invalid_transient_reservation_descriptor";
+            case jetspec_runtime_failure::invalid_tree_build_descriptor:                     return "invalid_tree_build_descriptor";
+            case jetspec_runtime_failure::invalid_root_tree_runtime:                         return "invalid_root_tree_runtime";
+            case jetspec_runtime_failure::invalid_root_verify_mask_runtime:                  return "invalid_root_verify_mask_runtime";
+            case jetspec_runtime_failure::invalid_verify_mask_descriptor:                    return "invalid_verify_mask_descriptor";
+            case jetspec_runtime_failure::invalid_root_anchor_accept_path_runtime:            return "invalid_root_anchor_accept_path_runtime";
+            case jetspec_runtime_failure::invalid_root_token_commit_noop_runtime:             return "invalid_root_token_commit_noop_runtime";
+            case jetspec_runtime_failure::invalid_root_hidden_kv_commit_noop_runtime:         return "invalid_root_hidden_kv_commit_noop_runtime";
+            case jetspec_runtime_failure::invalid_root_rejected_branch_discard_noop_runtime:    return "invalid_root_rejected_branch_discard_noop_runtime";
+            case jetspec_runtime_failure::invalid_root_publish_gate_noop_runtime:               return "invalid_root_publish_gate_noop_runtime";
+            case jetspec_runtime_failure::invalid_topk_tree_runtime:                         return "invalid_topk_tree_runtime";
+            case jetspec_runtime_failure::invalid_topk_verify_mask_runtime:                  return "invalid_topk_verify_mask_runtime";
+            case jetspec_runtime_failure::invalid_topk_accept_boundary_runtime:              return "invalid_topk_accept_boundary_runtime";
+            case jetspec_runtime_failure::invalid_real_draft_head_canary_runtime:            return "invalid_real_draft_head_canary_runtime";
+            case jetspec_runtime_failure::invalid_real_draft_head_logits_canary_runtime:     return "invalid_real_draft_head_logits_canary_runtime";
+            case jetspec_runtime_failure::invalid_real_draft_head_topk_candidate_runtime:          return "invalid_real_draft_head_topk_candidate_runtime";
+            case jetspec_runtime_failure::invalid_real_draft_head_topk_tree_runtime:               return "invalid_real_draft_head_topk_tree_runtime";
+            case jetspec_runtime_failure::invalid_real_draft_head_topk_verify_mask_runtime:        return "invalid_real_draft_head_topk_verify_mask_runtime";
+            case jetspec_runtime_failure::invalid_real_draft_head_topk_accept_boundary_runtime:    return "invalid_real_draft_head_topk_accept_boundary_runtime";
+            case jetspec_runtime_failure::invalid_real_draft_head_topk_accept_path_descriptor_runtime: return "invalid_real_draft_head_topk_accept_path_descriptor_runtime";
+            case jetspec_runtime_failure::invalid_real_draft_head_topk_token_commit_noop_runtime: return "invalid_real_draft_head_topk_token_commit_noop_runtime";
+            case jetspec_runtime_failure::invalid_real_draft_head_topk_hidden_kv_commit_noop_runtime: return "invalid_real_draft_head_topk_hidden_kv_commit_noop_runtime";
+            case jetspec_runtime_failure::invalid_real_draft_head_topk_rejected_branch_discard_noop_runtime: return "invalid_real_draft_head_topk_rejected_branch_discard_noop_runtime";
+            case jetspec_runtime_failure::invalid_real_draft_head_topk_publish_gate_noop_runtime: return "invalid_real_draft_head_topk_publish_gate_noop_runtime";
+            case jetspec_runtime_failure::invalid_real_draft_head_topk_target_logits_walk_canary_runtime: return "invalid_real_draft_head_topk_target_logits_walk_canary_runtime";
+            case jetspec_runtime_failure::invalid_accept_path_descriptor:                          return "invalid_accept_path_descriptor";
+            case jetspec_runtime_failure::invalid_token_commit_descriptor:                   return "invalid_token_commit_descriptor";
+            case jetspec_runtime_failure::invalid_hidden_kv_survivor_commit_descriptor:      return "invalid_hidden_kv_survivor_commit_descriptor";
+            case jetspec_runtime_failure::invalid_rejected_branch_discard_descriptor:        return "invalid_rejected_branch_discard_descriptor";
+            case jetspec_runtime_failure::invalid_publish_gate_descriptor:                   return "invalid_publish_gate_descriptor";
         }
         return "unknown";
     }
@@ -640,18 +1040,146 @@ struct common_speculative_impl_draft_jetspec : public common_speculative_impl {
         trace_taps = common_speculative_env_enabled("LLAMA_JETSPEC_TRACE") ||
                      common_speculative_env_enabled("LLAMA_JETSPEC_TAP_TRACE") ||
                      common_speculative_env_enabled("LLAMA_JETSPEC_STATE_TRACE");
+        p5x_root_tree_enabled = common_speculative_env_enabled("LLAMA_JETSPEC_TREE_BUILD_ROOT_ONLY");
+        p5y_root_verify_mask_enabled = common_speculative_env_enabled("LLAMA_JETSPEC_VERIFY_MASK_ROOT_ONLY");
+        p5z_root_anchor_accept_path_enabled = common_speculative_env_enabled("LLAMA_JETSPEC_ROOT_ANCHOR_ACCEPT_PATH_ONLY");
+        p5aa_root_token_commit_noop_enabled = common_speculative_env_enabled("LLAMA_JETSPEC_ROOT_TOKEN_COMMIT_NOOP_ONLY");
+        p5ab_root_hidden_kv_commit_noop_enabled = common_speculative_env_enabled("LLAMA_JETSPEC_ROOT_HIDDEN_KV_COMMIT_NOOP_ONLY");
+        p5ac_root_rejected_branch_discard_noop_enabled = common_speculative_env_enabled("LLAMA_JETSPEC_ROOT_REJECTED_BRANCH_DISCARD_NOOP_ONLY");
+        p5ad_root_publish_gate_noop_enabled = common_speculative_env_enabled("LLAMA_JETSPEC_ROOT_PUBLISH_GATE_NOOP_ONLY");
+        p5ae_topk_tree_enabled = common_speculative_env_enabled("LLAMA_JETSPEC_TREE_BUILD_TOPK_ABI_ONLY");
+        p5af_topk_verify_mask_enabled = common_speculative_env_enabled("LLAMA_JETSPEC_VERIFY_MASK_TOPK_ABI_ONLY");
+        p5ag_topk_accept_boundary_enabled = common_speculative_env_enabled("LLAMA_JETSPEC_ACCEPT_PATH_TOPK_ABI_ONLY");
+        p5aj_real_draft_head_logits_canary_enabled = common_speculative_env_enabled("LLAMA_JETSPEC_REAL_DRAFT_HEAD_LOGITS_CANARY");
+        p5ak_real_draft_head_topk_candidate_enabled = common_speculative_env_enabled("LLAMA_JETSPEC_REAL_DRAFT_HEAD_TOPK_ABI_ONLY");
+        p5al_real_draft_head_topk_tree_enabled = common_speculative_env_enabled("LLAMA_JETSPEC_REAL_DRAFT_HEAD_TOPK_TREE_ABI_ONLY");
+        p5am_real_draft_head_topk_verify_mask_enabled = common_speculative_env_enabled("LLAMA_JETSPEC_REAL_DRAFT_HEAD_TOPK_VERIFY_MASK_ABI_ONLY");
+        p5an_real_draft_head_topk_accept_boundary_enabled = common_speculative_env_enabled("LLAMA_JETSPEC_REAL_DRAFT_HEAD_TOPK_ACCEPT_BOUNDARY_ABI_ONLY");
+        p5ao_real_draft_head_topk_accept_path_descriptor_enabled = common_speculative_env_enabled("LLAMA_JETSPEC_REAL_DRAFT_HEAD_TOPK_ACCEPT_PATH_DESCRIPTOR_ABI_ONLY");
+        p5ap_real_draft_head_topk_token_commit_noop_enabled = common_speculative_env_enabled("LLAMA_JETSPEC_REAL_DRAFT_HEAD_TOPK_TOKEN_COMMIT_NOOP_ABI_ONLY");
+        p5aq_real_draft_head_topk_hidden_kv_commit_noop_enabled = common_speculative_env_enabled("LLAMA_JETSPEC_REAL_DRAFT_HEAD_TOPK_HIDDEN_KV_COMMIT_NOOP_ABI_ONLY");
+        p5ar_real_draft_head_topk_rejected_branch_discard_noop_enabled = common_speculative_env_enabled("LLAMA_JETSPEC_REAL_DRAFT_HEAD_TOPK_REJECTED_BRANCH_DISCARD_NOOP_ABI_ONLY");
+        p5as_real_draft_head_topk_publish_gate_noop_enabled = common_speculative_env_enabled("LLAMA_JETSPEC_REAL_DRAFT_HEAD_TOPK_PUBLISH_GATE_NOOP_ABI_ONLY");
+        p5av_real_draft_head_topk_target_logits_walk_canary_enabled = common_speculative_env_enabled("LLAMA_JETSPEC_REAL_DRAFT_HEAD_TOPK_TARGET_LOGITS_WALK_CANARY");
+        p5ai_real_draft_head_canary_enabled = common_speculative_env_enabled("LLAMA_JETSPEC_REAL_DRAFT_HEAD_CANARY") || p5aj_real_draft_head_logits_canary_enabled;
         if (this->params.ctx_tgt != nullptr) {
             llama_set_jetspec_target_hidden_taps(this->params.ctx_tgt, true, true);
         } else {
             disable_runtime_state(jetspec_runtime_failure::missing_target_context, 0, 0, nullptr);
         }
-        LOG_WRN("%s: draft-jetspec accepted as P5F binding-preflight/runtime-state/tap-ingestion route; runtime_supported=false, no draft tokens will be generated\n", __func__);
+        LOG_WRN("%s: draft-jetspec accepted as P5F binding-preflight plus P5N-P5W descriptor route; P5X root tree=%d P5Y root verify mask=%d P5Z root anchor accept path=%d P5AA root token commit noop=%d P5AB root hidden/KV noop=%d P5AC root discard noop=%d P5AD root publish noop=%d P5AE topk tree ABI=%d P5AF topk verify mask ABI=%d P5AG topk accept boundary ABI=%d P5AI real draft-head canary=%d P5AJ real draft-head logits canary=%d P5AK real draft-head topk ABI=%d P5AL real draft-head topk tree ABI=%d P5AM real draft-head topk verify mask ABI=%d P5AN real draft-head topk accept boundary ABI=%d P5AO real draft-head topk accept path descriptor ABI=%d P5AP real draft-head topk token commit noop ABI=%d P5AQ real draft-head topk hidden/KV commit noop ABI=%d P5AR real draft-head topk rejected-discard noop ABI=%d P5AS real draft-head topk publish-gate noop ABI=%d P5AV target-logits walk canary=%d; runtime_supported=false, no draft tokens will be generated\n", __func__, p5x_root_tree_enabled ? 1 : 0, p5y_root_verify_mask_enabled ? 1 : 0, p5z_root_anchor_accept_path_enabled ? 1 : 0, p5aa_root_token_commit_noop_enabled ? 1 : 0, p5ab_root_hidden_kv_commit_noop_enabled ? 1 : 0, p5ac_root_rejected_branch_discard_noop_enabled ? 1 : 0, p5ad_root_publish_gate_noop_enabled ? 1 : 0, p5ae_topk_tree_enabled ? 1 : 0, p5af_topk_verify_mask_enabled ? 1 : 0, p5ag_topk_accept_boundary_enabled ? 1 : 0, p5ai_real_draft_head_canary_enabled ? 1 : 0, p5aj_real_draft_head_logits_canary_enabled ? 1 : 0, p5ak_real_draft_head_topk_candidate_enabled ? 1 : 0, p5al_real_draft_head_topk_tree_enabled ? 1 : 0, p5am_real_draft_head_topk_verify_mask_enabled ? 1 : 0, p5an_real_draft_head_topk_accept_boundary_enabled ? 1 : 0, p5ao_real_draft_head_topk_accept_path_descriptor_enabled ? 1 : 0, p5ap_real_draft_head_topk_token_commit_noop_enabled ? 1 : 0, p5aq_real_draft_head_topk_hidden_kv_commit_noop_enabled ? 1 : 0, p5ar_real_draft_head_topk_rejected_branch_discard_noop_enabled ? 1 : 0, p5as_real_draft_head_topk_publish_gate_noop_enabled ? 1 : 0, p5av_real_draft_head_topk_target_logits_walk_canary_enabled ? 1 : 0);
     }
 
     ~common_speculative_impl_draft_jetspec() override {
         if (params.ctx_tgt != nullptr) {
             llama_set_jetspec_target_hidden_taps(params.ctx_tgt, false, true);
         }
+    }
+
+    void reset_tree_arrays() {
+        for (int32_t i = 0; i < JETSPEC_QWEN36_DRAFT_BLOCK_SIZE; ++i) {
+            tree_token_ids[i] = -1;
+            tree_parent_indices[i] = JETSPEC_TREE_ROOT_PARENT;
+            tree_depth[i] = JETSPEC_TREE_ROOT_DEPTH;
+            tree_rank[i] = -1;
+            tree_cum_logprob[i] = 0.0f;
+        }
+    }
+
+    void reset_verify_mask_arrays() {
+        for (int32_t i = 0; i < JETSPEC_QWEN36_DRAFT_BLOCK_SIZE * JETSPEC_QWEN36_DRAFT_BLOCK_SIZE; ++i) {
+            root_verify_mask_rows[i] = 0;
+            root_verify_mask_cols[i] = 0;
+            root_verify_mask_values[i] = 0;
+        }
+    }
+
+    void reset_real_draft_head_topk_tree_arrays() {
+        real_draft_head_topk_tree_token_ids.fill(-1);
+        real_draft_head_topk_tree_parent_indices.fill(JETSPEC_TREE_ROOT_PARENT);
+        real_draft_head_topk_tree_depth.fill(JETSPEC_TREE_ROOT_DEPTH);
+        real_draft_head_topk_tree_rank.fill(-1);
+        real_draft_head_topk_tree_cum_logit.fill(0.0f);
+    }
+
+    void reset_real_draft_head_topk_verify_mask_arrays() {
+        real_draft_head_topk_verify_mask_rows.fill(0);
+        real_draft_head_topk_verify_mask_cols.fill(0);
+        real_draft_head_topk_verify_mask_values.fill(0);
+        reset_real_draft_head_topk_accept_boundary_metadata();
+    }
+
+    void reset_real_draft_head_topk_accept_boundary_metadata() {
+        real_draft_head_topk_accept_boundary_runtime_ready = false;
+        real_draft_head_topk_accept_boundary_hash_last = 0;
+        real_draft_head_topk_accept_boundary_seq_id_last = -1;
+        real_draft_head_topk_accept_candidate_nodes_last = 0;
+        real_draft_head_topk_accept_boundary_verified_edges_last = 0;
+        real_draft_head_topk_actual_verified_logits_rows_last = 0;
+        real_draft_head_topk_accept_path_len_last = 0;
+        real_draft_head_topk_actual_accepted_nodes_last = 0;
+        real_draft_head_topk_correction_token_present_last = 0;
+        reset_real_draft_head_topk_accept_path_descriptor_metadata();
+    }
+
+    void reset_real_draft_head_topk_accept_path_descriptor_metadata() {
+        real_draft_head_topk_accept_path_descriptor_runtime_ready = false;
+        real_draft_head_topk_accept_path_descriptor_hash_last = 0;
+        real_draft_head_topk_accept_path_descriptor_seq_id_last = -1;
+        real_draft_head_topk_accept_path_descriptor_candidate_nodes_last = 0;
+        real_draft_head_topk_accept_path_descriptor_verified_edges_last = 0;
+        real_draft_head_topk_accept_path_descriptor_len_last = 0;
+        real_draft_head_topk_accept_path_descriptor_actual_accepted_nodes_last = 0;
+        real_draft_head_topk_accept_path_descriptor_correction_token_present_last = 0;
+        reset_real_draft_head_topk_token_commit_noop_metadata();
+    }
+
+    void reset_real_draft_head_topk_token_commit_noop_metadata() {
+        real_draft_head_topk_token_commit_noop_runtime_ready = false;
+        real_draft_head_topk_token_commit_noop_hash_last = 0;
+        real_draft_head_topk_token_commit_noop_seq_id_last = -1;
+        reset_real_draft_head_topk_hidden_kv_commit_noop_metadata();
+    }
+
+    void reset_real_draft_head_topk_hidden_kv_commit_noop_metadata() {
+        real_draft_head_topk_hidden_kv_commit_noop_runtime_ready = false;
+        real_draft_head_topk_hidden_kv_commit_noop_hash_last = 0;
+        real_draft_head_topk_hidden_kv_commit_noop_seq_id_last = -1;
+        reset_real_draft_head_topk_rejected_branch_discard_noop_metadata();
+    }
+
+    void reset_real_draft_head_topk_rejected_branch_discard_noop_metadata() {
+        real_draft_head_topk_rejected_branch_discard_noop_runtime_ready = false;
+        real_draft_head_topk_rejected_branch_discard_noop_hash_last = 0;
+        real_draft_head_topk_rejected_branch_discard_noop_seq_id_last = -1;
+        reset_real_draft_head_topk_publish_gate_noop_metadata();
+    }
+
+    void reset_real_draft_head_topk_publish_gate_noop_metadata() {
+        real_draft_head_topk_publish_gate_noop_runtime_ready = false;
+        real_draft_head_topk_publish_gate_noop_hash_last = 0;
+        real_draft_head_topk_publish_gate_noop_seq_id_last = -1;
+        reset_real_draft_head_topk_target_logits_walk_canary_metadata();
+    }
+
+    void reset_real_draft_head_topk_target_logits_walk_canary_metadata() {
+        real_draft_head_topk_target_logits_walk_canary_ready = false;
+        real_draft_head_topk_target_logits_walk_canary_hash_last = 0;
+        real_draft_head_topk_target_logits_walk_canary_seq_id_last = -1;
+        real_draft_head_topk_target_logits_planned_rows_last = 0;
+        real_draft_head_topk_target_logits_actual_rows_walked_last = 0;
+        real_draft_head_topk_target_logits_batch_index_last = -1;
+        real_draft_head_topk_target_logits_pos_last = -1;
+        real_draft_head_topk_target_logits_seq_id_last = -1;
+        real_draft_head_topk_target_logits_width_last = 0;
+        real_draft_head_topk_target_logits_candidate_nodes_last = 0;
+        real_draft_head_topk_target_logits_candidate_scores.fill(0.0f);
+    }
+
+    bool topk_abi_root_tail_conflict() const {
+        return p5y_root_verify_mask_enabled || p5z_root_anchor_accept_path_enabled ||
+               p5aa_root_token_commit_noop_enabled || p5ab_root_hidden_kv_commit_noop_enabled ||
+               p5ac_root_rejected_branch_discard_noop_enabled || p5ad_root_publish_gate_noop_enabled;
     }
 
     void reset_runtime_state() {
@@ -661,24 +1189,145 @@ struct common_speculative_impl_draft_jetspec : public common_speculative_impl {
         transaction_plan_hash_last = 0;
         transient_reservation_hash_last = 0;
         tree_build_descriptor_hash_last = 0;
+        root_tree_runtime_hash_last = 0;
+        root_verify_mask_runtime_hash_last = 0;
+        root_anchor_accept_path_runtime_hash_last = 0;
+        root_token_commit_noop_runtime_hash_last = 0;
+        root_hidden_kv_commit_noop_runtime_hash_last = 0;
+        root_rejected_branch_discard_noop_runtime_hash_last = 0;
+        root_publish_gate_noop_runtime_hash_last = 0;
+        topk_tree_runtime_hash_last = 0;
+        topk_verify_mask_runtime_hash_last = 0;
+        topk_accept_boundary_runtime_hash_last = 0;
+        real_draft_head_canary_hash_last = 0;
+        real_draft_head_topk_candidate_hash_last = 0;
+        real_draft_head_topk_tree_hash_last = 0;
+        real_draft_head_topk_verify_mask_hash_last = 0;
+        real_draft_head_topk_accept_boundary_hash_last = 0;
+        real_draft_head_topk_accept_path_descriptor_hash_last = 0;
+        real_draft_head_topk_token_commit_noop_hash_last = 0;
+        real_draft_head_topk_hidden_kv_commit_noop_hash_last = 0;
+        real_draft_head_topk_rejected_branch_discard_noop_hash_last = 0;
+        real_draft_head_topk_publish_gate_noop_hash_last = 0;
+        real_draft_head_topk_target_logits_walk_canary_hash_last = 0;
+        verify_mask_descriptor_hash_last = 0;
+        accept_path_descriptor_hash_last = 0;
+        token_commit_descriptor_hash_last = 0;
+        hidden_kv_survivor_commit_descriptor_hash_last = 0;
+        rejected_branch_discard_descriptor_hash_last = 0;
+        publish_gate_descriptor_hash_last = 0;
         target_tap_count_last = 0;
         target_tap_width_last = 0;
         pre_round_seq_id_last = -1;
         transient_reservation_seq_id_last = -1;
         tree_build_seq_id_last = -1;
+        root_tree_runtime_seq_id_last = -1;
+        root_verify_mask_runtime_seq_id_last = -1;
+        root_anchor_accept_path_runtime_seq_id_last = -1;
+        root_token_commit_noop_runtime_seq_id_last = -1;
+        root_hidden_kv_commit_noop_runtime_seq_id_last = -1;
+        root_rejected_branch_discard_noop_runtime_seq_id_last = -1;
+        root_publish_gate_noop_runtime_seq_id_last = -1;
+        topk_tree_runtime_seq_id_last = -1;
+        topk_verify_mask_runtime_seq_id_last = -1;
+        topk_accept_boundary_runtime_seq_id_last = -1;
+        real_draft_head_topk_candidate_seq_id_last = -1;
+        real_draft_head_topk_tree_seq_id_last = -1;
+        real_draft_head_topk_verify_mask_seq_id_last = -1;
+        real_draft_head_topk_target_logits_walk_canary_seq_id_last = -1;
+        verify_mask_seq_id_last = -1;
+        accept_path_seq_id_last = -1;
+        token_commit_seq_id_last = -1;
+        hidden_kv_survivor_commit_seq_id_last = -1;
+        rejected_branch_discard_seq_id_last = -1;
+        publish_gate_seq_id_last = -1;
         pre_round_prompt_tokens_last = 0;
+        pre_round_root_token_last = -1;
         transient_reservation_node_budget_last = 0;
         transient_reservation_actual_pages_last = 0;
         tree_build_node_budget_last = 0;
         tree_build_root_parent_last = JETSPEC_TREE_ROOT_PARENT;
         tree_build_root_depth_last = JETSPEC_TREE_ROOT_DEPTH;
         tree_build_actual_nodes_last = 0;
+        topk_tree_width_last = 0;
+        topk_tree_depth_last = 0;
+        topk_tree_non_root_nodes_last = 0;
+        topk_accept_candidate_nodes_last = 0;
+        topk_accept_boundary_verified_edges_last = 0;
+        topk_actual_verified_logits_rows_last = 0;
+        real_draft_head_canary_ctx_present_last = params.ctx_dft != nullptr ? 1 : 0;
+        real_draft_head_canary_decode_rc_last = 0;
+        real_draft_head_canary_input_rows_last = 0;
+        real_draft_head_canary_input_width_last = 0;
+        real_draft_head_canary_output_rows_last = 0;
+        real_draft_head_canary_output_width_last = 0;
+        real_draft_head_canary_logits_rows_last = 0;
+        real_draft_head_canary_topk_rows_last = 0;
+        real_draft_head_canary_topk_k_last = 0;
+        real_draft_head_canary_top1_id_last = -1;
+        real_draft_head_canary_top2_id_last = -1;
+        real_draft_head_canary_top1_logit_last = 0.0f;
+        real_draft_head_canary_top2_logit_last = 0.0f;
+        real_draft_head_topk_parent_node_last = -1;
+        real_draft_head_topk_candidate_nodes_last = 0;
+        real_draft_head_topk_verified_logits_rows_last = 0;
+        real_draft_head_topk_tree_seq_id_last = -1;
+        real_draft_head_topk_verify_mask_seq_id_last = -1;
+        real_draft_head_topk_tree_nodes_last = 0;
+        real_draft_head_topk_verify_mask_entries_last = 0;
+        real_draft_head_topk_target_logits_planned_rows_last = 0;
+        real_draft_head_topk_target_logits_actual_rows_walked_last = 0;
+        real_draft_head_topk_target_logits_batch_index_last = -1;
+        real_draft_head_topk_target_logits_pos_last = -1;
+        real_draft_head_topk_target_logits_seq_id_last = -1;
+        real_draft_head_topk_target_logits_width_last = 0;
+        real_draft_head_topk_target_logits_candidate_nodes_last = 0;
+        real_draft_head_topk_target_logits_candidate_scores.fill(0.0f);
+        real_draft_head_topk_candidate_ids.fill(-1);
+        real_draft_head_topk_candidate_logits.fill(0.0f);
+        reset_real_draft_head_topk_tree_arrays();
+        reset_real_draft_head_topk_verify_mask_arrays();
+        reset_tree_arrays();
+        reset_verify_mask_arrays();
+        actual_verify_mask_entries_last = 0;
+        root_verified_anchor_last = 0;
+        accept_path_len_last = 0;
+        actual_accepted_nodes_last = 0;
+        correction_token_present_last = 0;
+        actual_committed_tokens_last = 0;
+        actual_survivor_pages_committed_last = 0;
+        actual_pages_discarded_last = 0;
+        rejected_branch_pages_reachable_after_discard_last = 0;
+        actual_publish_visible_state_last = 0;
+        root_runtime_ready_for_real_test_last = 0;
         transaction_plan_phase_count_last = 0;
         transaction_plan_rollback_count_last = 0;
         pre_round_snapshot_ready = false;
         transaction_plan_ready = false;
         transient_reservation_ready = false;
         tree_build_descriptor_ready = false;
+        root_tree_runtime_ready = false;
+        root_verify_mask_runtime_ready = false;
+        root_anchor_accept_path_runtime_ready = false;
+        root_token_commit_noop_runtime_ready = false;
+        root_hidden_kv_commit_noop_runtime_ready = false;
+        root_rejected_branch_discard_noop_runtime_ready = false;
+        root_publish_gate_noop_runtime_ready = false;
+        topk_tree_runtime_ready = false;
+        topk_verify_mask_runtime_ready = false;
+        topk_accept_boundary_runtime_ready = false;
+        real_draft_head_canary_ready = false;
+        real_draft_head_logits_canary_ready = false;
+        real_draft_head_topk_candidate_runtime_ready = false;
+        real_draft_head_topk_tree_runtime_ready = false;
+        real_draft_head_topk_verify_mask_runtime_ready = false;
+        real_draft_head_topk_target_logits_walk_canary_ready = false;
+        verify_mask_descriptor_ready = false;
+        accept_path_descriptor_ready = false;
+        token_commit_descriptor_ready = false;
+        hidden_kv_survivor_commit_descriptor_ready = false;
+        rejected_branch_discard_descriptor_ready = false;
+        publish_gate_descriptor_ready = false;
         n_target_tap_rows_cached = 0;
         runtime_phase = target_taps_active ? jetspec_runtime_phase::waiting_for_target_taps : jetspec_runtime_phase::disabled;
         runtime_failure = target_taps_active ? jetspec_runtime_failure::none : runtime_failure;
@@ -699,22 +1348,143 @@ struct common_speculative_impl_draft_jetspec : public common_speculative_impl {
         transaction_plan_hash_last = 0;
         transient_reservation_hash_last = 0;
         tree_build_descriptor_hash_last = 0;
+        root_tree_runtime_hash_last = 0;
+        root_verify_mask_runtime_hash_last = 0;
+        root_anchor_accept_path_runtime_hash_last = 0;
+        root_token_commit_noop_runtime_hash_last = 0;
+        root_hidden_kv_commit_noop_runtime_hash_last = 0;
+        root_rejected_branch_discard_noop_runtime_hash_last = 0;
+        root_publish_gate_noop_runtime_hash_last = 0;
+        topk_tree_runtime_hash_last = 0;
+        topk_verify_mask_runtime_hash_last = 0;
+        topk_accept_boundary_runtime_hash_last = 0;
+        real_draft_head_canary_hash_last = 0;
+        real_draft_head_topk_candidate_hash_last = 0;
+        real_draft_head_topk_tree_hash_last = 0;
+        real_draft_head_topk_verify_mask_hash_last = 0;
+        real_draft_head_topk_accept_boundary_hash_last = 0;
+        real_draft_head_topk_accept_path_descriptor_hash_last = 0;
+        real_draft_head_topk_token_commit_noop_hash_last = 0;
+        real_draft_head_topk_hidden_kv_commit_noop_hash_last = 0;
+        real_draft_head_topk_rejected_branch_discard_noop_hash_last = 0;
+        real_draft_head_topk_publish_gate_noop_hash_last = 0;
+        real_draft_head_topk_target_logits_walk_canary_hash_last = 0;
+        verify_mask_descriptor_hash_last = 0;
+        accept_path_descriptor_hash_last = 0;
+        token_commit_descriptor_hash_last = 0;
+        hidden_kv_survivor_commit_descriptor_hash_last = 0;
+        rejected_branch_discard_descriptor_hash_last = 0;
+        publish_gate_descriptor_hash_last = 0;
         pre_round_seq_id_last = -1;
         transient_reservation_seq_id_last = -1;
         tree_build_seq_id_last = -1;
+        root_tree_runtime_seq_id_last = -1;
+        root_verify_mask_runtime_seq_id_last = -1;
+        root_anchor_accept_path_runtime_seq_id_last = -1;
+        root_token_commit_noop_runtime_seq_id_last = -1;
+        root_hidden_kv_commit_noop_runtime_seq_id_last = -1;
+        root_rejected_branch_discard_noop_runtime_seq_id_last = -1;
+        root_publish_gate_noop_runtime_seq_id_last = -1;
+        topk_tree_runtime_seq_id_last = -1;
+        topk_verify_mask_runtime_seq_id_last = -1;
+        topk_accept_boundary_runtime_seq_id_last = -1;
+        real_draft_head_topk_candidate_seq_id_last = -1;
+        real_draft_head_topk_tree_seq_id_last = -1;
+        real_draft_head_topk_verify_mask_seq_id_last = -1;
+        real_draft_head_topk_target_logits_walk_canary_seq_id_last = -1;
+        verify_mask_seq_id_last = -1;
+        accept_path_seq_id_last = -1;
+        token_commit_seq_id_last = -1;
+        hidden_kv_survivor_commit_seq_id_last = -1;
+        rejected_branch_discard_seq_id_last = -1;
+        publish_gate_seq_id_last = -1;
         pre_round_prompt_tokens_last = 0;
+        pre_round_root_token_last = -1;
         transient_reservation_node_budget_last = 0;
         transient_reservation_actual_pages_last = 0;
         tree_build_node_budget_last = 0;
         tree_build_root_parent_last = JETSPEC_TREE_ROOT_PARENT;
         tree_build_root_depth_last = JETSPEC_TREE_ROOT_DEPTH;
         tree_build_actual_nodes_last = 0;
+        topk_tree_width_last = 0;
+        topk_tree_depth_last = 0;
+        topk_tree_non_root_nodes_last = 0;
+        topk_accept_candidate_nodes_last = 0;
+        topk_accept_boundary_verified_edges_last = 0;
+        topk_actual_verified_logits_rows_last = 0;
+        real_draft_head_canary_ctx_present_last = params.ctx_dft != nullptr ? 1 : 0;
+        real_draft_head_canary_decode_rc_last = 0;
+        real_draft_head_canary_input_rows_last = 0;
+        real_draft_head_canary_input_width_last = 0;
+        real_draft_head_canary_output_rows_last = 0;
+        real_draft_head_canary_output_width_last = 0;
+        real_draft_head_canary_logits_rows_last = 0;
+        real_draft_head_canary_topk_rows_last = 0;
+        real_draft_head_canary_topk_k_last = 0;
+        real_draft_head_canary_top1_id_last = -1;
+        real_draft_head_canary_top2_id_last = -1;
+        real_draft_head_canary_top1_logit_last = 0.0f;
+        real_draft_head_canary_top2_logit_last = 0.0f;
+        real_draft_head_topk_parent_node_last = -1;
+        real_draft_head_topk_candidate_nodes_last = 0;
+        real_draft_head_topk_verified_logits_rows_last = 0;
+        real_draft_head_topk_tree_seq_id_last = -1;
+        real_draft_head_topk_verify_mask_seq_id_last = -1;
+        real_draft_head_topk_tree_nodes_last = 0;
+        real_draft_head_topk_verify_mask_entries_last = 0;
+        real_draft_head_topk_target_logits_planned_rows_last = 0;
+        real_draft_head_topk_target_logits_actual_rows_walked_last = 0;
+        real_draft_head_topk_target_logits_batch_index_last = -1;
+        real_draft_head_topk_target_logits_pos_last = -1;
+        real_draft_head_topk_target_logits_seq_id_last = -1;
+        real_draft_head_topk_target_logits_width_last = 0;
+        real_draft_head_topk_target_logits_candidate_nodes_last = 0;
+        real_draft_head_topk_target_logits_candidate_scores.fill(0.0f);
+        real_draft_head_topk_candidate_ids.fill(-1);
+        real_draft_head_topk_candidate_logits.fill(0.0f);
+        reset_real_draft_head_topk_tree_arrays();
+        reset_real_draft_head_topk_verify_mask_arrays();
+        reset_tree_arrays();
+        reset_verify_mask_arrays();
+        actual_verify_mask_entries_last = 0;
+        root_verified_anchor_last = 0;
+        accept_path_len_last = 0;
+        actual_accepted_nodes_last = 0;
+        correction_token_present_last = 0;
+        actual_committed_tokens_last = 0;
+        actual_survivor_pages_committed_last = 0;
+        actual_pages_discarded_last = 0;
+        rejected_branch_pages_reachable_after_discard_last = 0;
+        actual_publish_visible_state_last = 0;
+        root_runtime_ready_for_real_test_last = 0;
         transaction_plan_phase_count_last = 0;
         transaction_plan_rollback_count_last = 0;
         pre_round_snapshot_ready = false;
         transaction_plan_ready = false;
         transient_reservation_ready = false;
         tree_build_descriptor_ready = false;
+        root_tree_runtime_ready = false;
+        root_verify_mask_runtime_ready = false;
+        root_anchor_accept_path_runtime_ready = false;
+        root_token_commit_noop_runtime_ready = false;
+        root_hidden_kv_commit_noop_runtime_ready = false;
+        root_rejected_branch_discard_noop_runtime_ready = false;
+        root_publish_gate_noop_runtime_ready = false;
+        topk_tree_runtime_ready = false;
+        topk_verify_mask_runtime_ready = false;
+        topk_accept_boundary_runtime_ready = false;
+        real_draft_head_canary_ready = false;
+        real_draft_head_logits_canary_ready = false;
+        real_draft_head_topk_candidate_runtime_ready = false;
+        real_draft_head_topk_tree_runtime_ready = false;
+        real_draft_head_topk_verify_mask_runtime_ready = false;
+        real_draft_head_topk_target_logits_walk_canary_ready = false;
+        verify_mask_descriptor_ready = false;
+        accept_path_descriptor_ready = false;
+        token_commit_descriptor_ready = false;
+        hidden_kv_survivor_commit_descriptor_ready = false;
+        rejected_branch_discard_descriptor_ready = false;
+        publish_gate_descriptor_ready = false;
         target_tap_rows.clear();
         target_tap_row_state.clear();
         if (params.ctx_tgt != nullptr) {
@@ -744,24 +1514,1476 @@ struct common_speculative_impl_draft_jetspec : public common_speculative_impl {
         return (int32_t) target_tap_row_state.size();
     }
 
+    bool run_real_draft_head_canary_decode(int32_t tap_width) {
+        real_draft_head_canary_ready = false;
+        real_draft_head_logits_canary_ready = false;
+        real_draft_head_canary_hash_last = 0;
+        real_draft_head_canary_ctx_present_last = params.ctx_dft != nullptr ? 1 : 0;
+        real_draft_head_canary_decode_rc_last = 0;
+        real_draft_head_canary_input_rows_last = 0;
+        real_draft_head_canary_input_width_last = 0;
+        real_draft_head_canary_output_rows_last = 0;
+        real_draft_head_canary_output_width_last = 0;
+        real_draft_head_canary_logits_rows_last = 0;
+        real_draft_head_canary_topk_rows_last = 0;
+        real_draft_head_canary_topk_k_last = 0;
+        real_draft_head_canary_top1_id_last = -1;
+        real_draft_head_canary_top2_id_last = -1;
+        real_draft_head_canary_top1_logit_last = 0.0f;
+        real_draft_head_canary_top2_logit_last = 0.0f;
+        real_draft_head_topk_candidate_runtime_ready = false;
+        real_draft_head_topk_candidate_hash_last = 0;
+        real_draft_head_topk_tree_runtime_ready = false;
+        real_draft_head_topk_tree_hash_last = 0;
+        real_draft_head_topk_verify_mask_runtime_ready = false;
+        real_draft_head_topk_verify_mask_hash_last = 0;
+        real_draft_head_topk_candidate_seq_id_last = -1;
+        real_draft_head_topk_tree_seq_id_last = -1;
+        real_draft_head_topk_verify_mask_seq_id_last = -1;
+        real_draft_head_topk_parent_node_last = -1;
+        real_draft_head_topk_candidate_nodes_last = 0;
+        real_draft_head_topk_verified_logits_rows_last = 0;
+        real_draft_head_topk_tree_nodes_last = 0;
+        real_draft_head_topk_verify_mask_entries_last = 0;
+        real_draft_head_topk_candidate_ids.fill(-1);
+        real_draft_head_topk_candidate_logits.fill(0.0f);
+        reset_real_draft_head_topk_tree_arrays();
+        reset_real_draft_head_topk_verify_mask_arrays();
+
+        if (!p5ai_real_draft_head_canary_enabled) {
+            return true;
+        }
+        if (params.ctx_dft == nullptr || n_target_tap_rows_cached == 0 || target_tap_rows.empty()) {
+            return false;
+        }
+        if (tap_width != JETSPEC_QWEN36_TARGET_TAP_WIDTH || target_tap_row_state.size() != n_target_tap_rows_cached) {
+            return false;
+        }
+
+        const int32_t n_rows = (int32_t) n_target_tap_rows_cached;
+        const int32_t output_width = p5aj_real_draft_head_logits_canary_enabled ? JETSPEC_QWEN36_VOCAB_SIZE : JETSPEC_QWEN36_TARGET_HIDDEN;
+        llama_batch batch = llama_batch_init(n_rows, tap_width, 1);
+        batch.n_tokens = n_rows;
+        for (int32_t i = 0; i < n_rows; ++i) {
+            std::memcpy(batch.embd + (size_t) i * (size_t) tap_width,
+                    target_tap_rows.data() + (size_t) i * (size_t) tap_width,
+                    (size_t) tap_width * sizeof(float));
+            batch.pos[i] = target_tap_row_state[i].pos >= 0 ? target_tap_row_state[i].pos : i;
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = target_tap_row_state[i].seq_id >= 0 ? target_tap_row_state[i].seq_id : 0;
+            batch.logits[i] = 1;
+        }
+
+        const int32_t rc = common_speculative_jetspec_real_draft_head_canary_eval(params.ctx_dft, batch);
+        real_draft_head_canary_decode_rc_last = rc;
+        if (rc != 0) {
+            llama_batch_free(batch);
+            return false;
+        }
+
+        uint64_t hash = common_speculative_fnv1a64(
+                p5aj_real_draft_head_logits_canary_enabled ? JETSPEC_REAL_DRAFT_HEAD_LOGITS_CANARY_RUNTIME_PHASE : JETSPEC_REAL_DRAFT_HEAD_CANARY_RUNTIME_PHASE,
+                std::strlen(p5aj_real_draft_head_logits_canary_enabled ? JETSPEC_REAL_DRAFT_HEAD_LOGITS_CANARY_RUNTIME_PHASE : JETSPEC_REAL_DRAFT_HEAD_CANARY_RUNTIME_PHASE));
+        for (int32_t i = 0; i < n_rows; ++i) {
+            const float * embd = llama_get_embeddings_ith(params.ctx_dft, i);
+            if (embd == nullptr) {
+                llama_batch_free(batch);
+                return false;
+            }
+            hash ^= common_speculative_fnv1a64(embd, (size_t) output_width * sizeof(float));
+            if (p5aj_real_draft_head_logits_canary_enabled && i == 0) {
+                int32_t top1 = -1;
+                int32_t top2 = -1;
+                float top1_v = -std::numeric_limits<float>::infinity();
+                float top2_v = -std::numeric_limits<float>::infinity();
+                for (int32_t j = 0; j < output_width; ++j) {
+                    const float v = embd[j];
+                    if (v > top1_v) {
+                        top2_v = top1_v;
+                        top2 = top1;
+                        top1_v = v;
+                        top1 = j;
+                    } else if (v > top2_v) {
+                        top2_v = v;
+                        top2 = j;
+                    }
+                }
+                real_draft_head_canary_top1_id_last = top1;
+                real_draft_head_canary_top2_id_last = top2;
+                real_draft_head_canary_top1_logit_last = top1_v;
+                real_draft_head_canary_top2_logit_last = top2_v;
+            }
+        }
+
+        llama_batch_free(batch);
+
+        real_draft_head_canary_hash_last = hash;
+        real_draft_head_canary_input_rows_last = n_rows;
+        real_draft_head_canary_input_width_last = tap_width;
+        real_draft_head_canary_output_rows_last = n_rows;
+        real_draft_head_canary_output_width_last = output_width;
+        real_draft_head_canary_logits_rows_last = p5aj_real_draft_head_logits_canary_enabled ? n_rows : 0;
+        real_draft_head_canary_topk_rows_last = p5aj_real_draft_head_logits_canary_enabled ? n_rows : 0;
+        real_draft_head_canary_topk_k_last = p5aj_real_draft_head_logits_canary_enabled ? 2 : 0;
+        real_draft_head_canary_ready = true;
+        real_draft_head_logits_canary_ready = p5aj_real_draft_head_logits_canary_enabled;
+        n_real_draft_head_canary_decodes++;
+        runtime_phase = p5aj_real_draft_head_logits_canary_enabled ? jetspec_runtime_phase::real_draft_head_logits_canary_ready : jetspec_runtime_phase::real_draft_head_canary_ready;
+        return true;
+    }
+
+    bool build_real_draft_head_topk_candidate_runtime() {
+        real_draft_head_topk_candidate_runtime_ready = false;
+        real_draft_head_topk_candidate_hash_last = 0;
+        real_draft_head_topk_tree_runtime_ready = false;
+        real_draft_head_topk_tree_hash_last = 0;
+        real_draft_head_topk_verify_mask_runtime_ready = false;
+        real_draft_head_topk_verify_mask_hash_last = 0;
+        real_draft_head_topk_candidate_seq_id_last = -1;
+        real_draft_head_topk_tree_seq_id_last = -1;
+        real_draft_head_topk_verify_mask_seq_id_last = -1;
+        real_draft_head_topk_parent_node_last = -1;
+        real_draft_head_topk_candidate_nodes_last = 0;
+        real_draft_head_topk_verified_logits_rows_last = 0;
+        real_draft_head_topk_verify_mask_entries_last = 0;
+        real_draft_head_topk_candidate_ids.fill(-1);
+        real_draft_head_topk_candidate_logits.fill(0.0f);
+        reset_real_draft_head_topk_verify_mask_arrays();
+
+        if (!p5ak_real_draft_head_topk_candidate_enabled) {
+            return false;
+        }
+        if (!p5aj_real_draft_head_logits_canary_enabled || !real_draft_head_logits_canary_ready || real_draft_head_canary_hash_last == 0) {
+            return false;
+        }
+        if (!p5ag_topk_accept_boundary_enabled || !p5af_topk_verify_mask_enabled || !p5ae_topk_tree_enabled || !p5x_root_tree_enabled) {
+            return false;
+        }
+        if (topk_abi_root_tail_conflict()) {
+            return false;
+        }
+        if (!topk_accept_boundary_runtime_ready || topk_accept_boundary_runtime_hash_last == 0 ||
+                !topk_verify_mask_runtime_ready || topk_verify_mask_runtime_hash_last == 0 ||
+                !topk_tree_runtime_ready || topk_tree_runtime_hash_last == 0 ||
+                !root_tree_runtime_ready || root_tree_runtime_hash_last == 0) {
+            return false;
+        }
+        if (real_draft_head_canary_ctx_present_last != 1 || real_draft_head_canary_decode_rc_last != 0) {
+            return false;
+        }
+        if (real_draft_head_canary_logits_rows_last <= 0 || real_draft_head_canary_output_width_last != JETSPEC_QWEN36_VOCAB_SIZE ||
+                real_draft_head_canary_topk_rows_last != real_draft_head_canary_logits_rows_last || real_draft_head_canary_topk_k_last != JETSPEC_TOPK_ABI_WIDTH) {
+            return false;
+        }
+        if (real_draft_head_canary_top1_id_last < 0 || real_draft_head_canary_top2_id_last < 0 ||
+                real_draft_head_canary_top1_id_last >= JETSPEC_QWEN36_VOCAB_SIZE || real_draft_head_canary_top2_id_last >= JETSPEC_QWEN36_VOCAB_SIZE ||
+                real_draft_head_canary_top1_id_last == real_draft_head_canary_top2_id_last) {
+            return false;
+        }
+        if (!std::isfinite(real_draft_head_canary_top1_logit_last) || !std::isfinite(real_draft_head_canary_top2_logit_last) ||
+                real_draft_head_canary_top1_logit_last < real_draft_head_canary_top2_logit_last) {
+            return false;
+        }
+        if (tree_build_actual_nodes_last != JETSPEC_TOPK_ABI_NODES || actual_verify_mask_entries_last != JETSPEC_TOPK_ABI_MASK_ENTRIES ||
+                topk_accept_candidate_nodes_last != JETSPEC_TOPK_ABI_NON_ROOT_NODES || topk_accept_boundary_verified_edges_last != JETSPEC_TOPK_ABI_MASK_ENTRIES ||
+                accept_path_len_last != 0 || actual_accepted_nodes_last != 0 || correction_token_present_last != 0) {
+            return false;
+        }
+
+        real_draft_head_topk_candidate_seq_id_last = topk_accept_boundary_runtime_seq_id_last;
+        real_draft_head_topk_parent_node_last = 0;
+        real_draft_head_topk_candidate_nodes_last = JETSPEC_TOPK_ABI_NON_ROOT_NODES;
+        real_draft_head_topk_verified_logits_rows_last = real_draft_head_canary_logits_rows_last;
+        real_draft_head_topk_candidate_ids[0] = real_draft_head_canary_top1_id_last;
+        real_draft_head_topk_candidate_ids[1] = real_draft_head_canary_top2_id_last;
+        real_draft_head_topk_candidate_logits[0] = real_draft_head_canary_top1_logit_last;
+        real_draft_head_topk_candidate_logits[1] = real_draft_head_canary_top2_logit_last;
+
+        const int64_t candidate_words[] = {
+            (int64_t) transaction_plan_hash_last,
+            (int64_t) pre_round_snapshot_hash_last,
+            (int64_t) transient_reservation_hash_last,
+            (int64_t) tree_build_descriptor_hash_last,
+            (int64_t) root_tree_runtime_hash_last,
+            (int64_t) topk_tree_runtime_hash_last,
+            (int64_t) topk_verify_mask_runtime_hash_last,
+            (int64_t) topk_accept_boundary_runtime_hash_last,
+            (int64_t) real_draft_head_canary_hash_last,
+            (int64_t) real_draft_head_topk_candidate_seq_id_last,
+            (int64_t) real_draft_head_topk_parent_node_last,
+            (int64_t) real_draft_head_topk_candidate_nodes_last,
+            (int64_t) real_draft_head_topk_verified_logits_rows_last,
+            (int64_t) real_draft_head_canary_output_width_last,
+            (int64_t) real_draft_head_canary_topk_k_last,
+            (int64_t) real_draft_head_topk_candidate_ids[0],
+            (int64_t) real_draft_head_topk_candidate_ids[1],
+            (int64_t) tree_build_actual_nodes_last,
+            (int64_t) actual_verify_mask_entries_last,
+            (int64_t) accept_path_len_last,
+            (int64_t) actual_accepted_nodes_last,
+            (int64_t) correction_token_present_last,
+            JETSPEC_QWEN36_DRAFT_BLOCK_SIZE,
+            JETSPEC_TRANSACTION_PHASE_COUNT,
+            JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT,
+        };
+        real_draft_head_topk_candidate_hash_last = common_speculative_fnv1a64(candidate_words, sizeof(candidate_words));
+        real_draft_head_topk_candidate_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_candidate_logits.data(), real_draft_head_topk_candidate_logits.size() * sizeof(real_draft_head_topk_candidate_logits[0]));
+        real_draft_head_topk_candidate_hash_last ^= common_speculative_fnv1a64(JETSPEC_REAL_DRAFT_HEAD_TOPK_CANDIDATE_RUNTIME_PHASE, std::strlen(JETSPEC_REAL_DRAFT_HEAD_TOPK_CANDIDATE_RUNTIME_PHASE));
+        real_draft_head_topk_candidate_hash_last ^= common_speculative_fnv1a64(JETSPEC_REAL_DRAFT_HEAD_TOPK_LOGITS_SOURCE, std::strlen(JETSPEC_REAL_DRAFT_HEAD_TOPK_LOGITS_SOURCE));
+        real_draft_head_topk_candidate_hash_last ^= common_speculative_fnv1a64(JETSPEC_REAL_DRAFT_HEAD_TOPK_RANK_SEMANTICS, std::strlen(JETSPEC_REAL_DRAFT_HEAD_TOPK_RANK_SEMANTICS));
+        real_draft_head_topk_candidate_runtime_ready = true;
+        n_real_draft_head_topk_candidate_runtime_builds++;
+        runtime_phase = jetspec_runtime_phase::real_draft_head_topk_candidate_ready;
+        return true;
+    }
+
+    bool build_real_draft_head_topk_tree_runtime() {
+        real_draft_head_topk_tree_runtime_ready = false;
+        real_draft_head_topk_tree_hash_last = 0;
+        real_draft_head_topk_verify_mask_runtime_ready = false;
+        real_draft_head_topk_verify_mask_hash_last = 0;
+        real_draft_head_topk_tree_seq_id_last = -1;
+        real_draft_head_topk_verify_mask_seq_id_last = -1;
+        real_draft_head_topk_tree_nodes_last = 0;
+        real_draft_head_topk_verify_mask_entries_last = 0;
+        reset_real_draft_head_topk_tree_arrays();
+        reset_real_draft_head_topk_verify_mask_arrays();
+
+        if (!p5al_real_draft_head_topk_tree_enabled) {
+            return false;
+        }
+        if (!p5ak_real_draft_head_topk_candidate_enabled || !p5aj_real_draft_head_logits_canary_enabled ||
+                !p5ag_topk_accept_boundary_enabled || !p5af_topk_verify_mask_enabled || !p5ae_topk_tree_enabled || !p5x_root_tree_enabled) {
+            return false;
+        }
+        if (topk_abi_root_tail_conflict()) {
+            return false;
+        }
+        if (!real_draft_head_topk_candidate_runtime_ready || real_draft_head_topk_candidate_hash_last == 0) {
+            return false;
+        }
+        if (!real_draft_head_logits_canary_ready || real_draft_head_canary_hash_last == 0 ||
+                !topk_accept_boundary_runtime_ready || topk_accept_boundary_runtime_hash_last == 0 ||
+                !topk_verify_mask_runtime_ready || topk_verify_mask_runtime_hash_last == 0 ||
+                !topk_tree_runtime_ready || topk_tree_runtime_hash_last == 0 ||
+                !root_tree_runtime_ready || root_tree_runtime_hash_last == 0) {
+            return false;
+        }
+        if (real_draft_head_canary_ctx_present_last != 1 || real_draft_head_canary_decode_rc_last != 0) {
+            return false;
+        }
+        if (real_draft_head_canary_logits_rows_last != 1 || real_draft_head_canary_output_rows_last != 1 ||
+                real_draft_head_canary_output_width_last != JETSPEC_QWEN36_VOCAB_SIZE ||
+                real_draft_head_canary_topk_rows_last != 1 || real_draft_head_canary_topk_k_last != JETSPEC_TOPK_ABI_WIDTH ||
+                real_draft_head_topk_verified_logits_rows_last != 1) {
+            return false;
+        }
+        if (real_draft_head_topk_parent_node_last != 0 || real_draft_head_topk_candidate_nodes_last != JETSPEC_TOPK_ABI_NON_ROOT_NODES) {
+            return false;
+        }
+        if (real_draft_head_topk_candidate_ids[0] < 0 || real_draft_head_topk_candidate_ids[1] < 0 ||
+                real_draft_head_topk_candidate_ids[0] >= JETSPEC_QWEN36_VOCAB_SIZE ||
+                real_draft_head_topk_candidate_ids[1] >= JETSPEC_QWEN36_VOCAB_SIZE ||
+                real_draft_head_topk_candidate_ids[0] == real_draft_head_topk_candidate_ids[1]) {
+            return false;
+        }
+        if (!std::isfinite(real_draft_head_topk_candidate_logits[0]) || !std::isfinite(real_draft_head_topk_candidate_logits[1]) ||
+                real_draft_head_topk_candidate_logits[0] < real_draft_head_topk_candidate_logits[1]) {
+            return false;
+        }
+        if (tree_build_actual_nodes_last != JETSPEC_TOPK_ABI_NODES || topk_tree_width_last != JETSPEC_TOPK_ABI_WIDTH ||
+                topk_tree_depth_last != JETSPEC_TOPK_ABI_DEPTH || topk_tree_non_root_nodes_last != JETSPEC_TOPK_ABI_NON_ROOT_NODES) {
+            return false;
+        }
+        if (pre_round_root_token_last < 0 || tree_token_ids[0] != pre_round_root_token_last ||
+                tree_parent_indices[0] != JETSPEC_TREE_ROOT_PARENT || tree_parent_indices[1] != 0 || tree_parent_indices[2] != 0 ||
+                tree_depth[0] != JETSPEC_TREE_ROOT_DEPTH || tree_depth[1] != 1 || tree_depth[2] != 1 ||
+                tree_rank[0] != -1 || tree_rank[1] != 0 || tree_rank[2] != 1) {
+            return false;
+        }
+        if (actual_verify_mask_entries_last != JETSPEC_TOPK_ABI_MASK_ENTRIES ||
+                topk_accept_candidate_nodes_last != JETSPEC_TOPK_ABI_NON_ROOT_NODES ||
+                topk_accept_boundary_verified_edges_last != JETSPEC_TOPK_ABI_MASK_ENTRIES ||
+                accept_path_len_last != 0 || actual_accepted_nodes_last != 0 || correction_token_present_last != 0 ||
+                actual_committed_tokens_last != 0 || actual_survivor_pages_committed_last != 0 ||
+                actual_pages_discarded_last != 0 || actual_publish_visible_state_last != 0) {
+            return false;
+        }
+
+        real_draft_head_topk_tree_seq_id_last = real_draft_head_topk_candidate_seq_id_last;
+        real_draft_head_topk_tree_nodes_last = JETSPEC_TOPK_ABI_NODES;
+        real_draft_head_topk_tree_token_ids[0] = tree_token_ids[0];
+        real_draft_head_topk_tree_token_ids[1] = real_draft_head_topk_candidate_ids[0];
+        real_draft_head_topk_tree_token_ids[2] = real_draft_head_topk_candidate_ids[1];
+        real_draft_head_topk_tree_parent_indices[0] = JETSPEC_TREE_ROOT_PARENT;
+        real_draft_head_topk_tree_parent_indices[1] = 0;
+        real_draft_head_topk_tree_parent_indices[2] = 0;
+        real_draft_head_topk_tree_depth[0] = JETSPEC_TREE_ROOT_DEPTH;
+        real_draft_head_topk_tree_depth[1] = 1;
+        real_draft_head_topk_tree_depth[2] = 1;
+        real_draft_head_topk_tree_rank[0] = -1;
+        real_draft_head_topk_tree_rank[1] = 0;
+        real_draft_head_topk_tree_rank[2] = 1;
+        real_draft_head_topk_tree_cum_logit[0] = 0.0f;
+        real_draft_head_topk_tree_cum_logit[1] = real_draft_head_topk_candidate_logits[0];
+        real_draft_head_topk_tree_cum_logit[2] = real_draft_head_topk_candidate_logits[1];
+        if (real_draft_head_topk_tree_token_ids[0] != tree_token_ids[0] ||
+                real_draft_head_topk_tree_token_ids[1] != real_draft_head_topk_candidate_ids[0] ||
+                real_draft_head_topk_tree_token_ids[2] != real_draft_head_topk_candidate_ids[1]) {
+            return false;
+        }
+        if (real_draft_head_topk_tree_parent_indices[0] != JETSPEC_TREE_ROOT_PARENT ||
+                real_draft_head_topk_tree_parent_indices[1] != 0 || real_draft_head_topk_tree_parent_indices[2] != 0 ||
+                real_draft_head_topk_tree_depth[0] != 0 || real_draft_head_topk_tree_depth[1] != 1 || real_draft_head_topk_tree_depth[2] != 1 ||
+                real_draft_head_topk_tree_rank[0] != -1 || real_draft_head_topk_tree_rank[1] != 0 || real_draft_head_topk_tree_rank[2] != 1) {
+            return false;
+        }
+        if (real_draft_head_topk_tree_token_ids[1] < 0 || real_draft_head_topk_tree_token_ids[2] < 0 ||
+                real_draft_head_topk_tree_token_ids[1] == real_draft_head_topk_tree_token_ids[2]) {
+            return false;
+        }
+
+        const int64_t real_tree_words[] = {
+            (int64_t) transaction_plan_hash_last,
+            (int64_t) pre_round_snapshot_hash_last,
+            (int64_t) transient_reservation_hash_last,
+            (int64_t) tree_build_descriptor_hash_last,
+            (int64_t) root_tree_runtime_hash_last,
+            (int64_t) topk_tree_runtime_hash_last,
+            (int64_t) topk_verify_mask_runtime_hash_last,
+            (int64_t) topk_accept_boundary_runtime_hash_last,
+            (int64_t) real_draft_head_canary_hash_last,
+            (int64_t) real_draft_head_topk_candidate_hash_last,
+            (int64_t) real_draft_head_topk_tree_seq_id_last,
+            (int64_t) tree_build_node_budget_last,
+            (int64_t) real_draft_head_topk_tree_nodes_last,
+            (int64_t) topk_tree_width_last,
+            (int64_t) topk_tree_depth_last,
+            (int64_t) topk_tree_non_root_nodes_last,
+            (int64_t) real_draft_head_topk_tree_token_ids[0],
+            (int64_t) real_draft_head_topk_tree_token_ids[1],
+            (int64_t) real_draft_head_topk_tree_token_ids[2],
+            (int64_t) real_draft_head_topk_tree_parent_indices[0],
+            (int64_t) real_draft_head_topk_tree_parent_indices[1],
+            (int64_t) real_draft_head_topk_tree_parent_indices[2],
+            (int64_t) real_draft_head_topk_tree_depth[0],
+            (int64_t) real_draft_head_topk_tree_depth[1],
+            (int64_t) real_draft_head_topk_tree_depth[2],
+            (int64_t) real_draft_head_topk_tree_rank[0],
+            (int64_t) real_draft_head_topk_tree_rank[1],
+            (int64_t) real_draft_head_topk_tree_rank[2],
+            (int64_t) real_draft_head_topk_verified_logits_rows_last,
+            (int64_t) real_draft_head_canary_output_width_last,
+            (int64_t) actual_verify_mask_entries_last,
+            (int64_t) accept_path_len_last,
+            (int64_t) actual_accepted_nodes_last,
+            (int64_t) correction_token_present_last,
+            (int64_t) actual_committed_tokens_last,
+            (int64_t) actual_survivor_pages_committed_last,
+            (int64_t) actual_pages_discarded_last,
+            (int64_t) actual_publish_visible_state_last,
+            JETSPEC_QWEN36_DRAFT_BLOCK_SIZE,
+            JETSPEC_TRANSACTION_PHASE_COUNT,
+            JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT,
+        };
+        real_draft_head_topk_tree_hash_last = common_speculative_fnv1a64(real_tree_words, sizeof(real_tree_words));
+        real_draft_head_topk_tree_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_tree_cum_logit.data(), real_draft_head_topk_tree_cum_logit.size() * sizeof(real_draft_head_topk_tree_cum_logit[0]));
+        real_draft_head_topk_tree_hash_last ^= common_speculative_fnv1a64(JETSPEC_REAL_DRAFT_HEAD_TOPK_TREE_RUNTIME_PHASE, std::strlen(JETSPEC_REAL_DRAFT_HEAD_TOPK_TREE_RUNTIME_PHASE));
+        real_draft_head_topk_tree_hash_last ^= common_speculative_fnv1a64(JETSPEC_REAL_DRAFT_HEAD_TOPK_LOGITS_SOURCE, std::strlen(JETSPEC_REAL_DRAFT_HEAD_TOPK_LOGITS_SOURCE));
+        real_draft_head_topk_tree_hash_last ^= common_speculative_fnv1a64(JETSPEC_REAL_DRAFT_HEAD_TOPK_RANK_SEMANTICS, std::strlen(JETSPEC_REAL_DRAFT_HEAD_TOPK_RANK_SEMANTICS));
+        real_draft_head_topk_tree_hash_last ^= common_speculative_fnv1a64(JETSPEC_TREE_BUILD_PHASE, std::strlen(JETSPEC_TREE_BUILD_PHASE));
+        real_draft_head_topk_tree_runtime_ready = true;
+        n_real_draft_head_topk_tree_runtime_builds++;
+        runtime_phase = jetspec_runtime_phase::real_draft_head_topk_tree_ready;
+        return true;
+    }
+
+    bool build_real_draft_head_topk_verify_mask_runtime() {
+        real_draft_head_topk_verify_mask_runtime_ready = false;
+        real_draft_head_topk_verify_mask_hash_last = 0;
+        real_draft_head_topk_verify_mask_seq_id_last = -1;
+        real_draft_head_topk_verify_mask_entries_last = 0;
+        reset_real_draft_head_topk_verify_mask_arrays();
+
+        if (!p5am_real_draft_head_topk_verify_mask_enabled) {
+            return false;
+        }
+        if (!p5al_real_draft_head_topk_tree_enabled || !p5ak_real_draft_head_topk_candidate_enabled ||
+                !p5aj_real_draft_head_logits_canary_enabled || !p5ag_topk_accept_boundary_enabled ||
+                !p5af_topk_verify_mask_enabled || !p5ae_topk_tree_enabled || !p5x_root_tree_enabled) {
+            return false;
+        }
+        if (topk_abi_root_tail_conflict()) {
+            return false;
+        }
+        if (!real_draft_head_topk_tree_runtime_ready || real_draft_head_topk_tree_hash_last == 0 ||
+                !real_draft_head_topk_candidate_runtime_ready || real_draft_head_topk_candidate_hash_last == 0 ||
+                !real_draft_head_logits_canary_ready || real_draft_head_canary_hash_last == 0 ||
+                !topk_accept_boundary_runtime_ready || topk_accept_boundary_runtime_hash_last == 0 ||
+                !topk_verify_mask_runtime_ready || topk_verify_mask_runtime_hash_last == 0 ||
+                !topk_tree_runtime_ready || topk_tree_runtime_hash_last == 0 ||
+                !root_tree_runtime_ready || root_tree_runtime_hash_last == 0) {
+            return false;
+        }
+        if (real_draft_head_canary_ctx_present_last != 1 || real_draft_head_canary_decode_rc_last != 0 ||
+                real_draft_head_canary_logits_rows_last != 1 || real_draft_head_canary_output_rows_last != 1 ||
+                real_draft_head_canary_output_width_last != JETSPEC_QWEN36_VOCAB_SIZE ||
+                real_draft_head_topk_verified_logits_rows_last != 1 || real_draft_head_canary_topk_k_last != JETSPEC_TOPK_ABI_WIDTH) {
+            return false;
+        }
+        if (real_draft_head_topk_tree_nodes_last != JETSPEC_TOPK_ABI_NODES ||
+                real_draft_head_topk_tree_token_ids[0] != tree_token_ids[0] ||
+                real_draft_head_topk_tree_token_ids[1] != real_draft_head_topk_candidate_ids[0] ||
+                real_draft_head_topk_tree_token_ids[2] != real_draft_head_topk_candidate_ids[1] ||
+                real_draft_head_topk_tree_parent_indices[0] != JETSPEC_TREE_ROOT_PARENT ||
+                real_draft_head_topk_tree_parent_indices[1] != 0 || real_draft_head_topk_tree_parent_indices[2] != 0 ||
+                real_draft_head_topk_tree_depth[0] != JETSPEC_TREE_ROOT_DEPTH ||
+                real_draft_head_topk_tree_depth[1] != 1 || real_draft_head_topk_tree_depth[2] != 1 ||
+                real_draft_head_topk_tree_rank[0] != -1 || real_draft_head_topk_tree_rank[1] != 0 || real_draft_head_topk_tree_rank[2] != 1) {
+            return false;
+        }
+        if (real_draft_head_topk_tree_cum_logit[0] != 0.0f ||
+                real_draft_head_topk_tree_cum_logit[1] != real_draft_head_topk_candidate_logits[0] ||
+                real_draft_head_topk_tree_cum_logit[2] != real_draft_head_topk_candidate_logits[1]) {
+            return false;
+        }
+        if (actual_verify_mask_entries_last != JETSPEC_TOPK_ABI_MASK_ENTRIES ||
+                root_verify_mask_rows[0] != 0 || root_verify_mask_cols[0] != 0 || root_verify_mask_values[0] != 1 ||
+                root_verify_mask_rows[1] != 1 || root_verify_mask_cols[1] != 0 || root_verify_mask_values[1] != 1 ||
+                root_verify_mask_rows[2] != 1 || root_verify_mask_cols[2] != 1 || root_verify_mask_values[2] != 1 ||
+                root_verify_mask_rows[3] != 2 || root_verify_mask_cols[3] != 0 || root_verify_mask_values[3] != 1 ||
+                root_verify_mask_rows[4] != 2 || root_verify_mask_cols[4] != 2 || root_verify_mask_values[4] != 1) {
+            return false;
+        }
+        if (accept_path_len_last != 0 || actual_accepted_nodes_last != 0 || correction_token_present_last != 0 ||
+                actual_committed_tokens_last != 0 || actual_survivor_pages_committed_last != 0 ||
+                actual_pages_discarded_last != 0 || actual_publish_visible_state_last != 0) {
+            return false;
+        }
+
+        real_draft_head_topk_verify_mask_seq_id_last = real_draft_head_topk_tree_seq_id_last;
+        real_draft_head_topk_verify_mask_entries_last = JETSPEC_TOPK_ABI_MASK_ENTRIES;
+        real_draft_head_topk_verify_mask_rows[0] = 0;
+        real_draft_head_topk_verify_mask_cols[0] = 0;
+        real_draft_head_topk_verify_mask_values[0] = 1;
+        real_draft_head_topk_verify_mask_rows[1] = 1;
+        real_draft_head_topk_verify_mask_cols[1] = 0;
+        real_draft_head_topk_verify_mask_values[1] = 1;
+        real_draft_head_topk_verify_mask_rows[2] = 1;
+        real_draft_head_topk_verify_mask_cols[2] = 1;
+        real_draft_head_topk_verify_mask_values[2] = 1;
+        real_draft_head_topk_verify_mask_rows[3] = 2;
+        real_draft_head_topk_verify_mask_cols[3] = 0;
+        real_draft_head_topk_verify_mask_values[3] = 1;
+        real_draft_head_topk_verify_mask_rows[4] = 2;
+        real_draft_head_topk_verify_mask_cols[4] = 2;
+        real_draft_head_topk_verify_mask_values[4] = 1;
+        for (int32_t i = 0; i < real_draft_head_topk_verify_mask_entries_last; ++i) {
+            if (real_draft_head_topk_verify_mask_rows[i] < 0 || real_draft_head_topk_verify_mask_rows[i] >= real_draft_head_topk_tree_nodes_last ||
+                    real_draft_head_topk_verify_mask_cols[i] < 0 || real_draft_head_topk_verify_mask_cols[i] >= real_draft_head_topk_tree_nodes_last ||
+                    real_draft_head_topk_verify_mask_values[i] != 1) {
+                return false;
+            }
+        }
+        if (real_draft_head_topk_verify_mask_rows[1] != 1 || real_draft_head_topk_verify_mask_cols[1] != real_draft_head_topk_tree_parent_indices[1] ||
+                real_draft_head_topk_verify_mask_rows[3] != 2 || real_draft_head_topk_verify_mask_cols[3] != real_draft_head_topk_tree_parent_indices[2]) {
+            return false;
+        }
+
+        const int64_t real_mask_words[] = {
+            (int64_t) transaction_plan_hash_last,
+            (int64_t) pre_round_snapshot_hash_last,
+            (int64_t) transient_reservation_hash_last,
+            (int64_t) tree_build_descriptor_hash_last,
+            (int64_t) root_tree_runtime_hash_last,
+            (int64_t) topk_tree_runtime_hash_last,
+            (int64_t) topk_verify_mask_runtime_hash_last,
+            (int64_t) topk_accept_boundary_runtime_hash_last,
+            (int64_t) real_draft_head_canary_hash_last,
+            (int64_t) real_draft_head_topk_candidate_hash_last,
+            (int64_t) real_draft_head_topk_tree_hash_last,
+            (int64_t) real_draft_head_topk_verify_mask_seq_id_last,
+            (int64_t) real_draft_head_topk_tree_nodes_last,
+            (int64_t) real_draft_head_topk_verify_mask_entries_last,
+            (int64_t) real_draft_head_topk_tree_token_ids[0],
+            (int64_t) real_draft_head_topk_tree_token_ids[1],
+            (int64_t) real_draft_head_topk_tree_token_ids[2],
+            (int64_t) real_draft_head_topk_tree_parent_indices[0],
+            (int64_t) real_draft_head_topk_tree_parent_indices[1],
+            (int64_t) real_draft_head_topk_tree_parent_indices[2],
+            (int64_t) real_draft_head_topk_tree_depth[0],
+            (int64_t) real_draft_head_topk_tree_depth[1],
+            (int64_t) real_draft_head_topk_tree_depth[2],
+            (int64_t) real_draft_head_topk_tree_rank[0],
+            (int64_t) real_draft_head_topk_tree_rank[1],
+            (int64_t) real_draft_head_topk_tree_rank[2],
+            (int64_t) real_draft_head_topk_verified_logits_rows_last,
+            (int64_t) real_draft_head_canary_output_width_last,
+            (int64_t) real_draft_head_canary_topk_k_last,
+            (int64_t) accept_path_len_last,
+            (int64_t) actual_accepted_nodes_last,
+            (int64_t) correction_token_present_last,
+            (int64_t) actual_committed_tokens_last,
+            (int64_t) actual_survivor_pages_committed_last,
+            (int64_t) actual_pages_discarded_last,
+            (int64_t) actual_publish_visible_state_last,
+            JETSPEC_QWEN36_DRAFT_BLOCK_SIZE,
+            JETSPEC_TRANSACTION_PHASE_COUNT,
+            JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT,
+        };
+        real_draft_head_topk_verify_mask_hash_last = common_speculative_fnv1a64(real_mask_words, sizeof(real_mask_words));
+        real_draft_head_topk_verify_mask_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_tree_cum_logit.data(), real_draft_head_topk_tree_cum_logit.size() * sizeof(real_draft_head_topk_tree_cum_logit[0]));
+        real_draft_head_topk_verify_mask_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_verify_mask_rows.data(), real_draft_head_topk_verify_mask_rows.size() * sizeof(real_draft_head_topk_verify_mask_rows[0]));
+        real_draft_head_topk_verify_mask_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_verify_mask_cols.data(), real_draft_head_topk_verify_mask_cols.size() * sizeof(real_draft_head_topk_verify_mask_cols[0]));
+        real_draft_head_topk_verify_mask_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_verify_mask_values.data(), real_draft_head_topk_verify_mask_values.size() * sizeof(real_draft_head_topk_verify_mask_values[0]));
+        real_draft_head_topk_verify_mask_hash_last ^= common_speculative_fnv1a64(JETSPEC_REAL_DRAFT_HEAD_TOPK_VERIFY_MASK_RUNTIME_PHASE, std::strlen(JETSPEC_REAL_DRAFT_HEAD_TOPK_VERIFY_MASK_RUNTIME_PHASE));
+        real_draft_head_topk_verify_mask_hash_last ^= common_speculative_fnv1a64(JETSPEC_REAL_DRAFT_HEAD_TOPK_LOGITS_SOURCE, std::strlen(JETSPEC_REAL_DRAFT_HEAD_TOPK_LOGITS_SOURCE));
+        real_draft_head_topk_verify_mask_hash_last ^= common_speculative_fnv1a64(JETSPEC_REAL_DRAFT_HEAD_TOPK_RANK_SEMANTICS, std::strlen(JETSPEC_REAL_DRAFT_HEAD_TOPK_RANK_SEMANTICS));
+        real_draft_head_topk_verify_mask_hash_last ^= common_speculative_fnv1a64(JETSPEC_VERIFY_MASK_PHASE, std::strlen(JETSPEC_VERIFY_MASK_PHASE));
+        real_draft_head_topk_verify_mask_runtime_ready = true;
+        n_real_draft_head_topk_verify_mask_runtime_builds++;
+        runtime_phase = jetspec_runtime_phase::real_draft_head_topk_verify_mask_ready;
+        return true;
+    }
+
+    bool build_real_draft_head_topk_accept_boundary_runtime() {
+        reset_real_draft_head_topk_accept_boundary_metadata();
+
+        if (!p5an_real_draft_head_topk_accept_boundary_enabled) {
+            return false;
+        }
+        if (!p5am_real_draft_head_topk_verify_mask_enabled || !p5al_real_draft_head_topk_tree_enabled ||
+                !p5ak_real_draft_head_topk_candidate_enabled || !p5aj_real_draft_head_logits_canary_enabled ||
+                !p5ag_topk_accept_boundary_enabled || !p5af_topk_verify_mask_enabled || !p5ae_topk_tree_enabled ||
+                !p5x_root_tree_enabled) {
+            return false;
+        }
+        if (topk_abi_root_tail_conflict()) {
+            return false;
+        }
+        if (!real_draft_head_topk_verify_mask_runtime_ready || real_draft_head_topk_verify_mask_hash_last == 0 ||
+                !real_draft_head_topk_tree_runtime_ready || real_draft_head_topk_tree_hash_last == 0 ||
+                !real_draft_head_topk_candidate_runtime_ready || real_draft_head_topk_candidate_hash_last == 0 ||
+                !real_draft_head_logits_canary_ready || real_draft_head_canary_hash_last == 0 ||
+                !topk_accept_boundary_runtime_ready || topk_accept_boundary_runtime_hash_last == 0 ||
+                !topk_verify_mask_runtime_ready || topk_verify_mask_runtime_hash_last == 0 ||
+                !topk_tree_runtime_ready || topk_tree_runtime_hash_last == 0 ||
+                !root_tree_runtime_ready || root_tree_runtime_hash_last == 0) {
+            return false;
+        }
+        if (real_draft_head_canary_ctx_present_last != 1 || real_draft_head_canary_decode_rc_last != 0 ||
+                real_draft_head_canary_logits_rows_last != 1 || real_draft_head_canary_output_rows_last != 1 ||
+                real_draft_head_canary_output_width_last != JETSPEC_QWEN36_VOCAB_SIZE ||
+                real_draft_head_topk_verified_logits_rows_last != 1 || real_draft_head_canary_topk_k_last != JETSPEC_TOPK_ABI_WIDTH) {
+            return false;
+        }
+        if (real_draft_head_topk_tree_seq_id_last != real_draft_head_topk_candidate_seq_id_last ||
+                real_draft_head_topk_verify_mask_seq_id_last != real_draft_head_topk_tree_seq_id_last ||
+                real_draft_head_topk_tree_nodes_last != JETSPEC_TOPK_ABI_NODES ||
+                real_draft_head_topk_verify_mask_entries_last != JETSPEC_TOPK_ABI_MASK_ENTRIES) {
+            return false;
+        }
+        if (real_draft_head_topk_tree_token_ids[0] != tree_token_ids[0] ||
+                real_draft_head_topk_tree_token_ids[1] != real_draft_head_topk_candidate_ids[0] ||
+                real_draft_head_topk_tree_token_ids[2] != real_draft_head_topk_candidate_ids[1] ||
+                real_draft_head_topk_tree_parent_indices[0] != JETSPEC_TREE_ROOT_PARENT ||
+                real_draft_head_topk_tree_parent_indices[1] != 0 || real_draft_head_topk_tree_parent_indices[2] != 0 ||
+                real_draft_head_topk_tree_depth[0] != JETSPEC_TREE_ROOT_DEPTH ||
+                real_draft_head_topk_tree_depth[1] != 1 || real_draft_head_topk_tree_depth[2] != 1 ||
+                real_draft_head_topk_tree_rank[0] != -1 || real_draft_head_topk_tree_rank[1] != 0 ||
+                real_draft_head_topk_tree_rank[2] != 1) {
+            return false;
+        }
+        if (real_draft_head_topk_verify_mask_rows[0] != 0 || real_draft_head_topk_verify_mask_cols[0] != 0 || real_draft_head_topk_verify_mask_values[0] != 1 ||
+                real_draft_head_topk_verify_mask_rows[1] != 1 || real_draft_head_topk_verify_mask_cols[1] != 0 || real_draft_head_topk_verify_mask_values[1] != 1 ||
+                real_draft_head_topk_verify_mask_rows[2] != 1 || real_draft_head_topk_verify_mask_cols[2] != 1 || real_draft_head_topk_verify_mask_values[2] != 1 ||
+                real_draft_head_topk_verify_mask_rows[3] != 2 || real_draft_head_topk_verify_mask_cols[3] != 0 || real_draft_head_topk_verify_mask_values[3] != 1 ||
+                real_draft_head_topk_verify_mask_rows[4] != 2 || real_draft_head_topk_verify_mask_cols[4] != 2 || real_draft_head_topk_verify_mask_values[4] != 1) {
+            return false;
+        }
+        if (tree_build_actual_nodes_last != JETSPEC_TOPK_ABI_NODES || actual_verify_mask_entries_last != JETSPEC_TOPK_ABI_MASK_ENTRIES ||
+                topk_accept_candidate_nodes_last != JETSPEC_TOPK_ABI_NON_ROOT_NODES ||
+                topk_accept_boundary_verified_edges_last != JETSPEC_TOPK_ABI_MASK_ENTRIES ||
+                topk_actual_verified_logits_rows_last != 0 || accept_path_len_last != 0 || actual_accepted_nodes_last != 0 ||
+                correction_token_present_last != 0 || actual_committed_tokens_last != 0 ||
+                actual_survivor_pages_committed_last != 0 || actual_pages_discarded_last != 0 ||
+                actual_publish_visible_state_last != 0) {
+            return false;
+        }
+
+        real_draft_head_topk_accept_boundary_seq_id_last = real_draft_head_topk_verify_mask_seq_id_last;
+        real_draft_head_topk_accept_candidate_nodes_last = JETSPEC_TOPK_ABI_NON_ROOT_NODES;
+        real_draft_head_topk_accept_boundary_verified_edges_last = JETSPEC_TOPK_ABI_MASK_ENTRIES;
+        real_draft_head_topk_actual_verified_logits_rows_last = real_draft_head_topk_verified_logits_rows_last;
+        real_draft_head_topk_accept_path_len_last = 0;
+        real_draft_head_topk_actual_accepted_nodes_last = 0;
+        real_draft_head_topk_correction_token_present_last = 0;
+        if (real_draft_head_topk_accept_candidate_nodes_last != 2 || real_draft_head_topk_accept_boundary_verified_edges_last != 5 ||
+                real_draft_head_topk_actual_verified_logits_rows_last != 1 || real_draft_head_topk_accept_path_len_last != 0 ||
+                real_draft_head_topk_actual_accepted_nodes_last != 0 || real_draft_head_topk_correction_token_present_last != 0) {
+            return false;
+        }
+
+        const int64_t real_accept_words[] = {
+            (int64_t) transaction_plan_hash_last,
+            (int64_t) pre_round_snapshot_hash_last,
+            (int64_t) transient_reservation_hash_last,
+            (int64_t) tree_build_descriptor_hash_last,
+            (int64_t) root_tree_runtime_hash_last,
+            (int64_t) topk_tree_runtime_hash_last,
+            (int64_t) topk_verify_mask_runtime_hash_last,
+            (int64_t) topk_accept_boundary_runtime_hash_last,
+            (int64_t) real_draft_head_canary_hash_last,
+            (int64_t) real_draft_head_topk_candidate_hash_last,
+            (int64_t) real_draft_head_topk_tree_hash_last,
+            (int64_t) real_draft_head_topk_verify_mask_hash_last,
+            (int64_t) real_draft_head_topk_accept_boundary_seq_id_last,
+            (int64_t) real_draft_head_topk_tree_nodes_last,
+            (int64_t) real_draft_head_topk_verify_mask_entries_last,
+            (int64_t) real_draft_head_topk_accept_candidate_nodes_last,
+            (int64_t) real_draft_head_topk_accept_boundary_verified_edges_last,
+            (int64_t) real_draft_head_topk_actual_verified_logits_rows_last,
+            (int64_t) real_draft_head_topk_accept_path_len_last,
+            (int64_t) real_draft_head_topk_actual_accepted_nodes_last,
+            (int64_t) real_draft_head_topk_correction_token_present_last,
+            (int64_t) real_draft_head_topk_tree_token_ids[0],
+            (int64_t) real_draft_head_topk_tree_token_ids[1],
+            (int64_t) real_draft_head_topk_tree_token_ids[2],
+            (int64_t) real_draft_head_topk_tree_parent_indices[0],
+            (int64_t) real_draft_head_topk_tree_parent_indices[1],
+            (int64_t) real_draft_head_topk_tree_parent_indices[2],
+            (int64_t) real_draft_head_topk_verified_logits_rows_last,
+            (int64_t) real_draft_head_canary_output_width_last,
+            (int64_t) real_draft_head_canary_topk_k_last,
+            JETSPEC_QWEN36_DRAFT_BLOCK_SIZE,
+            JETSPEC_TRANSACTION_PHASE_COUNT,
+            JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT,
+        };
+        real_draft_head_topk_accept_boundary_hash_last = common_speculative_fnv1a64(real_accept_words, sizeof(real_accept_words));
+        real_draft_head_topk_accept_boundary_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_tree_cum_logit.data(), real_draft_head_topk_tree_cum_logit.size() * sizeof(real_draft_head_topk_tree_cum_logit[0]));
+        real_draft_head_topk_accept_boundary_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_verify_mask_rows.data(), real_draft_head_topk_verify_mask_rows.size() * sizeof(real_draft_head_topk_verify_mask_rows[0]));
+        real_draft_head_topk_accept_boundary_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_verify_mask_cols.data(), real_draft_head_topk_verify_mask_cols.size() * sizeof(real_draft_head_topk_verify_mask_cols[0]));
+        real_draft_head_topk_accept_boundary_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_verify_mask_values.data(), real_draft_head_topk_verify_mask_values.size() * sizeof(real_draft_head_topk_verify_mask_values[0]));
+        real_draft_head_topk_accept_boundary_hash_last ^= common_speculative_fnv1a64(JETSPEC_REAL_DRAFT_HEAD_TOPK_ACCEPT_BOUNDARY_RUNTIME_PHASE, std::strlen(JETSPEC_REAL_DRAFT_HEAD_TOPK_ACCEPT_BOUNDARY_RUNTIME_PHASE));
+        real_draft_head_topk_accept_boundary_hash_last ^= common_speculative_fnv1a64(JETSPEC_ACCEPT_PATH_PHASE, std::strlen(JETSPEC_ACCEPT_PATH_PHASE));
+        real_draft_head_topk_accept_boundary_hash_last ^= common_speculative_fnv1a64(JETSPEC_REAL_DRAFT_HEAD_TOPK_LOGITS_SOURCE, std::strlen(JETSPEC_REAL_DRAFT_HEAD_TOPK_LOGITS_SOURCE));
+        real_draft_head_topk_accept_boundary_hash_last ^= common_speculative_fnv1a64(JETSPEC_REAL_DRAFT_HEAD_TOPK_RANK_SEMANTICS, std::strlen(JETSPEC_REAL_DRAFT_HEAD_TOPK_RANK_SEMANTICS));
+        real_draft_head_topk_accept_boundary_hash_last ^= common_speculative_fnv1a64(JETSPEC_ACCEPT_DECISION_SOURCE_NONE_NO_TARGET_LOGITS, std::strlen(JETSPEC_ACCEPT_DECISION_SOURCE_NONE_NO_TARGET_LOGITS));
+        real_draft_head_topk_accept_boundary_runtime_ready = true;
+        n_real_draft_head_topk_accept_boundary_runtime_builds++;
+        runtime_phase = jetspec_runtime_phase::real_draft_head_topk_accept_boundary_ready;
+        return true;
+    }
+
+    bool build_real_draft_head_topk_accept_path_descriptor_runtime() {
+        reset_real_draft_head_topk_accept_path_descriptor_metadata();
+
+        if (!p5ao_real_draft_head_topk_accept_path_descriptor_enabled) {
+            return false;
+        }
+        if (!p5an_real_draft_head_topk_accept_boundary_enabled || !p5am_real_draft_head_topk_verify_mask_enabled ||
+                !p5al_real_draft_head_topk_tree_enabled || !p5ak_real_draft_head_topk_candidate_enabled ||
+                !p5aj_real_draft_head_logits_canary_enabled || !p5ag_topk_accept_boundary_enabled ||
+                !p5af_topk_verify_mask_enabled || !p5ae_topk_tree_enabled || !p5x_root_tree_enabled) {
+            return false;
+        }
+        if (topk_abi_root_tail_conflict()) {
+            return false;
+        }
+        if (accept_path_descriptor_ready || token_commit_descriptor_ready || hidden_kv_survivor_commit_descriptor_ready ||
+                rejected_branch_discard_descriptor_ready || publish_gate_descriptor_ready ||
+                root_token_commit_noop_runtime_ready || root_hidden_kv_commit_noop_runtime_ready ||
+                root_rejected_branch_discard_noop_runtime_ready || root_publish_gate_noop_runtime_ready) {
+            return false;
+        }
+        if (!real_draft_head_topk_accept_boundary_runtime_ready || real_draft_head_topk_accept_boundary_hash_last == 0 ||
+                !real_draft_head_topk_verify_mask_runtime_ready || real_draft_head_topk_verify_mask_hash_last == 0 ||
+                !real_draft_head_topk_tree_runtime_ready || real_draft_head_topk_tree_hash_last == 0 ||
+                !real_draft_head_topk_candidate_runtime_ready || real_draft_head_topk_candidate_hash_last == 0 ||
+                !real_draft_head_logits_canary_ready || real_draft_head_canary_hash_last == 0 ||
+                !topk_accept_boundary_runtime_ready || topk_accept_boundary_runtime_hash_last == 0 ||
+                !topk_verify_mask_runtime_ready || topk_verify_mask_runtime_hash_last == 0 ||
+                !topk_tree_runtime_ready || topk_tree_runtime_hash_last == 0 ||
+                !root_tree_runtime_ready || root_tree_runtime_hash_last == 0) {
+            return false;
+        }
+        if (real_draft_head_canary_ctx_present_last != 1 || real_draft_head_canary_decode_rc_last != 0 ||
+                real_draft_head_canary_logits_rows_last != 1 || real_draft_head_canary_output_rows_last != 1 ||
+                real_draft_head_canary_output_width_last != JETSPEC_QWEN36_VOCAB_SIZE ||
+                real_draft_head_topk_actual_verified_logits_rows_last != 1 ||
+                real_draft_head_topk_verified_logits_rows_last != 1 ||
+                real_draft_head_canary_topk_k_last != JETSPEC_TOPK_ABI_WIDTH) {
+            return false;
+        }
+        if (real_draft_head_topk_accept_boundary_seq_id_last != real_draft_head_topk_verify_mask_seq_id_last ||
+                real_draft_head_topk_tree_seq_id_last != real_draft_head_topk_candidate_seq_id_last ||
+                real_draft_head_topk_verify_mask_seq_id_last != real_draft_head_topk_tree_seq_id_last ||
+                real_draft_head_topk_tree_nodes_last != JETSPEC_TOPK_ABI_NODES ||
+                real_draft_head_topk_verify_mask_entries_last != JETSPEC_TOPK_ABI_MASK_ENTRIES) {
+            return false;
+        }
+        if (real_draft_head_topk_accept_candidate_nodes_last != JETSPEC_TOPK_ABI_NON_ROOT_NODES ||
+                real_draft_head_topk_accept_boundary_verified_edges_last != JETSPEC_TOPK_ABI_MASK_ENTRIES ||
+                real_draft_head_topk_accept_path_len_last != 0 || real_draft_head_topk_actual_accepted_nodes_last != 0 ||
+                real_draft_head_topk_correction_token_present_last != 0) {
+            return false;
+        }
+        if (tree_build_actual_nodes_last != JETSPEC_TOPK_ABI_NODES || actual_verify_mask_entries_last != JETSPEC_TOPK_ABI_MASK_ENTRIES ||
+                topk_accept_candidate_nodes_last != JETSPEC_TOPK_ABI_NON_ROOT_NODES ||
+                topk_accept_boundary_verified_edges_last != JETSPEC_TOPK_ABI_MASK_ENTRIES ||
+                topk_actual_verified_logits_rows_last != 0 || accept_path_len_last != 0 || actual_accepted_nodes_last != 0 ||
+                correction_token_present_last != 0 || actual_committed_tokens_last != 0 ||
+                actual_survivor_pages_committed_last != 0 || actual_pages_discarded_last != 0 ||
+                actual_publish_visible_state_last != 0) {
+            return false;
+        }
+
+        real_draft_head_topk_accept_path_descriptor_seq_id_last = real_draft_head_topk_accept_boundary_seq_id_last;
+        real_draft_head_topk_accept_path_descriptor_candidate_nodes_last = real_draft_head_topk_accept_candidate_nodes_last;
+        real_draft_head_topk_accept_path_descriptor_verified_edges_last = real_draft_head_topk_accept_boundary_verified_edges_last;
+        real_draft_head_topk_accept_path_descriptor_len_last = real_draft_head_topk_accept_path_len_last;
+        real_draft_head_topk_accept_path_descriptor_actual_accepted_nodes_last = real_draft_head_topk_actual_accepted_nodes_last;
+        real_draft_head_topk_accept_path_descriptor_correction_token_present_last = real_draft_head_topk_correction_token_present_last;
+        if (real_draft_head_topk_accept_path_descriptor_candidate_nodes_last != JETSPEC_TOPK_ABI_NON_ROOT_NODES ||
+                real_draft_head_topk_accept_path_descriptor_verified_edges_last != JETSPEC_TOPK_ABI_MASK_ENTRIES ||
+                real_draft_head_topk_accept_path_descriptor_len_last != 0 ||
+                real_draft_head_topk_accept_path_descriptor_actual_accepted_nodes_last != 0 ||
+                real_draft_head_topk_accept_path_descriptor_correction_token_present_last != 0) {
+            return false;
+        }
+
+        const int64_t real_accept_descriptor_words[] = {
+            (int64_t) transaction_plan_hash_last,
+            (int64_t) pre_round_snapshot_hash_last,
+            (int64_t) transient_reservation_hash_last,
+            (int64_t) tree_build_descriptor_hash_last,
+            (int64_t) root_tree_runtime_hash_last,
+            (int64_t) topk_tree_runtime_hash_last,
+            (int64_t) topk_verify_mask_runtime_hash_last,
+            (int64_t) topk_accept_boundary_runtime_hash_last,
+            (int64_t) real_draft_head_canary_hash_last,
+            (int64_t) real_draft_head_topk_candidate_hash_last,
+            (int64_t) real_draft_head_topk_tree_hash_last,
+            (int64_t) real_draft_head_topk_verify_mask_hash_last,
+            (int64_t) real_draft_head_topk_accept_boundary_hash_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_seq_id_last,
+            (int64_t) real_draft_head_topk_tree_nodes_last,
+            (int64_t) real_draft_head_topk_verify_mask_entries_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_candidate_nodes_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_verified_edges_last,
+            (int64_t) real_draft_head_topk_actual_verified_logits_rows_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_len_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_actual_accepted_nodes_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_correction_token_present_last,
+            (int64_t) actual_committed_tokens_last,
+            (int64_t) actual_survivor_pages_committed_last,
+            (int64_t) actual_pages_discarded_last,
+            (int64_t) actual_publish_visible_state_last,
+            JETSPEC_QWEN36_DRAFT_BLOCK_SIZE,
+            JETSPEC_TRANSACTION_PHASE_COUNT,
+            JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT,
+        };
+        real_draft_head_topk_accept_path_descriptor_hash_last = common_speculative_fnv1a64(real_accept_descriptor_words, sizeof(real_accept_descriptor_words));
+        real_draft_head_topk_accept_path_descriptor_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_tree_cum_logit.data(), real_draft_head_topk_tree_cum_logit.size() * sizeof(real_draft_head_topk_tree_cum_logit[0]));
+        real_draft_head_topk_accept_path_descriptor_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_verify_mask_rows.data(), real_draft_head_topk_verify_mask_rows.size() * sizeof(real_draft_head_topk_verify_mask_rows[0]));
+        real_draft_head_topk_accept_path_descriptor_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_verify_mask_cols.data(), real_draft_head_topk_verify_mask_cols.size() * sizeof(real_draft_head_topk_verify_mask_cols[0]));
+        real_draft_head_topk_accept_path_descriptor_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_verify_mask_values.data(), real_draft_head_topk_verify_mask_values.size() * sizeof(real_draft_head_topk_verify_mask_values[0]));
+        real_draft_head_topk_accept_path_descriptor_hash_last ^= common_speculative_fnv1a64(JETSPEC_REAL_DRAFT_HEAD_TOPK_ACCEPT_PATH_DESCRIPTOR_RUNTIME_PHASE, std::strlen(JETSPEC_REAL_DRAFT_HEAD_TOPK_ACCEPT_PATH_DESCRIPTOR_RUNTIME_PHASE));
+        real_draft_head_topk_accept_path_descriptor_hash_last ^= common_speculative_fnv1a64(JETSPEC_ACCEPT_PATH_PHASE, std::strlen(JETSPEC_ACCEPT_PATH_PHASE));
+        real_draft_head_topk_accept_path_descriptor_hash_last ^= common_speculative_fnv1a64(JETSPEC_ACCEPT_PATH_ROLLBACK_POINT, std::strlen(JETSPEC_ACCEPT_PATH_ROLLBACK_POINT));
+        real_draft_head_topk_accept_path_descriptor_hash_last ^= common_speculative_fnv1a64(JETSPEC_ACCEPT_PATH_DESCRIPTOR, std::strlen(JETSPEC_ACCEPT_PATH_DESCRIPTOR));
+        real_draft_head_topk_accept_path_descriptor_hash_last ^= common_speculative_fnv1a64(JETSPEC_ACCEPT_DECISION_SOURCE_NONE_NO_TARGET_LOGITS, std::strlen(JETSPEC_ACCEPT_DECISION_SOURCE_NONE_NO_TARGET_LOGITS));
+        real_draft_head_topk_accept_path_descriptor_runtime_ready = true;
+        n_real_draft_head_topk_accept_path_descriptor_runtime_builds++;
+        runtime_phase = jetspec_runtime_phase::real_draft_head_topk_accept_path_descriptor_ready;
+        return true;
+    }
+
+    bool build_real_draft_head_topk_token_commit_noop_runtime() {
+        reset_real_draft_head_topk_token_commit_noop_metadata();
+        actual_committed_tokens_last = 0;
+        actual_survivor_pages_committed_last = 0;
+        actual_pages_discarded_last = 0;
+        actual_publish_visible_state_last = 0;
+
+        if (!p5ap_real_draft_head_topk_token_commit_noop_enabled) {
+            return false;
+        }
+        if (!p5ao_real_draft_head_topk_accept_path_descriptor_enabled || !p5an_real_draft_head_topk_accept_boundary_enabled ||
+                !p5am_real_draft_head_topk_verify_mask_enabled || !p5al_real_draft_head_topk_tree_enabled ||
+                !p5ak_real_draft_head_topk_candidate_enabled || !p5aj_real_draft_head_logits_canary_enabled ||
+                !p5ag_topk_accept_boundary_enabled || !p5af_topk_verify_mask_enabled || !p5ae_topk_tree_enabled ||
+                !p5x_root_tree_enabled) {
+            return false;
+        }
+        if (topk_abi_root_tail_conflict()) {
+            return false;
+        }
+        if (accept_path_descriptor_ready || token_commit_descriptor_ready || hidden_kv_survivor_commit_descriptor_ready ||
+                rejected_branch_discard_descriptor_ready || publish_gate_descriptor_ready ||
+                root_token_commit_noop_runtime_ready || root_hidden_kv_commit_noop_runtime_ready ||
+                root_rejected_branch_discard_noop_runtime_ready || root_publish_gate_noop_runtime_ready) {
+            return false;
+        }
+        if (!real_draft_head_topk_accept_path_descriptor_runtime_ready || real_draft_head_topk_accept_path_descriptor_hash_last == 0 ||
+                !real_draft_head_topk_accept_boundary_runtime_ready || real_draft_head_topk_accept_boundary_hash_last == 0 ||
+                !real_draft_head_topk_verify_mask_runtime_ready || real_draft_head_topk_verify_mask_hash_last == 0 ||
+                !real_draft_head_topk_tree_runtime_ready || real_draft_head_topk_tree_hash_last == 0 ||
+                !real_draft_head_topk_candidate_runtime_ready || real_draft_head_topk_candidate_hash_last == 0 ||
+                !real_draft_head_logits_canary_ready || real_draft_head_canary_hash_last == 0 ||
+                !topk_accept_boundary_runtime_ready || topk_accept_boundary_runtime_hash_last == 0 ||
+                !topk_verify_mask_runtime_ready || topk_verify_mask_runtime_hash_last == 0 ||
+                !topk_tree_runtime_ready || topk_tree_runtime_hash_last == 0 ||
+                !root_tree_runtime_ready || root_tree_runtime_hash_last == 0) {
+            return false;
+        }
+        if (real_draft_head_canary_ctx_present_last != 1 || real_draft_head_canary_decode_rc_last != 0 ||
+                real_draft_head_canary_logits_rows_last != 1 || real_draft_head_canary_output_rows_last != 1 ||
+                real_draft_head_canary_output_width_last != JETSPEC_QWEN36_VOCAB_SIZE ||
+                real_draft_head_topk_actual_verified_logits_rows_last != 1 ||
+                real_draft_head_topk_verified_logits_rows_last != 1 ||
+                real_draft_head_canary_topk_k_last != JETSPEC_TOPK_ABI_WIDTH) {
+            return false;
+        }
+        if (real_draft_head_topk_accept_path_descriptor_seq_id_last != real_draft_head_topk_accept_boundary_seq_id_last ||
+                real_draft_head_topk_accept_boundary_seq_id_last != real_draft_head_topk_verify_mask_seq_id_last ||
+                real_draft_head_topk_tree_seq_id_last != real_draft_head_topk_candidate_seq_id_last ||
+                real_draft_head_topk_verify_mask_seq_id_last != real_draft_head_topk_tree_seq_id_last ||
+                real_draft_head_topk_tree_nodes_last != JETSPEC_TOPK_ABI_NODES ||
+                real_draft_head_topk_verify_mask_entries_last != JETSPEC_TOPK_ABI_MASK_ENTRIES) {
+            return false;
+        }
+        if (real_draft_head_topk_accept_path_descriptor_candidate_nodes_last != JETSPEC_TOPK_ABI_NON_ROOT_NODES ||
+                real_draft_head_topk_accept_path_descriptor_verified_edges_last != JETSPEC_TOPK_ABI_MASK_ENTRIES ||
+                real_draft_head_topk_accept_path_descriptor_len_last != 0 ||
+                real_draft_head_topk_accept_path_descriptor_actual_accepted_nodes_last != 0 ||
+                real_draft_head_topk_accept_path_descriptor_correction_token_present_last != 0) {
+            return false;
+        }
+        if (tree_build_actual_nodes_last != JETSPEC_TOPK_ABI_NODES || actual_verify_mask_entries_last != JETSPEC_TOPK_ABI_MASK_ENTRIES ||
+                topk_accept_candidate_nodes_last != JETSPEC_TOPK_ABI_NON_ROOT_NODES ||
+                topk_accept_boundary_verified_edges_last != JETSPEC_TOPK_ABI_MASK_ENTRIES ||
+                topk_actual_verified_logits_rows_last != 0 || accept_path_len_last != 0 || actual_accepted_nodes_last != 0 ||
+                correction_token_present_last != 0 || actual_committed_tokens_last != 0 ||
+                actual_survivor_pages_committed_last != 0 || actual_pages_discarded_last != 0 ||
+                actual_publish_visible_state_last != 0) {
+            return false;
+        }
+
+        real_draft_head_topk_token_commit_noop_seq_id_last = real_draft_head_topk_accept_path_descriptor_seq_id_last;
+        actual_committed_tokens_last = 0;
+        actual_survivor_pages_committed_last = 0;
+        actual_pages_discarded_last = 0;
+        actual_publish_visible_state_last = 0;
+        if (actual_committed_tokens_last != 0 || actual_survivor_pages_committed_last != 0 ||
+                actual_pages_discarded_last != 0 || actual_publish_visible_state_last != 0) {
+            return false;
+        }
+
+        const int64_t real_commit_words[] = {
+            (int64_t) transaction_plan_hash_last,
+            (int64_t) pre_round_snapshot_hash_last,
+            (int64_t) transient_reservation_hash_last,
+            (int64_t) tree_build_descriptor_hash_last,
+            (int64_t) root_tree_runtime_hash_last,
+            (int64_t) topk_tree_runtime_hash_last,
+            (int64_t) topk_verify_mask_runtime_hash_last,
+            (int64_t) topk_accept_boundary_runtime_hash_last,
+            (int64_t) real_draft_head_canary_hash_last,
+            (int64_t) real_draft_head_topk_candidate_hash_last,
+            (int64_t) real_draft_head_topk_tree_hash_last,
+            (int64_t) real_draft_head_topk_verify_mask_hash_last,
+            (int64_t) real_draft_head_topk_accept_boundary_hash_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_hash_last,
+            (int64_t) real_draft_head_topk_token_commit_noop_seq_id_last,
+            (int64_t) real_draft_head_topk_tree_nodes_last,
+            (int64_t) real_draft_head_topk_verify_mask_entries_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_candidate_nodes_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_verified_edges_last,
+            (int64_t) real_draft_head_topk_actual_verified_logits_rows_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_len_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_actual_accepted_nodes_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_correction_token_present_last,
+            (int64_t) actual_committed_tokens_last,
+            (int64_t) actual_survivor_pages_committed_last,
+            (int64_t) actual_pages_discarded_last,
+            (int64_t) actual_publish_visible_state_last,
+            JETSPEC_QWEN36_DRAFT_BLOCK_SIZE,
+            JETSPEC_TRANSACTION_PHASE_COUNT,
+            JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT,
+        };
+        real_draft_head_topk_token_commit_noop_hash_last = common_speculative_fnv1a64(real_commit_words, sizeof(real_commit_words));
+        real_draft_head_topk_token_commit_noop_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_tree_cum_logit.data(), real_draft_head_topk_tree_cum_logit.size() * sizeof(real_draft_head_topk_tree_cum_logit[0]));
+        real_draft_head_topk_token_commit_noop_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_verify_mask_rows.data(), real_draft_head_topk_verify_mask_rows.size() * sizeof(real_draft_head_topk_verify_mask_rows[0]));
+        real_draft_head_topk_token_commit_noop_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_verify_mask_cols.data(), real_draft_head_topk_verify_mask_cols.size() * sizeof(real_draft_head_topk_verify_mask_cols[0]));
+        real_draft_head_topk_token_commit_noop_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_verify_mask_values.data(), real_draft_head_topk_verify_mask_values.size() * sizeof(real_draft_head_topk_verify_mask_values[0]));
+        real_draft_head_topk_token_commit_noop_hash_last ^= common_speculative_fnv1a64(JETSPEC_REAL_DRAFT_HEAD_TOPK_TOKEN_COMMIT_NOOP_RUNTIME_PHASE, std::strlen(JETSPEC_REAL_DRAFT_HEAD_TOPK_TOKEN_COMMIT_NOOP_RUNTIME_PHASE));
+        real_draft_head_topk_token_commit_noop_hash_last ^= common_speculative_fnv1a64(JETSPEC_TOKEN_COMMIT_PHASE, std::strlen(JETSPEC_TOKEN_COMMIT_PHASE));
+        real_draft_head_topk_token_commit_noop_hash_last ^= common_speculative_fnv1a64(JETSPEC_TOKEN_COMMIT_ROLLBACK_POINT, std::strlen(JETSPEC_TOKEN_COMMIT_ROLLBACK_POINT));
+        real_draft_head_topk_token_commit_noop_hash_last ^= common_speculative_fnv1a64(JETSPEC_ACCEPT_DECISION_SOURCE_NONE_NO_TARGET_LOGITS, std::strlen(JETSPEC_ACCEPT_DECISION_SOURCE_NONE_NO_TARGET_LOGITS));
+        real_draft_head_topk_token_commit_noop_runtime_ready = true;
+        n_real_draft_head_topk_token_commit_noop_runtime_builds++;
+        runtime_phase = jetspec_runtime_phase::real_draft_head_topk_token_commit_noop_ready;
+        return true;
+    }
+
+    bool build_real_draft_head_topk_hidden_kv_commit_noop_runtime() {
+        reset_real_draft_head_topk_hidden_kv_commit_noop_metadata();
+        actual_committed_tokens_last = 0;
+        actual_survivor_pages_committed_last = 0;
+        actual_pages_discarded_last = 0;
+        actual_publish_visible_state_last = 0;
+
+        if (!p5aq_real_draft_head_topk_hidden_kv_commit_noop_enabled) {
+            return false;
+        }
+        if (!p5ap_real_draft_head_topk_token_commit_noop_enabled || !p5ao_real_draft_head_topk_accept_path_descriptor_enabled ||
+                !p5an_real_draft_head_topk_accept_boundary_enabled || !p5am_real_draft_head_topk_verify_mask_enabled ||
+                !p5al_real_draft_head_topk_tree_enabled || !p5ak_real_draft_head_topk_candidate_enabled ||
+                !p5aj_real_draft_head_logits_canary_enabled || !p5ag_topk_accept_boundary_enabled ||
+                !p5af_topk_verify_mask_enabled || !p5ae_topk_tree_enabled || !p5x_root_tree_enabled) {
+            return false;
+        }
+        if (topk_abi_root_tail_conflict()) {
+            return false;
+        }
+        if (accept_path_descriptor_ready || token_commit_descriptor_ready || hidden_kv_survivor_commit_descriptor_ready ||
+                rejected_branch_discard_descriptor_ready || publish_gate_descriptor_ready ||
+                root_token_commit_noop_runtime_ready || root_hidden_kv_commit_noop_runtime_ready ||
+                root_rejected_branch_discard_noop_runtime_ready || root_publish_gate_noop_runtime_ready) {
+            return false;
+        }
+        if (!real_draft_head_topk_token_commit_noop_runtime_ready || real_draft_head_topk_token_commit_noop_hash_last == 0 ||
+                !real_draft_head_topk_accept_path_descriptor_runtime_ready || real_draft_head_topk_accept_path_descriptor_hash_last == 0 ||
+                !real_draft_head_topk_accept_boundary_runtime_ready || real_draft_head_topk_accept_boundary_hash_last == 0 ||
+                !real_draft_head_topk_verify_mask_runtime_ready || real_draft_head_topk_verify_mask_hash_last == 0 ||
+                !real_draft_head_topk_tree_runtime_ready || real_draft_head_topk_tree_hash_last == 0 ||
+                !real_draft_head_topk_candidate_runtime_ready || real_draft_head_topk_candidate_hash_last == 0 ||
+                !real_draft_head_logits_canary_ready || real_draft_head_canary_hash_last == 0 ||
+                !topk_accept_boundary_runtime_ready || topk_accept_boundary_runtime_hash_last == 0 ||
+                !topk_verify_mask_runtime_ready || topk_verify_mask_runtime_hash_last == 0 ||
+                !topk_tree_runtime_ready || topk_tree_runtime_hash_last == 0 ||
+                !root_tree_runtime_ready || root_tree_runtime_hash_last == 0) {
+            return false;
+        }
+        if (real_draft_head_canary_ctx_present_last != 1 || real_draft_head_canary_decode_rc_last != 0 ||
+                real_draft_head_canary_logits_rows_last != 1 || real_draft_head_canary_output_rows_last != 1 ||
+                real_draft_head_canary_output_width_last != JETSPEC_QWEN36_VOCAB_SIZE ||
+                real_draft_head_topk_actual_verified_logits_rows_last != 1 ||
+                real_draft_head_topk_verified_logits_rows_last != 1 ||
+                real_draft_head_canary_topk_k_last != JETSPEC_TOPK_ABI_WIDTH) {
+            return false;
+        }
+        if (real_draft_head_topk_token_commit_noop_seq_id_last != real_draft_head_topk_accept_path_descriptor_seq_id_last ||
+                real_draft_head_topk_accept_path_descriptor_seq_id_last != real_draft_head_topk_accept_boundary_seq_id_last ||
+                real_draft_head_topk_accept_boundary_seq_id_last != real_draft_head_topk_verify_mask_seq_id_last ||
+                real_draft_head_topk_tree_seq_id_last != real_draft_head_topk_candidate_seq_id_last ||
+                real_draft_head_topk_verify_mask_seq_id_last != real_draft_head_topk_tree_seq_id_last ||
+                real_draft_head_topk_tree_nodes_last != JETSPEC_TOPK_ABI_NODES ||
+                real_draft_head_topk_verify_mask_entries_last != JETSPEC_TOPK_ABI_MASK_ENTRIES) {
+            return false;
+        }
+        if (real_draft_head_topk_accept_path_descriptor_candidate_nodes_last != JETSPEC_TOPK_ABI_NON_ROOT_NODES ||
+                real_draft_head_topk_accept_path_descriptor_verified_edges_last != JETSPEC_TOPK_ABI_MASK_ENTRIES ||
+                real_draft_head_topk_accept_path_descriptor_len_last != 0 ||
+                real_draft_head_topk_accept_path_descriptor_actual_accepted_nodes_last != 0 ||
+                real_draft_head_topk_accept_path_descriptor_correction_token_present_last != 0) {
+            return false;
+        }
+        if (actual_committed_tokens_last != 0 || actual_survivor_pages_committed_last != 0 ||
+                actual_pages_discarded_last != 0 || actual_publish_visible_state_last != 0) {
+            return false;
+        }
+
+        real_draft_head_topk_hidden_kv_commit_noop_seq_id_last = real_draft_head_topk_token_commit_noop_seq_id_last;
+        actual_committed_tokens_last = 0;
+        actual_survivor_pages_committed_last = 0;
+        actual_pages_discarded_last = 0;
+        actual_publish_visible_state_last = 0;
+        if (actual_committed_tokens_last != 0 || actual_survivor_pages_committed_last != 0 ||
+                actual_pages_discarded_last != 0 || actual_publish_visible_state_last != 0) {
+            return false;
+        }
+
+        const int64_t real_hidden_words[] = {
+            (int64_t) transaction_plan_hash_last,
+            (int64_t) pre_round_snapshot_hash_last,
+            (int64_t) transient_reservation_hash_last,
+            (int64_t) tree_build_descriptor_hash_last,
+            (int64_t) root_tree_runtime_hash_last,
+            (int64_t) topk_tree_runtime_hash_last,
+            (int64_t) topk_verify_mask_runtime_hash_last,
+            (int64_t) topk_accept_boundary_runtime_hash_last,
+            (int64_t) real_draft_head_canary_hash_last,
+            (int64_t) real_draft_head_topk_candidate_hash_last,
+            (int64_t) real_draft_head_topk_tree_hash_last,
+            (int64_t) real_draft_head_topk_verify_mask_hash_last,
+            (int64_t) real_draft_head_topk_accept_boundary_hash_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_hash_last,
+            (int64_t) real_draft_head_topk_token_commit_noop_hash_last,
+            (int64_t) real_draft_head_topk_hidden_kv_commit_noop_seq_id_last,
+            (int64_t) real_draft_head_topk_tree_nodes_last,
+            (int64_t) real_draft_head_topk_verify_mask_entries_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_candidate_nodes_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_verified_edges_last,
+            (int64_t) real_draft_head_topk_actual_verified_logits_rows_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_len_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_actual_accepted_nodes_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_correction_token_present_last,
+            (int64_t) actual_committed_tokens_last,
+            (int64_t) actual_survivor_pages_committed_last,
+            (int64_t) actual_pages_discarded_last,
+            (int64_t) actual_publish_visible_state_last,
+            JETSPEC_QWEN36_DRAFT_BLOCK_SIZE,
+            JETSPEC_TRANSACTION_PHASE_COUNT,
+            JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT,
+        };
+        real_draft_head_topk_hidden_kv_commit_noop_hash_last = common_speculative_fnv1a64(real_hidden_words, sizeof(real_hidden_words));
+        real_draft_head_topk_hidden_kv_commit_noop_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_tree_cum_logit.data(), real_draft_head_topk_tree_cum_logit.size() * sizeof(real_draft_head_topk_tree_cum_logit[0]));
+        real_draft_head_topk_hidden_kv_commit_noop_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_verify_mask_rows.data(), real_draft_head_topk_verify_mask_rows.size() * sizeof(real_draft_head_topk_verify_mask_rows[0]));
+        real_draft_head_topk_hidden_kv_commit_noop_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_verify_mask_cols.data(), real_draft_head_topk_verify_mask_cols.size() * sizeof(real_draft_head_topk_verify_mask_cols[0]));
+        real_draft_head_topk_hidden_kv_commit_noop_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_verify_mask_values.data(), real_draft_head_topk_verify_mask_values.size() * sizeof(real_draft_head_topk_verify_mask_values[0]));
+        real_draft_head_topk_hidden_kv_commit_noop_hash_last ^= common_speculative_fnv1a64(JETSPEC_REAL_DRAFT_HEAD_TOPK_HIDDEN_KV_COMMIT_NOOP_RUNTIME_PHASE, std::strlen(JETSPEC_REAL_DRAFT_HEAD_TOPK_HIDDEN_KV_COMMIT_NOOP_RUNTIME_PHASE));
+        real_draft_head_topk_hidden_kv_commit_noop_hash_last ^= common_speculative_fnv1a64(JETSPEC_HIDDEN_KV_SURVIVOR_COMMIT_PHASE, std::strlen(JETSPEC_HIDDEN_KV_SURVIVOR_COMMIT_PHASE));
+        real_draft_head_topk_hidden_kv_commit_noop_hash_last ^= common_speculative_fnv1a64(JETSPEC_HIDDEN_KV_SURVIVOR_COMMIT_ROLLBACK_POINT, std::strlen(JETSPEC_HIDDEN_KV_SURVIVOR_COMMIT_ROLLBACK_POINT));
+        real_draft_head_topk_hidden_kv_commit_noop_hash_last ^= common_speculative_fnv1a64(JETSPEC_ACCEPT_DECISION_SOURCE_NONE_NO_TARGET_LOGITS, std::strlen(JETSPEC_ACCEPT_DECISION_SOURCE_NONE_NO_TARGET_LOGITS));
+        real_draft_head_topk_hidden_kv_commit_noop_runtime_ready = true;
+        n_real_draft_head_topk_hidden_kv_commit_noop_runtime_builds++;
+        runtime_phase = jetspec_runtime_phase::real_draft_head_topk_hidden_kv_commit_noop_ready;
+        return true;
+    }
+
+    bool build_real_draft_head_topk_rejected_branch_discard_noop_runtime() {
+        reset_real_draft_head_topk_rejected_branch_discard_noop_metadata();
+        actual_committed_tokens_last = 0;
+        actual_survivor_pages_committed_last = 0;
+        actual_pages_discarded_last = 0;
+        rejected_branch_pages_reachable_after_discard_last = 0;
+        actual_publish_visible_state_last = 0;
+
+        if (!p5ar_real_draft_head_topk_rejected_branch_discard_noop_enabled) {
+            return false;
+        }
+        if (!p5aq_real_draft_head_topk_hidden_kv_commit_noop_enabled || !p5ap_real_draft_head_topk_token_commit_noop_enabled ||
+                !p5ao_real_draft_head_topk_accept_path_descriptor_enabled || !p5an_real_draft_head_topk_accept_boundary_enabled ||
+                !p5am_real_draft_head_topk_verify_mask_enabled || !p5al_real_draft_head_topk_tree_enabled ||
+                !p5ak_real_draft_head_topk_candidate_enabled || !p5aj_real_draft_head_logits_canary_enabled ||
+                !p5ag_topk_accept_boundary_enabled || !p5af_topk_verify_mask_enabled ||
+                !p5ae_topk_tree_enabled || !p5x_root_tree_enabled) {
+            return false;
+        }
+        if (topk_abi_root_tail_conflict()) {
+            return false;
+        }
+        if (accept_path_descriptor_ready || token_commit_descriptor_ready || hidden_kv_survivor_commit_descriptor_ready ||
+                rejected_branch_discard_descriptor_ready || publish_gate_descriptor_ready ||
+                root_token_commit_noop_runtime_ready || root_hidden_kv_commit_noop_runtime_ready ||
+                root_rejected_branch_discard_noop_runtime_ready || root_publish_gate_noop_runtime_ready) {
+            return false;
+        }
+        if (!real_draft_head_topk_hidden_kv_commit_noop_runtime_ready || real_draft_head_topk_hidden_kv_commit_noop_hash_last == 0 ||
+                !real_draft_head_topk_token_commit_noop_runtime_ready || real_draft_head_topk_token_commit_noop_hash_last == 0 ||
+                !real_draft_head_topk_accept_path_descriptor_runtime_ready || real_draft_head_topk_accept_path_descriptor_hash_last == 0 ||
+                !real_draft_head_topk_accept_boundary_runtime_ready || real_draft_head_topk_accept_boundary_hash_last == 0 ||
+                !real_draft_head_topk_verify_mask_runtime_ready || real_draft_head_topk_verify_mask_hash_last == 0 ||
+                !real_draft_head_topk_tree_runtime_ready || real_draft_head_topk_tree_hash_last == 0 ||
+                !real_draft_head_topk_candidate_runtime_ready || real_draft_head_topk_candidate_hash_last == 0 ||
+                !real_draft_head_logits_canary_ready || real_draft_head_canary_hash_last == 0 ||
+                !topk_accept_boundary_runtime_ready || topk_accept_boundary_runtime_hash_last == 0 ||
+                !topk_verify_mask_runtime_ready || topk_verify_mask_runtime_hash_last == 0 ||
+                !topk_tree_runtime_ready || topk_tree_runtime_hash_last == 0 ||
+                !root_tree_runtime_ready || root_tree_runtime_hash_last == 0) {
+            return false;
+        }
+        if (real_draft_head_canary_ctx_present_last != 1 || real_draft_head_canary_decode_rc_last != 0 ||
+                real_draft_head_canary_logits_rows_last != 1 || real_draft_head_canary_output_rows_last != 1 ||
+                real_draft_head_canary_output_width_last != JETSPEC_QWEN36_VOCAB_SIZE ||
+                real_draft_head_topk_actual_verified_logits_rows_last != 1 ||
+                real_draft_head_topk_verified_logits_rows_last != 1 ||
+                real_draft_head_canary_topk_k_last != JETSPEC_TOPK_ABI_WIDTH) {
+            return false;
+        }
+        if (real_draft_head_topk_hidden_kv_commit_noop_seq_id_last != real_draft_head_topk_token_commit_noop_seq_id_last ||
+                real_draft_head_topk_token_commit_noop_seq_id_last != real_draft_head_topk_accept_path_descriptor_seq_id_last ||
+                real_draft_head_topk_accept_path_descriptor_seq_id_last != real_draft_head_topk_accept_boundary_seq_id_last ||
+                real_draft_head_topk_accept_boundary_seq_id_last != real_draft_head_topk_verify_mask_seq_id_last ||
+                real_draft_head_topk_tree_seq_id_last != real_draft_head_topk_candidate_seq_id_last ||
+                real_draft_head_topk_verify_mask_seq_id_last != real_draft_head_topk_tree_seq_id_last ||
+                real_draft_head_topk_tree_nodes_last != JETSPEC_TOPK_ABI_NODES ||
+                real_draft_head_topk_verify_mask_entries_last != JETSPEC_TOPK_ABI_MASK_ENTRIES) {
+            return false;
+        }
+        if (real_draft_head_topk_accept_path_descriptor_candidate_nodes_last != JETSPEC_TOPK_ABI_NON_ROOT_NODES ||
+                real_draft_head_topk_accept_path_descriptor_verified_edges_last != JETSPEC_TOPK_ABI_MASK_ENTRIES ||
+                real_draft_head_topk_accept_path_descriptor_len_last != 0 ||
+                real_draft_head_topk_accept_path_descriptor_actual_accepted_nodes_last != 0 ||
+                real_draft_head_topk_accept_path_descriptor_correction_token_present_last != 0) {
+            return false;
+        }
+        if (actual_committed_tokens_last != 0 || actual_survivor_pages_committed_last != 0 ||
+                actual_pages_discarded_last != 0 || rejected_branch_pages_reachable_after_discard_last != 0 ||
+                actual_publish_visible_state_last != 0) {
+            return false;
+        }
+
+        real_draft_head_topk_rejected_branch_discard_noop_seq_id_last = real_draft_head_topk_hidden_kv_commit_noop_seq_id_last;
+        actual_committed_tokens_last = 0;
+        actual_survivor_pages_committed_last = 0;
+        actual_pages_discarded_last = 0;
+        rejected_branch_pages_reachable_after_discard_last = 0;
+        actual_publish_visible_state_last = 0;
+        if (actual_committed_tokens_last != 0 || actual_survivor_pages_committed_last != 0 ||
+                actual_pages_discarded_last != 0 || rejected_branch_pages_reachable_after_discard_last != 0 ||
+                actual_publish_visible_state_last != 0) {
+            return false;
+        }
+
+        const int64_t real_discard_words[] = {
+            (int64_t) transaction_plan_hash_last,
+            (int64_t) pre_round_snapshot_hash_last,
+            (int64_t) transient_reservation_hash_last,
+            (int64_t) tree_build_descriptor_hash_last,
+            (int64_t) root_tree_runtime_hash_last,
+            (int64_t) topk_tree_runtime_hash_last,
+            (int64_t) topk_verify_mask_runtime_hash_last,
+            (int64_t) topk_accept_boundary_runtime_hash_last,
+            (int64_t) real_draft_head_canary_hash_last,
+            (int64_t) real_draft_head_topk_candidate_hash_last,
+            (int64_t) real_draft_head_topk_tree_hash_last,
+            (int64_t) real_draft_head_topk_verify_mask_hash_last,
+            (int64_t) real_draft_head_topk_accept_boundary_hash_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_hash_last,
+            (int64_t) real_draft_head_topk_token_commit_noop_hash_last,
+            (int64_t) real_draft_head_topk_hidden_kv_commit_noop_hash_last,
+            (int64_t) real_draft_head_topk_rejected_branch_discard_noop_seq_id_last,
+            (int64_t) real_draft_head_topk_tree_nodes_last,
+            (int64_t) real_draft_head_topk_verify_mask_entries_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_candidate_nodes_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_verified_edges_last,
+            (int64_t) real_draft_head_topk_actual_verified_logits_rows_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_len_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_actual_accepted_nodes_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_correction_token_present_last,
+            (int64_t) actual_committed_tokens_last,
+            (int64_t) actual_survivor_pages_committed_last,
+            (int64_t) actual_pages_discarded_last,
+            (int64_t) rejected_branch_pages_reachable_after_discard_last,
+            (int64_t) actual_publish_visible_state_last,
+            JETSPEC_QWEN36_DRAFT_BLOCK_SIZE,
+            JETSPEC_TRANSACTION_PHASE_COUNT,
+            JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT,
+        };
+        real_draft_head_topk_rejected_branch_discard_noop_hash_last = common_speculative_fnv1a64(real_discard_words, sizeof(real_discard_words));
+        real_draft_head_topk_rejected_branch_discard_noop_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_tree_cum_logit.data(), real_draft_head_topk_tree_cum_logit.size() * sizeof(real_draft_head_topk_tree_cum_logit[0]));
+        real_draft_head_topk_rejected_branch_discard_noop_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_verify_mask_rows.data(), real_draft_head_topk_verify_mask_rows.size() * sizeof(real_draft_head_topk_verify_mask_rows[0]));
+        real_draft_head_topk_rejected_branch_discard_noop_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_verify_mask_cols.data(), real_draft_head_topk_verify_mask_cols.size() * sizeof(real_draft_head_topk_verify_mask_cols[0]));
+        real_draft_head_topk_rejected_branch_discard_noop_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_verify_mask_values.data(), real_draft_head_topk_verify_mask_values.size() * sizeof(real_draft_head_topk_verify_mask_values[0]));
+        real_draft_head_topk_rejected_branch_discard_noop_hash_last ^= common_speculative_fnv1a64(JETSPEC_REAL_DRAFT_HEAD_TOPK_REJECTED_BRANCH_DISCARD_NOOP_RUNTIME_PHASE, std::strlen(JETSPEC_REAL_DRAFT_HEAD_TOPK_REJECTED_BRANCH_DISCARD_NOOP_RUNTIME_PHASE));
+        real_draft_head_topk_rejected_branch_discard_noop_hash_last ^= common_speculative_fnv1a64(JETSPEC_REJECTED_BRANCH_DISCARD_PHASE, std::strlen(JETSPEC_REJECTED_BRANCH_DISCARD_PHASE));
+        real_draft_head_topk_rejected_branch_discard_noop_hash_last ^= common_speculative_fnv1a64(JETSPEC_REJECTED_BRANCH_DISCARD_ROLLBACK_POINT, std::strlen(JETSPEC_REJECTED_BRANCH_DISCARD_ROLLBACK_POINT));
+        real_draft_head_topk_rejected_branch_discard_noop_hash_last ^= common_speculative_fnv1a64(JETSPEC_ACCEPT_DECISION_SOURCE_NONE_NO_TARGET_LOGITS, std::strlen(JETSPEC_ACCEPT_DECISION_SOURCE_NONE_NO_TARGET_LOGITS));
+        real_draft_head_topk_rejected_branch_discard_noop_runtime_ready = true;
+        n_real_draft_head_topk_rejected_branch_discard_noop_runtime_builds++;
+        runtime_phase = jetspec_runtime_phase::real_draft_head_topk_rejected_branch_discard_noop_ready;
+        return true;
+    }
+
+    bool build_real_draft_head_topk_publish_gate_noop_runtime() {
+        reset_real_draft_head_topk_publish_gate_noop_metadata();
+        actual_committed_tokens_last = 0;
+        actual_survivor_pages_committed_last = 0;
+        actual_pages_discarded_last = 0;
+        rejected_branch_pages_reachable_after_discard_last = 0;
+        actual_publish_visible_state_last = 0;
+
+        if (!p5as_real_draft_head_topk_publish_gate_noop_enabled) {
+            return false;
+        }
+        if (!p5ar_real_draft_head_topk_rejected_branch_discard_noop_enabled ||
+                !p5aq_real_draft_head_topk_hidden_kv_commit_noop_enabled || !p5ap_real_draft_head_topk_token_commit_noop_enabled ||
+                !p5ao_real_draft_head_topk_accept_path_descriptor_enabled || !p5an_real_draft_head_topk_accept_boundary_enabled ||
+                !p5am_real_draft_head_topk_verify_mask_enabled || !p5al_real_draft_head_topk_tree_enabled ||
+                !p5ak_real_draft_head_topk_candidate_enabled || !p5aj_real_draft_head_logits_canary_enabled ||
+                !p5ag_topk_accept_boundary_enabled || !p5af_topk_verify_mask_enabled ||
+                !p5ae_topk_tree_enabled || !p5x_root_tree_enabled) {
+            return false;
+        }
+        if (topk_abi_root_tail_conflict()) {
+            return false;
+        }
+        if (accept_path_descriptor_ready || token_commit_descriptor_ready || hidden_kv_survivor_commit_descriptor_ready ||
+                rejected_branch_discard_descriptor_ready || publish_gate_descriptor_ready ||
+                root_token_commit_noop_runtime_ready || root_hidden_kv_commit_noop_runtime_ready ||
+                root_rejected_branch_discard_noop_runtime_ready || root_publish_gate_noop_runtime_ready) {
+            return false;
+        }
+        if (!real_draft_head_topk_rejected_branch_discard_noop_runtime_ready || real_draft_head_topk_rejected_branch_discard_noop_hash_last == 0 ||
+                !real_draft_head_topk_hidden_kv_commit_noop_runtime_ready || real_draft_head_topk_hidden_kv_commit_noop_hash_last == 0 ||
+                !real_draft_head_topk_token_commit_noop_runtime_ready || real_draft_head_topk_token_commit_noop_hash_last == 0 ||
+                !real_draft_head_topk_accept_path_descriptor_runtime_ready || real_draft_head_topk_accept_path_descriptor_hash_last == 0 ||
+                !real_draft_head_topk_accept_boundary_runtime_ready || real_draft_head_topk_accept_boundary_hash_last == 0 ||
+                !real_draft_head_topk_verify_mask_runtime_ready || real_draft_head_topk_verify_mask_hash_last == 0 ||
+                !real_draft_head_topk_tree_runtime_ready || real_draft_head_topk_tree_hash_last == 0 ||
+                !real_draft_head_topk_candidate_runtime_ready || real_draft_head_topk_candidate_hash_last == 0 ||
+                !real_draft_head_logits_canary_ready || real_draft_head_canary_hash_last == 0 ||
+                !topk_accept_boundary_runtime_ready || topk_accept_boundary_runtime_hash_last == 0 ||
+                !topk_verify_mask_runtime_ready || topk_verify_mask_runtime_hash_last == 0 ||
+                !topk_tree_runtime_ready || topk_tree_runtime_hash_last == 0 ||
+                !root_tree_runtime_ready || root_tree_runtime_hash_last == 0) {
+            return false;
+        }
+        if (real_draft_head_canary_ctx_present_last != 1 || real_draft_head_canary_decode_rc_last != 0 ||
+                real_draft_head_canary_logits_rows_last != 1 || real_draft_head_canary_output_rows_last != 1 ||
+                real_draft_head_canary_output_width_last != JETSPEC_QWEN36_VOCAB_SIZE ||
+                real_draft_head_topk_actual_verified_logits_rows_last != 1 ||
+                real_draft_head_topk_verified_logits_rows_last != 1 ||
+                real_draft_head_canary_topk_k_last != JETSPEC_TOPK_ABI_WIDTH) {
+            return false;
+        }
+        if (real_draft_head_topk_rejected_branch_discard_noop_seq_id_last != real_draft_head_topk_hidden_kv_commit_noop_seq_id_last ||
+                real_draft_head_topk_hidden_kv_commit_noop_seq_id_last != real_draft_head_topk_token_commit_noop_seq_id_last ||
+                real_draft_head_topk_token_commit_noop_seq_id_last != real_draft_head_topk_accept_path_descriptor_seq_id_last ||
+                real_draft_head_topk_accept_path_descriptor_seq_id_last != real_draft_head_topk_accept_boundary_seq_id_last ||
+                real_draft_head_topk_accept_boundary_seq_id_last != real_draft_head_topk_verify_mask_seq_id_last ||
+                real_draft_head_topk_tree_seq_id_last != real_draft_head_topk_candidate_seq_id_last ||
+                real_draft_head_topk_verify_mask_seq_id_last != real_draft_head_topk_tree_seq_id_last ||
+                real_draft_head_topk_tree_nodes_last != JETSPEC_TOPK_ABI_NODES ||
+                real_draft_head_topk_verify_mask_entries_last != JETSPEC_TOPK_ABI_MASK_ENTRIES) {
+            return false;
+        }
+        if (real_draft_head_topk_accept_path_descriptor_candidate_nodes_last != JETSPEC_TOPK_ABI_NON_ROOT_NODES ||
+                real_draft_head_topk_accept_path_descriptor_verified_edges_last != JETSPEC_TOPK_ABI_MASK_ENTRIES ||
+                real_draft_head_topk_accept_path_descriptor_len_last != 0 ||
+                real_draft_head_topk_accept_path_descriptor_actual_accepted_nodes_last != 0 ||
+                real_draft_head_topk_accept_path_descriptor_correction_token_present_last != 0) {
+            return false;
+        }
+        if (actual_committed_tokens_last != 0 || actual_survivor_pages_committed_last != 0 ||
+                actual_pages_discarded_last != 0 || rejected_branch_pages_reachable_after_discard_last != 0 ||
+                actual_publish_visible_state_last != 0) {
+            return false;
+        }
+
+        real_draft_head_topk_publish_gate_noop_seq_id_last = real_draft_head_topk_rejected_branch_discard_noop_seq_id_last;
+        actual_committed_tokens_last = 0;
+        actual_survivor_pages_committed_last = 0;
+        actual_pages_discarded_last = 0;
+        rejected_branch_pages_reachable_after_discard_last = 0;
+        actual_publish_visible_state_last = 0;
+        if (actual_committed_tokens_last != 0 || actual_survivor_pages_committed_last != 0 ||
+                actual_pages_discarded_last != 0 || rejected_branch_pages_reachable_after_discard_last != 0 ||
+                actual_publish_visible_state_last != 0) {
+            return false;
+        }
+
+        const int64_t real_publish_words[] = {
+            (int64_t) transaction_plan_hash_last,
+            (int64_t) pre_round_snapshot_hash_last,
+            (int64_t) transient_reservation_hash_last,
+            (int64_t) tree_build_descriptor_hash_last,
+            (int64_t) root_tree_runtime_hash_last,
+            (int64_t) topk_tree_runtime_hash_last,
+            (int64_t) topk_verify_mask_runtime_hash_last,
+            (int64_t) topk_accept_boundary_runtime_hash_last,
+            (int64_t) real_draft_head_canary_hash_last,
+            (int64_t) real_draft_head_topk_candidate_hash_last,
+            (int64_t) real_draft_head_topk_tree_hash_last,
+            (int64_t) real_draft_head_topk_verify_mask_hash_last,
+            (int64_t) real_draft_head_topk_accept_boundary_hash_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_hash_last,
+            (int64_t) real_draft_head_topk_token_commit_noop_hash_last,
+            (int64_t) real_draft_head_topk_hidden_kv_commit_noop_hash_last,
+            (int64_t) real_draft_head_topk_rejected_branch_discard_noop_hash_last,
+            (int64_t) real_draft_head_topk_publish_gate_noop_seq_id_last,
+            (int64_t) real_draft_head_topk_tree_nodes_last,
+            (int64_t) real_draft_head_topk_verify_mask_entries_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_candidate_nodes_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_verified_edges_last,
+            (int64_t) real_draft_head_topk_actual_verified_logits_rows_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_len_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_actual_accepted_nodes_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_correction_token_present_last,
+            (int64_t) actual_committed_tokens_last,
+            (int64_t) actual_survivor_pages_committed_last,
+            (int64_t) actual_pages_discarded_last,
+            (int64_t) rejected_branch_pages_reachable_after_discard_last,
+            (int64_t) actual_publish_visible_state_last,
+            JETSPEC_QWEN36_DRAFT_BLOCK_SIZE,
+            JETSPEC_TRANSACTION_PHASE_COUNT,
+            JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT,
+        };
+        real_draft_head_topk_publish_gate_noop_hash_last = common_speculative_fnv1a64(real_publish_words, sizeof(real_publish_words));
+        real_draft_head_topk_publish_gate_noop_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_tree_cum_logit.data(), real_draft_head_topk_tree_cum_logit.size() * sizeof(real_draft_head_topk_tree_cum_logit[0]));
+        real_draft_head_topk_publish_gate_noop_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_verify_mask_rows.data(), real_draft_head_topk_verify_mask_rows.size() * sizeof(real_draft_head_topk_verify_mask_rows[0]));
+        real_draft_head_topk_publish_gate_noop_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_verify_mask_cols.data(), real_draft_head_topk_verify_mask_cols.size() * sizeof(real_draft_head_topk_verify_mask_cols[0]));
+        real_draft_head_topk_publish_gate_noop_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_verify_mask_values.data(), real_draft_head_topk_verify_mask_values.size() * sizeof(real_draft_head_topk_verify_mask_values[0]));
+        real_draft_head_topk_publish_gate_noop_hash_last ^= common_speculative_fnv1a64(JETSPEC_REAL_DRAFT_HEAD_TOPK_PUBLISH_GATE_NOOP_RUNTIME_PHASE, std::strlen(JETSPEC_REAL_DRAFT_HEAD_TOPK_PUBLISH_GATE_NOOP_RUNTIME_PHASE));
+        real_draft_head_topk_publish_gate_noop_hash_last ^= common_speculative_fnv1a64(JETSPEC_PUBLISH_GATE_PHASE, std::strlen(JETSPEC_PUBLISH_GATE_PHASE));
+        real_draft_head_topk_publish_gate_noop_hash_last ^= common_speculative_fnv1a64(JETSPEC_ACCEPT_DECISION_SOURCE_NONE_NO_TARGET_LOGITS, std::strlen(JETSPEC_ACCEPT_DECISION_SOURCE_NONE_NO_TARGET_LOGITS));
+        real_draft_head_topk_publish_gate_noop_runtime_ready = true;
+        n_real_draft_head_topk_publish_gate_noop_runtime_builds++;
+        runtime_phase = jetspec_runtime_phase::real_draft_head_topk_publish_gate_noop_ready;
+        return true;
+    }
+
+    bool build_real_draft_head_topk_target_logits_walk_canary_runtime(const llama_batch & batch) {
+        reset_real_draft_head_topk_target_logits_walk_canary_metadata();
+        actual_committed_tokens_last = 0;
+        actual_survivor_pages_committed_last = 0;
+        actual_pages_discarded_last = 0;
+        rejected_branch_pages_reachable_after_discard_last = 0;
+        actual_publish_visible_state_last = 0;
+
+        if (!p5av_real_draft_head_topk_target_logits_walk_canary_enabled) {
+            return false;
+        }
+        if (!p5as_real_draft_head_topk_publish_gate_noop_enabled || !p5ar_real_draft_head_topk_rejected_branch_discard_noop_enabled ||
+                !p5aq_real_draft_head_topk_hidden_kv_commit_noop_enabled || !p5ap_real_draft_head_topk_token_commit_noop_enabled ||
+                !p5ao_real_draft_head_topk_accept_path_descriptor_enabled || !p5an_real_draft_head_topk_accept_boundary_enabled ||
+                !p5am_real_draft_head_topk_verify_mask_enabled || !p5al_real_draft_head_topk_tree_enabled ||
+                !p5ak_real_draft_head_topk_candidate_enabled || !p5aj_real_draft_head_logits_canary_enabled ||
+                !p5ag_topk_accept_boundary_enabled || !p5af_topk_verify_mask_enabled ||
+                !p5ae_topk_tree_enabled || !p5x_root_tree_enabled) {
+            return false;
+        }
+        if (topk_abi_root_tail_conflict()) {
+            return false;
+        }
+        if (accept_path_descriptor_ready || token_commit_descriptor_ready || hidden_kv_survivor_commit_descriptor_ready ||
+                rejected_branch_discard_descriptor_ready || publish_gate_descriptor_ready ||
+                root_token_commit_noop_runtime_ready || root_hidden_kv_commit_noop_runtime_ready ||
+                root_rejected_branch_discard_noop_runtime_ready || root_publish_gate_noop_runtime_ready) {
+            return false;
+        }
+        if (!real_draft_head_topk_publish_gate_noop_runtime_ready || real_draft_head_topk_publish_gate_noop_hash_last == 0 ||
+                !real_draft_head_topk_rejected_branch_discard_noop_runtime_ready || real_draft_head_topk_rejected_branch_discard_noop_hash_last == 0 ||
+                !real_draft_head_topk_hidden_kv_commit_noop_runtime_ready || real_draft_head_topk_hidden_kv_commit_noop_hash_last == 0 ||
+                !real_draft_head_topk_token_commit_noop_runtime_ready || real_draft_head_topk_token_commit_noop_hash_last == 0 ||
+                !real_draft_head_topk_accept_path_descriptor_runtime_ready || real_draft_head_topk_accept_path_descriptor_hash_last == 0 ||
+                !real_draft_head_topk_accept_boundary_runtime_ready || real_draft_head_topk_accept_boundary_hash_last == 0 ||
+                !real_draft_head_topk_verify_mask_runtime_ready || real_draft_head_topk_verify_mask_hash_last == 0 ||
+                !real_draft_head_topk_tree_runtime_ready || real_draft_head_topk_tree_hash_last == 0 ||
+                !real_draft_head_topk_candidate_runtime_ready || real_draft_head_topk_candidate_hash_last == 0) {
+            return false;
+        }
+        if (real_draft_head_topk_publish_gate_noop_seq_id_last != real_draft_head_topk_rejected_branch_discard_noop_seq_id_last ||
+                real_draft_head_topk_tree_nodes_last != JETSPEC_TOPK_ABI_NODES ||
+                real_draft_head_topk_verify_mask_entries_last != JETSPEC_TOPK_ABI_MASK_ENTRIES ||
+                real_draft_head_topk_accept_path_descriptor_len_last != 0 ||
+                real_draft_head_topk_accept_path_descriptor_actual_accepted_nodes_last != 0 ||
+                real_draft_head_topk_accept_path_descriptor_correction_token_present_last != 0) {
+            return false;
+        }
+        if (actual_committed_tokens_last != 0 || actual_survivor_pages_committed_last != 0 ||
+                actual_pages_discarded_last != 0 || rejected_branch_pages_reachable_after_discard_last != 0 ||
+                actual_publish_visible_state_last != 0) {
+            return false;
+        }
+        for (int32_t i = 0; i < JETSPEC_TOPK_ABI_WIDTH; ++i) {
+            if (real_draft_head_topk_candidate_ids[i] < 0 || real_draft_head_topk_candidate_ids[i] >= JETSPEC_QWEN36_VOCAB_SIZE) {
+                return false;
+            }
+        }
+
+        int32_t batch_index = -1;
+        if (batch.logits != nullptr) {
+            for (int32_t i = 0; i < batch.n_tokens; ++i) {
+                if (batch.logits[i] != 0) {
+                    batch_index = i;
+                    break;
+                }
+            }
+        }
+        if (batch_index < 0 || params.ctx_tgt == nullptr) {
+            return false;
+        }
+        const float * target_logits = llama_get_logits_ith(params.ctx_tgt, batch_index);
+        if (target_logits == nullptr) {
+            return false;
+        }
+
+        real_draft_head_topk_target_logits_walk_canary_seq_id_last = real_draft_head_topk_publish_gate_noop_seq_id_last;
+        real_draft_head_topk_target_logits_planned_rows_last = 1;
+        real_draft_head_topk_target_logits_actual_rows_walked_last = 1;
+        real_draft_head_topk_target_logits_batch_index_last = batch_index;
+        real_draft_head_topk_target_logits_pos_last = batch.pos != nullptr ? (int32_t) batch.pos[batch_index] : -1;
+        real_draft_head_topk_target_logits_seq_id_last = -1;
+        if (batch.n_seq_id != nullptr && batch.seq_id != nullptr && batch.n_seq_id[batch_index] > 0 && batch.seq_id[batch_index] != nullptr) {
+            real_draft_head_topk_target_logits_seq_id_last = (int32_t) batch.seq_id[batch_index][0];
+        }
+        real_draft_head_topk_target_logits_width_last = JETSPEC_QWEN36_VOCAB_SIZE;
+        real_draft_head_topk_target_logits_candidate_nodes_last = JETSPEC_TOPK_ABI_NON_ROOT_NODES;
+        for (int32_t i = 0; i < JETSPEC_TOPK_ABI_WIDTH; ++i) {
+            real_draft_head_topk_target_logits_candidate_scores[i] = target_logits[real_draft_head_topk_candidate_ids[i]];
+        }
+        actual_committed_tokens_last = 0;
+        actual_survivor_pages_committed_last = 0;
+        actual_pages_discarded_last = 0;
+        rejected_branch_pages_reachable_after_discard_last = 0;
+        actual_publish_visible_state_last = 0;
+
+        const int64_t target_walk_words[] = {
+            (int64_t) transaction_plan_hash_last,
+            (int64_t) pre_round_snapshot_hash_last,
+            (int64_t) real_draft_head_topk_publish_gate_noop_hash_last,
+            (int64_t) real_draft_head_topk_target_logits_walk_canary_seq_id_last,
+            (int64_t) real_draft_head_topk_target_logits_planned_rows_last,
+            (int64_t) real_draft_head_topk_target_logits_actual_rows_walked_last,
+            (int64_t) real_draft_head_topk_target_logits_batch_index_last,
+            (int64_t) real_draft_head_topk_target_logits_pos_last,
+            (int64_t) real_draft_head_topk_target_logits_seq_id_last,
+            (int64_t) real_draft_head_topk_target_logits_width_last,
+            (int64_t) real_draft_head_topk_target_logits_candidate_nodes_last,
+            (int64_t) real_draft_head_topk_candidate_ids[0],
+            (int64_t) real_draft_head_topk_candidate_ids[1],
+            (int64_t) real_draft_head_topk_tree_nodes_last,
+            (int64_t) real_draft_head_topk_verify_mask_entries_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_len_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_actual_accepted_nodes_last,
+            (int64_t) real_draft_head_topk_accept_path_descriptor_correction_token_present_last,
+            (int64_t) actual_committed_tokens_last,
+            (int64_t) actual_survivor_pages_committed_last,
+            (int64_t) actual_pages_discarded_last,
+            (int64_t) rejected_branch_pages_reachable_after_discard_last,
+            (int64_t) actual_publish_visible_state_last,
+            JETSPEC_QWEN36_DRAFT_BLOCK_SIZE,
+            JETSPEC_TRANSACTION_PHASE_COUNT,
+        };
+        real_draft_head_topk_target_logits_walk_canary_hash_last = common_speculative_fnv1a64(target_walk_words, sizeof(target_walk_words));
+        real_draft_head_topk_target_logits_walk_canary_hash_last ^= common_speculative_fnv1a64(real_draft_head_topk_target_logits_candidate_scores.data(), real_draft_head_topk_target_logits_candidate_scores.size() * sizeof(real_draft_head_topk_target_logits_candidate_scores[0]));
+        real_draft_head_topk_target_logits_walk_canary_hash_last ^= common_speculative_fnv1a64(JETSPEC_REAL_DRAFT_HEAD_TOPK_TARGET_LOGITS_WALK_CANARY_RUNTIME_PHASE, std::strlen(JETSPEC_REAL_DRAFT_HEAD_TOPK_TARGET_LOGITS_WALK_CANARY_RUNTIME_PHASE));
+        real_draft_head_topk_target_logits_walk_canary_hash_last ^= common_speculative_fnv1a64(JETSPEC_TARGET_LOGITS_SOURCE, std::strlen(JETSPEC_TARGET_LOGITS_SOURCE));
+        real_draft_head_topk_target_logits_walk_canary_hash_last ^= common_speculative_fnv1a64(JETSPEC_TARGET_LOGITS_WALK_ROW_SEMANTICS, std::strlen(JETSPEC_TARGET_LOGITS_WALK_ROW_SEMANTICS));
+        real_draft_head_topk_target_logits_walk_canary_ready = true;
+        n_real_draft_head_topk_target_logits_walk_canary_builds++;
+        runtime_phase = jetspec_runtime_phase::real_draft_head_topk_target_logits_walk_canary_ready;
+        return true;
+    }
+
     bool build_pre_round_snapshot(llama_seq_id seq_id, const llama_tokens & prompt) {
         pre_round_snapshot_ready = false;
         pre_round_snapshot_hash_last = 0;
         pre_round_prompt_hash_last = 0;
         pre_round_seq_id_last = -1;
         pre_round_prompt_tokens_last = 0;
+        pre_round_root_token_last = -1;
         if (seq_id < 0 || (uint32_t) seq_id >= n_seq) {
+            return false;
+        }
+        if (p5x_root_tree_enabled && prompt.empty()) {
             return false;
         }
 
         pre_round_seq_id_last = (int32_t) seq_id;
         pre_round_prompt_tokens_last = prompt.size();
+        pre_round_root_token_last = prompt.empty() ? -1 : prompt.back();
         pre_round_prompt_hash_last = common_speculative_fnv1a64(prompt.data(), prompt.size() * sizeof(prompt[0]));
 
         const int64_t snapshot_words[] = {
             (int64_t) pre_round_seq_id_last,
             (int64_t) pre_round_prompt_tokens_last,
             (int64_t) pre_round_prompt_hash_last,
+            (int64_t) pre_round_root_token_last,
             JETSPEC_TRANSACTION_PHASE_COUNT,
         };
         pre_round_snapshot_hash_last = common_speculative_fnv1a64(snapshot_words, sizeof(snapshot_words));
@@ -892,6 +3114,9 @@ struct common_speculative_impl_draft_jetspec : public common_speculative_impl {
 
         tree_build_seq_id_last = pre_round_seq_id_last;
         tree_build_node_budget_last = transient_reservation_node_budget_last;
+        if (p5ae_topk_tree_enabled) {
+            tree_build_node_budget_last = std::max(tree_build_node_budget_last, JETSPEC_TOPK_ABI_NODES);
+        }
         tree_build_root_parent_last = JETSPEC_TREE_ROOT_PARENT;
         tree_build_root_depth_last = JETSPEC_TREE_ROOT_DEPTH;
         tree_build_actual_nodes_last = 0;
@@ -929,6 +3154,1104 @@ struct common_speculative_impl_draft_jetspec : public common_speculative_impl {
         return true;
     }
 
+    bool build_root_only_runtime_tree() {
+        root_tree_runtime_ready = false;
+        root_tree_runtime_hash_last = 0;
+        root_tree_runtime_seq_id_last = -1;
+        tree_build_actual_nodes_last = 0;
+        topk_tree_width_last = 0;
+        topk_tree_depth_last = 0;
+        topk_tree_non_root_nodes_last = 0;
+        reset_tree_arrays();
+        if (!p5x_root_tree_enabled) {
+            return false;
+        }
+        if (!tree_build_descriptor_ready || tree_build_descriptor_hash_last == 0) {
+            return false;
+        }
+        if (!transient_reservation_ready || transient_reservation_hash_last == 0) {
+            return false;
+        }
+        if (!transaction_plan_ready || transaction_plan_hash_last == 0) {
+            return false;
+        }
+        if (!pre_round_snapshot_ready || pre_round_snapshot_hash_last == 0) {
+            return false;
+        }
+        if (transient_reservation_actual_pages_last != 0) {
+            return false;
+        }
+        if (tree_build_node_budget_last <= 0 || tree_build_node_budget_last > JETSPEC_QWEN36_DRAFT_BLOCK_SIZE) {
+            return false;
+        }
+        if (pre_round_root_token_last < 0) {
+            return false;
+        }
+
+        root_tree_runtime_seq_id_last = pre_round_seq_id_last;
+        tree_build_actual_nodes_last = 1;
+        tree_token_ids[0] = pre_round_root_token_last;
+        tree_parent_indices[0] = JETSPEC_TREE_ROOT_PARENT;
+        tree_depth[0] = JETSPEC_TREE_ROOT_DEPTH;
+        tree_rank[0] = -1;
+        tree_cum_logprob[0] = 0.0f;
+        if (tree_build_actual_nodes_last > tree_build_node_budget_last) {
+            return false;
+        }
+        if (tree_parent_indices[0] != JETSPEC_TREE_ROOT_PARENT || tree_depth[0] != JETSPEC_TREE_ROOT_DEPTH) {
+            return false;
+        }
+
+        const int64_t root_words[] = {
+            (int64_t) transaction_plan_hash_last,
+            (int64_t) pre_round_snapshot_hash_last,
+            (int64_t) transient_reservation_hash_last,
+            (int64_t) tree_build_descriptor_hash_last,
+            (int64_t) root_tree_runtime_seq_id_last,
+            (int64_t) tree_build_node_budget_last,
+            (int64_t) tree_build_actual_nodes_last,
+            (int64_t) tree_token_ids[0],
+            (int64_t) tree_parent_indices[0],
+            (int64_t) tree_depth[0],
+            (int64_t) tree_rank[0],
+            (int64_t) pre_round_prompt_tokens_last,
+            (int64_t) pre_round_prompt_hash_last,
+            (int64_t) n_target_tap_rows_cached,
+            (int64_t) target_tap_hash_last,
+            JETSPEC_QWEN36_DRAFT_BLOCK_SIZE,
+            JETSPEC_TRANSACTION_PHASE_COUNT,
+            JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT,
+        };
+        root_tree_runtime_hash_last = common_speculative_fnv1a64(root_words, sizeof(root_words));
+        root_tree_runtime_hash_last ^= common_speculative_fnv1a64(&tree_cum_logprob[0], sizeof(tree_cum_logprob[0]));
+        root_tree_runtime_hash_last ^= common_speculative_fnv1a64(JETSPEC_ROOT_TREE_RUNTIME_PHASE, std::strlen(JETSPEC_ROOT_TREE_RUNTIME_PHASE));
+        root_tree_runtime_hash_last ^= common_speculative_fnv1a64(JETSPEC_TREE_BUILD_PHASE, std::strlen(JETSPEC_TREE_BUILD_PHASE));
+        root_tree_runtime_ready = true;
+        n_root_tree_runtime_builds++;
+        runtime_phase = jetspec_runtime_phase::tree_build_runtime_ready;
+        return true;
+    }
+
+    bool build_topk_tree_runtime() {
+        topk_tree_runtime_ready = false;
+        topk_tree_runtime_hash_last = 0;
+        topk_tree_runtime_seq_id_last = -1;
+        topk_tree_width_last = 0;
+        topk_tree_depth_last = 0;
+        topk_tree_non_root_nodes_last = 0;
+        if (!p5ae_topk_tree_enabled) {
+            return false;
+        }
+        if (topk_abi_root_tail_conflict()) {
+            return false;
+        }
+        if (!p5x_root_tree_enabled || !root_tree_runtime_ready || root_tree_runtime_hash_last == 0) {
+            return false;
+        }
+        if (!tree_build_descriptor_ready || tree_build_descriptor_hash_last == 0) {
+            return false;
+        }
+        if (!transient_reservation_ready || transient_reservation_hash_last == 0) {
+            return false;
+        }
+        if (!transaction_plan_ready || transaction_plan_hash_last == 0) {
+            return false;
+        }
+        if (!pre_round_snapshot_ready || pre_round_snapshot_hash_last == 0) {
+            return false;
+        }
+        if (pre_round_root_token_last < 0 || tree_token_ids[0] != pre_round_root_token_last) {
+            return false;
+        }
+        if (tree_parent_indices[0] != JETSPEC_TREE_ROOT_PARENT || tree_depth[0] != JETSPEC_TREE_ROOT_DEPTH || tree_rank[0] != -1) {
+            return false;
+        }
+        if (tree_build_node_budget_last < JETSPEC_TOPK_ABI_NODES || tree_build_node_budget_last > JETSPEC_QWEN36_DRAFT_BLOCK_SIZE) {
+            return false;
+        }
+        if (n_target_tap_rows_cached == 0 || target_tap_row_state.size() != n_target_tap_rows_cached) {
+            return false;
+        }
+
+        topk_tree_runtime_seq_id_last = root_tree_runtime_seq_id_last;
+        topk_tree_width_last = JETSPEC_TOPK_ABI_WIDTH;
+        topk_tree_depth_last = JETSPEC_TOPK_ABI_DEPTH;
+        topk_tree_non_root_nodes_last = JETSPEC_TOPK_ABI_NON_ROOT_NODES;
+        tree_build_actual_nodes_last = JETSPEC_TOPK_ABI_NODES;
+        tree_token_ids[0] = pre_round_root_token_last;
+        tree_token_ids[1] = (pre_round_root_token_last + 1) % JETSPEC_QWEN36_VOCAB_SIZE;
+        tree_token_ids[2] = (pre_round_root_token_last + 2) % JETSPEC_QWEN36_VOCAB_SIZE;
+        tree_parent_indices[0] = JETSPEC_TREE_ROOT_PARENT;
+        tree_parent_indices[1] = 0;
+        tree_parent_indices[2] = 0;
+        tree_depth[0] = JETSPEC_TREE_ROOT_DEPTH;
+        tree_depth[1] = 1;
+        tree_depth[2] = 1;
+        tree_rank[0] = -1;
+        tree_rank[1] = 0;
+        tree_rank[2] = 1;
+        tree_cum_logprob[0] = 0.0f;
+        tree_cum_logprob[1] = -0.1f;
+        tree_cum_logprob[2] = -0.3f;
+        if (tree_build_actual_nodes_last > tree_build_node_budget_last) {
+            return false;
+        }
+        if (tree_parent_indices[1] >= 1 || tree_parent_indices[2] >= 2 || tree_depth[1] != tree_depth[0] + 1 || tree_depth[2] != tree_depth[0] + 1) {
+            return false;
+        }
+        if (tree_token_ids[1] < 0 || tree_token_ids[2] < 0 || tree_token_ids[1] == tree_token_ids[2]) {
+            return false;
+        }
+
+        const int64_t topk_words[] = {
+            (int64_t) transaction_plan_hash_last,
+            (int64_t) pre_round_snapshot_hash_last,
+            (int64_t) transient_reservation_hash_last,
+            (int64_t) tree_build_descriptor_hash_last,
+            (int64_t) root_tree_runtime_hash_last,
+            (int64_t) topk_tree_runtime_seq_id_last,
+            (int64_t) tree_build_node_budget_last,
+            (int64_t) tree_build_actual_nodes_last,
+            (int64_t) topk_tree_width_last,
+            (int64_t) topk_tree_depth_last,
+            (int64_t) topk_tree_non_root_nodes_last,
+            (int64_t) tree_token_ids[0],
+            (int64_t) tree_token_ids[1],
+            (int64_t) tree_token_ids[2],
+            (int64_t) tree_parent_indices[0],
+            (int64_t) tree_parent_indices[1],
+            (int64_t) tree_parent_indices[2],
+            (int64_t) tree_depth[0],
+            (int64_t) tree_depth[1],
+            (int64_t) tree_depth[2],
+            (int64_t) tree_rank[0],
+            (int64_t) tree_rank[1],
+            (int64_t) tree_rank[2],
+            (int64_t) pre_round_prompt_tokens_last,
+            (int64_t) pre_round_prompt_hash_last,
+            (int64_t) n_target_tap_rows_cached,
+            (int64_t) target_tap_hash_last,
+            JETSPEC_QWEN36_DRAFT_BLOCK_SIZE,
+            JETSPEC_TRANSACTION_PHASE_COUNT,
+            JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT,
+        };
+        topk_tree_runtime_hash_last = common_speculative_fnv1a64(topk_words, sizeof(topk_words));
+        topk_tree_runtime_hash_last ^= common_speculative_fnv1a64(&tree_cum_logprob[0], JETSPEC_TOPK_ABI_NODES * sizeof(tree_cum_logprob[0]));
+        topk_tree_runtime_hash_last ^= common_speculative_fnv1a64(JETSPEC_TOPK_TREE_RUNTIME_PHASE, std::strlen(JETSPEC_TOPK_TREE_RUNTIME_PHASE));
+        topk_tree_runtime_hash_last ^= common_speculative_fnv1a64(JETSPEC_SYNTHETIC_FULL_VOCAB_SOFTMAX, std::strlen(JETSPEC_SYNTHETIC_FULL_VOCAB_SOFTMAX));
+        topk_tree_runtime_hash_last ^= common_speculative_fnv1a64(JETSPEC_TREE_BUILD_PHASE, std::strlen(JETSPEC_TREE_BUILD_PHASE));
+        topk_tree_runtime_ready = true;
+        n_topk_tree_runtime_builds++;
+        runtime_phase = jetspec_runtime_phase::tree_build_runtime_ready;
+        return true;
+    }
+
+    bool build_topk_verify_mask_runtime() {
+        topk_verify_mask_runtime_ready = false;
+        topk_verify_mask_runtime_hash_last = 0;
+        topk_verify_mask_runtime_seq_id_last = -1;
+        actual_verify_mask_entries_last = 0;
+        reset_verify_mask_arrays();
+        if (!p5af_topk_verify_mask_enabled) {
+            return false;
+        }
+        if (!p5ae_topk_tree_enabled || !topk_tree_runtime_ready || topk_tree_runtime_hash_last == 0) {
+            return false;
+        }
+        if (topk_abi_root_tail_conflict()) {
+            return false;
+        }
+        if (tree_build_actual_nodes_last != JETSPEC_TOPK_ABI_NODES || topk_tree_width_last != JETSPEC_TOPK_ABI_WIDTH || topk_tree_depth_last != JETSPEC_TOPK_ABI_DEPTH) {
+            return false;
+        }
+        if (tree_parent_indices[0] != JETSPEC_TREE_ROOT_PARENT || tree_parent_indices[1] != 0 || tree_parent_indices[2] != 0) {
+            return false;
+        }
+        if (tree_depth[0] != 0 || tree_depth[1] != 1 || tree_depth[2] != 1 || tree_rank[0] != -1 || tree_rank[1] != 0 || tree_rank[2] != 1) {
+            return false;
+        }
+
+        topk_verify_mask_runtime_seq_id_last = topk_tree_runtime_seq_id_last;
+        actual_verify_mask_entries_last = JETSPEC_TOPK_ABI_MASK_ENTRIES;
+        root_verify_mask_rows[0] = 0;
+        root_verify_mask_cols[0] = 0;
+        root_verify_mask_values[0] = 1;
+        root_verify_mask_rows[1] = 1;
+        root_verify_mask_cols[1] = 0;
+        root_verify_mask_values[1] = 1;
+        root_verify_mask_rows[2] = 1;
+        root_verify_mask_cols[2] = 1;
+        root_verify_mask_values[2] = 1;
+        root_verify_mask_rows[3] = 2;
+        root_verify_mask_cols[3] = 0;
+        root_verify_mask_values[3] = 1;
+        root_verify_mask_rows[4] = 2;
+        root_verify_mask_cols[4] = 2;
+        root_verify_mask_values[4] = 1;
+        if (actual_verify_mask_entries_last > tree_build_actual_nodes_last * tree_build_actual_nodes_last) {
+            return false;
+        }
+        for (int32_t i = 0; i < actual_verify_mask_entries_last; ++i) {
+            if (root_verify_mask_rows[i] < 0 || root_verify_mask_rows[i] >= tree_build_actual_nodes_last ||
+                    root_verify_mask_cols[i] < 0 || root_verify_mask_cols[i] >= tree_build_actual_nodes_last ||
+                    root_verify_mask_values[i] != 1) {
+                return false;
+            }
+        }
+        for (int32_t i = actual_verify_mask_entries_last; i < JETSPEC_QWEN36_DRAFT_BLOCK_SIZE * JETSPEC_QWEN36_DRAFT_BLOCK_SIZE; ++i) {
+            if (root_verify_mask_values[i] != 0) {
+                return false;
+            }
+        }
+
+        const int64_t mask_words[] = {
+            (int64_t) transaction_plan_hash_last,
+            (int64_t) pre_round_snapshot_hash_last,
+            (int64_t) transient_reservation_hash_last,
+            (int64_t) tree_build_descriptor_hash_last,
+            (int64_t) root_tree_runtime_hash_last,
+            (int64_t) topk_tree_runtime_hash_last,
+            (int64_t) topk_verify_mask_runtime_seq_id_last,
+            (int64_t) tree_build_node_budget_last,
+            (int64_t) tree_build_actual_nodes_last,
+            (int64_t) actual_verify_mask_entries_last,
+            (int64_t) topk_tree_width_last,
+            (int64_t) topk_tree_depth_last,
+            (int64_t) tree_token_ids[0],
+            (int64_t) tree_token_ids[1],
+            (int64_t) tree_token_ids[2],
+            (int64_t) root_verify_mask_rows[0],
+            (int64_t) root_verify_mask_cols[0],
+            (int64_t) root_verify_mask_rows[1],
+            (int64_t) root_verify_mask_cols[1],
+            (int64_t) root_verify_mask_rows[2],
+            (int64_t) root_verify_mask_cols[2],
+            (int64_t) root_verify_mask_rows[3],
+            (int64_t) root_verify_mask_cols[3],
+            (int64_t) root_verify_mask_rows[4],
+            (int64_t) root_verify_mask_cols[4],
+            (int64_t) pre_round_prompt_tokens_last,
+            (int64_t) pre_round_prompt_hash_last,
+            (int64_t) n_target_tap_rows_cached,
+            (int64_t) target_tap_hash_last,
+            JETSPEC_QWEN36_DRAFT_BLOCK_SIZE,
+            JETSPEC_TRANSACTION_PHASE_COUNT,
+            JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT,
+        };
+        topk_verify_mask_runtime_hash_last = common_speculative_fnv1a64(mask_words, sizeof(mask_words));
+        topk_verify_mask_runtime_hash_last ^= common_speculative_fnv1a64(&root_verify_mask_values[0], JETSPEC_TOPK_ABI_MASK_ENTRIES * sizeof(root_verify_mask_values[0]));
+        topk_verify_mask_runtime_hash_last ^= common_speculative_fnv1a64(JETSPEC_TOPK_VERIFY_MASK_RUNTIME_PHASE, std::strlen(JETSPEC_TOPK_VERIFY_MASK_RUNTIME_PHASE));
+        topk_verify_mask_runtime_hash_last ^= common_speculative_fnv1a64(JETSPEC_VERIFY_MASK_PHASE, std::strlen(JETSPEC_VERIFY_MASK_PHASE));
+        topk_verify_mask_runtime_ready = true;
+        n_topk_verify_mask_runtime_builds++;
+        runtime_phase = jetspec_runtime_phase::verify_mask_runtime_ready;
+        return true;
+    }
+
+    bool build_topk_accept_boundary_runtime() {
+        topk_accept_boundary_runtime_ready = false;
+        topk_accept_boundary_runtime_hash_last = 0;
+        topk_accept_boundary_runtime_seq_id_last = -1;
+        topk_accept_candidate_nodes_last = 0;
+        topk_accept_boundary_verified_edges_last = 0;
+        topk_actual_verified_logits_rows_last = 0;
+        accept_path_len_last = 0;
+        actual_accepted_nodes_last = 0;
+        correction_token_present_last = 0;
+        if (!p5ag_topk_accept_boundary_enabled) {
+            return false;
+        }
+        if (!p5af_topk_verify_mask_enabled || !p5ae_topk_tree_enabled || !p5x_root_tree_enabled) {
+            return false;
+        }
+        if (!topk_verify_mask_runtime_ready || topk_verify_mask_runtime_hash_last == 0) {
+            return false;
+        }
+        if (!topk_tree_runtime_ready || topk_tree_runtime_hash_last == 0) {
+            return false;
+        }
+        if (topk_abi_root_tail_conflict()) {
+            return false;
+        }
+        if (tree_build_actual_nodes_last != JETSPEC_TOPK_ABI_NODES || actual_verify_mask_entries_last != JETSPEC_TOPK_ABI_MASK_ENTRIES) {
+            return false;
+        }
+        if (root_verify_mask_rows[0] != 0 || root_verify_mask_cols[0] != 0 || root_verify_mask_values[0] != 1 ||
+                root_verify_mask_rows[1] != 1 || root_verify_mask_cols[1] != 0 || root_verify_mask_values[1] != 1 ||
+                root_verify_mask_rows[2] != 1 || root_verify_mask_cols[2] != 1 || root_verify_mask_values[2] != 1 ||
+                root_verify_mask_rows[3] != 2 || root_verify_mask_cols[3] != 0 || root_verify_mask_values[3] != 1 ||
+                root_verify_mask_rows[4] != 2 || root_verify_mask_cols[4] != 2 || root_verify_mask_values[4] != 1) {
+            return false;
+        }
+        if (tree_parent_indices[0] != JETSPEC_TREE_ROOT_PARENT || tree_parent_indices[1] != 0 || tree_parent_indices[2] != 0) {
+            return false;
+        }
+        if (tree_depth[0] != 0 || tree_depth[1] != 1 || tree_depth[2] != 1 || tree_rank[0] != -1 || tree_rank[1] != 0 || tree_rank[2] != 1) {
+            return false;
+        }
+
+        topk_accept_boundary_runtime_seq_id_last = topk_verify_mask_runtime_seq_id_last;
+        topk_accept_candidate_nodes_last = JETSPEC_TOPK_ABI_NON_ROOT_NODES;
+        topk_accept_boundary_verified_edges_last = actual_verify_mask_entries_last;
+        topk_actual_verified_logits_rows_last = 0;
+        accept_path_len_last = 0;
+        actual_accepted_nodes_last = 0;
+        correction_token_present_last = 0;
+        if (topk_accept_candidate_nodes_last != 2 || topk_accept_boundary_verified_edges_last != 5 ||
+                topk_actual_verified_logits_rows_last != 0 || accept_path_len_last != 0 || actual_accepted_nodes_last != 0 ||
+                correction_token_present_last != 0) {
+            return false;
+        }
+
+        const int64_t accept_words[] = {
+            (int64_t) transaction_plan_hash_last,
+            (int64_t) pre_round_snapshot_hash_last,
+            (int64_t) transient_reservation_hash_last,
+            (int64_t) tree_build_descriptor_hash_last,
+            (int64_t) root_tree_runtime_hash_last,
+            (int64_t) topk_tree_runtime_hash_last,
+            (int64_t) topk_verify_mask_runtime_hash_last,
+            (int64_t) topk_accept_boundary_runtime_seq_id_last,
+            (int64_t) tree_build_node_budget_last,
+            (int64_t) tree_build_actual_nodes_last,
+            (int64_t) actual_verify_mask_entries_last,
+            (int64_t) topk_accept_candidate_nodes_last,
+            (int64_t) topk_accept_boundary_verified_edges_last,
+            (int64_t) topk_actual_verified_logits_rows_last,
+            (int64_t) accept_path_len_last,
+            (int64_t) actual_accepted_nodes_last,
+            (int64_t) correction_token_present_last,
+            (int64_t) tree_token_ids[0],
+            (int64_t) tree_token_ids[1],
+            (int64_t) tree_token_ids[2],
+            (int64_t) pre_round_prompt_tokens_last,
+            (int64_t) pre_round_prompt_hash_last,
+            (int64_t) n_target_tap_rows_cached,
+            (int64_t) target_tap_hash_last,
+            JETSPEC_QWEN36_DRAFT_BLOCK_SIZE,
+            JETSPEC_TRANSACTION_PHASE_COUNT,
+            JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT,
+        };
+        topk_accept_boundary_runtime_hash_last = common_speculative_fnv1a64(accept_words, sizeof(accept_words));
+        topk_accept_boundary_runtime_hash_last ^= common_speculative_fnv1a64(JETSPEC_TOPK_ACCEPT_BOUNDARY_RUNTIME_PHASE, std::strlen(JETSPEC_TOPK_ACCEPT_BOUNDARY_RUNTIME_PHASE));
+        topk_accept_boundary_runtime_hash_last ^= common_speculative_fnv1a64(JETSPEC_ACCEPT_PATH_PHASE, std::strlen(JETSPEC_ACCEPT_PATH_PHASE));
+        topk_accept_boundary_runtime_hash_last ^= common_speculative_fnv1a64(JETSPEC_ACCEPT_DECISION_SOURCE_NONE_NO_LOGITS, std::strlen(JETSPEC_ACCEPT_DECISION_SOURCE_NONE_NO_LOGITS));
+        topk_accept_boundary_runtime_ready = true;
+        n_topk_accept_boundary_runtime_builds++;
+        runtime_phase = jetspec_runtime_phase::accept_path_runtime_ready;
+        return true;
+    }
+
+    bool build_root_only_verify_mask_runtime() {
+        root_verify_mask_runtime_ready = false;
+        root_verify_mask_runtime_hash_last = 0;
+        root_verify_mask_runtime_seq_id_last = -1;
+        actual_verify_mask_entries_last = 0;
+        reset_verify_mask_arrays();
+        if (!p5y_root_verify_mask_enabled) {
+            return false;
+        }
+        if (!p5x_root_tree_enabled || !root_tree_runtime_ready || root_tree_runtime_hash_last == 0) {
+            return false;
+        }
+        if (!tree_build_descriptor_ready || tree_build_descriptor_hash_last == 0) {
+            return false;
+        }
+        if (!transient_reservation_ready || transient_reservation_hash_last == 0) {
+            return false;
+        }
+        if (!transaction_plan_ready || transaction_plan_hash_last == 0) {
+            return false;
+        }
+        if (!pre_round_snapshot_ready || pre_round_snapshot_hash_last == 0) {
+            return false;
+        }
+        if (tree_build_actual_nodes_last != 1) {
+            return false;
+        }
+        if (tree_build_actual_nodes_last > tree_build_node_budget_last) {
+            return false;
+        }
+        if (tree_token_ids[0] < 0 || tree_parent_indices[0] != JETSPEC_TREE_ROOT_PARENT || tree_depth[0] != JETSPEC_TREE_ROOT_DEPTH || tree_rank[0] != -1) {
+            return false;
+        }
+        if (n_target_tap_rows_cached == 0 || target_tap_row_state.size() != n_target_tap_rows_cached) {
+            return false;
+        }
+
+        root_verify_mask_runtime_seq_id_last = root_tree_runtime_seq_id_last;
+        actual_verify_mask_entries_last = 1;
+        root_verify_mask_rows[0] = 0;
+        root_verify_mask_cols[0] = 0;
+        root_verify_mask_values[0] = 1;
+        if (actual_verify_mask_entries_last > tree_build_actual_nodes_last * tree_build_actual_nodes_last) {
+            return false;
+        }
+        if (root_verify_mask_values[0] != 1 || root_verify_mask_rows[0] != 0 || root_verify_mask_cols[0] != 0) {
+            return false;
+        }
+
+        const int64_t mask_words[] = {
+            (int64_t) transaction_plan_hash_last,
+            (int64_t) pre_round_snapshot_hash_last,
+            (int64_t) transient_reservation_hash_last,
+            (int64_t) tree_build_descriptor_hash_last,
+            (int64_t) root_tree_runtime_hash_last,
+            (int64_t) root_verify_mask_runtime_seq_id_last,
+            (int64_t) tree_build_node_budget_last,
+            (int64_t) tree_build_actual_nodes_last,
+            (int64_t) actual_verify_mask_entries_last,
+            (int64_t) tree_token_ids[0],
+            (int64_t) tree_parent_indices[0],
+            (int64_t) tree_depth[0],
+            (int64_t) tree_rank[0],
+            (int64_t) root_verify_mask_rows[0],
+            (int64_t) root_verify_mask_cols[0],
+            (int64_t) root_verify_mask_values[0],
+            (int64_t) pre_round_prompt_tokens_last,
+            (int64_t) pre_round_prompt_hash_last,
+            (int64_t) n_target_tap_rows_cached,
+            (int64_t) target_tap_hash_last,
+            JETSPEC_QWEN36_DRAFT_BLOCK_SIZE,
+            JETSPEC_TRANSACTION_PHASE_COUNT,
+            JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT,
+        };
+        root_verify_mask_runtime_hash_last = common_speculative_fnv1a64(mask_words, sizeof(mask_words));
+        root_verify_mask_runtime_hash_last ^= common_speculative_fnv1a64(&tree_cum_logprob[0], sizeof(tree_cum_logprob[0]));
+        root_verify_mask_runtime_hash_last ^= common_speculative_fnv1a64(JETSPEC_ROOT_VERIFY_MASK_RUNTIME_PHASE, std::strlen(JETSPEC_ROOT_VERIFY_MASK_RUNTIME_PHASE));
+        root_verify_mask_runtime_hash_last ^= common_speculative_fnv1a64(JETSPEC_VERIFY_MASK_PHASE, std::strlen(JETSPEC_VERIFY_MASK_PHASE));
+        root_verify_mask_runtime_ready = true;
+        n_root_verify_mask_runtime_builds++;
+        runtime_phase = jetspec_runtime_phase::verify_mask_runtime_ready;
+        return true;
+    }
+
+    bool build_verify_mask_descriptor() {
+        verify_mask_descriptor_ready = false;
+        verify_mask_descriptor_hash_last = 0;
+        verify_mask_seq_id_last = -1;
+        actual_verify_mask_entries_last = 0;
+        if (!tree_build_descriptor_ready || tree_build_descriptor_hash_last == 0) {
+            return false;
+        }
+        if (!transient_reservation_ready || transient_reservation_hash_last == 0) {
+            return false;
+        }
+        if (!transaction_plan_ready || transaction_plan_hash_last == 0) {
+            return false;
+        }
+        if (!pre_round_snapshot_ready || pre_round_snapshot_hash_last == 0) {
+            return false;
+        }
+        if (tree_build_actual_nodes_last != 0) {
+            return false;
+        }
+        if (tree_build_node_budget_last <= 0 || tree_build_node_budget_last > JETSPEC_QWEN36_DRAFT_BLOCK_SIZE) {
+            return false;
+        }
+        if (n_target_tap_rows_cached == 0 || target_tap_row_state.size() != n_target_tap_rows_cached) {
+            return false;
+        }
+
+        verify_mask_seq_id_last = pre_round_seq_id_last;
+        actual_verify_mask_entries_last = 0;
+
+        std::vector<int64_t> mask_words;
+        mask_words.reserve(17 + target_tap_row_state.size() * 3);
+        mask_words.push_back((int64_t) transaction_plan_hash_last);
+        mask_words.push_back((int64_t) pre_round_snapshot_hash_last);
+        mask_words.push_back((int64_t) transient_reservation_hash_last);
+        mask_words.push_back((int64_t) tree_build_descriptor_hash_last);
+        mask_words.push_back((int64_t) pre_round_prompt_tokens_last);
+        mask_words.push_back((int64_t) pre_round_prompt_hash_last);
+        mask_words.push_back((int64_t) verify_mask_seq_id_last);
+        mask_words.push_back((int64_t) tree_build_node_budget_last);
+        mask_words.push_back((int64_t) tree_build_actual_nodes_last);
+        mask_words.push_back((int64_t) actual_verify_mask_entries_last);
+        mask_words.push_back((int64_t) n_target_tap_rows_cached);
+        mask_words.push_back((int64_t) target_tap_hash_last);
+        mask_words.push_back(JETSPEC_QWEN36_DRAFT_BLOCK_SIZE);
+        mask_words.push_back(JETSPEC_TRANSACTION_PHASE_COUNT);
+        mask_words.push_back(JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT);
+        mask_words.push_back(JETSPEC_TREE_ROOT_PARENT);
+        mask_words.push_back(JETSPEC_TREE_ROOT_DEPTH);
+        for (const auto & row : target_tap_row_state) {
+            mask_words.push_back((int64_t) row.batch_index);
+            mask_words.push_back((int64_t) row.pos);
+            mask_words.push_back((int64_t) row.seq_id);
+        }
+
+        verify_mask_descriptor_hash_last = common_speculative_fnv1a64(mask_words.data(), mask_words.size() * sizeof(mask_words[0]));
+        verify_mask_descriptor_hash_last ^= common_speculative_fnv1a64(JETSPEC_VERIFY_MASK_PHASE, std::strlen(JETSPEC_VERIFY_MASK_PHASE));
+        verify_mask_descriptor_hash_last ^= common_speculative_fnv1a64(JETSPEC_VERIFY_MASK_ROLLBACK_POINT, std::strlen(JETSPEC_VERIFY_MASK_ROLLBACK_POINT));
+        verify_mask_descriptor_hash_last ^= common_speculative_fnv1a64(JETSPEC_VERIFY_MASK_DESCRIPTOR, std::strlen(JETSPEC_VERIFY_MASK_DESCRIPTOR));
+        verify_mask_descriptor_ready = true;
+        n_verify_mask_descriptors++;
+        runtime_phase = jetspec_runtime_phase::verify_mask_descriptor_ready;
+        return true;
+    }
+
+    bool build_root_anchor_accept_path_runtime() {
+        root_anchor_accept_path_runtime_ready = false;
+        root_anchor_accept_path_runtime_hash_last = 0;
+        root_anchor_accept_path_runtime_seq_id_last = -1;
+        root_verified_anchor_last = 0;
+        accept_path_len_last = 0;
+        actual_accepted_nodes_last = 0;
+        correction_token_present_last = 0;
+        if (!p5z_root_anchor_accept_path_enabled) {
+            return false;
+        }
+        if (!p5y_root_verify_mask_enabled || !root_verify_mask_runtime_ready || root_verify_mask_runtime_hash_last == 0) {
+            return false;
+        }
+        if (!p5x_root_tree_enabled || !root_tree_runtime_ready || root_tree_runtime_hash_last == 0) {
+            return false;
+        }
+        if (!tree_build_descriptor_ready || tree_build_descriptor_hash_last == 0) {
+            return false;
+        }
+        if (!transient_reservation_ready || transient_reservation_hash_last == 0) {
+            return false;
+        }
+        if (!transaction_plan_ready || transaction_plan_hash_last == 0) {
+            return false;
+        }
+        if (!pre_round_snapshot_ready || pre_round_snapshot_hash_last == 0) {
+            return false;
+        }
+        if (tree_build_actual_nodes_last != 1 || actual_verify_mask_entries_last != 1) {
+            return false;
+        }
+        if (root_verify_mask_values[0] != 1 || root_verify_mask_rows[0] != 0 || root_verify_mask_cols[0] != 0) {
+            return false;
+        }
+        if (tree_token_ids[0] < 0 || tree_parent_indices[0] != JETSPEC_TREE_ROOT_PARENT || tree_depth[0] != JETSPEC_TREE_ROOT_DEPTH || tree_rank[0] != -1) {
+            return false;
+        }
+        if (n_target_tap_rows_cached == 0 || target_tap_row_state.size() != n_target_tap_rows_cached) {
+            return false;
+        }
+
+        root_anchor_accept_path_runtime_seq_id_last = root_verify_mask_runtime_seq_id_last;
+        root_verified_anchor_last = 1;
+        accept_path_len_last = 0;
+        actual_accepted_nodes_last = 0;
+        correction_token_present_last = 0;
+        if (root_verified_anchor_last != 1 || accept_path_len_last != 0 || actual_accepted_nodes_last != 0 || correction_token_present_last != 0) {
+            return false;
+        }
+
+        const int64_t accept_words[] = {
+            (int64_t) transaction_plan_hash_last,
+            (int64_t) pre_round_snapshot_hash_last,
+            (int64_t) transient_reservation_hash_last,
+            (int64_t) tree_build_descriptor_hash_last,
+            (int64_t) root_tree_runtime_hash_last,
+            (int64_t) root_verify_mask_runtime_hash_last,
+            (int64_t) root_anchor_accept_path_runtime_seq_id_last,
+            (int64_t) tree_build_node_budget_last,
+            (int64_t) tree_build_actual_nodes_last,
+            (int64_t) actual_verify_mask_entries_last,
+            (int64_t) root_verified_anchor_last,
+            (int64_t) accept_path_len_last,
+            (int64_t) actual_accepted_nodes_last,
+            (int64_t) correction_token_present_last,
+            (int64_t) tree_token_ids[0],
+            (int64_t) root_verify_mask_values[0],
+            (int64_t) pre_round_prompt_tokens_last,
+            (int64_t) pre_round_prompt_hash_last,
+            (int64_t) n_target_tap_rows_cached,
+            (int64_t) target_tap_hash_last,
+            JETSPEC_QWEN36_DRAFT_BLOCK_SIZE,
+            JETSPEC_TRANSACTION_PHASE_COUNT,
+            JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT,
+        };
+        root_anchor_accept_path_runtime_hash_last = common_speculative_fnv1a64(accept_words, sizeof(accept_words));
+        root_anchor_accept_path_runtime_hash_last ^= common_speculative_fnv1a64(&tree_cum_logprob[0], sizeof(tree_cum_logprob[0]));
+        root_anchor_accept_path_runtime_hash_last ^= common_speculative_fnv1a64(JETSPEC_ROOT_ANCHOR_ACCEPT_PATH_RUNTIME_PHASE, std::strlen(JETSPEC_ROOT_ANCHOR_ACCEPT_PATH_RUNTIME_PHASE));
+        root_anchor_accept_path_runtime_hash_last ^= common_speculative_fnv1a64(JETSPEC_ACCEPT_PATH_PHASE, std::strlen(JETSPEC_ACCEPT_PATH_PHASE));
+        root_anchor_accept_path_runtime_ready = true;
+        n_root_anchor_accept_path_runtime_builds++;
+        runtime_phase = jetspec_runtime_phase::accept_path_runtime_ready;
+        return true;
+    }
+
+    bool build_root_token_commit_noop_runtime() {
+        root_token_commit_noop_runtime_ready = false;
+        root_token_commit_noop_runtime_hash_last = 0;
+        root_token_commit_noop_runtime_seq_id_last = -1;
+        actual_committed_tokens_last = 0;
+        if (!p5aa_root_token_commit_noop_enabled) {
+            return false;
+        }
+        if (!p5z_root_anchor_accept_path_enabled || !root_anchor_accept_path_runtime_ready || root_anchor_accept_path_runtime_hash_last == 0) {
+            return false;
+        }
+        if (!p5y_root_verify_mask_enabled || !root_verify_mask_runtime_ready || root_verify_mask_runtime_hash_last == 0) {
+            return false;
+        }
+        if (!p5x_root_tree_enabled || !root_tree_runtime_ready || root_tree_runtime_hash_last == 0) {
+            return false;
+        }
+        if (!tree_build_descriptor_ready || tree_build_descriptor_hash_last == 0) {
+            return false;
+        }
+        if (!transient_reservation_ready || transient_reservation_hash_last == 0) {
+            return false;
+        }
+        if (!transaction_plan_ready || transaction_plan_hash_last == 0) {
+            return false;
+        }
+        if (!pre_round_snapshot_ready || pre_round_snapshot_hash_last == 0) {
+            return false;
+        }
+        if (tree_build_actual_nodes_last != 1 || actual_verify_mask_entries_last != 1) {
+            return false;
+        }
+        if (root_verified_anchor_last != 1 || accept_path_len_last != 0 || actual_accepted_nodes_last != 0 || correction_token_present_last != 0) {
+            return false;
+        }
+        if (token_commit_descriptor_ready || hidden_kv_survivor_commit_descriptor_ready || rejected_branch_discard_descriptor_ready || publish_gate_descriptor_ready) {
+            return false;
+        }
+        if (actual_survivor_pages_committed_last != 0 || actual_pages_discarded_last != 0 || actual_publish_visible_state_last != 0) {
+            return false;
+        }
+
+        root_token_commit_noop_runtime_seq_id_last = root_anchor_accept_path_runtime_seq_id_last;
+        actual_committed_tokens_last = 0;
+        if (actual_committed_tokens_last != 0) {
+            return false;
+        }
+
+        const int64_t commit_words[] = {
+            (int64_t) transaction_plan_hash_last,
+            (int64_t) pre_round_snapshot_hash_last,
+            (int64_t) transient_reservation_hash_last,
+            (int64_t) tree_build_descriptor_hash_last,
+            (int64_t) root_tree_runtime_hash_last,
+            (int64_t) root_verify_mask_runtime_hash_last,
+            (int64_t) root_anchor_accept_path_runtime_hash_last,
+            (int64_t) root_token_commit_noop_runtime_seq_id_last,
+            (int64_t) root_verified_anchor_last,
+            (int64_t) accept_path_len_last,
+            (int64_t) actual_accepted_nodes_last,
+            (int64_t) correction_token_present_last,
+            (int64_t) actual_committed_tokens_last,
+            (int64_t) tree_build_actual_nodes_last,
+            (int64_t) actual_verify_mask_entries_last,
+            (int64_t) tree_token_ids[0],
+            (int64_t) pre_round_prompt_tokens_last,
+            (int64_t) pre_round_prompt_hash_last,
+            (int64_t) n_target_tap_rows_cached,
+            (int64_t) target_tap_hash_last,
+            JETSPEC_QWEN36_DRAFT_BLOCK_SIZE,
+            JETSPEC_TRANSACTION_PHASE_COUNT,
+            JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT,
+        };
+        root_token_commit_noop_runtime_hash_last = common_speculative_fnv1a64(commit_words, sizeof(commit_words));
+        root_token_commit_noop_runtime_hash_last ^= common_speculative_fnv1a64(JETSPEC_ROOT_TOKEN_COMMIT_NOOP_RUNTIME_PHASE, std::strlen(JETSPEC_ROOT_TOKEN_COMMIT_NOOP_RUNTIME_PHASE));
+        root_token_commit_noop_runtime_hash_last ^= common_speculative_fnv1a64(JETSPEC_TOKEN_COMMIT_PHASE, std::strlen(JETSPEC_TOKEN_COMMIT_PHASE));
+        root_token_commit_noop_runtime_hash_last ^= common_speculative_fnv1a64(JETSPEC_TOKEN_COMMIT_ROLLBACK_POINT, std::strlen(JETSPEC_TOKEN_COMMIT_ROLLBACK_POINT));
+        root_token_commit_noop_runtime_ready = true;
+        n_root_token_commit_noop_runtime_builds++;
+        runtime_phase = jetspec_runtime_phase::token_commit_runtime_ready;
+        return true;
+    }
+
+    bool build_root_hidden_kv_commit_noop_runtime() {
+        root_hidden_kv_commit_noop_runtime_ready = false;
+        root_hidden_kv_commit_noop_runtime_hash_last = 0;
+        root_hidden_kv_commit_noop_runtime_seq_id_last = -1;
+        actual_survivor_pages_committed_last = 0;
+        if (!p5ab_root_hidden_kv_commit_noop_enabled) {
+            return false;
+        }
+        if (!p5aa_root_token_commit_noop_enabled || !root_token_commit_noop_runtime_ready || root_token_commit_noop_runtime_hash_last == 0) {
+            return false;
+        }
+        if (!p5z_root_anchor_accept_path_enabled || !root_anchor_accept_path_runtime_ready || root_anchor_accept_path_runtime_hash_last == 0) {
+            return false;
+        }
+        if (!p5y_root_verify_mask_enabled || !root_verify_mask_runtime_ready || root_verify_mask_runtime_hash_last == 0) {
+            return false;
+        }
+        if (!p5x_root_tree_enabled || !root_tree_runtime_ready || root_tree_runtime_hash_last == 0) {
+            return false;
+        }
+        if (actual_committed_tokens_last != 0 || actual_accepted_nodes_last != 0 || correction_token_present_last != 0) {
+            return false;
+        }
+        if (token_commit_descriptor_ready || hidden_kv_survivor_commit_descriptor_ready || rejected_branch_discard_descriptor_ready || publish_gate_descriptor_ready) {
+            return false;
+        }
+        if (actual_pages_discarded_last != 0 || rejected_branch_pages_reachable_after_discard_last != 0 || actual_publish_visible_state_last != 0) {
+            return false;
+        }
+
+        root_hidden_kv_commit_noop_runtime_seq_id_last = root_token_commit_noop_runtime_seq_id_last;
+        actual_survivor_pages_committed_last = 0;
+        if (actual_survivor_pages_committed_last != 0) {
+            return false;
+        }
+
+        const int64_t hidden_words[] = {
+            (int64_t) transaction_plan_hash_last,
+            (int64_t) pre_round_snapshot_hash_last,
+            (int64_t) root_token_commit_noop_runtime_hash_last,
+            (int64_t) root_hidden_kv_commit_noop_runtime_seq_id_last,
+            (int64_t) root_verified_anchor_last,
+            (int64_t) actual_committed_tokens_last,
+            (int64_t) actual_survivor_pages_committed_last,
+            (int64_t) n_target_tap_rows_cached,
+            (int64_t) target_tap_hash_last,
+            JETSPEC_TRANSACTION_PHASE_COUNT,
+            JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT,
+        };
+        root_hidden_kv_commit_noop_runtime_hash_last = common_speculative_fnv1a64(hidden_words, sizeof(hidden_words));
+        root_hidden_kv_commit_noop_runtime_hash_last ^= common_speculative_fnv1a64(JETSPEC_ROOT_HIDDEN_KV_COMMIT_NOOP_RUNTIME_PHASE, std::strlen(JETSPEC_ROOT_HIDDEN_KV_COMMIT_NOOP_RUNTIME_PHASE));
+        root_hidden_kv_commit_noop_runtime_hash_last ^= common_speculative_fnv1a64(JETSPEC_HIDDEN_KV_SURVIVOR_COMMIT_PHASE, std::strlen(JETSPEC_HIDDEN_KV_SURVIVOR_COMMIT_PHASE));
+        root_hidden_kv_commit_noop_runtime_hash_last ^= common_speculative_fnv1a64(JETSPEC_HIDDEN_KV_SURVIVOR_COMMIT_ROLLBACK_POINT, std::strlen(JETSPEC_HIDDEN_KV_SURVIVOR_COMMIT_ROLLBACK_POINT));
+        root_hidden_kv_commit_noop_runtime_ready = true;
+        n_root_hidden_kv_commit_noop_runtime_builds++;
+        runtime_phase = jetspec_runtime_phase::hidden_kv_commit_runtime_ready;
+        return true;
+    }
+
+    bool build_root_rejected_branch_discard_noop_runtime() {
+        root_rejected_branch_discard_noop_runtime_ready = false;
+        root_rejected_branch_discard_noop_runtime_hash_last = 0;
+        root_rejected_branch_discard_noop_runtime_seq_id_last = -1;
+        actual_pages_discarded_last = 0;
+        rejected_branch_pages_reachable_after_discard_last = 0;
+        if (!p5ac_root_rejected_branch_discard_noop_enabled) {
+            return false;
+        }
+        if (!p5ab_root_hidden_kv_commit_noop_enabled || !root_hidden_kv_commit_noop_runtime_ready || root_hidden_kv_commit_noop_runtime_hash_last == 0) {
+            return false;
+        }
+        if (!p5aa_root_token_commit_noop_enabled || !root_token_commit_noop_runtime_ready || root_token_commit_noop_runtime_hash_last == 0) {
+            return false;
+        }
+        if (actual_committed_tokens_last != 0 || actual_survivor_pages_committed_last != 0) {
+            return false;
+        }
+        if (hidden_kv_survivor_commit_descriptor_ready || rejected_branch_discard_descriptor_ready || publish_gate_descriptor_ready) {
+            return false;
+        }
+        if (actual_publish_visible_state_last != 0) {
+            return false;
+        }
+
+        root_rejected_branch_discard_noop_runtime_seq_id_last = root_hidden_kv_commit_noop_runtime_seq_id_last;
+        actual_pages_discarded_last = 0;
+        rejected_branch_pages_reachable_after_discard_last = 0;
+        if (actual_pages_discarded_last != 0 || rejected_branch_pages_reachable_after_discard_last != 0) {
+            return false;
+        }
+
+        const int64_t discard_words[] = {
+            (int64_t) transaction_plan_hash_last,
+            (int64_t) pre_round_snapshot_hash_last,
+            (int64_t) root_hidden_kv_commit_noop_runtime_hash_last,
+            (int64_t) root_rejected_branch_discard_noop_runtime_seq_id_last,
+            (int64_t) actual_survivor_pages_committed_last,
+            (int64_t) actual_pages_discarded_last,
+            (int64_t) rejected_branch_pages_reachable_after_discard_last,
+            (int64_t) n_target_tap_rows_cached,
+            (int64_t) target_tap_hash_last,
+            JETSPEC_TRANSACTION_PHASE_COUNT,
+            JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT,
+        };
+        root_rejected_branch_discard_noop_runtime_hash_last = common_speculative_fnv1a64(discard_words, sizeof(discard_words));
+        root_rejected_branch_discard_noop_runtime_hash_last ^= common_speculative_fnv1a64(JETSPEC_ROOT_REJECTED_BRANCH_DISCARD_NOOP_RUNTIME_PHASE, std::strlen(JETSPEC_ROOT_REJECTED_BRANCH_DISCARD_NOOP_RUNTIME_PHASE));
+        root_rejected_branch_discard_noop_runtime_hash_last ^= common_speculative_fnv1a64(JETSPEC_REJECTED_BRANCH_DISCARD_PHASE, std::strlen(JETSPEC_REJECTED_BRANCH_DISCARD_PHASE));
+        root_rejected_branch_discard_noop_runtime_hash_last ^= common_speculative_fnv1a64(JETSPEC_REJECTED_BRANCH_DISCARD_ROLLBACK_POINT, std::strlen(JETSPEC_REJECTED_BRANCH_DISCARD_ROLLBACK_POINT));
+        root_rejected_branch_discard_noop_runtime_ready = true;
+        n_root_rejected_branch_discard_noop_runtime_builds++;
+        runtime_phase = jetspec_runtime_phase::rejected_branch_discard_runtime_ready;
+        return true;
+    }
+
+    bool build_root_publish_gate_noop_runtime() {
+        root_publish_gate_noop_runtime_ready = false;
+        root_publish_gate_noop_runtime_hash_last = 0;
+        root_publish_gate_noop_runtime_seq_id_last = -1;
+        actual_publish_visible_state_last = 0;
+        root_runtime_ready_for_real_test_last = 0;
+        if (!p5ad_root_publish_gate_noop_enabled) {
+            return false;
+        }
+        if (!p5ac_root_rejected_branch_discard_noop_enabled || !root_rejected_branch_discard_noop_runtime_ready || root_rejected_branch_discard_noop_runtime_hash_last == 0) {
+            return false;
+        }
+        if (!p5ab_root_hidden_kv_commit_noop_enabled || !root_hidden_kv_commit_noop_runtime_ready || root_hidden_kv_commit_noop_runtime_hash_last == 0) {
+            return false;
+        }
+        if (!p5aa_root_token_commit_noop_enabled || !root_token_commit_noop_runtime_ready || root_token_commit_noop_runtime_hash_last == 0) {
+            return false;
+        }
+        if (actual_committed_tokens_last != 0 || actual_survivor_pages_committed_last != 0 || actual_pages_discarded_last != 0) {
+            return false;
+        }
+        if (rejected_branch_pages_reachable_after_discard_last != 0) {
+            return false;
+        }
+        if (publish_gate_descriptor_ready) {
+            return false;
+        }
+
+        root_publish_gate_noop_runtime_seq_id_last = root_rejected_branch_discard_noop_runtime_seq_id_last;
+        actual_publish_visible_state_last = 0;
+        root_runtime_ready_for_real_test_last = 1;
+        if (actual_publish_visible_state_last != 0 || root_runtime_ready_for_real_test_last != 1) {
+            return false;
+        }
+
+        const int64_t publish_words[] = {
+            (int64_t) transaction_plan_hash_last,
+            (int64_t) pre_round_snapshot_hash_last,
+            (int64_t) root_rejected_branch_discard_noop_runtime_hash_last,
+            (int64_t) root_publish_gate_noop_runtime_seq_id_last,
+            (int64_t) actual_committed_tokens_last,
+            (int64_t) actual_survivor_pages_committed_last,
+            (int64_t) actual_pages_discarded_last,
+            (int64_t) rejected_branch_pages_reachable_after_discard_last,
+            (int64_t) actual_publish_visible_state_last,
+            (int64_t) root_runtime_ready_for_real_test_last,
+            (int64_t) n_target_tap_rows_cached,
+            (int64_t) target_tap_hash_last,
+            JETSPEC_TRANSACTION_PHASE_COUNT,
+            JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT,
+        };
+        root_publish_gate_noop_runtime_hash_last = common_speculative_fnv1a64(publish_words, sizeof(publish_words));
+        root_publish_gate_noop_runtime_hash_last ^= common_speculative_fnv1a64(JETSPEC_ROOT_PUBLISH_GATE_NOOP_RUNTIME_PHASE, std::strlen(JETSPEC_ROOT_PUBLISH_GATE_NOOP_RUNTIME_PHASE));
+        root_publish_gate_noop_runtime_hash_last ^= common_speculative_fnv1a64(JETSPEC_PUBLISH_GATE_PHASE, std::strlen(JETSPEC_PUBLISH_GATE_PHASE));
+        root_publish_gate_noop_runtime_ready = true;
+        n_root_publish_gate_noop_runtime_builds++;
+        runtime_phase = jetspec_runtime_phase::publish_gate_runtime_ready;
+        return true;
+    }
+
+    bool build_accept_path_descriptor() {
+        accept_path_descriptor_ready = false;
+        accept_path_descriptor_hash_last = 0;
+        accept_path_seq_id_last = -1;
+        actual_accepted_nodes_last = 0;
+        correction_token_present_last = 0;
+        if (!verify_mask_descriptor_ready || verify_mask_descriptor_hash_last == 0) {
+            return false;
+        }
+        if (!tree_build_descriptor_ready || tree_build_descriptor_hash_last == 0) {
+            return false;
+        }
+        if (actual_verify_mask_entries_last != 0 || tree_build_actual_nodes_last != 0) {
+            return false;
+        }
+        if (n_target_tap_rows_cached == 0 || target_tap_row_state.size() != n_target_tap_rows_cached) {
+            return false;
+        }
+
+        accept_path_seq_id_last = pre_round_seq_id_last;
+        actual_accepted_nodes_last = 0;
+        correction_token_present_last = 0;
+
+        std::vector<int64_t> accept_words;
+        accept_words.reserve(18 + target_tap_row_state.size() * 3);
+        accept_words.push_back((int64_t) transaction_plan_hash_last);
+        accept_words.push_back((int64_t) pre_round_snapshot_hash_last);
+        accept_words.push_back((int64_t) transient_reservation_hash_last);
+        accept_words.push_back((int64_t) tree_build_descriptor_hash_last);
+        accept_words.push_back((int64_t) verify_mask_descriptor_hash_last);
+        accept_words.push_back((int64_t) pre_round_prompt_tokens_last);
+        accept_words.push_back((int64_t) pre_round_prompt_hash_last);
+        accept_words.push_back((int64_t) accept_path_seq_id_last);
+        accept_words.push_back((int64_t) tree_build_node_budget_last);
+        accept_words.push_back((int64_t) tree_build_actual_nodes_last);
+        accept_words.push_back((int64_t) actual_verify_mask_entries_last);
+        accept_words.push_back((int64_t) actual_accepted_nodes_last);
+        accept_words.push_back((int64_t) correction_token_present_last);
+        accept_words.push_back((int64_t) n_target_tap_rows_cached);
+        accept_words.push_back((int64_t) target_tap_hash_last);
+        accept_words.push_back(JETSPEC_QWEN36_DRAFT_BLOCK_SIZE);
+        accept_words.push_back(JETSPEC_TRANSACTION_PHASE_COUNT);
+        accept_words.push_back(JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT);
+        for (const auto & row : target_tap_row_state) {
+            accept_words.push_back((int64_t) row.batch_index);
+            accept_words.push_back((int64_t) row.pos);
+            accept_words.push_back((int64_t) row.seq_id);
+        }
+
+        accept_path_descriptor_hash_last = common_speculative_fnv1a64(accept_words.data(), accept_words.size() * sizeof(accept_words[0]));
+        accept_path_descriptor_hash_last ^= common_speculative_fnv1a64(JETSPEC_ACCEPT_PATH_PHASE, std::strlen(JETSPEC_ACCEPT_PATH_PHASE));
+        accept_path_descriptor_hash_last ^= common_speculative_fnv1a64(JETSPEC_ACCEPT_PATH_ROLLBACK_POINT, std::strlen(JETSPEC_ACCEPT_PATH_ROLLBACK_POINT));
+        accept_path_descriptor_hash_last ^= common_speculative_fnv1a64(JETSPEC_ACCEPT_PATH_DESCRIPTOR, std::strlen(JETSPEC_ACCEPT_PATH_DESCRIPTOR));
+        accept_path_descriptor_ready = true;
+        n_accept_path_descriptors++;
+        runtime_phase = jetspec_runtime_phase::accept_path_descriptor_ready;
+        return true;
+    }
+
+    bool build_token_commit_descriptor() {
+        token_commit_descriptor_ready = false;
+        token_commit_descriptor_hash_last = 0;
+        token_commit_seq_id_last = -1;
+        actual_committed_tokens_last = 0;
+        if (!accept_path_descriptor_ready || accept_path_descriptor_hash_last == 0) {
+            return false;
+        }
+        if (actual_accepted_nodes_last != 0 || correction_token_present_last != 0) {
+            return false;
+        }
+
+        token_commit_seq_id_last = pre_round_seq_id_last;
+        actual_committed_tokens_last = 0;
+
+        const int64_t commit_words[] = {
+            (int64_t) transaction_plan_hash_last,
+            (int64_t) pre_round_snapshot_hash_last,
+            (int64_t) accept_path_descriptor_hash_last,
+            (int64_t) token_commit_seq_id_last,
+            (int64_t) actual_accepted_nodes_last,
+            (int64_t) correction_token_present_last,
+            (int64_t) actual_committed_tokens_last,
+            (int64_t) n_target_tap_rows_cached,
+            (int64_t) target_tap_hash_last,
+            JETSPEC_TRANSACTION_PHASE_COUNT,
+            JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT,
+        };
+        token_commit_descriptor_hash_last = common_speculative_fnv1a64(commit_words, sizeof(commit_words));
+        token_commit_descriptor_hash_last ^= common_speculative_fnv1a64(JETSPEC_TOKEN_COMMIT_PHASE, std::strlen(JETSPEC_TOKEN_COMMIT_PHASE));
+        token_commit_descriptor_hash_last ^= common_speculative_fnv1a64(JETSPEC_TOKEN_COMMIT_ROLLBACK_POINT, std::strlen(JETSPEC_TOKEN_COMMIT_ROLLBACK_POINT));
+        token_commit_descriptor_hash_last ^= common_speculative_fnv1a64(JETSPEC_TOKEN_COMMIT_DESCRIPTOR, std::strlen(JETSPEC_TOKEN_COMMIT_DESCRIPTOR));
+        token_commit_descriptor_ready = true;
+        n_token_commit_descriptors++;
+        runtime_phase = jetspec_runtime_phase::token_commit_descriptor_ready;
+        return true;
+    }
+
+    bool build_hidden_kv_survivor_commit_descriptor() {
+        hidden_kv_survivor_commit_descriptor_ready = false;
+        hidden_kv_survivor_commit_descriptor_hash_last = 0;
+        hidden_kv_survivor_commit_seq_id_last = -1;
+        actual_survivor_pages_committed_last = 0;
+        if (!token_commit_descriptor_ready || token_commit_descriptor_hash_last == 0) {
+            return false;
+        }
+        if (actual_committed_tokens_last != 0) {
+            return false;
+        }
+
+        hidden_kv_survivor_commit_seq_id_last = pre_round_seq_id_last;
+        actual_survivor_pages_committed_last = 0;
+
+        const int64_t hidden_kv_words[] = {
+            (int64_t) transaction_plan_hash_last,
+            (int64_t) pre_round_snapshot_hash_last,
+            (int64_t) token_commit_descriptor_hash_last,
+            (int64_t) hidden_kv_survivor_commit_seq_id_last,
+            (int64_t) actual_committed_tokens_last,
+            (int64_t) actual_survivor_pages_committed_last,
+            (int64_t) n_target_tap_rows_cached,
+            (int64_t) target_tap_hash_last,
+            JETSPEC_TRANSACTION_PHASE_COUNT,
+            JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT,
+        };
+        hidden_kv_survivor_commit_descriptor_hash_last = common_speculative_fnv1a64(hidden_kv_words, sizeof(hidden_kv_words));
+        hidden_kv_survivor_commit_descriptor_hash_last ^= common_speculative_fnv1a64(JETSPEC_HIDDEN_KV_SURVIVOR_COMMIT_PHASE, std::strlen(JETSPEC_HIDDEN_KV_SURVIVOR_COMMIT_PHASE));
+        hidden_kv_survivor_commit_descriptor_hash_last ^= common_speculative_fnv1a64(JETSPEC_HIDDEN_KV_SURVIVOR_COMMIT_ROLLBACK_POINT, std::strlen(JETSPEC_HIDDEN_KV_SURVIVOR_COMMIT_ROLLBACK_POINT));
+        hidden_kv_survivor_commit_descriptor_hash_last ^= common_speculative_fnv1a64(JETSPEC_HIDDEN_KV_SURVIVOR_COMMIT_DESCRIPTOR, std::strlen(JETSPEC_HIDDEN_KV_SURVIVOR_COMMIT_DESCRIPTOR));
+        hidden_kv_survivor_commit_descriptor_ready = true;
+        n_hidden_kv_survivor_commit_descriptors++;
+        runtime_phase = jetspec_runtime_phase::hidden_kv_survivor_commit_descriptor_ready;
+        return true;
+    }
+
+    bool build_rejected_branch_discard_descriptor() {
+        rejected_branch_discard_descriptor_ready = false;
+        rejected_branch_discard_descriptor_hash_last = 0;
+        rejected_branch_discard_seq_id_last = -1;
+        actual_pages_discarded_last = 0;
+        rejected_branch_pages_reachable_after_discard_last = 0;
+        if (!hidden_kv_survivor_commit_descriptor_ready || hidden_kv_survivor_commit_descriptor_hash_last == 0) {
+            return false;
+        }
+        if (actual_survivor_pages_committed_last != 0) {
+            return false;
+        }
+
+        rejected_branch_discard_seq_id_last = pre_round_seq_id_last;
+        actual_pages_discarded_last = 0;
+        rejected_branch_pages_reachable_after_discard_last = 0;
+
+        const int64_t discard_words[] = {
+            (int64_t) transaction_plan_hash_last,
+            (int64_t) pre_round_snapshot_hash_last,
+            (int64_t) hidden_kv_survivor_commit_descriptor_hash_last,
+            (int64_t) rejected_branch_discard_seq_id_last,
+            (int64_t) actual_survivor_pages_committed_last,
+            (int64_t) actual_pages_discarded_last,
+            (int64_t) rejected_branch_pages_reachable_after_discard_last,
+            (int64_t) n_target_tap_rows_cached,
+            (int64_t) target_tap_hash_last,
+            JETSPEC_TRANSACTION_PHASE_COUNT,
+            JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT,
+        };
+        rejected_branch_discard_descriptor_hash_last = common_speculative_fnv1a64(discard_words, sizeof(discard_words));
+        rejected_branch_discard_descriptor_hash_last ^= common_speculative_fnv1a64(JETSPEC_REJECTED_BRANCH_DISCARD_PHASE, std::strlen(JETSPEC_REJECTED_BRANCH_DISCARD_PHASE));
+        rejected_branch_discard_descriptor_hash_last ^= common_speculative_fnv1a64(JETSPEC_REJECTED_BRANCH_DISCARD_ROLLBACK_POINT, std::strlen(JETSPEC_REJECTED_BRANCH_DISCARD_ROLLBACK_POINT));
+        rejected_branch_discard_descriptor_hash_last ^= common_speculative_fnv1a64(JETSPEC_REJECTED_BRANCH_DISCARD_DESCRIPTOR, std::strlen(JETSPEC_REJECTED_BRANCH_DISCARD_DESCRIPTOR));
+        rejected_branch_discard_descriptor_ready = true;
+        n_rejected_branch_discard_descriptors++;
+        runtime_phase = jetspec_runtime_phase::rejected_branch_discard_descriptor_ready;
+        return true;
+    }
+
+    bool build_publish_gate_descriptor() {
+        publish_gate_descriptor_ready = false;
+        publish_gate_descriptor_hash_last = 0;
+        publish_gate_seq_id_last = -1;
+        actual_publish_visible_state_last = 0;
+        if (!rejected_branch_discard_descriptor_ready || rejected_branch_discard_descriptor_hash_last == 0) {
+            return false;
+        }
+        if (actual_committed_tokens_last != 0 || actual_survivor_pages_committed_last != 0 || actual_pages_discarded_last != 0) {
+            return false;
+        }
+        if (rejected_branch_pages_reachable_after_discard_last != 0) {
+            return false;
+        }
+
+        publish_gate_seq_id_last = pre_round_seq_id_last;
+        actual_publish_visible_state_last = 0;
+
+        const int64_t publish_words[] = {
+            (int64_t) transaction_plan_hash_last,
+            (int64_t) pre_round_snapshot_hash_last,
+            (int64_t) token_commit_descriptor_hash_last,
+            (int64_t) hidden_kv_survivor_commit_descriptor_hash_last,
+            (int64_t) rejected_branch_discard_descriptor_hash_last,
+            (int64_t) publish_gate_seq_id_last,
+            (int64_t) actual_committed_tokens_last,
+            (int64_t) actual_survivor_pages_committed_last,
+            (int64_t) actual_pages_discarded_last,
+            (int64_t) rejected_branch_pages_reachable_after_discard_last,
+            (int64_t) actual_publish_visible_state_last,
+            (int64_t) n_target_tap_rows_cached,
+            (int64_t) target_tap_hash_last,
+            JETSPEC_TRANSACTION_PHASE_COUNT,
+            JETSPEC_TRANSACTION_ROLLBACK_POINT_COUNT,
+        };
+        publish_gate_descriptor_hash_last = common_speculative_fnv1a64(publish_words, sizeof(publish_words));
+        publish_gate_descriptor_hash_last ^= common_speculative_fnv1a64(JETSPEC_PUBLISH_GATE_PHASE, std::strlen(JETSPEC_PUBLISH_GATE_PHASE));
+        publish_gate_descriptor_hash_last ^= common_speculative_fnv1a64(JETSPEC_PUBLISH_GATE_DESCRIPTOR, std::strlen(JETSPEC_PUBLISH_GATE_DESCRIPTOR));
+        publish_gate_descriptor_ready = true;
+        n_publish_gate_descriptors++;
+        runtime_phase = jetspec_runtime_phase::publish_gate_descriptor_ready;
+        return true;
+    }
+
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         reset_runtime_state();
         runtime_phase = jetspec_runtime_phase::waiting_for_pre_round_snapshot;
@@ -960,14 +4283,128 @@ struct common_speculative_impl_draft_jetspec : public common_speculative_impl {
             transaction_plan_hash_last = 0;
             transient_reservation_hash_last = 0;
             tree_build_descriptor_hash_last = 0;
+            root_tree_runtime_hash_last = 0;
+            root_verify_mask_runtime_hash_last = 0;
+            root_anchor_accept_path_runtime_hash_last = 0;
+            root_token_commit_noop_runtime_hash_last = 0;
+            root_hidden_kv_commit_noop_runtime_hash_last = 0;
+            root_rejected_branch_discard_noop_runtime_hash_last = 0;
+            root_publish_gate_noop_runtime_hash_last = 0;
+            topk_tree_runtime_hash_last = 0;
+            topk_verify_mask_runtime_hash_last = 0;
+            topk_accept_boundary_runtime_hash_last = 0;
+            real_draft_head_canary_hash_last = 0;
+            real_draft_head_topk_candidate_hash_last = 0;
+            real_draft_head_topk_tree_hash_last = 0;
+            real_draft_head_topk_verify_mask_hash_last = 0;
+            real_draft_head_topk_target_logits_walk_canary_hash_last = 0;
+            verify_mask_descriptor_hash_last = 0;
+            accept_path_descriptor_hash_last = 0;
+            token_commit_descriptor_hash_last = 0;
+            hidden_kv_survivor_commit_descriptor_hash_last = 0;
+            rejected_branch_discard_descriptor_hash_last = 0;
+            publish_gate_descriptor_hash_last = 0;
+            root_tree_runtime_seq_id_last = -1;
+            root_verify_mask_runtime_seq_id_last = -1;
+            root_anchor_accept_path_runtime_seq_id_last = -1;
+            root_token_commit_noop_runtime_seq_id_last = -1;
+            root_hidden_kv_commit_noop_runtime_seq_id_last = -1;
+            root_rejected_branch_discard_noop_runtime_seq_id_last = -1;
+            root_publish_gate_noop_runtime_seq_id_last = -1;
+            topk_tree_runtime_seq_id_last = -1;
+            topk_verify_mask_runtime_seq_id_last = -1;
+            topk_accept_boundary_runtime_seq_id_last = -1;
+            real_draft_head_topk_candidate_seq_id_last = -1;
+            real_draft_head_topk_tree_seq_id_last = -1;
+            real_draft_head_topk_verify_mask_seq_id_last = -1;
+            real_draft_head_topk_target_logits_walk_canary_seq_id_last = -1;
             transaction_plan_phase_count_last = 0;
             transaction_plan_rollback_count_last = 0;
+            tree_build_actual_nodes_last = 0;
+            topk_tree_width_last = 0;
+            topk_tree_depth_last = 0;
+            topk_tree_non_root_nodes_last = 0;
+            topk_accept_candidate_nodes_last = 0;
+            topk_accept_boundary_verified_edges_last = 0;
+            topk_actual_verified_logits_rows_last = 0;
+            real_draft_head_canary_ctx_present_last = params.ctx_dft != nullptr ? 1 : 0;
+            real_draft_head_canary_decode_rc_last = 0;
+            real_draft_head_canary_input_rows_last = 0;
+            real_draft_head_canary_input_width_last = 0;
+            real_draft_head_canary_output_rows_last = 0;
+            real_draft_head_canary_output_width_last = 0;
+            real_draft_head_canary_logits_rows_last = 0;
+            real_draft_head_canary_topk_rows_last = 0;
+            real_draft_head_canary_topk_k_last = 0;
+            real_draft_head_canary_top1_id_last = -1;
+            real_draft_head_canary_top2_id_last = -1;
+            real_draft_head_canary_top1_logit_last = 0.0f;
+            real_draft_head_canary_top2_logit_last = 0.0f;
+            real_draft_head_topk_parent_node_last = -1;
+            real_draft_head_topk_candidate_nodes_last = 0;
+            real_draft_head_topk_verified_logits_rows_last = 0;
+            real_draft_head_topk_tree_seq_id_last = -1;
+            real_draft_head_topk_verify_mask_seq_id_last = -1;
+            real_draft_head_topk_tree_nodes_last = 0;
+            real_draft_head_topk_verify_mask_entries_last = 0;
+            real_draft_head_topk_target_logits_planned_rows_last = 0;
+            real_draft_head_topk_target_logits_actual_rows_walked_last = 0;
+            real_draft_head_topk_target_logits_batch_index_last = -1;
+            real_draft_head_topk_target_logits_pos_last = -1;
+            real_draft_head_topk_target_logits_seq_id_last = -1;
+            real_draft_head_topk_target_logits_width_last = 0;
+            real_draft_head_topk_target_logits_candidate_nodes_last = 0;
+            real_draft_head_topk_target_logits_candidate_scores.fill(0.0f);
+            real_draft_head_topk_candidate_ids.fill(-1);
+            real_draft_head_topk_candidate_logits.fill(0.0f);
+            reset_real_draft_head_topk_tree_arrays();
+            reset_real_draft_head_topk_verify_mask_arrays();
+            reset_tree_arrays();
+            reset_verify_mask_arrays();
+            actual_verify_mask_entries_last = 0;
+            root_verified_anchor_last = 0;
+            accept_path_len_last = 0;
+            actual_accepted_nodes_last = 0;
+            correction_token_present_last = 0;
+            actual_committed_tokens_last = 0;
+            actual_survivor_pages_committed_last = 0;
+            actual_pages_discarded_last = 0;
+            rejected_branch_pages_reachable_after_discard_last = 0;
+            actual_publish_visible_state_last = 0;
+            root_runtime_ready_for_real_test_last = 0;
             transaction_plan_ready = false;
             transient_reservation_ready = false;
             tree_build_descriptor_ready = false;
+            root_tree_runtime_ready = false;
+            root_verify_mask_runtime_ready = false;
+            root_anchor_accept_path_runtime_ready = false;
+            root_token_commit_noop_runtime_ready = false;
+            root_hidden_kv_commit_noop_runtime_ready = false;
+            root_rejected_branch_discard_noop_runtime_ready = false;
+            root_publish_gate_noop_runtime_ready = false;
+            topk_tree_runtime_ready = false;
+            topk_verify_mask_runtime_ready = false;
+            topk_accept_boundary_runtime_ready = false;
+            real_draft_head_canary_ready = false;
+            real_draft_head_logits_canary_ready = false;
+            real_draft_head_topk_candidate_runtime_ready = false;
+            real_draft_head_topk_tree_runtime_ready = false;
+            real_draft_head_topk_verify_mask_runtime_ready = false;
+            real_draft_head_topk_target_logits_walk_canary_ready = false;
+            verify_mask_descriptor_ready = false;
+            accept_path_descriptor_ready = false;
+            token_commit_descriptor_ready = false;
+            hidden_kv_survivor_commit_descriptor_ready = false;
+            rejected_branch_discard_descriptor_ready = false;
+            publish_gate_descriptor_ready = false;
             target_tap_rows.clear();
             target_tap_row_state.clear();
             runtime_phase = jetspec_runtime_phase::waiting_for_target_taps;
+            return true;
+        }
+
+        if (!pre_round_snapshot_ready) {
+            runtime_phase = jetspec_runtime_phase::waiting_for_pre_round_snapshot;
             return true;
         }
 
@@ -997,9 +4434,29 @@ struct common_speculative_impl_draft_jetspec : public common_speculative_impl {
             disable_runtime_state(jetspec_runtime_failure::invalid_target_taps, tap_count, tap_width, taps);
             return true;
         }
-        if (!pre_round_snapshot_ready) {
-            disable_runtime_state(jetspec_runtime_failure::invalid_pre_round_snapshot, tap_count, tap_width, taps);
+        if (!run_real_draft_head_canary_decode(tap_width)) {
+            disable_runtime_state(p5aj_real_draft_head_logits_canary_enabled ?
+                    jetspec_runtime_failure::invalid_real_draft_head_logits_canary_runtime :
+                    jetspec_runtime_failure::invalid_real_draft_head_canary_runtime, tap_count, tap_width, taps);
             return true;
+        }
+        if (trace_taps && p5aj_real_draft_head_logits_canary_enabled) {
+            LOG_INF("%s: draft-jetspec p5aj_real_draft_head_logits_canary phase=%s logits_canary_enabled=1 ctx_dft_present=%d decode_rc=%d input_rows=%d input_width=%d logits_rows=%d logits_width=%d logits_hash=%016" PRIx64 " topk_rows=%d topk_k=%d top1_id=%d top2_id=%d top1_logit=%.6g top2_logit=%.6g logits_extract_source=private_embeddings_output real_draft_head_tensors_bound=1 hidden_taps_source=target_tap_capture no_accept=1 no_token_commit=1 no_hidden_kv_commit=1 no_rejected_branch_discard=1 no_publish=1 no_visible_state_change=1 no_kv_mutation=1 no_draft_tokens=1\n",
+                    __func__, jetspec_runtime_phase_name(runtime_phase), real_draft_head_canary_ctx_present_last,
+                    real_draft_head_canary_decode_rc_last, real_draft_head_canary_input_rows_last,
+                    real_draft_head_canary_input_width_last, real_draft_head_canary_logits_rows_last,
+                    real_draft_head_canary_output_width_last, real_draft_head_canary_hash_last,
+                    real_draft_head_canary_topk_rows_last, real_draft_head_canary_topk_k_last,
+                    real_draft_head_canary_top1_id_last, real_draft_head_canary_top2_id_last,
+                    (double) real_draft_head_canary_top1_logit_last,
+                    (double) real_draft_head_canary_top2_logit_last);
+        } else if (trace_taps && p5ai_real_draft_head_canary_enabled) {
+            LOG_INF("%s: draft-jetspec p5ai_real_draft_head_canary phase=%s canary_enabled=1 ctx_dft_present=%d decode_rc=%d input_rows=%d input_width=%d output_rows=%d output_width=%d graph_hash=%016" PRIx64 " actual_draft_head_graph_rows=%d actual_draft_head_logits_rows=%d actual_topk_rows=0 real_draft_head_tensors_bound=1 hidden_taps_source=target_tap_capture no_accept=1 no_token_commit=1 no_hidden_kv_commit=1 no_rejected_branch_discard=1 no_publish=1 no_visible_state_change=1 no_kv_mutation=1 no_draft_tokens=1\n",
+                    __func__, jetspec_runtime_phase_name(runtime_phase), real_draft_head_canary_ctx_present_last,
+                    real_draft_head_canary_decode_rc_last, real_draft_head_canary_input_rows_last,
+                    real_draft_head_canary_input_width_last, real_draft_head_canary_output_rows_last,
+                    real_draft_head_canary_output_width_last, real_draft_head_canary_hash_last,
+                    real_draft_head_canary_output_rows_last, real_draft_head_canary_logits_rows_last);
         }
         if (!build_transaction_plan_scaffold()) {
             disable_runtime_state(jetspec_runtime_failure::invalid_transaction_plan, tap_count, tap_width, taps);
@@ -1011,6 +4468,648 @@ struct common_speculative_impl_draft_jetspec : public common_speculative_impl {
         }
         if (!build_tree_build_descriptor()) {
             disable_runtime_state(jetspec_runtime_failure::invalid_tree_build_descriptor, tap_count, tap_width, taps);
+            return true;
+        }
+        if (p5av_real_draft_head_topk_target_logits_walk_canary_enabled && (!p5as_real_draft_head_topk_publish_gate_noop_enabled || !p5ar_real_draft_head_topk_rejected_branch_discard_noop_enabled || !p5aq_real_draft_head_topk_hidden_kv_commit_noop_enabled || !p5ap_real_draft_head_topk_token_commit_noop_enabled || !p5ao_real_draft_head_topk_accept_path_descriptor_enabled || !p5an_real_draft_head_topk_accept_boundary_enabled || !p5am_real_draft_head_topk_verify_mask_enabled || !p5al_real_draft_head_topk_tree_enabled || !p5ak_real_draft_head_topk_candidate_enabled || !p5aj_real_draft_head_logits_canary_enabled || !p5ag_topk_accept_boundary_enabled || !p5af_topk_verify_mask_enabled || !p5ae_topk_tree_enabled || !p5x_root_tree_enabled || topk_abi_root_tail_conflict())) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_real_draft_head_topk_target_logits_walk_canary_runtime, tap_count, tap_width, taps);
+            return true;
+        }
+        if (p5as_real_draft_head_topk_publish_gate_noop_enabled && (!p5ar_real_draft_head_topk_rejected_branch_discard_noop_enabled || !p5aq_real_draft_head_topk_hidden_kv_commit_noop_enabled || !p5ap_real_draft_head_topk_token_commit_noop_enabled || !p5ao_real_draft_head_topk_accept_path_descriptor_enabled || !p5an_real_draft_head_topk_accept_boundary_enabled || !p5am_real_draft_head_topk_verify_mask_enabled || !p5al_real_draft_head_topk_tree_enabled || !p5ak_real_draft_head_topk_candidate_enabled || !p5aj_real_draft_head_logits_canary_enabled || !p5ag_topk_accept_boundary_enabled || !p5af_topk_verify_mask_enabled || !p5ae_topk_tree_enabled || !p5x_root_tree_enabled || topk_abi_root_tail_conflict())) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_real_draft_head_topk_publish_gate_noop_runtime, tap_count, tap_width, taps);
+            return true;
+        }
+        if (p5ar_real_draft_head_topk_rejected_branch_discard_noop_enabled && (!p5aq_real_draft_head_topk_hidden_kv_commit_noop_enabled || !p5ap_real_draft_head_topk_token_commit_noop_enabled || !p5ao_real_draft_head_topk_accept_path_descriptor_enabled || !p5an_real_draft_head_topk_accept_boundary_enabled || !p5am_real_draft_head_topk_verify_mask_enabled || !p5al_real_draft_head_topk_tree_enabled || !p5ak_real_draft_head_topk_candidate_enabled || !p5aj_real_draft_head_logits_canary_enabled || !p5ag_topk_accept_boundary_enabled || !p5af_topk_verify_mask_enabled || !p5ae_topk_tree_enabled || !p5x_root_tree_enabled || topk_abi_root_tail_conflict())) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_real_draft_head_topk_rejected_branch_discard_noop_runtime, tap_count, tap_width, taps);
+            return true;
+        }
+        if (p5aq_real_draft_head_topk_hidden_kv_commit_noop_enabled && (!p5ap_real_draft_head_topk_token_commit_noop_enabled || !p5ao_real_draft_head_topk_accept_path_descriptor_enabled || !p5an_real_draft_head_topk_accept_boundary_enabled || !p5am_real_draft_head_topk_verify_mask_enabled || !p5al_real_draft_head_topk_tree_enabled || !p5ak_real_draft_head_topk_candidate_enabled || !p5aj_real_draft_head_logits_canary_enabled || !p5ag_topk_accept_boundary_enabled || !p5af_topk_verify_mask_enabled || !p5ae_topk_tree_enabled || !p5x_root_tree_enabled || topk_abi_root_tail_conflict())) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_real_draft_head_topk_hidden_kv_commit_noop_runtime, tap_count, tap_width, taps);
+            return true;
+        }
+        if (p5ap_real_draft_head_topk_token_commit_noop_enabled && (!p5ao_real_draft_head_topk_accept_path_descriptor_enabled || !p5an_real_draft_head_topk_accept_boundary_enabled || !p5am_real_draft_head_topk_verify_mask_enabled || !p5al_real_draft_head_topk_tree_enabled || !p5ak_real_draft_head_topk_candidate_enabled || !p5aj_real_draft_head_logits_canary_enabled || !p5ag_topk_accept_boundary_enabled || !p5af_topk_verify_mask_enabled || !p5ae_topk_tree_enabled || !p5x_root_tree_enabled || topk_abi_root_tail_conflict())) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_real_draft_head_topk_token_commit_noop_runtime, tap_count, tap_width, taps);
+            return true;
+        }
+        if (p5ao_real_draft_head_topk_accept_path_descriptor_enabled && (!p5an_real_draft_head_topk_accept_boundary_enabled || !p5am_real_draft_head_topk_verify_mask_enabled || !p5al_real_draft_head_topk_tree_enabled || !p5ak_real_draft_head_topk_candidate_enabled || !p5aj_real_draft_head_logits_canary_enabled || !p5ag_topk_accept_boundary_enabled || !p5af_topk_verify_mask_enabled || !p5ae_topk_tree_enabled || !p5x_root_tree_enabled || topk_abi_root_tail_conflict())) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_real_draft_head_topk_accept_path_descriptor_runtime, tap_count, tap_width, taps);
+            return true;
+        }
+        if (p5an_real_draft_head_topk_accept_boundary_enabled && (!p5am_real_draft_head_topk_verify_mask_enabled || !p5al_real_draft_head_topk_tree_enabled || !p5ak_real_draft_head_topk_candidate_enabled || !p5aj_real_draft_head_logits_canary_enabled || !p5ag_topk_accept_boundary_enabled || !p5af_topk_verify_mask_enabled || !p5ae_topk_tree_enabled || !p5x_root_tree_enabled || topk_abi_root_tail_conflict())) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_real_draft_head_topk_accept_boundary_runtime, tap_count, tap_width, taps);
+            return true;
+        }
+        if (p5am_real_draft_head_topk_verify_mask_enabled && (!p5al_real_draft_head_topk_tree_enabled || !p5ak_real_draft_head_topk_candidate_enabled || !p5aj_real_draft_head_logits_canary_enabled || !p5ag_topk_accept_boundary_enabled || !p5af_topk_verify_mask_enabled || !p5ae_topk_tree_enabled || !p5x_root_tree_enabled || topk_abi_root_tail_conflict())) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_real_draft_head_topk_verify_mask_runtime, tap_count, tap_width, taps);
+            return true;
+        }
+        if (p5al_real_draft_head_topk_tree_enabled && (!p5ak_real_draft_head_topk_candidate_enabled || !p5aj_real_draft_head_logits_canary_enabled || !p5ag_topk_accept_boundary_enabled || !p5af_topk_verify_mask_enabled || !p5ae_topk_tree_enabled || !p5x_root_tree_enabled || topk_abi_root_tail_conflict())) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_real_draft_head_topk_tree_runtime, tap_count, tap_width, taps);
+            return true;
+        }
+        if (p5ak_real_draft_head_topk_candidate_enabled && (!p5aj_real_draft_head_logits_canary_enabled || !p5ag_topk_accept_boundary_enabled || !p5af_topk_verify_mask_enabled || !p5ae_topk_tree_enabled || !p5x_root_tree_enabled || topk_abi_root_tail_conflict())) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_real_draft_head_topk_candidate_runtime, tap_count, tap_width, taps);
+            return true;
+        }
+        if (p5ag_topk_accept_boundary_enabled && (!p5af_topk_verify_mask_enabled || !p5ae_topk_tree_enabled || !p5x_root_tree_enabled || topk_abi_root_tail_conflict())) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_topk_accept_boundary_runtime, tap_count, tap_width, taps);
+            return true;
+        }
+        if (p5af_topk_verify_mask_enabled && (!p5ae_topk_tree_enabled || !p5x_root_tree_enabled || topk_abi_root_tail_conflict())) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_topk_verify_mask_runtime, tap_count, tap_width, taps);
+            return true;
+        }
+        if (p5ae_topk_tree_enabled && (!p5x_root_tree_enabled || topk_abi_root_tail_conflict())) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_topk_tree_runtime, tap_count, tap_width, taps);
+            return true;
+        }
+        if (p5ad_root_publish_gate_noop_enabled && (!p5x_root_tree_enabled || !p5y_root_verify_mask_enabled || !p5z_root_anchor_accept_path_enabled || !p5aa_root_token_commit_noop_enabled || !p5ab_root_hidden_kv_commit_noop_enabled || !p5ac_root_rejected_branch_discard_noop_enabled)) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_root_publish_gate_noop_runtime, tap_count, tap_width, taps);
+            return true;
+        }
+        if (p5ac_root_rejected_branch_discard_noop_enabled && (!p5x_root_tree_enabled || !p5y_root_verify_mask_enabled || !p5z_root_anchor_accept_path_enabled || !p5aa_root_token_commit_noop_enabled || !p5ab_root_hidden_kv_commit_noop_enabled)) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_root_rejected_branch_discard_noop_runtime, tap_count, tap_width, taps);
+            return true;
+        }
+        if (p5ab_root_hidden_kv_commit_noop_enabled && (!p5x_root_tree_enabled || !p5y_root_verify_mask_enabled || !p5z_root_anchor_accept_path_enabled || !p5aa_root_token_commit_noop_enabled)) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_root_hidden_kv_commit_noop_runtime, tap_count, tap_width, taps);
+            return true;
+        }
+        if (p5aa_root_token_commit_noop_enabled && (!p5x_root_tree_enabled || !p5y_root_verify_mask_enabled || !p5z_root_anchor_accept_path_enabled)) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_root_token_commit_noop_runtime, tap_count, tap_width, taps);
+            return true;
+        }
+        if (p5z_root_anchor_accept_path_enabled && (!p5x_root_tree_enabled || !p5y_root_verify_mask_enabled)) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_root_anchor_accept_path_runtime, tap_count, tap_width, taps);
+            return true;
+        }
+        if (p5y_root_verify_mask_enabled && !p5x_root_tree_enabled) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_root_verify_mask_runtime, tap_count, tap_width, taps);
+            return true;
+        }
+        if (p5x_root_tree_enabled) {
+            if (!build_root_only_runtime_tree()) {
+                disable_runtime_state(jetspec_runtime_failure::invalid_root_tree_runtime, tap_count, tap_width, taps);
+                return true;
+            }
+            if (p5ae_topk_tree_enabled) {
+                if (!build_topk_tree_runtime()) {
+                    disable_runtime_state(jetspec_runtime_failure::invalid_topk_tree_runtime, tap_count, tap_width, taps);
+                    return true;
+                }
+                if (p5af_topk_verify_mask_enabled) {
+                    if (!build_topk_verify_mask_runtime()) {
+                        disable_runtime_state(jetspec_runtime_failure::invalid_topk_verify_mask_runtime, tap_count, tap_width, taps);
+                        return true;
+                    }
+                    if (p5ag_topk_accept_boundary_enabled) {
+                        if (!build_topk_accept_boundary_runtime()) {
+                            disable_runtime_state(jetspec_runtime_failure::invalid_topk_accept_boundary_runtime, tap_count, tap_width, taps);
+                            return true;
+                        }
+                        if (p5ak_real_draft_head_topk_candidate_enabled) {
+                            if (!build_real_draft_head_topk_candidate_runtime()) {
+                                disable_runtime_state(jetspec_runtime_failure::invalid_real_draft_head_topk_candidate_runtime, tap_count, tap_width, taps);
+                                return true;
+                            }
+                            if (p5al_real_draft_head_topk_tree_enabled) {
+                                if (!build_real_draft_head_topk_tree_runtime()) {
+                                    disable_runtime_state(jetspec_runtime_failure::invalid_real_draft_head_topk_tree_runtime, tap_count, tap_width, taps);
+                                    return true;
+                                }
+                                if (p5am_real_draft_head_topk_verify_mask_enabled) {
+                                    if (!build_real_draft_head_topk_verify_mask_runtime()) {
+                                        disable_runtime_state(jetspec_runtime_failure::invalid_real_draft_head_topk_verify_mask_runtime, tap_count, tap_width, taps);
+                                        return true;
+                                    }
+                                    if (p5an_real_draft_head_topk_accept_boundary_enabled) {
+                                        if (!build_real_draft_head_topk_accept_boundary_runtime()) {
+                                            disable_runtime_state(jetspec_runtime_failure::invalid_real_draft_head_topk_accept_boundary_runtime, tap_count, tap_width, taps);
+                                            return true;
+                                        }
+                                        if (p5ao_real_draft_head_topk_accept_path_descriptor_enabled) {
+                                            if (!build_real_draft_head_topk_accept_path_descriptor_runtime()) {
+                                                disable_runtime_state(jetspec_runtime_failure::invalid_real_draft_head_topk_accept_path_descriptor_runtime, tap_count, tap_width, taps);
+                                                return true;
+                                            }
+                                            if (p5ap_real_draft_head_topk_token_commit_noop_enabled) {
+                                                if (!build_real_draft_head_topk_token_commit_noop_runtime()) {
+                                                    disable_runtime_state(jetspec_runtime_failure::invalid_real_draft_head_topk_token_commit_noop_runtime, tap_count, tap_width, taps);
+                                                    return true;
+                                                }
+                                                if (p5aq_real_draft_head_topk_hidden_kv_commit_noop_enabled) {
+                                                    if (!build_real_draft_head_topk_hidden_kv_commit_noop_runtime()) {
+                                                        disable_runtime_state(jetspec_runtime_failure::invalid_real_draft_head_topk_hidden_kv_commit_noop_runtime, tap_count, tap_width, taps);
+                                                        return true;
+                                                    }
+                                                    if (p5ar_real_draft_head_topk_rejected_branch_discard_noop_enabled) {
+                                                        if (!build_real_draft_head_topk_rejected_branch_discard_noop_runtime()) {
+                                                            disable_runtime_state(jetspec_runtime_failure::invalid_real_draft_head_topk_rejected_branch_discard_noop_runtime, tap_count, tap_width, taps);
+                                                            return true;
+                                                        }
+                                                        if (p5as_real_draft_head_topk_publish_gate_noop_enabled) {
+                                                            if (!build_real_draft_head_topk_publish_gate_noop_runtime()) {
+                                                                disable_runtime_state(jetspec_runtime_failure::invalid_real_draft_head_topk_publish_gate_noop_runtime, tap_count, tap_width, taps);
+                                                                return true;
+                                                            }
+                                                            if (trace_taps) {
+                                                                LOG_INF("%s: draft-jetspec p5as_real_draft_head_topk_publish_gate_noop_runtime phase=%s real_topk_publish_gate_noop_runtime_ready=%d real_topk_publish_gate_noop_runtime_hash=%016" PRIx64 " real_topk_publish_gate_noop_seq_id=%d real_topk_publish_gate_noop_builds=%zu p5as_real_topk_publish_gate_noop_env=%d real_topk_rejected_branch_discard_noop_runtime_ready=%d real_topk_hidden_kv_commit_noop_runtime_ready=%d real_topk_token_commit_noop_runtime_ready=%d real_topk_accept_path_descriptor_runtime_ready=%d real_topk_accept_boundary_runtime_ready=%d real_topk_verify_mask_runtime_ready=%d real_topk_tree_runtime_ready=%d real_topk_candidate_runtime_ready=%d logits_source=%s ctx_dft_present=%d decode_rc=%d logits_rows=%d logits_width=%d actual_verified_logits_rows=%d topk_k=%d actual_tree_nodes=%d real_tree_token_ids=[%d,%d,%d] candidate_nodes=%d candidate_ids=[%d,%d] rank_semantics=%s actual_verify_mask_entries=%d allowed_edges=[0:0,1:0,1:1,2:0,2:2] accept_boundary_candidate_nodes=%d accept_boundary_verified_edges=%d accept_path_descriptor_len=%d actual_accepted_nodes=%d correction_token_present=%d accept_decision_source=%s token_commit_noop=1 hidden_kv_commit_noop=1 rejected_branch_discard_noop=1 reuse_p5ar_rejected_branch_discard_noop=1 publish_gate_noop=1 publish_after_commit_and_discard_only=1 actual_committed_tokens=%d actual_survivor_pages_committed=%d actual_pages_discarded=%d rejected_branch_pages_reachable_after_discard=%d actual_publish_visible_state=%d no_target_logits_walk=1 no_target_accept_walk=1 no_accept=1 no_real_token_commit=1 no_visible_token_publish=1 no_real_hidden_kv_commit=1 no_hidden_kv_commit=1 no_real_rejected_branch_discard=1 no_rejected_branch_discard=1 no_real_publish=1 no_publish=1 no_visible_state_change=1 no_kv_mutation=1 no_draft_tokens=1\n",
+                                                                        __func__, jetspec_runtime_phase_name(runtime_phase),
+                                                                        real_draft_head_topk_publish_gate_noop_runtime_ready ? 1 : 0,
+                                                                        real_draft_head_topk_publish_gate_noop_hash_last,
+                                                                        real_draft_head_topk_publish_gate_noop_seq_id_last,
+                                                                        n_real_draft_head_topk_publish_gate_noop_runtime_builds,
+                                                                        p5as_real_draft_head_topk_publish_gate_noop_enabled ? 1 : 0,
+                                                                        real_draft_head_topk_rejected_branch_discard_noop_runtime_ready ? 1 : 0,
+                                                                        real_draft_head_topk_hidden_kv_commit_noop_runtime_ready ? 1 : 0,
+                                                                        real_draft_head_topk_token_commit_noop_runtime_ready ? 1 : 0,
+                                                                        real_draft_head_topk_accept_path_descriptor_runtime_ready ? 1 : 0,
+                                                                        real_draft_head_topk_accept_boundary_runtime_ready ? 1 : 0,
+                                                                        real_draft_head_topk_verify_mask_runtime_ready ? 1 : 0,
+                                                                        real_draft_head_topk_tree_runtime_ready ? 1 : 0,
+                                                                        real_draft_head_topk_candidate_runtime_ready ? 1 : 0,
+                                                                        JETSPEC_REAL_DRAFT_HEAD_TOPK_LOGITS_SOURCE,
+                                                                        real_draft_head_canary_ctx_present_last,
+                                                                        real_draft_head_canary_decode_rc_last,
+                                                                        real_draft_head_canary_logits_rows_last,
+                                                                        real_draft_head_canary_output_width_last,
+                                                                        real_draft_head_topk_actual_verified_logits_rows_last,
+                                                                        real_draft_head_canary_topk_k_last,
+                                                                        real_draft_head_topk_tree_nodes_last,
+                                                                        real_draft_head_topk_tree_token_ids[0], real_draft_head_topk_tree_token_ids[1], real_draft_head_topk_tree_token_ids[2],
+                                                                        real_draft_head_topk_accept_path_descriptor_candidate_nodes_last,
+                                                                        real_draft_head_topk_candidate_ids[0], real_draft_head_topk_candidate_ids[1],
+                                                                        JETSPEC_REAL_DRAFT_HEAD_TOPK_RANK_SEMANTICS,
+                                                                        real_draft_head_topk_verify_mask_entries_last,
+                                                                        real_draft_head_topk_accept_candidate_nodes_last,
+                                                                        real_draft_head_topk_accept_boundary_verified_edges_last,
+                                                                        real_draft_head_topk_accept_path_descriptor_len_last,
+                                                                        real_draft_head_topk_accept_path_descriptor_actual_accepted_nodes_last,
+                                                                        real_draft_head_topk_accept_path_descriptor_correction_token_present_last,
+                                                                        JETSPEC_ACCEPT_DECISION_SOURCE_NONE_NO_TARGET_LOGITS,
+                                                                        actual_committed_tokens_last,
+                                                                        actual_survivor_pages_committed_last,
+                                                                        actual_pages_discarded_last,
+                                                                        rejected_branch_pages_reachable_after_discard_last,
+                                                                        actual_publish_visible_state_last);
+                                                            }
+                                                            if (p5av_real_draft_head_topk_target_logits_walk_canary_enabled) {
+                                                                if (!build_real_draft_head_topk_target_logits_walk_canary_runtime(batch)) {
+                                                                    disable_runtime_state(jetspec_runtime_failure::invalid_real_draft_head_topk_target_logits_walk_canary_runtime, tap_count, tap_width, taps);
+                                                                    return true;
+                                                                }
+                                                                if (trace_taps) {
+                                                                    LOG_INF("%s: draft-jetspec p5av_real_draft_head_topk_target_logits_walk_canary_runtime phase=%s target_logits_walk_canary_ready=%d target_logits_walk_canary_hash=%016" PRIx64 " target_logits_walk_canary_seq_id=%d target_logits_walk_canary_builds=%zu p5av_target_logits_walk_canary_env=%d real_topk_publish_gate_noop_runtime_ready=%d real_topk_publish_gate_noop_runtime_hash=%016" PRIx64 " planned_target_logits_rows=%d actual_target_logits_rows_walked=%d target_logits_source=%s target_logits_width=%d target_logits_batch_index=%d target_logits_pos=%d target_logits_seq_id=%d planned_parent_nodes=[0] planned_candidate_nodes=[1,2] candidate_ids=[%d,%d] target_candidate_logits=[%.6g,%.6g] row_semantics=%s accept_decision_source=%s actual_target_accept_steps=0 actual_accepted_nodes=%d correction_token_present=%d actual_committed_tokens=%d actual_survivor_pages_committed=%d actual_pages_discarded=%d rejected_branch_pages_reachable_after_discard=%d actual_publish_visible_state=%d target_logits_walk_canary_only=1 no_target_accept_walk=1 no_accept=1 no_real_token_commit=1 no_visible_token_publish=1 no_real_hidden_kv_commit=1 no_hidden_kv_commit=1 no_real_rejected_branch_discard=1 no_rejected_branch_discard=1 no_real_publish=1 no_publish=1 no_visible_state_change=1 no_kv_mutation=1 no_draft_tokens=1\n",
+                                                                            __func__, jetspec_runtime_phase_name(runtime_phase),
+                                                                            real_draft_head_topk_target_logits_walk_canary_ready ? 1 : 0,
+                                                                            real_draft_head_topk_target_logits_walk_canary_hash_last,
+                                                                            real_draft_head_topk_target_logits_walk_canary_seq_id_last,
+                                                                            n_real_draft_head_topk_target_logits_walk_canary_builds,
+                                                                            p5av_real_draft_head_topk_target_logits_walk_canary_enabled ? 1 : 0,
+                                                                            real_draft_head_topk_publish_gate_noop_runtime_ready ? 1 : 0,
+                                                                            real_draft_head_topk_publish_gate_noop_hash_last,
+                                                                            real_draft_head_topk_target_logits_planned_rows_last,
+                                                                            real_draft_head_topk_target_logits_actual_rows_walked_last,
+                                                                            JETSPEC_TARGET_LOGITS_SOURCE,
+                                                                            real_draft_head_topk_target_logits_width_last,
+                                                                            real_draft_head_topk_target_logits_batch_index_last,
+                                                                            real_draft_head_topk_target_logits_pos_last,
+                                                                            real_draft_head_topk_target_logits_seq_id_last,
+                                                                            real_draft_head_topk_candidate_ids[0], real_draft_head_topk_candidate_ids[1],
+                                                                            (double) real_draft_head_topk_target_logits_candidate_scores[0],
+                                                                            (double) real_draft_head_topk_target_logits_candidate_scores[1],
+                                                                            JETSPEC_TARGET_LOGITS_WALK_ROW_SEMANTICS,
+                                                                            JETSPEC_ACCEPT_DECISION_SOURCE_TARGET_LOGITS_CANARY_ONLY,
+                                                                            real_draft_head_topk_accept_path_descriptor_actual_accepted_nodes_last,
+                                                                            real_draft_head_topk_accept_path_descriptor_correction_token_present_last,
+                                                                            actual_committed_tokens_last,
+                                                                            actual_survivor_pages_committed_last,
+                                                                            actual_pages_discarded_last,
+                                                                            rejected_branch_pages_reachable_after_discard_last,
+                                                                            actual_publish_visible_state_last);
+                                                                }
+                                                            }
+                                                            return true;
+                                                        }
+                                                        if (trace_taps) {
+                                                            LOG_INF("%s: draft-jetspec p5ar_real_draft_head_topk_rejected_branch_discard_noop_runtime phase=%s real_topk_rejected_branch_discard_noop_runtime_ready=%d real_topk_rejected_branch_discard_noop_runtime_hash=%016" PRIx64 " real_topk_rejected_branch_discard_noop_seq_id=%d real_topk_rejected_branch_discard_noop_builds=%zu p5ar_real_topk_rejected_branch_discard_noop_env=%d real_topk_hidden_kv_commit_noop_runtime_ready=%d real_topk_token_commit_noop_runtime_ready=%d real_topk_accept_path_descriptor_runtime_ready=%d real_topk_accept_boundary_runtime_ready=%d real_topk_verify_mask_runtime_ready=%d real_topk_tree_runtime_ready=%d real_topk_candidate_runtime_ready=%d logits_source=%s ctx_dft_present=%d decode_rc=%d logits_rows=%d logits_width=%d actual_verified_logits_rows=%d topk_k=%d actual_tree_nodes=%d real_tree_token_ids=[%d,%d,%d] candidate_nodes=%d candidate_ids=[%d,%d] rank_semantics=%s actual_verify_mask_entries=%d allowed_edges=[0:0,1:0,1:1,2:0,2:2] accept_boundary_candidate_nodes=%d accept_boundary_verified_edges=%d accept_path_descriptor_len=%d actual_accepted_nodes=%d correction_token_present=%d accept_decision_source=%s token_commit_noop=1 hidden_kv_commit_noop=1 reuse_p5aq_hidden_kv_commit_noop=1 rejected_branch_discard_noop=1 actual_committed_tokens=%d actual_survivor_pages_committed=%d actual_pages_discarded=%d rejected_branch_pages_reachable_after_discard=%d actual_publish_visible_state=%d no_target_logits_walk=1 no_target_accept_walk=1 no_accept=1 no_real_token_commit=1 no_visible_token_publish=1 no_real_hidden_kv_commit=1 no_hidden_kv_commit=1 no_real_rejected_branch_discard=1 no_rejected_branch_discard=1 no_publish=1 no_visible_state_change=1 no_kv_mutation=1 no_draft_tokens=1\n",
+                                                                    __func__, jetspec_runtime_phase_name(runtime_phase),
+                                                                    real_draft_head_topk_rejected_branch_discard_noop_runtime_ready ? 1 : 0,
+                                                                    real_draft_head_topk_rejected_branch_discard_noop_hash_last,
+                                                                    real_draft_head_topk_rejected_branch_discard_noop_seq_id_last,
+                                                                    n_real_draft_head_topk_rejected_branch_discard_noop_runtime_builds,
+                                                                    p5ar_real_draft_head_topk_rejected_branch_discard_noop_enabled ? 1 : 0,
+                                                                    real_draft_head_topk_hidden_kv_commit_noop_runtime_ready ? 1 : 0,
+                                                                    real_draft_head_topk_token_commit_noop_runtime_ready ? 1 : 0,
+                                                                    real_draft_head_topk_accept_path_descriptor_runtime_ready ? 1 : 0,
+                                                                    real_draft_head_topk_accept_boundary_runtime_ready ? 1 : 0,
+                                                                    real_draft_head_topk_verify_mask_runtime_ready ? 1 : 0,
+                                                                    real_draft_head_topk_tree_runtime_ready ? 1 : 0,
+                                                                    real_draft_head_topk_candidate_runtime_ready ? 1 : 0,
+                                                                    JETSPEC_REAL_DRAFT_HEAD_TOPK_LOGITS_SOURCE,
+                                                                    real_draft_head_canary_ctx_present_last,
+                                                                    real_draft_head_canary_decode_rc_last,
+                                                                    real_draft_head_canary_logits_rows_last,
+                                                                    real_draft_head_canary_output_width_last,
+                                                                    real_draft_head_topk_actual_verified_logits_rows_last,
+                                                                    real_draft_head_canary_topk_k_last,
+                                                                    real_draft_head_topk_tree_nodes_last,
+                                                                    real_draft_head_topk_tree_token_ids[0], real_draft_head_topk_tree_token_ids[1], real_draft_head_topk_tree_token_ids[2],
+                                                                    real_draft_head_topk_accept_path_descriptor_candidate_nodes_last,
+                                                                    real_draft_head_topk_candidate_ids[0], real_draft_head_topk_candidate_ids[1],
+                                                                    JETSPEC_REAL_DRAFT_HEAD_TOPK_RANK_SEMANTICS,
+                                                                    real_draft_head_topk_verify_mask_entries_last,
+                                                                    real_draft_head_topk_accept_candidate_nodes_last,
+                                                                    real_draft_head_topk_accept_boundary_verified_edges_last,
+                                                                    real_draft_head_topk_accept_path_descriptor_len_last,
+                                                                    real_draft_head_topk_accept_path_descriptor_actual_accepted_nodes_last,
+                                                                    real_draft_head_topk_accept_path_descriptor_correction_token_present_last,
+                                                                    JETSPEC_ACCEPT_DECISION_SOURCE_NONE_NO_TARGET_LOGITS,
+                                                                    actual_committed_tokens_last,
+                                                                    actual_survivor_pages_committed_last,
+                                                                    actual_pages_discarded_last,
+                                                                    rejected_branch_pages_reachable_after_discard_last,
+                                                                    actual_publish_visible_state_last);
+                                                        }
+                                                        return true;
+                                                    }
+                                                    if (trace_taps) {
+                                                        LOG_INF("%s: draft-jetspec p5aq_real_draft_head_topk_hidden_kv_commit_noop_runtime phase=%s real_topk_hidden_kv_commit_noop_runtime_ready=%d real_topk_hidden_kv_commit_noop_runtime_hash=%016" PRIx64 " real_topk_hidden_kv_commit_noop_seq_id=%d real_topk_hidden_kv_commit_noop_builds=%zu p5aq_real_topk_hidden_kv_commit_noop_env=%d real_topk_token_commit_noop_runtime_ready=%d real_topk_accept_path_descriptor_runtime_ready=%d real_topk_accept_boundary_runtime_ready=%d real_topk_verify_mask_runtime_ready=%d real_topk_tree_runtime_ready=%d real_topk_candidate_runtime_ready=%d logits_source=%s ctx_dft_present=%d decode_rc=%d logits_rows=%d logits_width=%d actual_verified_logits_rows=%d topk_k=%d actual_tree_nodes=%d real_tree_token_ids=[%d,%d,%d] candidate_nodes=%d candidate_ids=[%d,%d] rank_semantics=%s actual_verify_mask_entries=%d allowed_edges=[0:0,1:0,1:1,2:0,2:2] accept_boundary_candidate_nodes=%d accept_boundary_verified_edges=%d accept_path_descriptor_len=%d actual_accepted_nodes=%d correction_token_present=%d accept_decision_source=%s token_commit_noop=1 reuse_p5ap_token_commit_noop=1 hidden_kv_commit_noop=1 actual_committed_tokens=%d actual_survivor_pages_committed=%d actual_pages_discarded=%d actual_publish_visible_state=%d no_target_logits_walk=1 no_target_accept_walk=1 no_accept=1 no_real_token_commit=1 no_visible_token_publish=1 no_real_hidden_kv_commit=1 no_hidden_kv_commit=1 no_rejected_branch_discard=1 no_publish=1 no_visible_state_change=1 no_kv_mutation=1 no_draft_tokens=1\n",
+                                                                __func__, jetspec_runtime_phase_name(runtime_phase),
+                                                                real_draft_head_topk_hidden_kv_commit_noop_runtime_ready ? 1 : 0,
+                                                                real_draft_head_topk_hidden_kv_commit_noop_hash_last,
+                                                                real_draft_head_topk_hidden_kv_commit_noop_seq_id_last,
+                                                                n_real_draft_head_topk_hidden_kv_commit_noop_runtime_builds,
+                                                                p5aq_real_draft_head_topk_hidden_kv_commit_noop_enabled ? 1 : 0,
+                                                                real_draft_head_topk_token_commit_noop_runtime_ready ? 1 : 0,
+                                                                real_draft_head_topk_accept_path_descriptor_runtime_ready ? 1 : 0,
+                                                                real_draft_head_topk_accept_boundary_runtime_ready ? 1 : 0,
+                                                                real_draft_head_topk_verify_mask_runtime_ready ? 1 : 0,
+                                                                real_draft_head_topk_tree_runtime_ready ? 1 : 0,
+                                                                real_draft_head_topk_candidate_runtime_ready ? 1 : 0,
+                                                                JETSPEC_REAL_DRAFT_HEAD_TOPK_LOGITS_SOURCE,
+                                                                real_draft_head_canary_ctx_present_last,
+                                                                real_draft_head_canary_decode_rc_last,
+                                                                real_draft_head_canary_logits_rows_last,
+                                                                real_draft_head_canary_output_width_last,
+                                                                real_draft_head_topk_actual_verified_logits_rows_last,
+                                                                real_draft_head_canary_topk_k_last,
+                                                                real_draft_head_topk_tree_nodes_last,
+                                                                real_draft_head_topk_tree_token_ids[0], real_draft_head_topk_tree_token_ids[1], real_draft_head_topk_tree_token_ids[2],
+                                                                real_draft_head_topk_accept_path_descriptor_candidate_nodes_last,
+                                                                real_draft_head_topk_candidate_ids[0], real_draft_head_topk_candidate_ids[1],
+                                                                JETSPEC_REAL_DRAFT_HEAD_TOPK_RANK_SEMANTICS,
+                                                                real_draft_head_topk_verify_mask_entries_last,
+                                                                real_draft_head_topk_accept_candidate_nodes_last,
+                                                                real_draft_head_topk_accept_boundary_verified_edges_last,
+                                                                real_draft_head_topk_accept_path_descriptor_len_last,
+                                                                real_draft_head_topk_accept_path_descriptor_actual_accepted_nodes_last,
+                                                                real_draft_head_topk_accept_path_descriptor_correction_token_present_last,
+                                                                JETSPEC_ACCEPT_DECISION_SOURCE_NONE_NO_TARGET_LOGITS,
+                                                                actual_committed_tokens_last,
+                                                                actual_survivor_pages_committed_last,
+                                                                actual_pages_discarded_last,
+                                                                actual_publish_visible_state_last);
+                                                    }
+                                                    return true;
+                                                }
+                                                if (trace_taps) {
+                                                    LOG_INF("%s: draft-jetspec p5ap_real_draft_head_topk_token_commit_noop_runtime phase=%s real_topk_token_commit_noop_runtime_ready=%d real_topk_token_commit_noop_runtime_hash=%016" PRIx64 " real_topk_token_commit_noop_seq_id=%d real_topk_token_commit_noop_builds=%zu p5ap_real_topk_token_commit_noop_env=%d real_topk_accept_path_descriptor_runtime_ready=%d real_topk_accept_boundary_runtime_ready=%d real_topk_verify_mask_runtime_ready=%d real_topk_tree_runtime_ready=%d real_topk_candidate_runtime_ready=%d logits_source=%s ctx_dft_present=%d decode_rc=%d logits_rows=%d logits_width=%d actual_verified_logits_rows=%d topk_k=%d actual_tree_nodes=%d real_tree_token_ids=[%d,%d,%d] candidate_nodes=%d candidate_ids=[%d,%d] rank_semantics=%s actual_verify_mask_entries=%d allowed_edges=[0:0,1:0,1:1,2:0,2:2] accept_boundary_candidate_nodes=%d accept_boundary_verified_edges=%d accept_path_descriptor_len=%d actual_accepted_nodes=%d correction_token_present=%d accept_decision_source=%s token_commit_noop=1 reuse_p5ao_accept_path_descriptor=1 actual_committed_tokens=%d actual_survivor_pages_committed=%d actual_pages_discarded=%d actual_publish_visible_state=%d no_target_logits_walk=1 no_target_accept_walk=1 no_accept=1 no_real_token_commit=1 no_visible_token_publish=1 no_hidden_kv_commit=1 no_rejected_branch_discard=1 no_publish=1 no_visible_state_change=1 no_kv_mutation=1 no_draft_tokens=1\n",
+                                                            __func__, jetspec_runtime_phase_name(runtime_phase),
+                                                            real_draft_head_topk_token_commit_noop_runtime_ready ? 1 : 0,
+                                                            real_draft_head_topk_token_commit_noop_hash_last,
+                                                            real_draft_head_topk_token_commit_noop_seq_id_last,
+                                                            n_real_draft_head_topk_token_commit_noop_runtime_builds,
+                                                            p5ap_real_draft_head_topk_token_commit_noop_enabled ? 1 : 0,
+                                                            real_draft_head_topk_accept_path_descriptor_runtime_ready ? 1 : 0,
+                                                            real_draft_head_topk_accept_boundary_runtime_ready ? 1 : 0,
+                                                            real_draft_head_topk_verify_mask_runtime_ready ? 1 : 0,
+                                                            real_draft_head_topk_tree_runtime_ready ? 1 : 0,
+                                                            real_draft_head_topk_candidate_runtime_ready ? 1 : 0,
+                                                            JETSPEC_REAL_DRAFT_HEAD_TOPK_LOGITS_SOURCE,
+                                                            real_draft_head_canary_ctx_present_last,
+                                                            real_draft_head_canary_decode_rc_last,
+                                                            real_draft_head_canary_logits_rows_last,
+                                                            real_draft_head_canary_output_width_last,
+                                                            real_draft_head_topk_actual_verified_logits_rows_last,
+                                                            real_draft_head_canary_topk_k_last,
+                                                            real_draft_head_topk_tree_nodes_last,
+                                                            real_draft_head_topk_tree_token_ids[0], real_draft_head_topk_tree_token_ids[1], real_draft_head_topk_tree_token_ids[2],
+                                                            real_draft_head_topk_accept_path_descriptor_candidate_nodes_last,
+                                                            real_draft_head_topk_candidate_ids[0], real_draft_head_topk_candidate_ids[1],
+                                                            JETSPEC_REAL_DRAFT_HEAD_TOPK_RANK_SEMANTICS,
+                                                            real_draft_head_topk_verify_mask_entries_last,
+                                                            real_draft_head_topk_accept_candidate_nodes_last,
+                                                            real_draft_head_topk_accept_boundary_verified_edges_last,
+                                                            real_draft_head_topk_accept_path_descriptor_len_last,
+                                                            real_draft_head_topk_accept_path_descriptor_actual_accepted_nodes_last,
+                                                            real_draft_head_topk_accept_path_descriptor_correction_token_present_last,
+                                                            JETSPEC_ACCEPT_DECISION_SOURCE_NONE_NO_TARGET_LOGITS,
+                                                            actual_committed_tokens_last,
+                                                            actual_survivor_pages_committed_last,
+                                                            actual_pages_discarded_last,
+                                                            actual_publish_visible_state_last);
+                                                }
+                                                return true;
+                                            }
+                                            if (trace_taps) {
+                                                LOG_INF("%s: draft-jetspec p5ao_real_draft_head_topk_accept_path_descriptor_runtime phase=%s real_topk_accept_path_descriptor_runtime_ready=%d real_topk_accept_path_descriptor_runtime_hash=%016" PRIx64 " real_topk_accept_path_descriptor_seq_id=%d real_topk_accept_path_descriptor_builds=%zu p5ao_real_topk_accept_path_descriptor_env=%d real_topk_accept_boundary_runtime_ready=%d real_topk_accept_boundary_runtime_hash=%016" PRIx64 " real_topk_verify_mask_runtime_ready=%d real_topk_verify_mask_runtime_hash=%016" PRIx64 " real_topk_tree_runtime_ready=%d real_topk_tree_runtime_hash=%016" PRIx64 " real_topk_candidate_runtime_ready=%d real_topk_candidate_runtime_hash=%016" PRIx64 " topk_accept_boundary_runtime_ready=%d topk_accept_boundary_runtime_hash=%016" PRIx64 " topk_verify_mask_runtime_ready=%d topk_verify_mask_runtime_hash=%016" PRIx64 " topk_tree_runtime_ready=%d topk_tree_runtime_hash=%016" PRIx64 " logits_source=%s ctx_dft_present=%d decode_rc=%d logits_rows=%d logits_width=%d actual_verified_logits_rows=%d topk_k=%d actual_tree_nodes=%d real_tree_token_ids=[%d,%d,%d] candidate_nodes=%d candidate_ids=[%d,%d] rank_semantics=%s actual_verify_mask_entries=%d allowed_edges=[0:0,1:0,1:1,2:0,2:2] accept_boundary_candidate_nodes=%d accept_boundary_verified_edges=%d accept_path_descriptor_len=%d actual_accepted_nodes=%d correction_token_present=%d accept_decision_source=%s descriptor_only=1 reuse_p5an_accept_boundary_metadata=1 actual_committed_tokens=%d actual_survivor_pages_committed=%d actual_pages_discarded=%d actual_publish_visible_state=%d no_target_logits_walk=1 no_target_accept_walk=1 no_accept=1 no_token_commit=1 no_hidden_kv_commit=1 no_rejected_branch_discard=1 no_publish=1 no_visible_state_change=1 no_kv_mutation=1 no_draft_tokens=1\n",
+                                                        __func__, jetspec_runtime_phase_name(runtime_phase),
+                                                        real_draft_head_topk_accept_path_descriptor_runtime_ready ? 1 : 0,
+                                                        real_draft_head_topk_accept_path_descriptor_hash_last,
+                                                        real_draft_head_topk_accept_path_descriptor_seq_id_last,
+                                                        n_real_draft_head_topk_accept_path_descriptor_runtime_builds,
+                                                        p5ao_real_draft_head_topk_accept_path_descriptor_enabled ? 1 : 0,
+                                                        real_draft_head_topk_accept_boundary_runtime_ready ? 1 : 0,
+                                                        real_draft_head_topk_accept_boundary_hash_last,
+                                                        real_draft_head_topk_verify_mask_runtime_ready ? 1 : 0,
+                                                        real_draft_head_topk_verify_mask_hash_last,
+                                                        real_draft_head_topk_tree_runtime_ready ? 1 : 0,
+                                                        real_draft_head_topk_tree_hash_last,
+                                                        real_draft_head_topk_candidate_runtime_ready ? 1 : 0,
+                                                        real_draft_head_topk_candidate_hash_last,
+                                                        topk_accept_boundary_runtime_ready ? 1 : 0,
+                                                        topk_accept_boundary_runtime_hash_last,
+                                                        topk_verify_mask_runtime_ready ? 1 : 0,
+                                                        topk_verify_mask_runtime_hash_last,
+                                                        topk_tree_runtime_ready ? 1 : 0,
+                                                        topk_tree_runtime_hash_last,
+                                                        JETSPEC_REAL_DRAFT_HEAD_TOPK_LOGITS_SOURCE,
+                                                        real_draft_head_canary_ctx_present_last,
+                                                        real_draft_head_canary_decode_rc_last,
+                                                        real_draft_head_canary_logits_rows_last,
+                                                        real_draft_head_canary_output_width_last,
+                                                        real_draft_head_topk_actual_verified_logits_rows_last,
+                                                        real_draft_head_canary_topk_k_last,
+                                                        real_draft_head_topk_tree_nodes_last,
+                                                        real_draft_head_topk_tree_token_ids[0], real_draft_head_topk_tree_token_ids[1], real_draft_head_topk_tree_token_ids[2],
+                                                        real_draft_head_topk_accept_path_descriptor_candidate_nodes_last,
+                                                        real_draft_head_topk_candidate_ids[0], real_draft_head_topk_candidate_ids[1],
+                                                        JETSPEC_REAL_DRAFT_HEAD_TOPK_RANK_SEMANTICS,
+                                                        real_draft_head_topk_verify_mask_entries_last,
+                                                        real_draft_head_topk_accept_candidate_nodes_last,
+                                                        real_draft_head_topk_accept_boundary_verified_edges_last,
+                                                        real_draft_head_topk_accept_path_descriptor_len_last,
+                                                        real_draft_head_topk_accept_path_descriptor_actual_accepted_nodes_last,
+                                                        real_draft_head_topk_accept_path_descriptor_correction_token_present_last,
+                                                        JETSPEC_ACCEPT_DECISION_SOURCE_NONE_NO_TARGET_LOGITS,
+                                                        actual_committed_tokens_last,
+                                                        actual_survivor_pages_committed_last,
+                                                        actual_pages_discarded_last,
+                                                        actual_publish_visible_state_last);
+                                            }
+                                            return true;
+                                        }
+                                        if (trace_taps) {
+                                            LOG_INF("%s: draft-jetspec p5an_real_draft_head_topk_accept_boundary_runtime phase=%s real_topk_accept_boundary_runtime_ready=%d real_topk_accept_boundary_runtime_hash=%016" PRIx64 " real_topk_accept_boundary_seq_id=%d real_topk_verify_mask_runtime_ready=%d real_topk_verify_mask_runtime_hash=%016" PRIx64 " real_topk_tree_runtime_ready=%d real_topk_tree_runtime_hash=%016" PRIx64 " real_topk_candidate_runtime_ready=%d real_topk_candidate_runtime_hash=%016" PRIx64 " topk_accept_boundary_runtime_ready=%d topk_accept_boundary_runtime_hash=%016" PRIx64 " topk_verify_mask_runtime_ready=%d topk_verify_mask_runtime_hash=%016" PRIx64 " topk_tree_runtime_ready=%d topk_tree_runtime_hash=%016" PRIx64 " logits_source=%s ctx_dft_present=%d decode_rc=%d logits_rows=%d logits_width=%d actual_verified_logits_rows=%d topk_k=%d actual_tree_nodes=%d real_tree_token_ids=[%d,%d,%d] real_tree_parent_indices=[%d,%d,%d] real_tree_depth=[%d,%d,%d] real_tree_rank=[%d,%d,%d] real_tree_logits=[%.6g,%.6g,%.6g] parent_node=%d candidate_nodes=%d candidate_ids=[%d,%d] candidate_logits=[%.6g,%.6g] rank_semantics=%s actual_verify_mask_entries=%d verify_mask_rows=3 verify_mask_cols=3 allowed_edges=[0:0,1:0,1:1,2:0,2:2] real_verify_mask_rows=[%d,%d,%d,%d,%d] real_verify_mask_cols=[%d,%d,%d,%d,%d] real_verify_mask_values=[%d,%d,%d,%d,%d] accept_boundary_candidate_nodes=%d accept_boundary_verified_edges=%d accept_decision_source=%s accept_path_len=%d actual_accepted_nodes=%d correction_token_present=%d actual_committed_tokens=%d actual_survivor_pages_committed=%d actual_pages_discarded=%d actual_publish_visible_state=%d reuse_p5am_real_tree_mask_metadata=1 no_target_logits_walk=1 no_target_accept_walk=1 no_sampler=1 no_accept=1 no_mask_tensor=1 no_token_commit=1 no_hidden_kv_commit=1 no_rejected_branch_discard=1 no_discard=1 no_publish=1 no_visible_state_change=1 no_kv_mutation=1 no_draft_tokens=1\n",
+                                                    __func__, jetspec_runtime_phase_name(runtime_phase), real_draft_head_topk_accept_boundary_runtime_ready ? 1 : 0,
+                                                    real_draft_head_topk_accept_boundary_hash_last, real_draft_head_topk_accept_boundary_seq_id_last,
+                                                    real_draft_head_topk_verify_mask_runtime_ready ? 1 : 0, real_draft_head_topk_verify_mask_hash_last,
+                                                    real_draft_head_topk_tree_runtime_ready ? 1 : 0, real_draft_head_topk_tree_hash_last,
+                                                    real_draft_head_topk_candidate_runtime_ready ? 1 : 0, real_draft_head_topk_candidate_hash_last,
+                                                    topk_accept_boundary_runtime_ready ? 1 : 0, topk_accept_boundary_runtime_hash_last,
+                                                    topk_verify_mask_runtime_ready ? 1 : 0, topk_verify_mask_runtime_hash_last,
+                                                    topk_tree_runtime_ready ? 1 : 0, topk_tree_runtime_hash_last,
+                                                    JETSPEC_REAL_DRAFT_HEAD_TOPK_LOGITS_SOURCE, real_draft_head_canary_ctx_present_last,
+                                                    real_draft_head_canary_decode_rc_last, real_draft_head_canary_logits_rows_last,
+                                                    real_draft_head_canary_output_width_last, real_draft_head_topk_actual_verified_logits_rows_last,
+                                                    real_draft_head_canary_topk_k_last, real_draft_head_topk_tree_nodes_last,
+                                                    real_draft_head_topk_tree_token_ids[0], real_draft_head_topk_tree_token_ids[1], real_draft_head_topk_tree_token_ids[2],
+                                                    real_draft_head_topk_tree_parent_indices[0], real_draft_head_topk_tree_parent_indices[1], real_draft_head_topk_tree_parent_indices[2],
+                                                    real_draft_head_topk_tree_depth[0], real_draft_head_topk_tree_depth[1], real_draft_head_topk_tree_depth[2],
+                                                    real_draft_head_topk_tree_rank[0], real_draft_head_topk_tree_rank[1], real_draft_head_topk_tree_rank[2],
+                                                    (double) real_draft_head_topk_tree_cum_logit[0], (double) real_draft_head_topk_tree_cum_logit[1], (double) real_draft_head_topk_tree_cum_logit[2],
+                                                    real_draft_head_topk_parent_node_last, real_draft_head_topk_accept_candidate_nodes_last,
+                                                    real_draft_head_topk_candidate_ids[0], real_draft_head_topk_candidate_ids[1],
+                                                    (double) real_draft_head_topk_candidate_logits[0], (double) real_draft_head_topk_candidate_logits[1],
+                                                    JETSPEC_REAL_DRAFT_HEAD_TOPK_RANK_SEMANTICS, real_draft_head_topk_verify_mask_entries_last,
+                                                    real_draft_head_topk_verify_mask_rows[0], real_draft_head_topk_verify_mask_rows[1], real_draft_head_topk_verify_mask_rows[2], real_draft_head_topk_verify_mask_rows[3], real_draft_head_topk_verify_mask_rows[4],
+                                                    real_draft_head_topk_verify_mask_cols[0], real_draft_head_topk_verify_mask_cols[1], real_draft_head_topk_verify_mask_cols[2], real_draft_head_topk_verify_mask_cols[3], real_draft_head_topk_verify_mask_cols[4],
+                                                    (int) real_draft_head_topk_verify_mask_values[0], (int) real_draft_head_topk_verify_mask_values[1], (int) real_draft_head_topk_verify_mask_values[2], (int) real_draft_head_topk_verify_mask_values[3], (int) real_draft_head_topk_verify_mask_values[4],
+                                                    real_draft_head_topk_accept_candidate_nodes_last, real_draft_head_topk_accept_boundary_verified_edges_last,
+                                                    JETSPEC_ACCEPT_DECISION_SOURCE_NONE_NO_TARGET_LOGITS, real_draft_head_topk_accept_path_len_last,
+                                                    real_draft_head_topk_actual_accepted_nodes_last, real_draft_head_topk_correction_token_present_last,
+                                                    actual_committed_tokens_last, actual_survivor_pages_committed_last, actual_pages_discarded_last,
+                                                    actual_publish_visible_state_last);
+                                        }
+                                        return true;
+                                    }
+                                    if (trace_taps) {
+                                        LOG_INF("%s: draft-jetspec p5am_real_draft_head_topk_verify_mask_runtime phase=%s real_topk_verify_mask_runtime_ready=%d real_topk_verify_mask_runtime_hash=%016" PRIx64 " real_topk_tree_runtime_ready=%d real_topk_tree_runtime_hash=%016" PRIx64 " real_topk_candidate_runtime_ready=%d real_topk_candidate_runtime_hash=%016" PRIx64 " topk_accept_boundary_runtime_ready=%d topk_accept_boundary_runtime_hash=%016" PRIx64 " topk_verify_mask_runtime_ready=%d topk_verify_mask_runtime_hash=%016" PRIx64 " topk_tree_runtime_ready=%d topk_tree_runtime_hash=%016" PRIx64 " logits_source=%s ctx_dft_present=%d decode_rc=%d logits_rows=%d logits_width=%d actual_verified_logits_rows=%d topk_k=%d actual_tree_nodes=%d real_tree_token_ids=[%d,%d,%d] real_tree_parent_indices=[%d,%d,%d] real_tree_depth=[%d,%d,%d] real_tree_rank=[%d,%d,%d] real_tree_logits=[%.6g,%.6g,%.6g] parent_node=%d candidate_nodes=%d candidate_ids=[%d,%d] candidate_logits=[%.6g,%.6g] rank_semantics=%s accept_path_len=%d actual_accepted_nodes=%d correction_token_present=%d actual_verify_mask_entries=%d verify_mask_rows=3 verify_mask_cols=3 allowed_edges=[0:0,1:0,1:1,2:0,2:2] real_verify_mask_rows=[%d,%d,%d,%d,%d] real_verify_mask_cols=[%d,%d,%d,%d,%d] real_verify_mask_values=[%d,%d,%d,%d,%d] prefix_visible=1 ancestor_only=1 root_attends_self=1 child_attends_root=1 child_attends_self=1 sibling_visible=0 descendant_visible=0 no_mask_tensor=1 no_synthetic_mask_mutation=1 no_target_logits_walk=1 no_target_accept_walk=1 no_accept=1 no_token_commit=1 no_hidden_kv_commit=1 no_rejected_branch_discard=1 no_publish=1 no_visible_state_change=1 no_kv_mutation=1 no_draft_tokens=1\n",
+                                                __func__, jetspec_runtime_phase_name(runtime_phase), real_draft_head_topk_verify_mask_runtime_ready ? 1 : 0,
+                                                real_draft_head_topk_verify_mask_hash_last, real_draft_head_topk_tree_runtime_ready ? 1 : 0,
+                                                real_draft_head_topk_tree_hash_last, real_draft_head_topk_candidate_runtime_ready ? 1 : 0,
+                                                real_draft_head_topk_candidate_hash_last, topk_accept_boundary_runtime_ready ? 1 : 0,
+                                                topk_accept_boundary_runtime_hash_last, topk_verify_mask_runtime_ready ? 1 : 0,
+                                                topk_verify_mask_runtime_hash_last, topk_tree_runtime_ready ? 1 : 0,
+                                                topk_tree_runtime_hash_last, JETSPEC_REAL_DRAFT_HEAD_TOPK_LOGITS_SOURCE,
+                                                real_draft_head_canary_ctx_present_last, real_draft_head_canary_decode_rc_last,
+                                                real_draft_head_canary_logits_rows_last, real_draft_head_canary_output_width_last,
+                                                real_draft_head_topk_verified_logits_rows_last, real_draft_head_canary_topk_k_last,
+                                                real_draft_head_topk_tree_nodes_last,
+                                                real_draft_head_topk_tree_token_ids[0], real_draft_head_topk_tree_token_ids[1], real_draft_head_topk_tree_token_ids[2],
+                                                real_draft_head_topk_tree_parent_indices[0], real_draft_head_topk_tree_parent_indices[1], real_draft_head_topk_tree_parent_indices[2],
+                                                real_draft_head_topk_tree_depth[0], real_draft_head_topk_tree_depth[1], real_draft_head_topk_tree_depth[2],
+                                                real_draft_head_topk_tree_rank[0], real_draft_head_topk_tree_rank[1], real_draft_head_topk_tree_rank[2],
+                                                (double) real_draft_head_topk_tree_cum_logit[0], (double) real_draft_head_topk_tree_cum_logit[1], (double) real_draft_head_topk_tree_cum_logit[2],
+                                                real_draft_head_topk_parent_node_last, real_draft_head_topk_candidate_nodes_last,
+                                                real_draft_head_topk_candidate_ids[0], real_draft_head_topk_candidate_ids[1],
+                                                (double) real_draft_head_topk_candidate_logits[0], (double) real_draft_head_topk_candidate_logits[1],
+                                                JETSPEC_REAL_DRAFT_HEAD_TOPK_RANK_SEMANTICS, accept_path_len_last,
+                                                actual_accepted_nodes_last, correction_token_present_last, real_draft_head_topk_verify_mask_entries_last,
+                                                real_draft_head_topk_verify_mask_rows[0], real_draft_head_topk_verify_mask_rows[1], real_draft_head_topk_verify_mask_rows[2], real_draft_head_topk_verify_mask_rows[3], real_draft_head_topk_verify_mask_rows[4],
+                                                real_draft_head_topk_verify_mask_cols[0], real_draft_head_topk_verify_mask_cols[1], real_draft_head_topk_verify_mask_cols[2], real_draft_head_topk_verify_mask_cols[3], real_draft_head_topk_verify_mask_cols[4],
+                                                (int) real_draft_head_topk_verify_mask_values[0], (int) real_draft_head_topk_verify_mask_values[1], (int) real_draft_head_topk_verify_mask_values[2], (int) real_draft_head_topk_verify_mask_values[3], (int) real_draft_head_topk_verify_mask_values[4]);
+                                    }
+                                    return true;
+                                }
+                                if (trace_taps) {
+                                    LOG_INF("%s: draft-jetspec p5al_real_draft_head_topk_tree_runtime phase=%s real_topk_tree_runtime_ready=%d real_topk_tree_runtime_hash=%016" PRIx64 " real_topk_candidate_runtime_ready=%d real_topk_candidate_runtime_hash=%016" PRIx64 " topk_accept_boundary_runtime_ready=%d topk_accept_boundary_runtime_hash=%016" PRIx64 " topk_verify_mask_runtime_ready=%d topk_verify_mask_runtime_hash=%016" PRIx64 " topk_tree_runtime_ready=%d topk_tree_runtime_hash=%016" PRIx64 " logits_source=%s ctx_dft_present=%d decode_rc=%d logits_rows=%d logits_width=%d actual_verified_logits_rows=%d topk_k=%d actual_tree_nodes=%d real_tree_token_ids=[%d,%d,%d] real_tree_parent_indices=[%d,%d,%d] real_tree_depth=[%d,%d,%d] real_tree_rank=[%d,%d,%d] real_tree_logits=[%.6g,%.6g,%.6g] parent_node=%d candidate_nodes=%d candidate_ids=[%d,%d] candidate_logits=[%.6g,%.6g] rank_semantics=%s accept_path_len=%d actual_accepted_nodes=%d correction_token_present=%d no_synthetic_token_ids=1 no_external_logits_walk=1 no_target_logits_walk=1 no_target_accept_walk=1 no_accept=1 no_token_commit=1 no_hidden_kv_commit=1 no_rejected_branch_discard=1 no_publish=1 no_visible_state_change=1 no_kv_mutation=1 no_draft_tokens=1\n",
+                                            __func__, jetspec_runtime_phase_name(runtime_phase), real_draft_head_topk_tree_runtime_ready ? 1 : 0,
+                                            real_draft_head_topk_tree_hash_last, real_draft_head_topk_candidate_runtime_ready ? 1 : 0,
+                                            real_draft_head_topk_candidate_hash_last, topk_accept_boundary_runtime_ready ? 1 : 0,
+                                            topk_accept_boundary_runtime_hash_last, topk_verify_mask_runtime_ready ? 1 : 0, topk_verify_mask_runtime_hash_last,
+                                            topk_tree_runtime_ready ? 1 : 0, topk_tree_runtime_hash_last, JETSPEC_REAL_DRAFT_HEAD_TOPK_LOGITS_SOURCE,
+                                            real_draft_head_canary_ctx_present_last, real_draft_head_canary_decode_rc_last,
+                                            real_draft_head_canary_logits_rows_last, real_draft_head_canary_output_width_last,
+                                            real_draft_head_topk_verified_logits_rows_last, real_draft_head_canary_topk_k_last,
+                                            real_draft_head_topk_tree_nodes_last,
+                                            real_draft_head_topk_tree_token_ids[0], real_draft_head_topk_tree_token_ids[1], real_draft_head_topk_tree_token_ids[2],
+                                            real_draft_head_topk_tree_parent_indices[0], real_draft_head_topk_tree_parent_indices[1], real_draft_head_topk_tree_parent_indices[2],
+                                            real_draft_head_topk_tree_depth[0], real_draft_head_topk_tree_depth[1], real_draft_head_topk_tree_depth[2],
+                                            real_draft_head_topk_tree_rank[0], real_draft_head_topk_tree_rank[1], real_draft_head_topk_tree_rank[2],
+                                            (double) real_draft_head_topk_tree_cum_logit[0], (double) real_draft_head_topk_tree_cum_logit[1], (double) real_draft_head_topk_tree_cum_logit[2],
+                                            real_draft_head_topk_parent_node_last, real_draft_head_topk_candidate_nodes_last,
+                                            real_draft_head_topk_candidate_ids[0], real_draft_head_topk_candidate_ids[1],
+                                            (double) real_draft_head_topk_candidate_logits[0], (double) real_draft_head_topk_candidate_logits[1],
+                                            JETSPEC_REAL_DRAFT_HEAD_TOPK_RANK_SEMANTICS, accept_path_len_last,
+                                            actual_accepted_nodes_last, correction_token_present_last);
+                                }
+                                return true;
+                            }
+                            if (trace_taps) {
+                                LOG_INF("%s: draft-jetspec p5ak_real_draft_head_topk_candidate_runtime phase=%s real_topk_candidate_runtime_ready=%d real_topk_candidate_runtime_hash=%016" PRIx64 " topk_accept_boundary_runtime_ready=%d topk_accept_boundary_runtime_hash=%016" PRIx64 " topk_verify_mask_runtime_ready=%d topk_verify_mask_runtime_hash=%016" PRIx64 " topk_tree_runtime_ready=%d topk_tree_runtime_hash=%016" PRIx64 " logits_source=%s ctx_dft_present=%d decode_rc=%d logits_rows=%d logits_width=%d actual_verified_logits_rows=%d topk_k=%d parent_node=%d candidate_nodes=%d candidate_ids=[%d,%d] candidate_logits=[%.6g,%.6g] rank_semantics=%s accept_path_len=%d actual_accepted_nodes=%d correction_token_present=%d no_external_logits_walk=1 no_target_accept_walk=1 no_accept=1 no_token_commit=1 no_hidden_kv_commit=1 no_rejected_branch_discard=1 no_publish=1 no_visible_state_change=1 no_kv_mutation=1 no_draft_tokens=1\n",
+                                        __func__, jetspec_runtime_phase_name(runtime_phase), real_draft_head_topk_candidate_runtime_ready ? 1 : 0,
+                                        real_draft_head_topk_candidate_hash_last, topk_accept_boundary_runtime_ready ? 1 : 0,
+                                        topk_accept_boundary_runtime_hash_last, topk_verify_mask_runtime_ready ? 1 : 0, topk_verify_mask_runtime_hash_last,
+                                        topk_tree_runtime_ready ? 1 : 0, topk_tree_runtime_hash_last, JETSPEC_REAL_DRAFT_HEAD_TOPK_LOGITS_SOURCE,
+                                        real_draft_head_canary_ctx_present_last, real_draft_head_canary_decode_rc_last,
+                                        real_draft_head_canary_logits_rows_last, real_draft_head_canary_output_width_last,
+                                        real_draft_head_topk_verified_logits_rows_last, real_draft_head_canary_topk_k_last,
+                                        real_draft_head_topk_parent_node_last, real_draft_head_topk_candidate_nodes_last,
+                                        real_draft_head_topk_candidate_ids[0], real_draft_head_topk_candidate_ids[1],
+                                        (double) real_draft_head_topk_candidate_logits[0], (double) real_draft_head_topk_candidate_logits[1],
+                                        JETSPEC_REAL_DRAFT_HEAD_TOPK_RANK_SEMANTICS, accept_path_len_last,
+                                        actual_accepted_nodes_last, correction_token_present_last);
+                            }
+                            return true;
+                        }
+                        if (trace_taps) {
+                            LOG_INF("%s: draft-jetspec p5ag_topk_accept_boundary_runtime phase=%s topk_accept_boundary_runtime_ready=%d topk_accept_boundary_runtime_hash=%016" PRIx64 " topk_verify_mask_runtime_ready=%d topk_verify_mask_runtime_hash=%016" PRIx64 " topk_tree_runtime_ready=%d topk_tree_runtime_hash=%016" PRIx64 " actual_tree_nodes=%d actual_verify_mask_entries=%d accept_boundary_candidate_nodes=%d accept_boundary_verified_edges=%d actual_verified_logits_rows=%d accept_decision_source=%s accept_path_len=%d actual_accepted_nodes=%d correction_token_present=%d no_target_logits_walk=1 no_target_accept_walk=1 no_token_commit=1 no_hidden_kv_commit=1 no_rejected_branch_discard=1 no_publish=1 no_visible_state_change=1 no_kv_mutation=1 no_draft_head_graph=1 no_draft_tokens=1\n",
+                                    __func__, jetspec_runtime_phase_name(runtime_phase), topk_accept_boundary_runtime_ready ? 1 : 0,
+                                    topk_accept_boundary_runtime_hash_last, topk_verify_mask_runtime_ready ? 1 : 0, topk_verify_mask_runtime_hash_last,
+                                    topk_tree_runtime_ready ? 1 : 0, topk_tree_runtime_hash_last, tree_build_actual_nodes_last,
+                                    actual_verify_mask_entries_last, topk_accept_candidate_nodes_last, topk_accept_boundary_verified_edges_last,
+                                    topk_actual_verified_logits_rows_last, JETSPEC_ACCEPT_DECISION_SOURCE_NONE_NO_LOGITS, accept_path_len_last,
+                                    actual_accepted_nodes_last, correction_token_present_last);
+                        }
+                        return true;
+                    }
+                    if (trace_taps) {
+                        LOG_INF("%s: draft-jetspec p5af_topk_verify_mask_runtime phase=%s topk_verify_mask_runtime_ready=%d topk_verify_mask_runtime_hash=%016" PRIx64 " topk_tree_runtime_ready=%d topk_tree_runtime_hash=%016" PRIx64 " actual_tree_nodes=%d actual_verify_mask_entries=%d verify_mask_rows=3 verify_mask_cols=3 allowed_edges=[0:0,1:0,1:1,2:0,2:2] prefix_visible=1 ancestor_only=1 root_attends_self=1 child_attends_root=1 child_attends_self=1 sibling_visible=0 descendant_visible=0 no_mask_tensor=1 no_accept=1 no_token_commit=1 no_hidden_kv_commit=1 no_rejected_branch_discard=1 no_publish=1 no_visible_state_change=1 no_kv_mutation=1 no_draft_head_graph=1 no_draft_tokens=1\n",
+                                __func__, jetspec_runtime_phase_name(runtime_phase), topk_verify_mask_runtime_ready ? 1 : 0,
+                                topk_verify_mask_runtime_hash_last, topk_tree_runtime_ready ? 1 : 0, topk_tree_runtime_hash_last,
+                                tree_build_actual_nodes_last, actual_verify_mask_entries_last);
+                    }
+                    return true;
+                }
+                if (trace_taps) {
+                    LOG_INF("%s: draft-jetspec p5ae_topk_tree_runtime phase=%s topk_tree_runtime_ready=%d topk_tree_runtime_hash=%016" PRIx64 " topk_logprob_source=%s topk_width=%d topk_depth=%d actual_tree_nodes=%d tree_token_ids=[%d,%d,%d] tree_parent_indices=[%d,%d,%d] tree_depth=[%d,%d,%d] tree_rank=[%d,%d,%d] tree_cum_logprob=[%.1f,%.1f,%.1f] parent_before_child=1 num_nodes_lte_budget=1 non_root_nodes=%d no_draft_head_graph=1 no_draft_logits=1 no_verify_mask=1 no_accept=1 no_token_commit=1 no_hidden_kv_commit=1 no_rejected_branch_discard=1 no_publish=1 no_visible_state_change=1 no_kv_mutation=1 no_draft_tokens=1\n",
+                            __func__, jetspec_runtime_phase_name(runtime_phase), topk_tree_runtime_ready ? 1 : 0,
+                            topk_tree_runtime_hash_last, JETSPEC_SYNTHETIC_FULL_VOCAB_SOFTMAX, topk_tree_width_last,
+                            topk_tree_depth_last, tree_build_actual_nodes_last, tree_token_ids[0], tree_token_ids[1], tree_token_ids[2],
+                            tree_parent_indices[0], tree_parent_indices[1], tree_parent_indices[2], tree_depth[0], tree_depth[1], tree_depth[2],
+                            tree_rank[0], tree_rank[1], tree_rank[2], (double) tree_cum_logprob[0], (double) tree_cum_logprob[1],
+                            (double) tree_cum_logprob[2], topk_tree_non_root_nodes_last);
+                }
+                return true;
+            }
+            if (p5y_root_verify_mask_enabled) {
+                if (!build_root_only_verify_mask_runtime()) {
+                    disable_runtime_state(jetspec_runtime_failure::invalid_root_verify_mask_runtime, tap_count, tap_width, taps);
+                    return true;
+                }
+                if (p5z_root_anchor_accept_path_enabled) {
+                    if (!build_root_anchor_accept_path_runtime()) {
+                        disable_runtime_state(jetspec_runtime_failure::invalid_root_anchor_accept_path_runtime, tap_count, tap_width, taps);
+                        return true;
+                    }
+                    if (p5aa_root_token_commit_noop_enabled) {
+                        if (!build_root_token_commit_noop_runtime()) {
+                            disable_runtime_state(jetspec_runtime_failure::invalid_root_token_commit_noop_runtime, tap_count, tap_width, taps);
+                            return true;
+                        }
+                        if (p5ab_root_hidden_kv_commit_noop_enabled) {
+                            if (!build_root_hidden_kv_commit_noop_runtime()) {
+                                disable_runtime_state(jetspec_runtime_failure::invalid_root_hidden_kv_commit_noop_runtime, tap_count, tap_width, taps);
+                                return true;
+                            }
+                            if (p5ac_root_rejected_branch_discard_noop_enabled) {
+                                if (!build_root_rejected_branch_discard_noop_runtime()) {
+                                    disable_runtime_state(jetspec_runtime_failure::invalid_root_rejected_branch_discard_noop_runtime, tap_count, tap_width, taps);
+                                    return true;
+                                }
+                                if (p5ad_root_publish_gate_noop_enabled) {
+                                    if (!build_root_publish_gate_noop_runtime()) {
+                                        disable_runtime_state(jetspec_runtime_failure::invalid_root_publish_gate_noop_runtime, tap_count, tap_width, taps);
+                                        return true;
+                                    }
+                                    if (trace_taps) {
+                                        LOG_INF("%s: draft-jetspec p5ad_root_publish_gate_noop_runtime phase=%s root_publish_gate_noop_runtime_ready=%d root_publish_gate_noop_runtime_hash=%016" PRIx64 " root_rejected_branch_discard_noop_runtime_ready=%d root_rejected_branch_discard_noop_runtime_hash=%016" PRIx64 " root_hidden_kv_commit_noop_runtime_ready=%d root_hidden_kv_commit_noop_runtime_hash=%016" PRIx64 " root_token_commit_noop_runtime_ready=%d root_token_commit_noop_runtime_hash=%016" PRIx64 " root_runtime_ready_for_real_test=%d actual_committed_tokens=%d actual_survivor_pages_committed=%d actual_pages_discarded=%d rejected_branch_pages_reachable_after_discard=%d actual_publish_visible_state=%d publish_after_commit_and_discard_only=1 no_real_token_commit=1 no_real_hidden_kv_commit=1 no_real_rejected_branch_discard=1 no_real_publish=1 no_visible_state_change=1 no_kv_mutation=1 no_draft_head_graph=1 no_draft_tokens=1\n",
+                                                __func__, jetspec_runtime_phase_name(runtime_phase), root_publish_gate_noop_runtime_ready ? 1 : 0,
+                                                root_publish_gate_noop_runtime_hash_last, root_rejected_branch_discard_noop_runtime_ready ? 1 : 0,
+                                                root_rejected_branch_discard_noop_runtime_hash_last, root_hidden_kv_commit_noop_runtime_ready ? 1 : 0,
+                                                root_hidden_kv_commit_noop_runtime_hash_last, root_token_commit_noop_runtime_ready ? 1 : 0,
+                                                root_token_commit_noop_runtime_hash_last, root_runtime_ready_for_real_test_last, actual_committed_tokens_last,
+                                                actual_survivor_pages_committed_last, actual_pages_discarded_last,
+                                                rejected_branch_pages_reachable_after_discard_last, actual_publish_visible_state_last);
+                                    }
+                                    return true;
+                                }
+                                if (trace_taps) {
+                                    LOG_INF("%s: draft-jetspec p5ac_root_rejected_branch_discard_noop_runtime phase=%s root_rejected_branch_discard_noop_runtime_ready=%d root_rejected_branch_discard_noop_runtime_hash=%016" PRIx64 " root_hidden_kv_commit_noop_runtime_ready=%d root_hidden_kv_commit_noop_runtime_hash=%016" PRIx64 " actual_survivor_pages_committed=%d actual_pages_discarded=%d rejected_branch_pages_reachable_after_discard=%d no_real_rejected_branch_discard=1 no_publish=1 no_visible_state_change=1 no_kv_mutation=1 no_draft_head_graph=1 no_draft_tokens=1\n",
+                                            __func__, jetspec_runtime_phase_name(runtime_phase), root_rejected_branch_discard_noop_runtime_ready ? 1 : 0,
+                                            root_rejected_branch_discard_noop_runtime_hash_last, root_hidden_kv_commit_noop_runtime_ready ? 1 : 0,
+                                            root_hidden_kv_commit_noop_runtime_hash_last, actual_survivor_pages_committed_last,
+                                            actual_pages_discarded_last, rejected_branch_pages_reachable_after_discard_last);
+                                }
+                                return true;
+                            }
+                            if (trace_taps) {
+                                LOG_INF("%s: draft-jetspec p5ab_root_hidden_kv_commit_noop_runtime phase=%s root_hidden_kv_commit_noop_runtime_ready=%d root_hidden_kv_commit_noop_runtime_hash=%016" PRIx64 " root_token_commit_noop_runtime_ready=%d root_token_commit_noop_runtime_hash=%016" PRIx64 " actual_committed_tokens=%d actual_survivor_pages_committed=%d no_real_hidden_kv_commit=1 no_rejected_branch_discard=1 no_publish=1 no_visible_state_change=1 no_kv_mutation=1 no_draft_head_graph=1 no_draft_tokens=1\n",
+                                        __func__, jetspec_runtime_phase_name(runtime_phase), root_hidden_kv_commit_noop_runtime_ready ? 1 : 0,
+                                        root_hidden_kv_commit_noop_runtime_hash_last, root_token_commit_noop_runtime_ready ? 1 : 0,
+                                        root_token_commit_noop_runtime_hash_last, actual_committed_tokens_last, actual_survivor_pages_committed_last);
+                            }
+                            return true;
+                        }
+                        if (trace_taps) {
+                            LOG_INF("%s: draft-jetspec p5aa_root_token_commit_noop_runtime phase=%s root_token_commit_noop_runtime_ready=%d root_token_commit_noop_runtime_hash=%016" PRIx64 " root_anchor_accept_path_runtime_ready=%d root_anchor_accept_path_runtime_hash=%016" PRIx64 " root_verify_mask_runtime_ready=%d root_verify_mask_runtime_hash=%016" PRIx64 " root_tree_runtime_ready=%d root_tree_runtime_hash=%016" PRIx64 " root_verified_anchor=%d accept_path_len=%d actual_tree_nodes=%d actual_verify_mask_entries=%d actual_accepted_nodes=%d correction_token_present=%d actual_committed_tokens=%d no_real_token_commit=1 no_visible_token_publish=1 no_hidden_kv_commit=1 no_rejected_branch_discard=1 no_publish=1 no_visible_state_change=1 no_kv_mutation=1 no_draft_head_graph=1 no_draft_tokens=1\n",
+                                    __func__, jetspec_runtime_phase_name(runtime_phase), root_token_commit_noop_runtime_ready ? 1 : 0,
+                                    root_token_commit_noop_runtime_hash_last, root_anchor_accept_path_runtime_ready ? 1 : 0,
+                                    root_anchor_accept_path_runtime_hash_last, root_verify_mask_runtime_ready ? 1 : 0,
+                                    root_verify_mask_runtime_hash_last, root_tree_runtime_ready ? 1 : 0, root_tree_runtime_hash_last,
+                                    root_verified_anchor_last, accept_path_len_last, tree_build_actual_nodes_last, actual_verify_mask_entries_last,
+                                    actual_accepted_nodes_last, correction_token_present_last, actual_committed_tokens_last);
+                        }
+                        return true;
+                    }
+                    if (trace_taps) {
+                        LOG_INF("%s: draft-jetspec p5z_root_anchor_accept_path_runtime phase=%s root_anchor_accept_path_runtime_ready=%d root_anchor_accept_path_runtime_hash=%016" PRIx64 " root_verify_mask_runtime_ready=%d root_verify_mask_runtime_hash=%016" PRIx64 " root_tree_runtime_ready=%d root_tree_runtime_hash=%016" PRIx64 " root_verified_anchor=%d accept_path_len=%d actual_tree_nodes=%d actual_verify_mask_entries=%d actual_accepted_nodes=%d correction_token_present=%d no_target_logits_walk=1 no_target_accept_walk=1 no_token_commit=1 no_hidden_kv_commit=1 no_rejected_branch_discard=1 no_publish=1 no_visible_state_change=1 no_kv_mutation=1 no_draft_head_graph=1 no_draft_tokens=1\n",
+                                __func__, jetspec_runtime_phase_name(runtime_phase), root_anchor_accept_path_runtime_ready ? 1 : 0,
+                                root_anchor_accept_path_runtime_hash_last, root_verify_mask_runtime_ready ? 1 : 0, root_verify_mask_runtime_hash_last,
+                                root_tree_runtime_ready ? 1 : 0, root_tree_runtime_hash_last, root_verified_anchor_last, accept_path_len_last,
+                                tree_build_actual_nodes_last, actual_verify_mask_entries_last, actual_accepted_nodes_last, correction_token_present_last);
+                    }
+                    return true;
+                }
+                if (trace_taps) {
+                    LOG_INF("%s: draft-jetspec p5y_root_verify_mask_runtime phase=%s root_verify_mask_runtime_ready=%d root_verify_mask_runtime_hash=%016" PRIx64 " root_tree_runtime_ready=%d root_tree_runtime_hash=%016" PRIx64 " actual_tree_nodes=%d actual_verify_mask_entries=1 verify_mask_rows=1 verify_mask_cols=1 root_attends_self=%d root_mask_row=%d root_mask_col=%d prefix_visible=1 ancestor_only=1 sibling_visible=0 descendant_visible=0 no_draft_head_graph=1 no_mask_tensor=1 no_accept=1 no_token_commit=1 no_hidden_kv_commit=1 no_rejected_branch_discard=1 no_publish=1 no_visible_state_change=1 no_kv_mutation=1 no_draft_tokens=1\n",
+                            __func__, jetspec_runtime_phase_name(runtime_phase), root_verify_mask_runtime_ready ? 1 : 0,
+                            root_verify_mask_runtime_hash_last, root_tree_runtime_ready ? 1 : 0, root_tree_runtime_hash_last,
+                            tree_build_actual_nodes_last, (int) root_verify_mask_values[0], root_verify_mask_rows[0], root_verify_mask_cols[0]);
+                }
+                return true;
+            }
+            if (trace_taps) {
+                LOG_INF("%s: draft-jetspec p5x_root_tree_runtime phase=%s root_tree_runtime_ready=%d root_tree_runtime_hash=%016" PRIx64 " actual_tree_nodes=1 tree_token_ids=[%d] tree_parent_indices=[%d] tree_depth=[%d] tree_rank=[%d] tree_cum_logprob=[%.1f] root_parent=%d root_depth=%d parent_before_child=1 num_nodes_lte_budget=1 tree_build_node_budget=%d no_draft_head_graph=1 no_verify_mask=1 no_accept=1 no_token_commit=1 no_hidden_kv_commit=1 no_rejected_branch_discard=1 no_publish=1 no_visible_state_change=1 no_draft_tokens=1\n",
+                        __func__, jetspec_runtime_phase_name(runtime_phase), root_tree_runtime_ready ? 1 : 0,
+                        root_tree_runtime_hash_last, tree_token_ids[0], tree_parent_indices[0], tree_depth[0], tree_rank[0],
+                        (double) tree_cum_logprob[0], tree_parent_indices[0], tree_depth[0], tree_build_node_budget_last);
+            }
+            return true;
+        }
+        if (!build_verify_mask_descriptor()) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_verify_mask_descriptor, tap_count, tap_width, taps);
+            return true;
+        }
+        if (!build_accept_path_descriptor()) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_accept_path_descriptor, tap_count, tap_width, taps);
+            return true;
+        }
+        if (!build_token_commit_descriptor()) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_token_commit_descriptor, tap_count, tap_width, taps);
+            return true;
+        }
+        if (!build_hidden_kv_survivor_commit_descriptor()) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_hidden_kv_survivor_commit_descriptor, tap_count, tap_width, taps);
+            return true;
+        }
+        if (!build_rejected_branch_discard_descriptor()) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_rejected_branch_discard_descriptor, tap_count, tap_width, taps);
+            return true;
+        }
+        if (!build_publish_gate_descriptor()) {
+            disable_runtime_state(jetspec_runtime_failure::invalid_publish_gate_descriptor, tap_count, tap_width, taps);
             return true;
         }
 
@@ -1031,6 +5130,18 @@ struct common_speculative_impl_draft_jetspec : public common_speculative_impl {
             LOG_INF("%s: draft-jetspec tree_build_descriptor tree_build_phase=build_tree rollback_point=after_build_tree tree_build_descriptor_only=1 tree_build_descriptor_ready=%d tree_build_descriptor_hash=%016" PRIx64 " planned_tree_node_budget=%d actual_tree_nodes=0 root_parent=%d root_depth=%d pre_publish_visible_state_unmodified=1 no_real_tree_build=1 no_tree_arrays=1 no_verify_mask=1 no_accept=1 no_kv_mutation=1 no_publish=1 no_draft_tokens=1\n",
                     __func__, tree_build_descriptor_ready ? 1 : 0, tree_build_descriptor_hash_last,
                     tree_build_node_budget_last, tree_build_root_parent_last, tree_build_root_depth_last);
+            LOG_INF("%s: draft-jetspec verify_mask_descriptor verify_mask_phase=build_verify_mask rollback_point=after_verify_mask verify_mask_descriptor_only=1 verify_mask_descriptor_ready=%d verify_mask_descriptor_hash=%016" PRIx64 " actual_verify_mask_entries=0 pre_publish_visible_state_unmodified=1 no_real_verify_mask=1 no_verify_mask=1 no_accept=1 no_kv_mutation=1 no_publish=1 no_draft_tokens=1\n",
+                    __func__, verify_mask_descriptor_ready ? 1 : 0, verify_mask_descriptor_hash_last);
+            LOG_INF("%s: draft-jetspec accept_path_descriptor accept_path_phase=accept_path rollback_point=after_accept accept_path_descriptor_only=1 accept_path_descriptor_ready=%d accept_path_descriptor_hash=%016" PRIx64 " actual_accepted_nodes=0 correction_token_present=0 pre_publish_visible_state_unmodified=1 no_real_accept=1 no_commit_tokens=1 no_kv_mutation=1 no_publish=1 no_draft_tokens=1\n",
+                    __func__, accept_path_descriptor_ready ? 1 : 0, accept_path_descriptor_hash_last);
+            LOG_INF("%s: draft-jetspec token_commit_descriptor token_commit_phase=commit_tokens rollback_point=after_token_commit token_commit_descriptor_only=1 token_commit_descriptor_ready=%d token_commit_descriptor_hash=%016" PRIx64 " actual_committed_tokens=0 pre_publish_visible_state_unmodified=1 no_real_token_commit=1 no_visible_token_publish=1 no_kv_mutation=1 no_publish=1 no_draft_tokens=1\n",
+                    __func__, token_commit_descriptor_ready ? 1 : 0, token_commit_descriptor_hash_last);
+            LOG_INF("%s: draft-jetspec hidden_kv_survivor_commit_descriptor hidden_kv_survivor_commit_phase=commit_hidden_kv_survivors rollback_point=after_hidden_kv_commit hidden_kv_survivor_commit_descriptor_only=1 hidden_kv_survivor_commit_descriptor_ready=%d hidden_kv_survivor_commit_descriptor_hash=%016" PRIx64 " actual_survivor_pages_committed=0 pre_publish_visible_state_unmodified=1 no_real_hidden_kv_commit=1 no_kv_mutation=1 no_publish=1 no_draft_tokens=1\n",
+                    __func__, hidden_kv_survivor_commit_descriptor_ready ? 1 : 0, hidden_kv_survivor_commit_descriptor_hash_last);
+            LOG_INF("%s: draft-jetspec rejected_branch_discard_descriptor rejected_branch_discard_phase=discard_rejected_branches rollback_point=after_rejected_discard rejected_branch_discard_descriptor_only=1 rejected_branch_discard_descriptor_ready=%d rejected_branch_discard_descriptor_hash=%016" PRIx64 " actual_pages_discarded=0 rejected_branch_pages_reachable_after_discard=0 pre_publish_visible_state_unmodified=1 no_real_rejected_branch_discard=1 no_kv_mutation=1 no_publish=1 no_draft_tokens=1\n",
+                    __func__, rejected_branch_discard_descriptor_ready ? 1 : 0, rejected_branch_discard_descriptor_hash_last);
+            LOG_INF("%s: draft-jetspec publish_gate_descriptor publish_gate_phase=publish_post_commit_state publish_gate_descriptor_only=1 publish_gate_descriptor_ready=%d publish_gate_descriptor_hash=%016" PRIx64 " actual_publish_visible_state=0 publish_after_commit_and_discard_only=1 no_real_publish=1 no_visible_state_change=1 no_draft_tokens=1\n",
+                    __func__, publish_gate_descriptor_ready ? 1 : 0, publish_gate_descriptor_hash_last);
         }
 
         return true;
@@ -1039,12 +5150,37 @@ struct common_speculative_impl_draft_jetspec : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & /*dparams*/) override {
         n_runtime_draft_calls++;
         if (trace_taps) {
-            LOG_INF("%s: draft-jetspec runtime_state phase=%s failure=%s pre_round_snapshot_ready=%d pre_round_snapshot_hash=%016" PRIx64 " captured_rows=%zu hash=%016" PRIx64 " transaction_plan_ready=%d transaction_plan_hash=%016" PRIx64 " transient_reservation_ready=%d transient_reservation_hash=%016" PRIx64 " actual_pages_reserved=0 tree_build_descriptor_ready=%d tree_build_descriptor_hash=%016" PRIx64 " actual_tree_nodes=0 draft_call=%zu no_draft=1 no_kv_mutation=1 no_graph_exec=1 no_reserve=1 no_real_reserve=1 no_page_map_write=1 no_real_tree_build=1 no_tree_arrays=1 no_tree_build=1 no_verify_mask=1 no_accept=1\n",
+            LOG_INF("%s: draft-jetspec runtime_state phase=%s failure=%s pre_round_snapshot_ready=%d pre_round_snapshot_hash=%016" PRIx64 " captured_rows=%zu hash=%016" PRIx64 " transaction_plan_ready=%d transaction_plan_hash=%016" PRIx64 " transient_reservation_ready=%d transient_reservation_hash=%016" PRIx64 " actual_pages_reserved=0 tree_build_descriptor_ready=%d tree_build_descriptor_hash=%016" PRIx64 " root_tree_runtime_ready=%d root_tree_runtime_hash=%016" PRIx64 " root_verify_mask_runtime_ready=%d root_verify_mask_runtime_hash=%016" PRIx64 " root_anchor_accept_path_runtime_ready=%d root_anchor_accept_path_runtime_hash=%016" PRIx64 " root_token_commit_noop_runtime_ready=%d root_token_commit_noop_runtime_hash=%016" PRIx64 " real_draft_head_canary_ready=%d real_draft_head_canary_hash=%016" PRIx64 " real_topk_candidate_runtime_ready=%d real_topk_candidate_runtime_hash=%016" PRIx64 " real_topk_candidate_runtime_builds=%zu real_topk_tree_runtime_ready=%d real_topk_tree_runtime_hash=%016" PRIx64 " real_topk_tree_runtime_builds=%zu real_draft_head_canary_rows=%d real_draft_head_logits_rows=%d actual_tree_nodes=%d actual_verify_mask_entries=%d root_verified_anchor=%d accept_path_len=%d actual_accepted_nodes=%d correction_token_present=%d actual_committed_tokens=%d draft_call=%zu no_draft=1 no_kv_mutation=1 no_draft_token_emit=1 no_reserve=1 no_real_reserve=1 no_page_map_write=1 no_tree_expand=1 no_full_verify_mask=1 no_target_logits_walk=1 no_real_token_commit=1 no_visible_token_publish=1\n",
                     __func__, jetspec_runtime_phase_name(runtime_phase), jetspec_runtime_failure_name(runtime_failure),
                     pre_round_snapshot_ready ? 1 : 0, pre_round_snapshot_hash_last,
                     n_target_tap_rows_cached, target_tap_hash_last, transaction_plan_ready ? 1 : 0,
                     transaction_plan_hash_last, transient_reservation_ready ? 1 : 0, transient_reservation_hash_last,
-                    tree_build_descriptor_ready ? 1 : 0, tree_build_descriptor_hash_last, n_runtime_draft_calls);
+                    tree_build_descriptor_ready ? 1 : 0, tree_build_descriptor_hash_last,
+                    root_tree_runtime_ready ? 1 : 0, root_tree_runtime_hash_last,
+                    root_verify_mask_runtime_ready ? 1 : 0, root_verify_mask_runtime_hash_last,
+                    root_anchor_accept_path_runtime_ready ? 1 : 0, root_anchor_accept_path_runtime_hash_last,
+                    root_token_commit_noop_runtime_ready ? 1 : 0, root_token_commit_noop_runtime_hash_last,
+                    real_draft_head_canary_ready ? 1 : 0, real_draft_head_canary_hash_last,
+                    real_draft_head_topk_candidate_runtime_ready ? 1 : 0, real_draft_head_topk_candidate_hash_last,
+                    n_real_draft_head_topk_candidate_runtime_builds,
+                    real_draft_head_topk_tree_runtime_ready ? 1 : 0, real_draft_head_topk_tree_hash_last,
+                    n_real_draft_head_topk_tree_runtime_builds,
+                    real_draft_head_canary_output_rows_last, real_draft_head_canary_logits_rows_last,
+                    tree_build_actual_nodes_last, actual_verify_mask_entries_last, root_verified_anchor_last,
+                    accept_path_len_last, actual_accepted_nodes_last, correction_token_present_last, actual_committed_tokens_last, n_runtime_draft_calls);
+            LOG_INF("%s: draft-jetspec descriptor_gate verify_mask_descriptor_ready=%d verify_mask_descriptor_hash=%016" PRIx64 " root_verify_mask_runtime_ready=%d root_verify_mask_runtime_hash=%016" PRIx64 " root_anchor_accept_path_runtime_ready=%d root_anchor_accept_path_runtime_hash=%016" PRIx64 " root_token_commit_noop_runtime_ready=%d root_token_commit_noop_runtime_hash=%016" PRIx64 " actual_verify_mask_entries=%d accept_path_descriptor_ready=%d accept_path_descriptor_hash=%016" PRIx64 " actual_accepted_nodes=%d token_commit_descriptor_ready=%d token_commit_descriptor_hash=%016" PRIx64 " actual_committed_tokens=%d hidden_kv_survivor_commit_descriptor_ready=%d hidden_kv_survivor_commit_descriptor_hash=%016" PRIx64 " actual_survivor_pages_committed=0 rejected_branch_discard_descriptor_ready=%d rejected_branch_discard_descriptor_hash=%016" PRIx64 " actual_pages_discarded=0 publish_gate_descriptor_ready=%d publish_gate_descriptor_hash=%016" PRIx64 " actual_publish_visible_state=0 no_real_token_commit=1 no_real_hidden_kv_commit=1 no_real_rejected_branch_discard=1 no_real_publish=1 no_visible_state_change=1 no_draft_tokens=1\n",
+                    __func__, verify_mask_descriptor_ready ? 1 : 0, verify_mask_descriptor_hash_last,
+                    root_verify_mask_runtime_ready ? 1 : 0, root_verify_mask_runtime_hash_last,
+                    root_anchor_accept_path_runtime_ready ? 1 : 0, root_anchor_accept_path_runtime_hash_last,
+                    root_token_commit_noop_runtime_ready ? 1 : 0, root_token_commit_noop_runtime_hash_last,
+                    actual_verify_mask_entries_last,
+                    accept_path_descriptor_ready ? 1 : 0, accept_path_descriptor_hash_last,
+                    actual_accepted_nodes_last,
+                    token_commit_descriptor_ready ? 1 : 0, token_commit_descriptor_hash_last,
+                    actual_committed_tokens_last,
+                    hidden_kv_survivor_commit_descriptor_ready ? 1 : 0, hidden_kv_survivor_commit_descriptor_hash_last,
+                    rejected_branch_discard_descriptor_ready ? 1 : 0, rejected_branch_discard_descriptor_hash_last,
+                    publish_gate_descriptor_ready ? 1 : 0, publish_gate_descriptor_hash_last);
         }
         // fail closed: do not emit draft tokens before draft-head graph, tree verify, and rollback runtime exist.
     }
@@ -2311,7 +6447,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                             used_backend_topk ? "backend_topk" : "cpu_sampler");
                 }
 
-                h_row = llama_get_embeddings_pre_norm_ith(ctx_dft, sample_idx);
                 ++i_batch;
 
                 if (p_draft < params.p_min) {
@@ -2353,6 +6488,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 common_batch_add(batch, id, dp.n_past + i + 1, { seq_id }, true);
+                h_row = llama_get_embeddings_pre_norm_ith(ctx_dft, sample_idx);
+                GGML_ASSERT(h_row != nullptr);
                 std::memcpy(batch.embd + n_embd*(batch.n_tokens - 1), h_row, row_bytes);
             }
 
@@ -3004,11 +7141,12 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         }
 
         if (has_draft_jetspec) {
+            const bool has_draft_head_model = params.draft.ctx_dft != nullptr || params.draft.model != nullptr;
             if (!common_speculative_env_enabled("LLAMA_JETSPEC_EXPERIMENTAL")) {
                 LOG_WRN("%s: draft-jetspec requires LLAMA_JETSPEC_EXPERIMENTAL=1; disabling JetSpec before runtime execution\n", __func__);
                 has_draft_jetspec = false;
-            } else if (params.draft.ctx_tgt == nullptr || params.draft.ctx_dft == nullptr) {
-                LOG_WRN("%s: draft-jetspec requires explicit target and draft contexts; disabling JetSpec before runtime execution\n", __func__);
+            } else if (params.draft.ctx_tgt == nullptr || !has_draft_head_model) {
+                LOG_WRN("%s: draft-jetspec requires a target context and a loaded draft-head model; disabling JetSpec before runtime execution\n", __func__);
                 has_draft_jetspec = false;
             } else {
                 llama_set_jetspec_target_hidden_taps(params.draft.ctx_tgt, true, true);

@@ -62,10 +62,12 @@
 #define cudaErrorMemoryAllocation hipErrorOutOfMemory
 #define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
 #define cudaErrorPeerAccessNotEnabled hipErrorPeerAccessNotEnabled
+#define cudaEventCreate hipEventCreate
 #define cudaEventCreateWithFlags hipEventCreateWithFlags
 #define cudaEventDisableTiming hipEventDisableTiming
 #define cudaEventRecord hipEventRecord
 #define cudaEventSynchronize hipEventSynchronize
+#define cudaEventElapsedTime hipEventElapsedTime
 #define cudaEvent_t hipEvent_t
 #define cudaEventDestroy hipEventDestroy
 #define cudaFree hipFree
@@ -113,9 +115,14 @@
 #define cuMemGetAllocationGranularity hipMemGetAllocationGranularity
 #define CUmemAllocationProp hipMemAllocationProp
 #define cuDeviceGetAttribute hipDeviceGetAttribute
+#define cudaStreamCaptureStatus hipStreamCaptureStatus
+#define cudaStreamCaptureStatusActive hipStreamCaptureStatusActive
+#define cudaStreamCaptureStatusInvalidated hipStreamCaptureStatusInvalidated
+#define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
 #define cudaStreamCreateWithFlags hipStreamCreateWithFlags
 #define cudaStreamDestroy hipStreamDestroy
 #define cudaStreamFireAndForget hipStreamFireAndForget
+#define cudaStreamIsCapturing hipStreamIsCapturing
 #define cudaStreamNonBlocking hipStreamNonBlocking
 #define cudaStreamPerThread hipStreamPerThread
 #define cudaStreamSynchronize hipStreamSynchronize

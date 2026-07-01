@@ -23,6 +23,7 @@ class P5FBindingPreflightTests(unittest.TestCase):
         expected = {
             "common/speculative.cpp",
             "docs/speculative.md",
+            "src/models/jetspec_qwen3_draft_head.cpp",
         }
         self.assertEqual({str(path) for path in P5F_ALLOWED_FILES}, expected)
 
@@ -38,7 +39,8 @@ class P5FBindingPreflightTests(unittest.TestCase):
         self.assertIn("JETSPEC_QWEN36_DRAFT_HEADS_KV    = 4", text)
         self.assertIn("JETSPEC_QWEN36_VOCAB_SIZE        = 248320", text)
         self.assertIn("target.n_embd", text)
-        self.assertIn("target.n_layer", text)
+        self.assertIn("target.effective_n_layer", text)
+        self.assertIn("qwen35moe.nextn_predict_layers", text)
         self.assertIn("draft.n_ctx_train", text)
         self.assertIn("draft.n_head_kv", text)
         self.assertIn("target_tap_width_vs_target", text)
@@ -90,13 +92,27 @@ class P5FBindingPreflightTests(unittest.TestCase):
         self.assertIn("preview_not_allowed", text)
         self.assertIn("unsupported_runtime", text)
         self.assertIn("runtime_supported=false", text)
-        self.assertIn("throw std::runtime_error(\"unsupported_runtime: JetSpec P5A has no graph execution path\")", text)
+        self.assertIn("jetspec_expect(!meta.runtime_supported", text)
+        self.assertIn("jetspec.experimental.runtime_supported must remain false until JetSpec draft-head graph execution is implemented", text)
+        self.assertIn("LLAMA_JETSPEC_DRAFT_HEAD_LOAD", text)
+        self.assertIn("target-owned JetSpec draft-head artifact", text)
+        self.assertIn("throw std::runtime_error(\"unsupported_runtime: JetSpec draft-head graph execution is not implemented\")", text)
+
+    def test_model_only_binding_requires_target_tensors(self) -> None:
+        text = (REPO_ROOT / "src/models/jetspec_qwen3_draft_head.cpp").read_text(encoding="utf-8")
+        self.assertIn("jetspec_require_target_tensor", text)
+        self.assertIn("missing required target tensor", text)
+        self.assertIn("must have shape", text)
+        self.assertIn("jetspec_require_target_tensor(main_model, \"token_embd.weight\", { 2048, 248320 })", text)
+        self.assertIn("jetspec_require_target_tensor(main_model, \"output.weight\", { 2048, 248320 })", text)
+        self.assertIn("jetspec_require_target_tensor(main_model, \"output_norm.weight\", { 2048 })", text)
 
     def test_docs_mark_preflight_only_no_draft_tokens(self) -> None:
         text = (REPO_ROOT / "docs/speculative.md").read_text(encoding="utf-8")
         self.assertIn("binding preflight", text)
         self.assertIn("metadata/shape", text)
         self.assertIn("target tap count/width", text)
+        self.assertIn("target tensor presence/shape", text)
         self.assertIn("emits no draft", text)
         self.assertIn("tokens and does not execute the draft head", text)
 

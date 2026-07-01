@@ -1,0 +1,95 @@
+{
+  "status": "draft_head_topk_readiness_verified_not_executed",
+  "scope": "experiments/jetspec only",
+  "production_source_approval": false,
+  "production_paths_touched": [],
+  "chain": {
+    "requires_gates": [
+      "LLAMA_JETSPEC_TREE_BUILD_ROOT_ONLY=1",
+      "LLAMA_JETSPEC_TREE_BUILD_TOPK_ABI_ONLY=1",
+      "LLAMA_JETSPEC_VERIFY_MASK_TOPK_ABI_ONLY=1",
+      "LLAMA_JETSPEC_ACCEPT_PATH_TOPK_ABI_ONLY=1"
+    ],
+    "p5ag_accept_boundary_ready_required": true,
+    "p5ag_accept_boundary_hash_required": true,
+    "topk_abi_root_tail_conflict_rejected": true
+  },
+  "future_topk_contract": {
+    "future_logits_source": "draft_head_full_vocab_logits",
+    "forbidden_sources": [
+      "target_logits",
+      "sampler",
+      "synthetic_full_vocab_softmax",
+      "topk_only_renormalization"
+    ],
+    "full_vocab_softmax_required": true,
+    "topk_only_renormalization_allowed": false,
+    "target_layer_ids": [1, 10, 19, 28, 37],
+    "target_tap_width": 10240,
+    "embedding_length": 2048,
+    "vocab_size": 248320,
+    "topk_width": 2,
+    "tree_depth": 1,
+    "candidate_nodes": 2,
+    "output_tree_nodes": 3,
+    "planned_draft_head_logits_rows": 1,
+    "actual_verified_logits_rows": 0,
+    "actual_accepted_nodes": 0,
+    "correction_token_present": 0,
+    "rank_semantics": "rank_stable_descending_logprob",
+    "parent_logits_rows": [
+      {
+        "logits_row": 0,
+        "parent_node": 0,
+        "candidate_nodes": [1, 2]
+      }
+    ]
+  },
+  "runtime_boundary": {
+    "runtime_supported": false,
+    "ctx_dft_null": true,
+    "model_only_binding_preserved": true,
+    "draft_context_created": false,
+    "draft_head_graph_executed": false,
+    "llama_decode_called": false,
+    "draft_logits_buffer_read": false,
+    "sampler_used": false,
+    "target_logits_walked": false,
+    "target_accept_walked": false,
+    "draft_tokens_emitted": false,
+    "token_commit_performed": false,
+    "hidden_kv_commit_performed": false,
+    "rejected_branch_discard_performed": false,
+    "kv_mutated": false,
+    "visible_state_published": false,
+    "cuda_dispatched": false,
+    "server_route_added": false,
+    "public_api_added": false,
+    "cmake_wired": false,
+    "performance_claimed": false,
+    "promotion_claimed": false
+  },
+  "failure_modes": [
+    "missing_p5ag_accept_boundary",
+    "missing_p5ag_hash",
+    "runtime_supported_true",
+    "ctx_dft_non_null",
+    "draft_context_created",
+    "draft_head_graph_execution_attempted",
+    "llama_decode_attempted",
+    "draft_logits_rows_nonzero_without_approval",
+    "target_logits_source_attempted",
+    "sampler_source_attempted",
+    "synthetic_source_used_as_real_topk"
+  ],
+  "approval_gates": [
+    "aggregate_contracts",
+    "default_build_only",
+    "disabled_no_spec_path",
+    "existing_mtp_path",
+    "jetspec_opt_in_fail_closed",
+    "real_draft_head_logits_source_approval",
+    "runtime_correctness_matrix",
+    "baseline_benchmark_before_promotion"
+  ]
+}

@@ -138,6 +138,29 @@ void quantize_row_q8_K_generic(const float * GGML_RESTRICT x, void * GGML_RESTRI
     quantize_row_q8_K_ref(x, y, k);
 }
 
+void ggml_vec_dot_q8_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_K == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q8_K * GGML_RESTRICT x = vx;
+    const block_q8_K * GGML_RESTRICT y = vy;
+    const int nb = n / QK_K;
+
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; ++i) {
+        int sumi = 0;
+        for (int j = 0; j < QK_K; ++j) {
+            sumi += (int) x[i].qs[j] * (int) y[i].qs[j];
+        }
+        sumf += x[i].d * y[i].d * sumi;
+    }
+    *s = sumf;
+}
+
 //===================================== Dot products =================================
 
 void ggml_vec_dot_q1_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {

@@ -1828,7 +1828,11 @@ void llama_model::print_info() const {
         }
     }
 
-    vocab.print_info();
+    if (arch == LLM_ARCH_JETSPEC_QWEN3_DRAFT_HEAD) {
+        LLAMA_LOG_INFO("%s: vocab                 = target-owned JetSpec draft-head artifact\n", __func__);
+    } else {
+        vocab.print_info();
+    }
 }
 
 ggml_backend_dev_t llama_model::dev_layer(int il) const {

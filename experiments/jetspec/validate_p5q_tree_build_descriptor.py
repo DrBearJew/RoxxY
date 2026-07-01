@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import re
+import subprocess
 from typing import Any
 
 
@@ -155,6 +157,16 @@ FORBIDDEN_TREE_ARRAY_TOKENS = [
     "cum_logprob.resize",
 ]
 
+FORBIDDEN_IMPL_REGEXES = [
+    r"std::vector\s*<\s*llama_token\s*>",
+    r"std::vector\s*<\s*int32_t\s*>\s*(parent|parents|depth)",
+    r"std::vector\s*<\s*float\s*>\s*cum_?log",
+    r"(?<!real_draft_head_topk_tree_)parent_indices\s*\.",
+    r"(?<!real_draft_head_topk_tree_)token_ids\s*\.",
+    r"cum_logprob\s*\.",
+    r"ancestor_matrix\s*\.",
+]
+
 
 class P5QTreeBuildDescriptorError(ValueError):
     """Raised when P5Q source-slice constraints are violated."""
@@ -195,6 +207,25 @@ def _impl_slice(source: str) -> str:
     return source[start:end]
 
 
+def _dirty_p5q_hits() -> list[dict[str, Any]]:
+    try:
+        proc = subprocess.run(["git", "diff", "--name-only", "--diff-filter=ACMR"], cwd=REPO_ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    except OSError:
+        return []
+    hits: list[dict[str, Any]] = []
+    if proc.returncode != 0:
+        return [{"path": "<git diff failed>", "token": proc.stderr.strip()}]
+    for line in proc.stdout.splitlines():
+        rel = pathlib.Path(line.strip())
+        if not rel or rel in P5Q_ALLOWED_FILES or str(rel).startswith("experiments/jetspec/"):
+            continue
+        diff = subprocess.run(["git", "diff", "--", str(rel)], cwd=REPO_ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False).stdout
+        for token in P5Q_TOKENS:
+            if token in diff:
+                hits.append({"path": str(rel), "token": token})
+    return hits
+
+
 def validate_p5q_tree_build_descriptor() -> dict[str, Any]:
     errors: list[str] = []
 
@@ -225,6 +256,10 @@ def validate_p5q_tree_build_descriptor() -> dict[str, Any]:
             cmake_hits.append({"path": str(rel), "tokens": matched})
             errors.append(f"P5Q must not add explicit CMake wiring in {rel}: {matched}")
 
+    dirty_p5q_hits = _dirty_p5q_hits()
+    for hit in dirty_p5q_hits:
+        errors.append(f"dirty diff contains P5Q token outside allowlist: {hit}")
+
     try:
         source = _read(pathlib.Path("common/speculative.cpp"))
         impl = _impl_slice(source)
@@ -235,6 +270,9 @@ def validate_p5q_tree_build_descriptor() -> dict[str, Any]:
     for token in FORBIDDEN_IMPL_TOKENS + FORBIDDEN_TREE_ARRAY_TOKENS:
         if token in impl:
             errors.append(f"draft-jetspec P5Q implementation must not contain {token!r}")
+    for pattern in FORBIDDEN_IMPL_REGEXES:
+        if re.search(pattern, impl):
+            errors.append(f"draft-jetspec P5Q implementation matched forbidden pattern {pattern!r}")
     if "build_tree_build_descriptor()" not in impl:
         errors.append("P5Q must build a tree-build descriptor")
     if "tree_build_actual_nodes_last = 0" not in impl:
@@ -256,6 +294,7 @@ def validate_p5q_tree_build_descriptor() -> dict[str, Any]:
         "allowed_files": sorted(str(path) for path in P5Q_ALLOWED_FILES),
         "token_hits": token_hits,
         "cmake_hits": cmake_hits,
+        "dirty_p5q_hits": dirty_p5q_hits,
     }
 
 

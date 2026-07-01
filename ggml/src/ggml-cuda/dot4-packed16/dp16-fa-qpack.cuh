@@ -117,6 +117,7 @@ enum dp16_fa_qblock_q_precision_mode {
 enum dp16_fa_qblock_qpack_layout {
     DP16_FA_QBLOCK_QPACK_LAYOUT_NONE = 0,
     DP16_FA_QBLOCK_QPACK_LAYOUT_QBLOCK_MAJOR,
+    DP16_FA_QBLOCK_QPACK_LAYOUT_QBLOCK_MAJOR_VEC4,
 };
 
 enum dp16_fa_qblock_scale_mode {
@@ -206,6 +207,12 @@ static inline const char * dp16_fa_qblock_q_precision_mode_name(const int mode) 
         case DP16_FA_QBLOCK_Q_PRECISION_DRAFT_INLINE:  return "draft_inline";
         default:                                      return "unknown";
     }
+}
+
+static inline bool dp16_fa_qpack_consumer_vec4_enabled() {
+    return dp16_env_enabled("GGML_CUDA_DP16_FA_QPACK_CONSUMER_VEC4") ||
+           dp16_env_enabled("GGML_CUDA_ROCM_MTP_QBLOCK_QPACK_CONSUMER_VEC4") ||
+           dp16_env_enabled("GGML_CUDA_ROCM_PACKED16_QPACK_CONSUMER_VEC4");
 }
 
 static inline const char * dp16_fa_qblock_row_output_policy_name(const int mode) {
@@ -352,7 +359,8 @@ static __host__ __device__ __forceinline__ dp16_fa_qblock_program dp16_fa_qblock
     p.k_tile         = k_tile;
     p.split_k        = split_k;
 
-    p.qpack_layout      = DP16_FA_QBLOCK_QPACK_LAYOUT_QBLOCK_MAJOR;
+    p.qpack_layout      = q_stage == DP16_FA_Q_STAGE_QPACK_I8_BLOCK32 && dp16_fa_qpack_consumer_vec4_enabled() ?
+        DP16_FA_QBLOCK_QPACK_LAYOUT_QBLOCK_MAJOR_VEC4 : DP16_FA_QBLOCK_QPACK_LAYOUT_QBLOCK_MAJOR;
     p.qpack_scale_mode  = q_stage == DP16_FA_Q_STAGE_QPACK_I8_BLOCK32 ? DP16_FA_QBLOCK_SCALE_I8_BLOCK32 : DP16_FA_QBLOCK_SCALE_NONE;
     p.qpack_reuse_scope = q_stage == DP16_FA_Q_STAGE_QPACK_I8_BLOCK32 ? DP16_FA_QBLOCK_REUSE_K_SHARD : DP16_FA_QBLOCK_REUSE_NONE;
 
@@ -634,6 +642,12 @@ struct dp16_fa_q_view {
     size_t payload_stride_row_i32;
     size_t scales_stride_row_f32;
 
+    size_t qpack_rows;
+    size_t qpack_payload_bytes;
+    size_t qpack_scale_bytes;
+    float  qpack_prepare_ms;
+    int    qpack_profile_capture_skipped;
+
     dp16_fa_qblock_program qblock_program;
 };
 
@@ -662,6 +676,11 @@ static inline dp16_fa_q_view dp16_fa_make_inline_q_view(const ggml_tensor * Q, c
     view.q_nb03 = Q->nb[3];
     view.payload_stride_row_i32 = 0;
     view.scales_stride_row_f32 = 0;
+    view.qpack_rows = 0;
+    view.qpack_payload_bytes = 0;
+    view.qpack_scale_bytes = 0;
+    view.qpack_prepare_ms = -1.0f;
+    view.qpack_profile_capture_skipped = 0;
     view.qblock_program = dp16_fa_qblock_program_disabled();
     return view;
 }
@@ -741,18 +760,32 @@ static __global__ __launch_bounds__(THREADS, 1) void dp16_fa_qpack_i8_block32_ro
     if (lane == 0) {
         qpack_scales[row * size_t(Q_BLOCKS) + size_t(qb)] = scale;
     }
+    // Reuse the first Q load from each lane in this block32 group. The previous
+    // version reread all f32 values from global memory for packing after
+    // computing amax. All lanes execute the shuffle collectives; only lane 0 of
+    // each 4-lane word stores the packed i8 payload.
+    const int q_lane = amax > 0.0f ? dp16_fa_qpack_quant_i8(x, inv_scale) : 0;
+    const int word_lane = lane & ~3;
+    const int q0 = __shfl_sync(0xffffffff, q_lane, word_lane + 0, WARP_SIZE);
+    const int q1 = __shfl_sync(0xffffffff, q_lane, word_lane + 1, WARP_SIZE);
+    const int q2 = __shfl_sync(0xffffffff, q_lane, word_lane + 2, WARP_SIZE);
+    const int q3 = __shfl_sync(0xffffffff, q_lane, word_lane + 3, WARP_SIZE);
     if ((lane & 3) == 0) {
-        int qs[4] = {0, 0, 0, 0};
-        if (amax > 0.0f) {
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const int d = qb * QK8_0 + lane + j;
-                qs[j] = dp16_fa_qpack_quant_i8(
-                    dp16_fa_qpack_load_q_f32(Q, q_nb01, q_nb02, q_nb03, q, hq, b, d), inv_scale);
-            }
-        }
-        qpack_payload[row * size_t(Q_WORDS) + size_t(tid / 4)] = dp16_fa_qpack_pack_i8x4(qs[0], qs[1], qs[2], qs[3]);
+        qpack_payload[row * size_t(Q_WORDS) + size_t(tid / 4)] = dp16_fa_qpack_pack_i8x4(q0, q1, q2, q3);
     }
+}
+
+static inline bool dp16_fa_qpack_profile_enabled() {
+    return dp16_env_enabled("GGML_CUDA_DP16_FA_QPACK_PROFILE") ||
+           dp16_env_enabled("GGML_CUDA_ROCM_MTP_QBLOCK_QPACK_PROFILE") ||
+           dp16_env_enabled("GGML_CUDA_ROCM_PACKED16_QPACK_PROFILE");
+}
+
+static inline int dp16_fa_qpack_profile_limit() {
+    const char * v = getenv("GGML_CUDA_DP16_FA_QPACK_PROFILE_LIMIT");
+    if (!v || !*v) v = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_QPACK_PROFILE_LIMIT");
+    if (!v || !*v) v = getenv("GGML_CUDA_ROCM_PACKED16_QPACK_PROFILE_LIMIT");
+    return v && *v ? atoi(v) : 64;
 }
 
 template<int D, int THREADS>
@@ -773,8 +806,34 @@ static inline dp16_fa_q_view dp16_fa_prepare_q_stage(
     GGML_ASSERT(Q->ne[0] == D);
 
     const size_t qpack_rows = size_t(view.batch) * size_t(view.n_heads_q) * size_t(view.nq);
-    int   * payload = workspace.payload.alloc(qpack_rows * size_t(D / 4));
-    float * scales  = workspace.scales.alloc (qpack_rows * size_t(D / QK8_0));
+    const size_t qpack_payload_words = qpack_rows * size_t(D / 4);
+    const size_t qpack_scale_words   = qpack_rows * size_t(D / QK8_0);
+    int   * payload = workspace.payload.alloc(qpack_payload_words);
+    float * scales  = workspace.scales.alloc (qpack_scale_words);
+
+    const bool profile_enabled = dp16_fa_qpack_profile_enabled();
+    bool profile_this = false;
+    if (profile_enabled) {
+        static int profile_count = 0;
+        const int profile_limit = dp16_fa_qpack_profile_limit();
+        profile_this = profile_limit < 0 || profile_count++ < profile_limit;
+    }
+
+    cudaEvent_t profile_start = nullptr;
+    cudaEvent_t profile_stop = nullptr;
+    bool profile_timed = false;
+    int profile_capture_skipped = 0;
+    if (profile_this) {
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &capture_status) == cudaSuccess && capture_status != cudaStreamCaptureStatusNone) {
+            profile_capture_skipped = 1;
+        } else {
+            CUDA_CHECK(cudaEventCreate(&profile_start));
+            CUDA_CHECK(cudaEventCreate(&profile_stop));
+            CUDA_CHECK(cudaEventRecord(profile_start, stream));
+            profile_timed = true;
+        }
+    }
 
     const dim3 block(THREADS);
     const dim3 grid(view.nq, view.n_heads_q, view.batch);
@@ -783,10 +842,33 @@ static inline dp16_fa_q_view dp16_fa_prepare_q_stage(
         view.q_nb01, view.q_nb02, view.q_nb03,
         view.nq, view.n_heads_q);
 
+    float prepare_ms = -1.0f;
+    if (profile_timed) {
+        CUDA_CHECK(cudaEventRecord(profile_stop, stream));
+        CUDA_CHECK(cudaEventSynchronize(profile_stop));
+        CUDA_CHECK(cudaEventElapsedTime(&prepare_ms, profile_start, profile_stop));
+        CUDA_CHECK(cudaEventDestroy(profile_start));
+        CUDA_CHECK(cudaEventDestroy(profile_stop));
+    }
+
     view.stage = DP16_FA_Q_STAGE_QPACK_I8_BLOCK32;
     view.qpack_payload = payload;
     view.qpack_scales = scales;
     view.payload_stride_row_i32 = D / 4;
     view.scales_stride_row_f32 = D / QK8_0;
+    view.qpack_rows = qpack_rows;
+    view.qpack_payload_bytes = qpack_payload_words * sizeof(int);
+    view.qpack_scale_bytes = qpack_scale_words * sizeof(float);
+    view.qpack_prepare_ms = prepare_ms;
+    view.qpack_profile_capture_skipped = profile_capture_skipped;
+
+    if (profile_this) {
+        fprintf(stderr,
+            "DP16_FA_QPACK_PROFILE: stage=%s nq=%d heads=%d batch=%d d=%d rows=%zu payload_bytes=%zu scale_bytes=%zu total_bytes=%zu prep_ms=%.3f capture_skipped=%d grid=(%u,%u,%u) block=%u\n",
+            dp16_fa_q_stage_name(view.stage), view.nq, view.n_heads_q, view.batch, D,
+            view.qpack_rows, view.qpack_payload_bytes, view.qpack_scale_bytes,
+            view.qpack_payload_bytes + view.qpack_scale_bytes, view.qpack_prepare_ms,
+            view.qpack_profile_capture_skipped, grid.x, grid.y, grid.z, block.x);
+    }
     return view;
 }

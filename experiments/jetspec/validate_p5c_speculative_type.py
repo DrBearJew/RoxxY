@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Validate the P5C JetSpec speculative type candidate.
 
-P5C may add only an explicit, default-off, fail-closed `draft-jetspec` route. It
-must not add a public API, server route behavior, CMake wiring, kernels, or a
-runtime tree implementation.
+P5C may add only an explicit, default-off, fail-closed `draft-jetspec` route. A
+later approved runtime-loader slice may reference the type in server model-only
+binding, but must not add a public API, CMake wiring, kernels, or a runtime tree
+implementation.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ P5C_ALLOWED_FILES = {
     pathlib.Path("common/common.h"),
     pathlib.Path("common/speculative.cpp"),
     pathlib.Path("docs/speculative.md"),
+    pathlib.Path("tools/server/server-context.cpp"),
 }
 
 REQUIRED_TOKENS: dict[pathlib.Path, list[str]] = {
@@ -48,6 +50,13 @@ REQUIRED_TOKENS: dict[pathlib.Path, list[str]] = {
         "runtime_supported=false",
         "fail-closed",
     ],
+    pathlib.Path("tools/server/server-context.cpp"): [
+        "COMMON_SPECULATIVE_TYPE_DRAFT_JETSPEC",
+        "spec_jetspec",
+        "llama_model_link_shared_tensors(model_dft.get(), model_tgt)",
+        "params_base.speculative.draft.ctx_dft = nullptr",
+        "loaded JetSpec draft-head model-only binding; draft context and graph execution remain disabled",
+    ],
 }
 
 P5C_TOKENS = [
@@ -57,7 +66,6 @@ P5C_TOKENS = [
 
 FORBIDDEN_PATH_TOKENS: dict[pathlib.Path, list[str]] = {
     pathlib.Path("include/llama.h"): P5C_TOKENS,
-    pathlib.Path("tools/server/server-context.cpp"): P5C_TOKENS,
     pathlib.Path("common/speculative.h"): P5C_TOKENS,
     pathlib.Path("common/arg.cpp"): ["COMMON_SPECULATIVE_TYPE_DRAFT_JETSPEC"],
 }

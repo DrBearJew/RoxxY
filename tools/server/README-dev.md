@@ -43,6 +43,13 @@ The server supports two primary operating modes:
 - **Inference mode**: The default mode for performing inference with a single loaded GGUF model.
 - **Router mode**: Enables management of multiple inference server instances behind a single API endpoint. Requests are automatically routed to the appropriate backend instance based on the requested model.
 
+Router replica pools: multiple uniquely named presets can be exposed as one logical model by giving them a shared tag `pool:<logical-name>` (also accepted: `replica:<logical-name>` or `lane:<logical-name>`). A request with `"model":"<logical-name>"` is routed to the least-recently-used running replica; this is useful for exact single-slot MTP/QBlock lanes where each child server runs `--parallel 1`.
+
+Exact MTP lane modes:
+
+- `one_model_shared_context` is the default for `--parallel N` with integrated `draft-mtp`: one loaded target model, one target `llama_context`, one MTP draft context, and N logical slot lanes/seq IDs. It can be requested explicitly with `LLAMA_MTP_EXACT_LANE_MODE=one_model_shared_context`. The shared context owns the total KV budget for all active resident slots, so p2 resident 8k+8k tests need `--ctx-size` around 32768 rather than 16384. Over-budget requests fail fast with a `one_model_shared_context KV budget exceeded` context-size error instead of entering KV retry loops. The safe exact policy keeps `LLAMA_MTP_EXACT_SINGLE_SLOT_LANE_SERIAL=1`, so this mode favors correctness/resident-cache semantics over full p2 throughput.
+- `one_model_multi_context` is selected with `LLAMA_MTP_EXACT_LANE_MODE=one_model_multi_context` or the compatibility knob `LLAMA_MTP_EXACT_INPROC_LANES=N`: one loaded target model shared by N independent target/draft contexts plus lane-local speculative state. If the mode is selected without `LLAMA_MTP_EXACT_INPROC_LANES`, the lane count defaults to `--parallel`. Slots are assigned round-robin to context lanes. This is the experimental p2 path validated for one-model sharing without two full model loads.
+
 The core architecture consists of the following components:
 
 - `server_context`: Holds the primary inference state, including the main `llama_context` and all active slots.

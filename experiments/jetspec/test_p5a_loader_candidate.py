@@ -41,6 +41,8 @@ class P5ALoaderCandidateTests(unittest.TestCase):
             "preview_not_allowed",
             "unsupported_runtime",
             "jetspec.experimental.runtime_supported",
+            "jetspec.experimental.runtime_supported must remain false until JetSpec draft-head graph execution is implemented",
+            "jetspec_expect(!meta.runtime_supported",
             "n_tensors == 0 || n_tensors == 91",
             "GGML_TYPE_BF16",
         ]:

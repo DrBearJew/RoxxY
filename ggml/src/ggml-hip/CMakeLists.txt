@@ -47,6 +47,46 @@ find_package(hip     REQUIRED)
 find_package(hipblas REQUIRED)
 find_package(rocblas REQUIRED)
 
+if (NOT DEFINED GGML_HIP_HIPBLASLT)
+    set(GGML_HIP_HIPBLASLT "AUTO" CACHE STRING "ggml: optional hipBLASLt int8 GEMM glue for HIP backend: AUTO, ON, OFF")
+    set_property(CACHE GGML_HIP_HIPBLASLT PROPERTY STRINGS AUTO ON OFF)
+endif()
+
+set(GGML_HIPBLASLT_FOUND OFF)
+if (NOT GGML_HIP_HIPBLASLT STREQUAL "OFF")
+    find_package(hipblaslt CONFIG QUIET)
+    if (TARGET hip::hipblaslt)
+        set(GGML_HIPBLASLT_TARGET hip::hipblaslt)
+        set(GGML_HIPBLASLT_FOUND ON)
+    elseif (TARGET roc::hipblaslt)
+        set(GGML_HIPBLASLT_TARGET roc::hipblaslt)
+        set(GGML_HIPBLASLT_FOUND ON)
+    else()
+        find_path(GGML_HIPBLASLT_INCLUDE_DIR
+            NAMES hipblaslt/hipblaslt.h
+            HINTS ${ROCM_PATH}/include)
+        find_library(GGML_HIPBLASLT_LIBRARY
+            NAMES hipblaslt
+            HINTS ${ROCM_PATH}/lib ${ROCM_PATH}/lib64)
+        if (GGML_HIPBLASLT_INCLUDE_DIR AND GGML_HIPBLASLT_LIBRARY)
+            add_library(ggml-hipblaslt UNKNOWN IMPORTED)
+            set_target_properties(ggml-hipblaslt PROPERTIES
+                IMPORTED_LOCATION "${GGML_HIPBLASLT_LIBRARY}"
+                INTERFACE_INCLUDE_DIRECTORIES "${GGML_HIPBLASLT_INCLUDE_DIR}")
+            set(GGML_HIPBLASLT_TARGET ggml-hipblaslt)
+            set(GGML_HIPBLASLT_FOUND ON)
+        endif()
+    endif()
+
+    if (GGML_HIPBLASLT_FOUND)
+        message(STATUS "hipBLASLt found, enabling optional ggml HIP i8 GEMM glue")
+    elseif (GGML_HIP_HIPBLASLT STREQUAL "ON")
+        message(FATAL_ERROR "GGML_HIP_HIPBLASLT=ON but hipBLASLt header/library was not found")
+    else()
+        message(STATUS "hipBLASLt not found, optional ggml HIP i8 GEMM glue disabled")
+    endif()
+endif()
+
 if (GGML_HIP_RCCL)
     find_package(rccl REQUIRED)
 endif()
@@ -70,6 +110,8 @@ file(GLOB   GGML_HEADERS_ROCM "../ggml-cuda/*.cuh")
 list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
 
 file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu")
+list(APPEND GGML_SOURCES_ROCM ../ggml-cuda/rdna-i8-packed16.cu)
+list(REMOVE_DUPLICATES GGML_SOURCES_ROCM)
 if (GGML_HIP_QWEN35_ATTENTION_INSTANCES_ONLY)
     list(APPEND GGML_SOURCES_ROCM
         ../ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256.cu)
@@ -209,3 +251,8 @@ if (GGML_HIP_RCCL)
 endif()
 
 target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
+
+if (GGML_HIPBLASLT_FOUND)
+    target_compile_definitions(ggml-hip PRIVATE GGML_HIP_HAS_HIPBLASLT=1)
+    target_link_libraries(ggml-hip PRIVATE ${GGML_HIPBLASLT_TARGET})
+endif()

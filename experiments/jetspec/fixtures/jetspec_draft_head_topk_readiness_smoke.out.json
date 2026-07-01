@@ -1,0 +1,107 @@
+{
+  "approval_gates": [
+    "aggregate_contracts",
+    "default_build_only",
+    "disabled_no_spec_path",
+    "existing_mtp_path",
+    "jetspec_opt_in_fail_closed",
+    "real_draft_head_logits_source_approval",
+    "runtime_correctness_matrix",
+    "baseline_benchmark_before_promotion"
+  ],
+  "chain": {
+    "p5ag_accept_boundary_hash_required": true,
+    "p5ag_accept_boundary_ready_required": true,
+    "requires_gates": [
+      "LLAMA_JETSPEC_TREE_BUILD_ROOT_ONLY=1",
+      "LLAMA_JETSPEC_TREE_BUILD_TOPK_ABI_ONLY=1",
+      "LLAMA_JETSPEC_VERIFY_MASK_TOPK_ABI_ONLY=1",
+      "LLAMA_JETSPEC_ACCEPT_PATH_TOPK_ABI_ONLY=1"
+    ],
+    "topk_abi_root_tail_conflict_rejected": true
+  },
+  "failure_modes": [
+    "missing_p5ag_accept_boundary",
+    "missing_p5ag_hash",
+    "runtime_supported_true",
+    "ctx_dft_non_null",
+    "draft_context_created",
+    "draft_head_graph_execution_attempted",
+    "llama_decode_attempted",
+    "draft_logits_rows_nonzero_without_approval",
+    "target_logits_source_attempted",
+    "sampler_source_attempted",
+    "synthetic_source_used_as_real_topk"
+  ],
+  "future_topk_contract": {
+    "actual_accepted_nodes": 0,
+    "actual_verified_logits_rows": 0,
+    "candidate_nodes": 2,
+    "correction_token_present": 0,
+    "embedding_length": 2048,
+    "forbidden_sources": [
+      "sampler",
+      "synthetic_full_vocab_softmax",
+      "target_logits",
+      "topk_only_renormalization"
+    ],
+    "full_vocab_softmax_required": true,
+    "future_logits_source": "draft_head_full_vocab_logits",
+    "output_tree_nodes": 3,
+    "parent_logits_rows": [
+      {
+        "candidate_nodes": [
+          1,
+          2
+        ],
+        "logits_row": 0,
+        "parent_node": 0
+      }
+    ],
+    "planned_draft_head_logits_rows": 1,
+    "rank_semantics": "rank_stable_descending_logprob",
+    "target_layer_ids": [
+      1,
+      10,
+      19,
+      28,
+      37
+    ],
+    "target_tap_width": 10240,
+    "topk_only_renormalization_allowed": false,
+    "topk_width": 2,
+    "tree_depth": 1,
+    "vocab_size": 248320
+  },
+  "next_allowed_work": "explicit production-source approval required before real draft-head logits/top-k construction",
+  "ok": true,
+  "production_paths_touched": [],
+  "production_source_approval": false,
+  "runtime_boundary": {
+    "cmake_wired": false,
+    "ctx_dft_null": true,
+    "cuda_dispatched": false,
+    "draft_context_created": false,
+    "draft_head_graph_executed": false,
+    "draft_logits_buffer_read": false,
+    "draft_tokens_emitted": false,
+    "hidden_kv_commit_performed": false,
+    "kv_mutated": false,
+    "llama_decode_called": false,
+    "model_only_binding_preserved": true,
+    "no_runtime_execution": true,
+    "performance_claimed": false,
+    "promotion_claimed": false,
+    "public_api_added": false,
+    "rejected_branch_discard_performed": false,
+    "runtime_supported": false,
+    "sampler_used": false,
+    "server_route_added": false,
+    "target_accept_walked": false,
+    "target_logits_walked": false,
+    "token_commit_performed": false,
+    "visible_state_published": false
+  },
+  "scope": "experiments/jetspec only",
+  "status": "draft_head_topk_readiness_verified_not_executed"
+}

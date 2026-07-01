@@ -216,7 +216,7 @@ def validate_p5e_runtime_state() -> dict[str, Any]:
         "preview_not_allowed",
         "unsupported_runtime",
         "build_arch_graph",
-        "throw std::runtime_error(\"unsupported_runtime: JetSpec P5A has no graph execution path\")",
+        "throw std::runtime_error(\"unsupported_runtime: JetSpec draft-head graph execution is not implemented\")",
     ]:
         if token not in loader:
             errors.append(f"JetSpec draft-head loader no longer preserves fail-closed token: {token}")

@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""Validate the P5AO real draft-head top-k accept-path descriptor no-model contract wiring."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import sys
+from typing import Any
+
+HERE = pathlib.Path(__file__).resolve().parent
+REPO_ROOT = HERE.parent.parent
+DOC = REPO_ROOT / "docs/speculative.md"
+README = HERE / "README.md"
+CANDIDATE = HERE / "jetspec_p5ao_real_draft_head_topk_accept_path_descriptor_runtime_candidate.md"
+PROBE = HERE / "probe_p5ao_real_draft_head_topk_accept_path_descriptor_trace.py"
+TEST = HERE / "test_p5ao_real_draft_head_topk_accept_path_descriptor_trace_probe.py"
+AGGREGATE = HERE / "run_all_jetspec_contracts.py"
+PRODUCTION_SOURCE = REPO_ROOT / "common/speculative.cpp"
+
+P5AO_TOKENS = [
+    "P5AO real draft-head top-k accept-path descriptor ABI",
+    "LLAMA_JETSPEC_REAL_DRAFT_HEAD_TOPK_ACCEPT_PATH_DESCRIPTOR_ABI_ONLY",
+    "p5ao_real_draft_head_topk_accept_path_descriptor_runtime",
+    "real_draft_head_topk_accept_path_descriptor_ready",
+    "invalid_real_draft_head_topk_accept_path_descriptor_runtime",
+    "real_topk_accept_path_descriptor_runtime_ready",
+]
+
+REQUIRED_SOURCE_TOKENS = [
+    "LLAMA_JETSPEC_REAL_DRAFT_HEAD_TOPK_ACCEPT_PATH_DESCRIPTOR_ABI_ONLY",
+    "p5ao_real_draft_head_topk_accept_path_descriptor_runtime",
+    "real_draft_head_topk_accept_path_descriptor_ready",
+    "invalid_real_draft_head_topk_accept_path_descriptor_runtime",
+    "real_topk_accept_path_descriptor_runtime_ready",
+]
+
+REQUIRED_DOC_TOKENS = [
+    "P5AO real draft-head top-k accept-path descriptor ABI",
+    "LLAMA_JETSPEC_REAL_DRAFT_HEAD_TOPK_ACCEPT_PATH_DESCRIPTOR_ABI_ONLY=1",
+    "p5ao_real_draft_head_topk_accept_path_descriptor_runtime",
+    "phase=real_draft_head_topk_accept_path_descriptor_ready",
+    "invalid_real_draft_head_topk_accept_path_descriptor_runtime",
+    "real_topk_accept_path_descriptor_runtime_ready=1",
+    "P5AN",
+    "P5AM",
+    "P5AL",
+    "P5AK",
+    "P5AJ",
+    "P5AG",
+    "P5AF",
+    "P5AE",
+    "P5X",
+    "actual_verified_logits_rows=1",
+    "topk_k=2",
+    "actual_tree_nodes=3",
+    "candidate_nodes=2",
+    "actual_verify_mask_entries=5",
+    "accept_boundary_candidate_nodes=2",
+    "accept_boundary_verified_edges=5",
+    "accept_path_descriptor_len=0",
+    "actual_accepted_nodes=0",
+    "correction_token_present=0",
+    "accept_decision_source=none_no_target_logits",
+    "descriptor_only=1",
+    "reuse_p5an_accept_boundary_metadata=1",
+    "actual_committed_tokens=0",
+    "actual_survivor_pages_committed=0",
+    "actual_pages_discarded=0",
+    "actual_publish_visible_state=0",
+    "no target logits walk",
+    "no target accept walk",
+    "no accept",
+    "no token commit",
+    "no hidden/KV commit",
+    "no rejected-branch discard",
+    "no publish",
+    "no KV mutation",
+    "no draft tokens",
+]
+
+REQUIRED_CANDIDATE_TOKENS = REQUIRED_DOC_TOKENS + [
+    "LLAMA_JETSPEC_TREE_BUILD_ROOT_ONLY=1",
+    "LLAMA_JETSPEC_TREE_BUILD_TOPK_ABI_ONLY=1",
+    "LLAMA_JETSPEC_VERIFY_MASK_TOPK_ABI_ONLY=1",
+    "LLAMA_JETSPEC_ACCEPT_PATH_TOPK_ABI_ONLY=1",
+    "LLAMA_JETSPEC_REAL_DRAFT_HEAD_LOGITS_CANARY=1",
+    "real_tree_token_ids[1:] == candidate_ids",
+    "token commit readiness",
+    "hidden KV readiness",
+    "rejected branch discard readiness",
+    "publish readiness",
+]
+
+REQUIRED_PROBE_TOKENS = [
+    "REQUIRED_TRACE_TOKENS",
+    "FORBIDDEN_TRACE_TOKENS",
+    "SELF_TEST_TRACE",
+    "validate_trace_line",
+    "probe_p5ao_real_draft_head_topk_accept_path_descriptor_trace",
+    "p5ao_real_draft_head_topk_accept_path_descriptor_trace_contract_verified",
+    "LLAMA_JETSPEC_REAL_DRAFT_HEAD_TOPK_ACCEPT_PATH_DESCRIPTOR_ABI_ONLY=1",
+    "phase=real_draft_head_topk_accept_path_descriptor_ready",
+    "real_topk_accept_path_descriptor_runtime_ready=1",
+    "real_topk_accept_boundary_runtime_ready=1",
+    "accept_path_descriptor_len=0",
+    "descriptor_only=1",
+    "reuse_p5an_accept_boundary_metadata=1",
+    "token_commit_descriptor_ready=1",
+    "hidden_kv_survivor_commit_descriptor_ready=1",
+    "rejected_branch_discard_descriptor_ready=1",
+    "publish_gate_descriptor_ready=1",
+]
+
+REQUIRED_TEST_TOKENS = [
+    "P5AORealDraftHeadTopKAcceptPathDescriptorTraceProbeTests",
+    "test_probe_passes_without_live_log",
+    "test_trace_line_requires_descriptor_and_zero_side_effects",
+    "test_trace_line_rejects_missing_required_zero_counters",
+    "test_trace_line_rejects_token_commit_hidden_kv_discard_publish_readiness",
+    "test_validator_passes",
+]
+
+REQUIRED_AGGREGATE_TOKENS = [
+    "test_p5ao_real_draft_head_topk_accept_path_descriptor_trace_probe.py",
+    "validate_p5ao_real_draft_head_topk_accept_path_descriptor_runtime.py",
+    "probe_p5ao_real_draft_head_topk_accept_path_descriptor_trace.py",
+    "p5ao_real_draft_head_topk_accept_path_descriptor_trace_contract_verified",
+    "LLAMA_JETSPEC_REAL_DRAFT_HEAD_TOPK_ACCEPT_PATH_DESCRIPTOR_ABI_ONLY",
+    "invalid_real_draft_head_topk_accept_path_descriptor_runtime",
+]
+
+FORBIDDEN_CONTRACT_TOKENS = [
+    "llama_decode(",
+    "llama_graph",
+    "llama_kv_cache",
+    "common_sampler_sample",
+    "llama_sampler",
+    "result->push_back",
+]
+
+FORBIDDEN_WIRING_ROOTS = [
+    pathlib.Path("src"),
+    pathlib.Path("include"),
+    pathlib.Path("tools/server"),
+    pathlib.Path("ggml/src"),
+    pathlib.Path("tests"),
+    pathlib.Path("examples"),
+    pathlib.Path("pocs"),
+]
+
+CMAKE_FORBIDDEN_TOKENS = P5AO_TOKENS + [
+    "jetspec_p5ao_real_draft_head_topk_accept_path_descriptor_runtime_candidate",
+    "validate_p5ao_real_draft_head_topk_accept_path_descriptor_runtime",
+    "probe_p5ao_real_draft_head_topk_accept_path_descriptor_trace",
+    "test_p5ao_real_draft_head_topk_accept_path_descriptor_trace_probe",
+]
+
+
+def _read(path: pathlib.Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+
+
+def _require_tokens(text: str, tokens: list[str], label: str, errors: list[str]) -> None:
+    for token in tokens:
+        if token not in text:
+            errors.append(f"{label} missing token: {token}")
+
+
+def _cmake_files() -> list[pathlib.Path]:
+    files = list(REPO_ROOT.rglob("CMakeLists.txt"))
+    files.extend(REPO_ROOT.rglob("*.cmake"))
+    return sorted(path for path in files if path.is_file())
+
+
+def _scan_forbidden_wiring() -> list[dict[str, Any]]:
+    hits: list[dict[str, Any]] = []
+    suffixes = {".c", ".cc", ".cpp", ".h", ".hpp", ".cu", ".cuh", ".md"}
+    for root in FORBIDDEN_WIRING_ROOTS:
+        base = REPO_ROOT / root
+        if not base.exists():
+            continue
+        for path in base.rglob("*"):
+            if not path.is_file() or path.suffix not in suffixes:
+                continue
+            text = _read(path)
+            matched = [token for token in P5AO_TOKENS if token in text]
+            if matched:
+                hits.append({"path": str(path.relative_to(REPO_ROOT)), "tokens": matched})
+    return hits
+
+
+def _scan_cmake_wiring() -> list[dict[str, Any]]:
+    hits: list[dict[str, Any]] = []
+    for path in _cmake_files():
+        text = _read(path)
+        matched = [token for token in CMAKE_FORBIDDEN_TOKENS if token in text]
+        if matched:
+            hits.append({"path": str(path.relative_to(REPO_ROOT)), "tokens": matched})
+    return hits
+
+
+def validate_p5ao_real_draft_head_topk_accept_path_descriptor_runtime() -> dict[str, Any]:
+    errors: list[str] = []
+    doc = _read(DOC)
+    readme = _read(README)
+    candidate = _read(CANDIDATE)
+    probe = _read(PROBE)
+    test = _read(TEST)
+    aggregate = _read(AGGREGATE)
+    production_source = _read(PRODUCTION_SOURCE)
+
+    _require_tokens(doc, REQUIRED_DOC_TOKENS, "docs/speculative.md", errors)
+    _require_tokens(readme, REQUIRED_DOC_TOKENS, "experiments/jetspec/README.md", errors)
+    _require_tokens(candidate, REQUIRED_CANDIDATE_TOKENS, CANDIDATE.name, errors)
+    _require_tokens(probe, REQUIRED_PROBE_TOKENS, PROBE.name, errors)
+    _require_tokens(test, REQUIRED_TEST_TOKENS, TEST.name, errors)
+    _require_tokens(aggregate, REQUIRED_AGGREGATE_TOKENS, AGGREGATE.name, errors)
+    _require_tokens(production_source, REQUIRED_SOURCE_TOKENS, "common/speculative.cpp", errors)
+
+    contract_text = "\n".join([candidate, probe, test])
+    for token in FORBIDDEN_CONTRACT_TOKENS:
+        if token in contract_text:
+            errors.append(f"P5AO no-model contract must not contain runtime side-effect token: {token}")
+
+    cmake_hits = _scan_cmake_wiring()
+    wiring_hits = _scan_forbidden_wiring()
+    for hit in cmake_hits:
+        errors.append(f"P5AO contract must not add CMake wiring: {hit}")
+    for hit in wiring_hits:
+        errors.append(f"P5AO contract must not add server/public API/ggml wiring: {hit}")
+
+    return {
+        "ok": not errors,
+        "status": "p5ao_real_draft_head_topk_accept_path_descriptor_contract_wiring_validated" if not errors else "p5ao_real_draft_head_topk_accept_path_descriptor_contract_wiring_invalid",
+        "errors": errors,
+        "runtime_executed": False,
+        "model_loaded": False,
+        "context_created": False,
+        "source_implementation_required_in_this_lane": True,
+        "source_implementation_present": "p5ao_real_draft_head_topk_accept_path_descriptor_runtime" in production_source,
+        "cmake_hits": cmake_hits,
+        "forbidden_wiring_hits": wiring_hits,
+        "actual_verified_logits_rows": 1,
+        "accept_path_descriptor_len": 0,
+        "actual_accepted_nodes": 0,
+        "correction_token_present": 0,
+        "committed_tokens": 0,
+        "survivor_pages_committed": 0,
+        "pages_discarded": 0,
+        "published_visible_state": False,
+        "kv_mutated": False,
+        "draft_tokens_emitted": False,
+    }
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    out = validate_p5ao_real_draft_head_topk_accept_path_descriptor_runtime()
+    if args.json or not out["ok"]:
+        print(json.dumps(out, indent=2, sort_keys=True))
+    else:
+        print(out["status"])
+    return 0 if out["ok"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

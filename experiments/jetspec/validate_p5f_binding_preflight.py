@@ -20,6 +20,7 @@ REPO_ROOT = HERE.parent.parent
 P5F_ALLOWED_FILES = {
     pathlib.Path("common/speculative.cpp"),
     pathlib.Path("docs/speculative.md"),
+    pathlib.Path("src/models/jetspec_qwen3_draft_head.cpp"),
 }
 
 REQUIRED_TOKENS: dict[pathlib.Path, list[str]] = {
@@ -37,9 +38,9 @@ REQUIRED_TOKENS: dict[pathlib.Path, list[str]] = {
         "JETSPEC_QWEN36_DRAFT_HEADS       = 32",
         "JETSPEC_QWEN36_DRAFT_HEADS_KV    = 4",
         "JETSPEC_QWEN36_VOCAB_SIZE        = 248320",
-        "missing target or draft context",
+        "missing target context",
         "missing target or draft model",
-        "missing target or draft vocab",
+        "missing target vocab",
         "general.architecture",
         "jetspec_qwen3_draft_head",
         "jetspec.architecture",
@@ -49,7 +50,8 @@ REQUIRED_TOKENS: dict[pathlib.Path, list[str]] = {
         "jetspec.tensor_data_dtype",
         "bfloat16",
         "target.n_embd",
-        "target.n_layer",
+        "target.effective_n_layer",
+        "qwen35moe.nextn_predict_layers",
         "target.vocab",
         "draft.n_ctx_train",
         "draft.n_embd",
@@ -67,11 +69,23 @@ REQUIRED_TOKENS: dict[pathlib.Path, list[str]] = {
         "invalid_binding",
         "no draft tokens will be generated",
     ],
+    pathlib.Path("src/models/jetspec_qwen3_draft_head.cpp"): [
+        "jetspec_require_target_tensor",
+        "missing required target tensor",
+        "target tensor",
+        "must have shape",
+        "jetspec_require_target_tensor(main_model, \"token_embd.weight\", { 2048, 248320 })",
+        "jetspec_require_target_tensor(main_model, \"output.weight\", { 2048, 248320 })",
+        "jetspec_require_target_tensor(main_model, \"output_norm.weight\", { 2048 })",
+        "target-owned JetSpec draft-head artifact",
+        "throw std::runtime_error(\"unsupported_runtime: JetSpec draft-head graph execution is not implemented\")",
+    ],
     pathlib.Path("docs/speculative.md"): [
         "draft-jetspec",
         "binding preflight",
         "metadata/shape",
         "target tap count/width",
+        "target tensor presence/shape",
         "emits no draft",
         "tokens and does not execute the draft head",
     ],
@@ -92,6 +106,7 @@ P5F_TOKENS = [
     "JETSPEC_QWEN36_TARGET_TAP_WIDTH",
     "target_tap_width_vs_target",
     "draft-jetspec preflight failed",
+    "jetspec_require_target_tensor",
     "jetspec_p5f_binding_preflight",
 ]
 
@@ -246,9 +261,10 @@ def validate_p5f_binding_preflight() -> dict[str, Any]:
 
     for required in [
         "llama_get_model(params.ctx_tgt)",
-        "llama_get_model(params.ctx_dft)",
+        "params.ctx_dft != nullptr ? llama_get_model(params.ctx_dft) : params.model",
         "llama_model_get_vocab(model_tgt)",
-        "llama_model_get_vocab(model_dft)",
+        "common_speculative_jetspec_meta_i32",
+        "qwen35moe.nextn_predict_layers",
         "llama_model_n_ctx_train(model_dft)",
         "llama_model_n_embd(model_tgt)",
         "llama_model_n_layer(model_tgt)",
@@ -257,7 +273,7 @@ def validate_p5f_binding_preflight() -> dict[str, Any]:
         "llama_model_n_head(model_dft)",
         "llama_model_n_head_kv(model_dft)",
         "llama_vocab_n_tokens(vocab_tgt)",
-        "llama_vocab_n_tokens(vocab_dft)",
+        "draft_vocab",
     ]:
         if required not in preflight:
             errors.append(f"preflight missing accessor or check: {required}")
@@ -267,8 +283,17 @@ def validate_p5f_binding_preflight() -> dict[str, Any]:
         "runtime_supported=false",
         "preview_not_allowed",
         "unsupported_runtime",
+        "jetspec_expect(!meta.runtime_supported",
+        "jetspec.experimental.runtime_supported must remain false until JetSpec draft-head graph execution is implemented",
+        "LLAMA_JETSPEC_DRAFT_HEAD_LOAD",
+        "target-owned JetSpec draft-head artifact",
+        "jetspec_require_target_tensor(main_model, \"token_embd.weight\", { 2048, 248320 })",
+        "jetspec_require_target_tensor(main_model, \"output.weight\", { 2048, 248320 })",
+        "jetspec_require_target_tensor(main_model, \"output_norm.weight\", { 2048 })",
+        "missing required target tensor",
+        "must have shape",
         "build_arch_graph",
-        "throw std::runtime_error(\"unsupported_runtime: JetSpec P5A has no graph execution path\")",
+        "throw std::runtime_error(\"unsupported_runtime: JetSpec draft-head graph execution is not implemented\")",
     ]:
         if token not in loader:
             errors.append(f"JetSpec draft-head loader no longer preserves fail-closed token: {token}")

@@ -1,18 +1,23 @@
 # JetSpec P5F binding preflight candidate
 
-Status: approved bounded runtime slice. This is not draft-head execution, tree
-verify, KV/hidden rollback, or server behavior.
+Status: approved bounded runtime slice. This includes model-only draft-head
+binding, but not draft-head execution, tree verify, KV/hidden rollback, or
+executable server drafting behavior.
 
 ## Production hook set
 
-Only these production files are in scope for this candidate:
+Primary preflight files in scope for this candidate:
 
 - `common/speculative.cpp`
 - `docs/speculative.md`
 
-No public `include/llama.h`, `tools/server/`, repository `tests/`, `examples/`,
-`pocs/`, `ggml/src/`, production CMake wiring, or non-P5A/P5B model registration
-edits are approved by P5F.
+The follow-on model-only binding slice also uses the existing JetSpec model
+loader hooks and `tools/server/server-context.cpp` to carry a draft model pointer
+with `ctx_dft = nullptr`. The model-only linker fails closed unless the paired
+target model exposes `token_embd.weight`, `output.weight`, and
+`output_norm.weight` with the staged Qwen3.6 target shapes. No public
+`include/llama.h`, repository `tests`, `examples`, `pocs`, `ggml/src`, production
+CMake wiring, or executable graph path is approved by P5F.
 
 ## Runtime behavior
 
@@ -24,8 +29,9 @@ Required preflight inputs:
 
 - explicit `--spec-type draft-jetspec` or `--spec-type jetspec`;
 - `LLAMA_JETSPEC_EXPERIMENTAL=1`;
-- non-null target and draft contexts;
-- non-null target and draft models/vocabs;
+- non-null target context;
+- either a draft context or model-only loaded draft-head model;
+- non-null target model/vocab and draft model metadata;
 - draft metadata strings:
   - `general.architecture=jetspec_qwen3_draft_head`;
   - `jetspec.architecture=qwen3_draft_head`;
@@ -35,7 +41,9 @@ Required preflight inputs:
 - draft shape: context train size 16, hidden size 2048, layer count 8, heads 32,
   KV heads 4, vocab size 248320;
 - target tap shape: count 5, width 10240, and width equals `tap_count *
-  target_hidden_size`.
+  target_hidden_size`;
+- model-only target tensor presence/shape: `token_embd.weight` `[2048,248320]`,
+  `output.weight` `[2048,248320]`, and `output_norm.weight` `[2048]`.
 
 On any mismatch, P5F disables the private target-tap side channel, drops the
 JetSpec implementation before runtime execution, logs the preflight reason, and
@@ -71,8 +79,8 @@ the draft head. `validate_p5f_artifact_binding.py` verifies:
   `runtime_supported=false` remain explicit.
 
 This upgrades P5F from source/build-only verification to
-`artifact_verified_not_runtime_executed`. It still does not prove live target
-GGUF loading, live draft `llama_context` creation, or runtime preflight execution.
+`artifact_verified_not_runtime_executed`. It still does not prove draft-head graph
+execution, tree verification, or token drafting.
 
 ## Live metadata-only loader gate
 
@@ -83,26 +91,37 @@ not a JetSpec runtime execution probe.
 Expected outcomes:
 
 - default load fails nonzero with `preview_not_allowed`;
-- `LLAMA_JETSPEC_ALLOW_PREVIEW_LOAD=1` load still fails nonzero with
-  `unsupported_runtime`;
-- no P5F preflight, draft-head graph, tree verify, or rollback path executes.
+- `LLAMA_JETSPEC_ALLOW_PREVIEW_LOAD=1` plus `LLAMA_JETSPEC_EXPERIMENTAL=1` load
+  still fails nonzero with `unsupported_runtime`;
+- source guard proves `runtime_supported=true` is rejected before optional load
+  gates;
+- no draft-head graph, tree verify, or rollback path executes.
 
 A passing probe reports `loader_gate_verified_preflight_still_blocked`. This is
 stronger than source-only validation, but it confirms the current safety boundary:
-P5F live preflight cannot run until a separately approved runnable draft context
-exists.
+The metadata-only loader-gate probe remains blocked before model-only binding;
+model-only binding of the 91-tensor artifact is still non-drafting.
+
+`probe_p5f_target_tensor_binding.py` is a separate header-only target probe. It
+reads GGUF tensor-info headers for the paired target split files and verifies the
+model-only linker requirements for `token_embd.weight`, `output.weight`, and
+`output_norm.weight` without loading weights, creating contexts, executing
+preflight, or running the draft-head graph.
 
 ## Source guard
 
 `validate_p5f_binding_preflight.py` checks:
 
-- P5F state lives only in `common/speculative.cpp` and `docs/speculative.md`;
-- the private preflight validates target/draft context, model, vocab, draft
-  metadata strings, shape constants, and target tap width/count;
+- P5F preflight state lives in `common/speculative.cpp` and `docs/speculative.md`, with the model-only target tensor linker guard in `src/models/jetspec_qwen3_draft_head.cpp`;
+- the private preflight validates target context, draft context or model-only
+  draft model, target vocab, draft metadata strings, shape constants, and target
+  tap width/count;
 - target tap width is cross-checked against target hidden size;
+- the model-only linker requires target tensor presence/shape for
+  `token_embd.weight`, `output.weight`, and `output_norm.weight`;
 - preflight failure disables target taps and drops JetSpec before runtime;
 - no draft tokens are emitted;
-- no draft-head graph execution, tree verifier, public/server/CMake/kernel/test,
+- no draft-head graph execution, tree verifier, public API/CMake/kernel/test,
   example, or poc route is added.
 
 `validate_p5f_artifact_binding.py` checks:
@@ -118,9 +137,18 @@ exists.
 
 - the metadata-only GGUF is rejected by the actual built loader as
   `preview_not_allowed` by default;
-- even the explicit preview-load escape hatch rejects as `unsupported_runtime`;
-- live P5F preflight remains blocked before any draft context, graph, tree, or
-  rollback execution.
+- even the explicit preview-load plus experimental escape hatch rejects as
+  `unsupported_runtime`;
+- `runtime_supported=true` is rejected before optional load gates;
+- no graph, tree, or rollback execution occurs.
+
+`probe_p5f_target_tensor_binding.py` checks:
+
+- split target GGUF headers contain `token_embd.weight`, `output.weight`, and
+  `output_norm.weight`;
+- header shapes match the P5F model-only linker contract;
+- the result reports `target_tensor_headers_verified_not_loaded` and keeps
+  `model_loaded=false`, `context_created=false`, and `runtime_executed=false`.
 
 ## Verification evidence
 
@@ -131,13 +159,15 @@ cmake --build build-rocm-qwen35-dev -j2 --target llama-server
 python3 experiments/jetspec/validate_p5f_binding_preflight.py
 python3 experiments/jetspec/validate_p5f_artifact_binding.py
 python3 experiments/jetspec/probe_p5f_loader_gate.py
+python3 experiments/jetspec/probe_p5f_target_tensor_binding.py --json
 python3 experiments/jetspec/run_all_jetspec_contracts.py
 ```
 
 Expected outcome: build passes, P5F source guard passes, P5F artifact-binding
 check reports `artifact_verified_not_runtime_executed`, loader-gate probe reports
-`loader_gate_verified_preflight_still_blocked`, aggregate contracts pass, and
-JetSpec remains explicit-opt-in/non-drafting.
+`loader_gate_verified_preflight_still_blocked`, target tensor probe reports
+`target_tensor_headers_verified_not_loaded`, aggregate contracts pass, and JetSpec
+remains explicit-opt-in/non-drafting.
 
 ## Next blocked work
 

@@ -1,0 +1,68 @@
+{
+  "slice": "P5AT",
+  "completed_chain": [
+    "P5AK",
+    "P5AL",
+    "P5AM",
+    "P5AN",
+    "P5AO",
+    "P5AP",
+    "P5AQ",
+    "P5AR",
+    "P5AS"
+  ],
+  "p5as_status": "p5as_real_draft_head_topk_publish_gate_noop_trace_contract_verified",
+  "promotion_result": "blocked_pending_explicit_approval",
+  "approvals": {
+    "target_logits_walk_approved": false,
+    "target_accept_walk_approved": false,
+    "real_token_commit_approved": false,
+    "visible_token_publish_approved": false,
+    "real_hidden_kv_commit_approved": false,
+    "real_rejected_branch_discard_approved": false,
+    "real_publish_approved": false,
+    "product_runtime_hooks_approved": false,
+    "draft_token_emission_approved": false,
+    "performance_promotion_approved": false
+  },
+  "runtime_hooks": {
+    "p5t_token_commit_runtime_product_hook": false,
+    "p5u_hidden_kv_survivor_commit_runtime_product_hook": false,
+    "p5v_rejected_branch_discard_runtime_product_hook": false,
+    "p5w_publish_gate_runtime_product_hook": false,
+    "p5ad_root_publish_noop_product_hook_reuse": false,
+    "server_draft_token_emission_hook": false,
+    "public_api_route_hook": false,
+    "ggml_kv_mutation_hook": false
+  },
+  "side_effect_counters": {
+    "actual_committed_tokens": 0,
+    "actual_survivor_pages_committed": 0,
+    "actual_pages_discarded": 0,
+    "rejected_branch_pages_reachable_after_discard": 0,
+    "actual_publish_visible_state": 0,
+    "actual_draft_tokens_emitted": 0,
+    "actual_target_logits_rows_walked": 0,
+    "actual_target_accept_steps": 0
+  },
+  "runtime_boundary": {
+    "runtime_executed": false,
+    "model_loaded": false,
+    "context_created": false,
+    "llama_decode_called": false,
+    "target_logits_walk_executed": false,
+    "target_accept_walk_executed": false,
+    "accept_executed": false,
+    "real_token_commit_executed": false,
+    "visible_token_publish_executed": false,
+    "real_hidden_kv_commit_executed": false,
+    "real_rejected_branch_discard_executed": false,
+    "real_publish_executed": false,
+    "visible_state_changed": false,
+    "kv_mutated": false,
+    "draft_tokens_emitted": false
+  },
+  "allowed_paths": [
+    "experiments/jetspec"
+  ]
+}

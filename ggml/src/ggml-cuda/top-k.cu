@@ -1,6 +1,7 @@
 #include "argsort.cuh"
 #include "top-k.cuh"
 #include "quantize.cuh"
+#include "rdna-i8-packed16.cuh"
 #include "vecdotq.cuh"
 
 #include <cstdlib>
@@ -1796,6 +1797,10 @@ void ggml_cuda_op_moe_routed_lanes_projection(ggml_backend_cuda_context & ctx, g
     GGML_ASSERT(dst->ne[0] == n_out && dst->ne[1] == n_lanes);
     GGML_ASSERT(lanes->ne[0] == 4 && lanes->ne[1] == n_lanes + n_expert);
     GGML_ASSERT(bounds->ne[0] == 2 && bounds->ne[1] == n_expert);
+
+    if (ggml_cuda_moe_routed_lanes_projection_rdna_i8_packed16(ctx, dst)) {
+        return;
+    }
 
     if (weights_q8_0 || weights_iq4_xs || weights_iq3_s) {
         GGML_ASSERT(n_in % ggml_blck_size(weights->type) == 0);

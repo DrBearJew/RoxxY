@@ -6,11 +6,11 @@ the approved zero-tensor metadata preview, optionally invokes a built llama-cli,
 and requires both loader gates to fail before any graph/runtime path can exist:
 
 1. default load fails as preview_not_allowed;
-2. LLAMA_JETSPEC_ALLOW_PREVIEW_LOAD=1 load still fails as unsupported_runtime.
+2. LLAMA_JETSPEC_ALLOW_PREVIEW_LOAD=1 plus LLAMA_JETSPEC_EXPERIMENTAL=1 load still fails as unsupported_runtime.
 
-Because P5A blocks draft context creation, this also proves the live P5F preflight
-is still blocked by design: no target/draft llama_context pair exists and no draft
-head, tree, verify, or rollback runtime executes.
+This metadata-only probe remains blocked before model-only binding: no target/draft
+llama_context pair exists and no draft head, tree, verify, or rollback runtime
+executes. The separate 91-tensor model-only binding path remains non-drafting.
 """
 
 from __future__ import annotations
@@ -60,6 +60,7 @@ def _run_case(
     expected_token: str,
     *,
     allow_preview: bool,
+    experimental: bool,
     timeout_s: float,
 ) -> dict[str, Any]:
     env = os.environ.copy()
@@ -67,6 +68,10 @@ def _run_case(
         env["LLAMA_JETSPEC_ALLOW_PREVIEW_LOAD"] = "1"
     else:
         env.pop("LLAMA_JETSPEC_ALLOW_PREVIEW_LOAD", None)
+    if experimental:
+        env["LLAMA_JETSPEC_EXPERIMENTAL"] = "1"
+    else:
+        env.pop("LLAMA_JETSPEC_EXPERIMENTAL", None)
 
     cmd = [str(llama_cli), "-m", str(preview_path), "-p", "jetspec-loader-gate", "-n", "1"]
     started = time.perf_counter()
@@ -115,6 +120,25 @@ def _run_case(
     }
 
 
+def _source_runtime_supported_true_rejected() -> dict[str, Any]:
+    source_path = REPO_ROOT / "src/models/jetspec_qwen3_draft_head.cpp"
+    text = source_path.read_text(encoding="utf-8", errors="replace")
+    reject_token = "jetspec_expect(!meta.runtime_supported"
+    message_token = "jetspec.experimental.runtime_supported must remain false until JetSpec draft-head graph execution is implemented"
+    optional_gate = "if (!meta.runtime_supported)"
+    reject_pos = text.find(reject_token)
+    optional_pos = text.find(optional_gate)
+    ok = reject_pos >= 0 and message_token in text and optional_pos >= 0 and reject_pos < optional_pos
+    return {
+        "name": "runtime_supported_true_source_rejected",
+        "ok": ok,
+        "source": str(source_path.relative_to(REPO_ROOT)),
+        "reject_token_found": reject_pos >= 0,
+        "message_token_found": message_token in text,
+        "reject_before_optional_load_gate": reject_pos >= 0 and optional_pos >= 0 and reject_pos < optional_pos,
+    }
+
+
 def probe_loader_gate(
     *,
     llama_cli: pathlib.Path = DEFAULT_LLAMA_CLI,
@@ -150,6 +174,7 @@ def probe_loader_gate(
                     preview_path,
                     "preview_not_allowed",
                     allow_preview=False,
+                    experimental=False,
                     timeout_s=timeout_s,
                 )
             )
@@ -160,6 +185,7 @@ def probe_loader_gate(
                     preview_path,
                     "unsupported_runtime",
                     allow_preview=True,
+                    experimental=True,
                     timeout_s=timeout_s,
                 )
             )
@@ -175,6 +201,10 @@ def probe_loader_gate(
                 }
             )
 
+    runtime_supported_true_negative = _source_runtime_supported_true_rejected()
+    if not runtime_supported_true_negative.get("ok"):
+        errors.append("loader source must reject runtime_supported=true before optional load gates")
+
     for case in cases:
         if not case.get("ok"):
             errors.append(f"loader gate case failed: {case.get('name')}")
@@ -188,6 +218,7 @@ def probe_loader_gate(
         "draft_context_created": False,
         "p5f_preflight_executed": False,
         "preview_metadata": preview,
+        "runtime_supported_true_negative": runtime_supported_true_negative,
         "cases": cases,
         "limitations": [
             "probes live loader rejection only",

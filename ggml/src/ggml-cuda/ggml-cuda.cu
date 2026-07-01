@@ -27,6 +27,11 @@
 #include "ggml-cuda/fattn-dot4-q8k-kq.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
+#include "ggml-cuda/hipblaslt-i8.cuh"
+#include "ggml-cuda/q8-1-act-cache.cuh"
+#include "ggml-cuda/rdna-i8-packed16.cuh"
+#include "ggml-cuda/rdna-i8-q6-k.cuh"
+#include "ggml-cuda/rdna-i8-q8-0.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
@@ -3400,6 +3405,19 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     bool use_batched_cublas_bf16 = src0->type == GGML_TYPE_BF16 && bf16_mma_hardware_available(cc);
     bool use_batched_cublas_f32  = src0->type == GGML_TYPE_F32;
 
+    if (!split && ggml_cuda_should_use_rdna_i8_packed16_gemm(src0, src1, dst, cc)) {
+        ggml_cuda_kernel_attrib_log_mul_mat(__func__, "direct_rdna_i8_packed16_gemm", src0, src1, dst);
+        if (ggml_cuda_mul_mat_rdna_i8_packed16(ctx, src0, src1, dst)) {
+            return;
+        }
+        GGML_ABORT("%s: direct_rdna_i8_packed16_gemm selected but launch failed tensor=%s dst=%s", __func__, src0->name, dst->name);
+    }
+
+    if (!split) {
+        // Probe-only scaffold. Q8_K never claims support until a validated bsums/scale epilogue exists.
+        (void) ggml_cuda_should_use_hipblaslt_i8_q8_K_prefill(src0, src1, dst, cc);
+    }
+
     if (!split && use_mul_mat_vec_f) {
         // the custom F16 vector kernel can be used over batched cuBLAS GEMM
         // but this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
@@ -3411,6 +3429,82 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     } else if (!split && use_mul_mat_vec_q) {
         ggml_cuda_kernel_attrib_log_mul_mat(__func__, "direct_mmvq", src0, src1, dst);
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+    } else if (!split && use_mul_mat_q && ggml_cuda_should_use_hipblaslt_i8_q8_0_prefill(src0, src1, dst, cc)) {
+        ggml_cuda_kernel_attrib_log_mul_mat(__func__, "direct_hipblaslt_i8_q8_0_prefill", src0, src1, dst);
+        if (ggml_cuda_mul_mat_hipblaslt_i8(ctx, src0, src1, nullptr, dst)) {
+            return;
+        }
+        if (ggml_cuda_should_use_rdna_i8_q8_0_prefill(src0, src1, dst, cc)) {
+            ggml_cuda_kernel_attrib_log_mul_mat(__func__, "direct_rdna_i8_q8_0_after_hipblaslt_i8_fallback", src0, src1, dst);
+            if (ggml_cuda_mul_mat_rdna_i8_q8_0(ctx, src0, src1, nullptr, dst)) {
+                return;
+            }
+        }
+        GGML_LOG_WARN("%s: direct_hipblaslt_i8_q8_0_prefill failed; falling back to direct_mmq tensor=%s dst=%s\n", __func__, src0->name, dst->name);
+        ggml_cuda_kernel_attrib_log_mul_mat(__func__, "direct_mmq_after_hipblaslt_i8_q8_0_fallback", src0, src1, dst);
+        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+    } else if (!split && use_mul_mat_q && ggml_cuda_should_use_rdna_i8_q8_0_prefill(src0, src1, dst, cc)) {
+        ggml_cuda_kernel_attrib_log_mul_mat(__func__, "direct_rdna_i8_q8_0_prefill", src0, src1, dst);
+        if (ggml_cuda_mul_mat_rdna_i8_q8_0(ctx, src0, src1, nullptr, dst)) {
+            return;
+        }
+        GGML_LOG_WARN("%s: direct_rdna_i8_q8_0_prefill failed; falling back to direct_mmq tensor=%s dst=%s\n", __func__, src0->name, dst->name);
+        ggml_cuda_kernel_attrib_log_mul_mat(__func__, "direct_mmq_after_rdna_i8_q8_0_fallback", src0, src1, dst);
+        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+    } else if (!split && use_mul_mat_q && ggml_cuda_should_use_hipblaslt_i8_q6_K_prefill(src0, src1, dst, cc)) {
+        ggml_cuda_kernel_attrib_log_mul_mat(__func__, "direct_hipblaslt_i8_q6_K_prefill", src0, src1, dst);
+        if (ggml_cuda_mul_mat_hipblaslt_i8(ctx, src0, src1, nullptr, dst)) {
+            return;
+        }
+        if (ggml_cuda_should_use_rdna_i8_q6_K_prefill(src0, src1, dst, cc)) {
+            ggml_cuda_kernel_attrib_log_mul_mat(__func__, "direct_rdna_i8_q6_K_after_hipblaslt_i8_fallback", src0, src1, dst);
+            if (ggml_cuda_mul_mat_rdna_i8_q6_K(ctx, src0, src1, nullptr, dst)) {
+                return;
+            }
+        }
+        GGML_LOG_WARN("%s: direct_hipblaslt_i8_q6_K_prefill failed; falling back to direct_mmq tensor=%s dst=%s\n", __func__, src0->name, dst->name);
+        ggml_cuda_kernel_attrib_log_mul_mat(__func__, "direct_mmq_after_hipblaslt_i8_q6_K_fallback", src0, src1, dst);
+        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+    } else if (!split && use_mul_mat_q && ggml_cuda_should_use_rdna_i8_q6_K_prefill(src0, src1, dst, cc)) {
+        ggml_cuda_kernel_attrib_log_mul_mat(__func__, "direct_rdna_i8_q6_K_prefill", src0, src1, dst);
+        if (ggml_cuda_mul_mat_rdna_i8_q6_K(ctx, src0, src1, nullptr, dst)) {
+            return;
+        }
+        GGML_LOG_WARN("%s: direct_rdna_i8_q6_K_prefill failed; falling back to direct_mmq tensor=%s dst=%s\n", __func__, src0->name, dst->name);
+        ggml_cuda_kernel_attrib_log_mul_mat(__func__, "direct_mmq_after_rdna_i8_q6_K_fallback", src0, src1, dst);
+        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+    } else if (!split && use_mul_mat_q && ggml_cuda_should_use_hipblaslt_i8_q4_0_prefill(src0, src1, dst, cc)) {
+        ggml_cuda_kernel_attrib_log_mul_mat(__func__, "direct_hipblaslt_i8_q4_0_prefill", src0, src1, dst);
+        if (ggml_cuda_mul_mat_hipblaslt_i8(ctx, src0, src1, nullptr, dst)) {
+            return;
+        }
+        GGML_LOG_WARN("%s: direct_hipblaslt_i8_q4_0_prefill failed; falling back to direct_mmq tensor=%s dst=%s\n", __func__, src0->name, dst->name);
+        ggml_cuda_kernel_attrib_log_mul_mat(__func__, "direct_mmq_after_hipblaslt_i8_q4_0_fallback", src0, src1, dst);
+        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+    } else if (!split && use_mul_mat_q && ggml_cuda_should_use_hipblaslt_i8_q4_1_prefill(src0, src1, dst, cc)) {
+        ggml_cuda_kernel_attrib_log_mul_mat(__func__, "direct_hipblaslt_i8_q4_1_prefill", src0, src1, dst);
+        if (ggml_cuda_mul_mat_hipblaslt_i8(ctx, src0, src1, nullptr, dst)) {
+            return;
+        }
+        GGML_LOG_WARN("%s: direct_hipblaslt_i8_q4_1_prefill failed; falling back to direct_mmq tensor=%s dst=%s\n", __func__, src0->name, dst->name);
+        ggml_cuda_kernel_attrib_log_mul_mat(__func__, "direct_mmq_after_hipblaslt_i8_q4_1_fallback", src0, src1, dst);
+        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+    } else if (!split && use_mul_mat_q && ggml_cuda_should_use_hipblaslt_i8_q5_0_prefill(src0, src1, dst, cc)) {
+        ggml_cuda_kernel_attrib_log_mul_mat(__func__, "direct_hipblaslt_i8_q5_0_prefill", src0, src1, dst);
+        if (ggml_cuda_mul_mat_hipblaslt_i8(ctx, src0, src1, nullptr, dst)) {
+            return;
+        }
+        GGML_LOG_WARN("%s: direct_hipblaslt_i8_q5_0_prefill failed; falling back to direct_mmq tensor=%s dst=%s\n", __func__, src0->name, dst->name);
+        ggml_cuda_kernel_attrib_log_mul_mat(__func__, "direct_mmq_after_hipblaslt_i8_q5_0_fallback", src0, src1, dst);
+        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+    } else if (!split && use_mul_mat_q && ggml_cuda_should_use_hipblaslt_i8_q5_1_prefill(src0, src1, dst, cc)) {
+        ggml_cuda_kernel_attrib_log_mul_mat(__func__, "direct_hipblaslt_i8_q5_1_prefill", src0, src1, dst);
+        if (ggml_cuda_mul_mat_hipblaslt_i8(ctx, src0, src1, nullptr, dst)) {
+            return;
+        }
+        GGML_LOG_WARN("%s: direct_hipblaslt_i8_q5_1_prefill failed; falling back to direct_mmq tensor=%s dst=%s\n", __func__, src0->name, dst->name);
+        ggml_cuda_kernel_attrib_log_mul_mat(__func__, "direct_mmq_after_hipblaslt_i8_q5_1_fallback", src0, src1, dst);
+        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_q) {
         ggml_cuda_kernel_attrib_log_mul_mat(__func__, "direct_mmq", src0, src1, dst);
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
@@ -3439,19 +3533,181 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
 
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (ggml_cuda_should_use_rdna_i8_packed16_gemm_id(src0, src1, ids, dst, cc)) {
+        ggml_cuda_kernel_attrib_log_mul_mat(__func__, "id_rdna_i8_packed16_gemm", src0, src1, dst);
+        if (ggml_cuda_mul_mat_id_rdna_i8_packed16(ctx, dst)) {
+            return;
+        }
+        GGML_ABORT("%s: id_rdna_i8_packed16_gemm selected but launch failed tensor=%s dst=%s", __func__, src0->name, dst->name);
+    }
+
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ggml_backend_buft_is_cuda_split(src0->buffer->buft) && "mul_mat_id does not support split buffers");
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
-    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         const int64_t n_expert_used_for_policy = ids->ne[0];
         const bool small_route_gemv_preferred = ggml_cuda_mtp_moe_small_route_gemv_preferred(ne2, n_expert_used_for_policy);
+        if (ggml_cuda_should_use_hipblaslt_i8_iq3s_moe_prefill(src0, src1, ids, dst, cc)) {
+            ggml_cuda_mtp_moe_route_policy_log(__func__, src0, ne2, n_expert_used_for_policy, get_mmvq_mmid_max_batch(src0->type, cc),
+                    small_route_gemv_preferred, false, "hipblaslt_i8_iq3s_moe_prefill");
+            ggml_cuda_kernel_attrib_log_mul_mat(__func__, "id_hipblaslt_i8_iq3s_moe_prefill", src0, src1, dst);
+            if (ggml_cuda_mul_mat_hipblaslt_i8(ctx, src0, src1, ids, dst)) {
+                return;
+            }
+            GGML_LOG_WARN("%s: id_hipblaslt_i8_iq3s_moe_prefill failed; falling back to standard MUL_MAT_ID route tensor=%s dst=%s\n", __func__, src0->name, dst->name);
+        } else if (ggml_cuda_mtp_env_enabled("GGML_CUDA_HIPBLASLT_I8_IQ3S_MOE_GROUPED") &&
+                ggml_cuda_mtp_env_enabled("GGML_CUDA_HIPBLASLT_I8_IQ3S_MOE_GROUPED_FORCE") &&
+                src0->type == GGML_TYPE_IQ3_S && src1->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32) {
+            ggml_cuda_mtp_moe_route_policy_log(__func__, src0, ne2, n_expert_used_for_policy, get_mmvq_mmid_max_batch(src0->type, cc),
+                    small_route_gemv_preferred, false, "hipblaslt_i8_iq3s_moe_grouped");
+            ggml_cuda_kernel_attrib_log_mul_mat(__func__, "id_hipblaslt_i8_iq3s_moe_grouped", src0, src1, dst);
+            if (ggml_cuda_mul_mat_hipblaslt_i8(ctx, src0, src1, ids, dst)) {
+                return;
+            }
+            GGML_LOG_WARN("%s: id_hipblaslt_i8_iq3s_moe_grouped failed; falling back to standard MUL_MAT_ID route tensor=%s dst=%s\n", __func__, src0->name, dst->name);
+        } else if (ggml_cuda_should_use_hipblaslt_i8_iq4_xs_moe_grouped(src0, src1, ids, dst, cc)) {
+            ggml_cuda_mtp_moe_route_policy_log(__func__, src0, ne2, n_expert_used_for_policy, get_mmvq_mmid_max_batch(src0->type, cc),
+                    small_route_gemv_preferred, false, "hipblaslt_i8_iq4_xs_moe_grouped");
+            ggml_cuda_kernel_attrib_log_mul_mat(__func__, "id_hipblaslt_i8_iq4_xs_moe_grouped", src0, src1, dst);
+            if (ggml_cuda_mul_mat_hipblaslt_i8(ctx, src0, src1, ids, dst)) {
+                return;
+            }
+            GGML_LOG_WARN("%s: id_hipblaslt_i8_iq4_xs_moe_grouped failed; falling back to standard MUL_MAT_ID route tensor=%s dst=%s\n", __func__, src0->name, dst->name);
+        } else if (ggml_cuda_should_use_hipblaslt_i8_iq4_nl_moe_grouped(src0, src1, ids, dst, cc)) {
+            ggml_cuda_mtp_moe_route_policy_log(__func__, src0, ne2, n_expert_used_for_policy, get_mmvq_mmid_max_batch(src0->type, cc),
+                    small_route_gemv_preferred, false, "hipblaslt_i8_iq4_nl_moe_grouped");
+            ggml_cuda_kernel_attrib_log_mul_mat(__func__, "id_hipblaslt_i8_iq4_nl_moe_grouped", src0, src1, dst);
+            if (ggml_cuda_mul_mat_hipblaslt_i8(ctx, src0, src1, ids, dst)) {
+                return;
+            }
+            GGML_LOG_WARN("%s: id_hipblaslt_i8_iq4_nl_moe_grouped failed; falling back to standard MUL_MAT_ID route tensor=%s dst=%s\n", __func__, src0->name, dst->name);
+        } else if (ggml_cuda_should_use_hipblaslt_i8_iq3_xxs_moe_grouped(src0, src1, ids, dst, cc)) {
+            ggml_cuda_mtp_moe_route_policy_log(__func__, src0, ne2, n_expert_used_for_policy, get_mmvq_mmid_max_batch(src0->type, cc),
+                    small_route_gemv_preferred, false, "hipblaslt_i8_iq3_xxs_moe_grouped");
+            ggml_cuda_kernel_attrib_log_mul_mat(__func__, "id_hipblaslt_i8_iq3_xxs_moe_grouped", src0, src1, dst);
+            if (ggml_cuda_mul_mat_hipblaslt_i8(ctx, src0, src1, ids, dst)) {
+                return;
+            }
+            GGML_LOG_WARN("%s: id_hipblaslt_i8_iq3_xxs_moe_grouped failed; falling back to standard MUL_MAT_ID route tensor=%s dst=%s\n", __func__, src0->name, dst->name);
+        } else if (ggml_cuda_should_use_hipblaslt_i8_iq2_xxs_moe_grouped(src0, src1, ids, dst, cc)) {
+            ggml_cuda_mtp_moe_route_policy_log(__func__, src0, ne2, n_expert_used_for_policy, get_mmvq_mmid_max_batch(src0->type, cc),
+                    small_route_gemv_preferred, false, "hipblaslt_i8_iq2_xxs_moe_grouped");
+            ggml_cuda_kernel_attrib_log_mul_mat(__func__, "id_hipblaslt_i8_iq2_xxs_moe_grouped", src0, src1, dst);
+            if (ggml_cuda_mul_mat_hipblaslt_i8(ctx, src0, src1, ids, dst)) {
+                return;
+            }
+            GGML_LOG_WARN("%s: id_hipblaslt_i8_iq2_xxs_moe_grouped failed; falling back to standard MUL_MAT_ID route tensor=%s dst=%s\n", __func__, src0->name, dst->name);
+        } else if (ggml_cuda_should_use_hipblaslt_i8_iq2_xs_moe_grouped(src0, src1, ids, dst, cc)) {
+            ggml_cuda_mtp_moe_route_policy_log(__func__, src0, ne2, n_expert_used_for_policy, get_mmvq_mmid_max_batch(src0->type, cc),
+                    small_route_gemv_preferred, false, "hipblaslt_i8_iq2_xs_moe_grouped");
+            ggml_cuda_kernel_attrib_log_mul_mat(__func__, "id_hipblaslt_i8_iq2_xs_moe_grouped", src0, src1, dst);
+            if (ggml_cuda_mul_mat_hipblaslt_i8(ctx, src0, src1, ids, dst)) {
+                return;
+            }
+            GGML_LOG_WARN("%s: id_hipblaslt_i8_iq2_xs_moe_grouped failed; falling back to standard MUL_MAT_ID route tensor=%s dst=%s\n", __func__, src0->name, dst->name);
+        } else if (ggml_cuda_should_use_hipblaslt_i8_iq2_s_moe_grouped(src0, src1, ids, dst, cc)) {
+            ggml_cuda_mtp_moe_route_policy_log(__func__, src0, ne2, n_expert_used_for_policy, get_mmvq_mmid_max_batch(src0->type, cc),
+                    small_route_gemv_preferred, false, "hipblaslt_i8_iq2_s_moe_grouped");
+            ggml_cuda_kernel_attrib_log_mul_mat(__func__, "id_hipblaslt_i8_iq2_s_moe_grouped", src0, src1, dst);
+            if (ggml_cuda_mul_mat_hipblaslt_i8(ctx, src0, src1, ids, dst)) {
+                return;
+            }
+            GGML_LOG_WARN("%s: id_hipblaslt_i8_iq2_s_moe_grouped failed; falling back to standard MUL_MAT_ID route tensor=%s dst=%s\n", __func__, src0->name, dst->name);
+        } else if (ggml_cuda_should_use_hipblaslt_i8_q8_0_moe_grouped(src0, src1, ids, dst, cc)) {
+            ggml_cuda_mtp_moe_route_policy_log(__func__, src0, ne2, n_expert_used_for_policy, get_mmvq_mmid_max_batch(src0->type, cc),
+                    small_route_gemv_preferred, false, "hipblaslt_i8_q8_0_moe_grouped");
+            ggml_cuda_kernel_attrib_log_mul_mat(__func__, "id_hipblaslt_i8_q8_0_moe_grouped", src0, src1, dst);
+            if (ggml_cuda_mul_mat_hipblaslt_i8(ctx, src0, src1, ids, dst)) {
+                return;
+            }
+            GGML_LOG_WARN("%s: id_hipblaslt_i8_q8_0_moe_grouped failed; falling back to standard MUL_MAT_ID route tensor=%s dst=%s\n", __func__, src0->name, dst->name);
+        } else if (ggml_cuda_should_use_hipblaslt_i8_q6_K_moe_grouped(src0, src1, ids, dst, cc)) {
+            ggml_cuda_mtp_moe_route_policy_log(__func__, src0, ne2, n_expert_used_for_policy, get_mmvq_mmid_max_batch(src0->type, cc),
+                    small_route_gemv_preferred, false, "hipblaslt_i8_q6_K_moe_grouped");
+            ggml_cuda_kernel_attrib_log_mul_mat(__func__, "id_hipblaslt_i8_q6_K_moe_grouped", src0, src1, dst);
+            if (ggml_cuda_mul_mat_hipblaslt_i8(ctx, src0, src1, ids, dst)) {
+                return;
+            }
+            GGML_LOG_WARN("%s: id_hipblaslt_i8_q6_K_moe_grouped failed; falling back to standard MUL_MAT_ID route tensor=%s dst=%s\n", __func__, src0->name, dst->name);
+        } else if (ggml_cuda_should_use_hipblaslt_i8_q8_K_moe_grouped(src0, src1, ids, dst, cc)) {
+            ggml_cuda_mtp_moe_route_policy_log(__func__, src0, ne2, n_expert_used_for_policy, get_mmvq_mmid_max_batch(src0->type, cc),
+                    small_route_gemv_preferred, false, "hipblaslt_i8_q8_K_moe_grouped");
+            ggml_cuda_kernel_attrib_log_mul_mat(__func__, "id_hipblaslt_i8_q8_K_moe_grouped", src0, src1, dst);
+            if (ggml_cuda_mul_mat_hipblaslt_i8(ctx, src0, src1, ids, dst)) {
+                return;
+            }
+            GGML_LOG_WARN("%s: id_hipblaslt_i8_q8_K_moe_grouped failed; falling back to standard MUL_MAT_ID route tensor=%s dst=%s\n", __func__, src0->name, dst->name);
+        } else if (ggml_cuda_should_use_hipblaslt_i8_q2_K_moe_grouped(src0, src1, ids, dst, cc)) {
+            ggml_cuda_mtp_moe_route_policy_log(__func__, src0, ne2, n_expert_used_for_policy, get_mmvq_mmid_max_batch(src0->type, cc),
+                    small_route_gemv_preferred, false, "hipblaslt_i8_q2_K_moe_grouped");
+            ggml_cuda_kernel_attrib_log_mul_mat(__func__, "id_hipblaslt_i8_q2_K_moe_grouped", src0, src1, dst);
+            if (ggml_cuda_mul_mat_hipblaslt_i8(ctx, src0, src1, ids, dst)) {
+                return;
+            }
+            GGML_LOG_WARN("%s: id_hipblaslt_i8_q2_K_moe_grouped failed; falling back to standard MUL_MAT_ID route tensor=%s dst=%s\n", __func__, src0->name, dst->name);
+        } else if (ggml_cuda_should_use_hipblaslt_i8_q3_K_moe_grouped(src0, src1, ids, dst, cc)) {
+            ggml_cuda_mtp_moe_route_policy_log(__func__, src0, ne2, n_expert_used_for_policy, get_mmvq_mmid_max_batch(src0->type, cc),
+                    small_route_gemv_preferred, false, "hipblaslt_i8_q3_K_moe_grouped");
+            ggml_cuda_kernel_attrib_log_mul_mat(__func__, "id_hipblaslt_i8_q3_K_moe_grouped", src0, src1, dst);
+            if (ggml_cuda_mul_mat_hipblaslt_i8(ctx, src0, src1, ids, dst)) {
+                return;
+            }
+            GGML_LOG_WARN("%s: id_hipblaslt_i8_q3_K_moe_grouped failed; falling back to standard MUL_MAT_ID route tensor=%s dst=%s\n", __func__, src0->name, dst->name);
+        } else if (ggml_cuda_should_use_hipblaslt_i8_q4_K_moe_grouped(src0, src1, ids, dst, cc)) {
+            ggml_cuda_mtp_moe_route_policy_log(__func__, src0, ne2, n_expert_used_for_policy, get_mmvq_mmid_max_batch(src0->type, cc),
+                    small_route_gemv_preferred, false, "hipblaslt_i8_q4_K_moe_grouped");
+            ggml_cuda_kernel_attrib_log_mul_mat(__func__, "id_hipblaslt_i8_q4_K_moe_grouped", src0, src1, dst);
+            if (ggml_cuda_mul_mat_hipblaslt_i8(ctx, src0, src1, ids, dst)) {
+                return;
+            }
+            GGML_LOG_WARN("%s: id_hipblaslt_i8_q4_K_moe_grouped failed; falling back to standard MUL_MAT_ID route tensor=%s dst=%s\n", __func__, src0->name, dst->name);
+        } else if (ggml_cuda_should_use_hipblaslt_i8_q5_K_moe_grouped(src0, src1, ids, dst, cc)) {
+            ggml_cuda_mtp_moe_route_policy_log(__func__, src0, ne2, n_expert_used_for_policy, get_mmvq_mmid_max_batch(src0->type, cc),
+                    small_route_gemv_preferred, false, "hipblaslt_i8_q5_K_moe_grouped");
+            ggml_cuda_kernel_attrib_log_mul_mat(__func__, "id_hipblaslt_i8_q5_K_moe_grouped", src0, src1, dst);
+            if (ggml_cuda_mul_mat_hipblaslt_i8(ctx, src0, src1, ids, dst)) {
+                return;
+            }
+            GGML_LOG_WARN("%s: id_hipblaslt_i8_q5_K_moe_grouped failed; falling back to standard MUL_MAT_ID route tensor=%s dst=%s\n", __func__, src0->name, dst->name);
+        } else if (ggml_cuda_should_use_hipblaslt_i8_q4_0_moe_grouped(src0, src1, ids, dst, cc)) {
+            ggml_cuda_mtp_moe_route_policy_log(__func__, src0, ne2, n_expert_used_for_policy, get_mmvq_mmid_max_batch(src0->type, cc),
+                    small_route_gemv_preferred, false, "hipblaslt_i8_q4_0_moe_grouped");
+            ggml_cuda_kernel_attrib_log_mul_mat(__func__, "id_hipblaslt_i8_q4_0_moe_grouped", src0, src1, dst);
+            if (ggml_cuda_mul_mat_hipblaslt_i8(ctx, src0, src1, ids, dst)) {
+                return;
+            }
+            GGML_LOG_WARN("%s: id_hipblaslt_i8_q4_0_moe_grouped failed; falling back to standard MUL_MAT_ID route tensor=%s dst=%s\n", __func__, src0->name, dst->name);
+        } else if (ggml_cuda_should_use_hipblaslt_i8_q4_1_moe_grouped(src0, src1, ids, dst, cc)) {
+            ggml_cuda_mtp_moe_route_policy_log(__func__, src0, ne2, n_expert_used_for_policy, get_mmvq_mmid_max_batch(src0->type, cc),
+                    small_route_gemv_preferred, false, "hipblaslt_i8_q4_1_moe_grouped");
+            ggml_cuda_kernel_attrib_log_mul_mat(__func__, "id_hipblaslt_i8_q4_1_moe_grouped", src0, src1, dst);
+            if (ggml_cuda_mul_mat_hipblaslt_i8(ctx, src0, src1, ids, dst)) {
+                return;
+            }
+            GGML_LOG_WARN("%s: id_hipblaslt_i8_q4_1_moe_grouped failed; falling back to standard MUL_MAT_ID route tensor=%s dst=%s\n", __func__, src0->name, dst->name);
+        } else if (ggml_cuda_should_use_hipblaslt_i8_q5_0_moe_grouped(src0, src1, ids, dst, cc)) {
+            ggml_cuda_mtp_moe_route_policy_log(__func__, src0, ne2, n_expert_used_for_policy, get_mmvq_mmid_max_batch(src0->type, cc),
+                    small_route_gemv_preferred, false, "hipblaslt_i8_q5_0_moe_grouped");
+            ggml_cuda_kernel_attrib_log_mul_mat(__func__, "id_hipblaslt_i8_q5_0_moe_grouped", src0, src1, dst);
+            if (ggml_cuda_mul_mat_hipblaslt_i8(ctx, src0, src1, ids, dst)) {
+                return;
+            }
+            GGML_LOG_WARN("%s: id_hipblaslt_i8_q5_0_moe_grouped failed; falling back to standard MUL_MAT_ID route tensor=%s dst=%s\n", __func__, src0->name, dst->name);
+        } else if (ggml_cuda_should_use_hipblaslt_i8_q5_1_moe_grouped(src0, src1, ids, dst, cc)) {
+            ggml_cuda_mtp_moe_route_policy_log(__func__, src0, ne2, n_expert_used_for_policy, get_mmvq_mmid_max_batch(src0->type, cc),
+                    small_route_gemv_preferred, false, "hipblaslt_i8_q5_1_moe_grouped");
+            ggml_cuda_kernel_attrib_log_mul_mat(__func__, "id_hipblaslt_i8_q5_1_moe_grouped", src0, src1, dst);
+            if (ggml_cuda_mul_mat_hipblaslt_i8(ctx, src0, src1, ids, dst)) {
+                return;
+            }
+            GGML_LOG_WARN("%s: id_hipblaslt_i8_q5_1_moe_grouped failed; falling back to standard MUL_MAT_ID route tensor=%s dst=%s\n", __func__, src0->name, dst->name);
+        }
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
@@ -4978,6 +5234,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * src1 = up->src[1];
             const ggml_tensor * ids  = up->src[2];
 
+            if (op == GGML_OP_MUL_MAT && ids == nullptr && ggml_cuda_mul_mat_hipblaslt_i8_dense_gate_up(*cuda_ctx, up, gate, glu)) {
+                fused_mul_mat_vec = true;
+                fused_node_count  = 3;
+                break;
+            }
+
             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate   = gate->src[0];
@@ -5115,6 +5377,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     const bool graph_trace = ggml_cuda_graph_trace_enabled();
     const int64_t eval_start_us = graph_trace ? ggml_time_us() : 0;
     ggml_cuda_mtp_q8_dot4_mmvq_act_cache_reset();
+    ggml_cuda_q8_1_act_cache_reset();
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
@@ -6064,6 +6327,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
                         return true;
+                    case GGML_TYPE_I32:
+                        if (op->op == GGML_OP_MUL_MAT && b->type == GGML_TYPE_I32 && op->type == GGML_TYPE_F32) {
+                            return ggml_cuda_should_use_rdna_i8_packed16_gemm(a, b, op, ggml_cuda_info().devices[dev_ctx->device].cc);
+                        }
+                        if (op->op == GGML_OP_MUL_MAT_ID && b->type == GGML_TYPE_I32 && op->src[2] != nullptr && op->type == GGML_TYPE_F32) {
+                            return ggml_cuda_should_use_rdna_i8_packed16_gemm_id(a, b, op->src[2], op, ggml_cuda_info().devices[dev_ctx->device].cc);
+                        }
+                        return false;
                     default:
                         return false;
                 }

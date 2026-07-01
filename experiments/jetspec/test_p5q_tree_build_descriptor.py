@@ -23,6 +23,7 @@ class P5QTreeBuildDescriptorTests(unittest.TestCase):
     def test_validator_passes(self) -> None:
         self.assertTrue(self.result["ok"], self.result["errors"])
         self.assertEqual(self.result["cmake_hits"], [])
+        self.assertEqual(self.result["dirty_p5q_hits"], [])
         self.assertEqual(self.result["status"], "p5q_tree_build_descriptor_validated")
 
     def test_allowlist_is_bounded(self) -> None:

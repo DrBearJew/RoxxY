@@ -1,0 +1,153 @@
+{
+  "accept_executed": false,
+  "approvals": {
+    "draft_token_emission_approved": false,
+    "performance_promotion_approved": false,
+    "product_runtime_hooks_approved": false,
+    "real_accept_approved": false,
+    "real_hidden_kv_commit_approved": false,
+    "real_publish_approved": false,
+    "real_rejected_branch_discard_approved": false,
+    "real_token_commit_approved": false,
+    "target_accept_walk_approved": false,
+    "visible_token_publish_approved": false
+  },
+  "completed_chain": [
+    "P5AK",
+    "P5AL",
+    "P5AM",
+    "P5AN",
+    "P5AO",
+    "P5AP",
+    "P5AQ",
+    "P5AR",
+    "P5AS",
+    "P5AT",
+    "P5AU",
+    "P5AV"
+  ],
+  "context_created": false,
+  "draft_tokens_emitted": false,
+  "errors": [],
+  "kv_mutated": false,
+  "model_loaded": false,
+  "ok": true,
+  "p5av_target_logits_walk_evidence": {
+    "accept_decision_source": "target_logits_canary_only_no_accept",
+    "actual_accepted_nodes": 0,
+    "actual_target_accept_steps": 0,
+    "actual_target_logits_rows_walked": 1,
+    "candidate_ids": [
+      92637,
+      2054
+    ],
+    "correction_token_present": 0,
+    "planned_candidate_nodes": [
+      1,
+      2
+    ],
+    "planned_parent_nodes": [
+      0
+    ],
+    "planned_target_logits_rows": 1,
+    "row_semantics": "parent_position_scores_candidate_children",
+    "target_candidate_logits": [
+      12.5,
+      11.25
+    ],
+    "target_logits_batch_index": 0,
+    "target_logits_pos": 23,
+    "target_logits_seq_id": 3,
+    "target_logits_source": "target_model_full_vocab_logits",
+    "target_logits_walk_canary_only": true,
+    "target_logits_width": 248320,
+    "trace_status": "p5av_target_logits_walk_canary_trace_contract_verified",
+    "wiring_status": "p5av_real_draft_head_topk_target_logits_walk_canary_contract_wiring_validated"
+  },
+  "promotion_result": "target_accept_walk_blocked_pending_explicit_approval",
+  "runtime_boundary": {
+    "accept_executed": false,
+    "context_created": false,
+    "draft_tokens_emitted": false,
+    "kv_mutated": false,
+    "llama_decode_called": false,
+    "model_loaded": false,
+    "real_hidden_kv_commit_executed": false,
+    "real_publish_executed": false,
+    "real_rejected_branch_discard_executed": false,
+    "real_token_commit_executed": false,
+    "runtime_executed": false,
+    "target_accept_walk_executed": false,
+    "visible_state_changed": false,
+    "visible_token_publish_executed": false
+  },
+  "runtime_executed": false,
+  "runtime_hooks": {
+    "common_speculative_hook": false,
+    "ggml_kv_mutation_hook": false,
+    "p5ad_root_publish_noop_product_hook_reuse": false,
+    "p5aw_target_accept_walk_runtime_hook": false,
+    "p5t_token_commit_runtime_product_hook": false,
+    "p5u_hidden_kv_survivor_commit_runtime_product_hook": false,
+    "p5v_rejected_branch_discard_runtime_product_hook": false,
+    "p5w_publish_gate_runtime_product_hook": false,
+    "public_api_route_hook": false,
+    "server_draft_token_emission_hook": false
+  },
+  "side_effect_counters": {
+    "actual_accepted_nodes": 0,
+    "actual_committed_tokens": 0,
+    "actual_draft_tokens_emitted": 0,
+    "actual_pages_discarded": 0,
+    "actual_publish_visible_state": 0,
+    "actual_survivor_pages_committed": 0,
+    "actual_target_accept_steps": 0,
+    "additional_target_logits_rows_walked": 0,
+    "correction_token_present": 0,
+    "rejected_branch_pages_reachable_after_discard": 0
+  },
+  "source_tree": {
+    "actual_tree_nodes": 3,
+    "actual_verify_mask_entries": 5,
+    "allowed_edges": [
+      "0:0",
+      "1:0",
+      "1:1",
+      "2:0",
+      "2:2"
+    ],
+    "candidate_ids": [
+      92637,
+      2054
+    ],
+    "candidate_nodes": 2,
+    "real_tree_token_ids": [
+      13,
+      92637,
+      2054
+    ]
+  },
+  "status": "p5aw_target_accept_walk_readiness_verified_not_executed",
+  "target_accept_plan": {
+    "actual_accepted_nodes": 0,
+    "actual_target_accept_steps": 0,
+    "correction_token_present": 0,
+    "planned_accept_candidate_ids": [
+      92637,
+      2054
+    ],
+    "planned_accept_candidate_nodes": [
+      1,
+      2
+    ],
+    "planned_accept_output_visibility": "metadata_only_until_explicit_runtime_approval",
+    "planned_accept_parent_nodes": [
+      0
+    ],
+    "planned_accept_rule": "greedy_target_argmax_child_match_or_correction",
+    "planned_accept_score_source": "target_candidate_logits_from_p5av_row",
+    "planned_correction_token_source": "target_full_vocab_argmax_when_no_child_match",
+    "planned_target_accept_steps": 1
+  },
+  "target_accept_walk_executed": false
+}

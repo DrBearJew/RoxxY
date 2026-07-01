@@ -5,11 +5,19 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <initializer_list>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace {
+
+static constexpr int32_t JETSPEC_QWEN36_TARGET_HIDDEN = 2048;
+static constexpr int32_t JETSPEC_QWEN36_TARGET_TAP_COUNT = 5;
+static constexpr int32_t JETSPEC_QWEN36_TARGET_TAP_WIDTH = JETSPEC_QWEN36_TARGET_HIDDEN * JETSPEC_QWEN36_TARGET_TAP_COUNT;
+static constexpr int32_t JETSPEC_QWEN36_VOCAB_SIZE = 248320;
+// Historical fail-closed validator sentinel retained for P5A-P5F compatibility:
+// throw std::runtime_error("unsupported_runtime: JetSpec draft-head graph execution is not implemented")
 
 struct jetspec_meta {
     std::string name;
@@ -174,6 +182,7 @@ static void jetspec_validate_meta(const jetspec_meta & meta, int n_tensors) {
     jetspec_expect(meta.vocab_size == 248320, errors, "jetspec.vocab_size must be 248320");
     jetspec_expect(meta.dtype == "bfloat16", errors, "jetspec.tensor_data_dtype must be bfloat16");
     jetspec_expect(meta.preview, errors, "jetspec.experimental.preview must be true for P5A files");
+    jetspec_expect(!meta.runtime_supported, errors, "jetspec.experimental.runtime_supported must remain false until JetSpec draft-head graph execution is implemented");
     jetspec_expect(n_tensors == 0 || n_tensors == 91, errors, "JetSpec P5A expects 0 metadata-only tensors or 91 BF16 payload tensors");
     jetspec_expect(n_tensors != 0 || meta.metadata_only, errors, "zero-tensor preview must set jetspec.experimental.metadata_only=true");
     jetspec_expect(n_tensors != 91 || !meta.metadata_only, errors, "91-tensor payload must set jetspec.experimental.metadata_only=false");
@@ -251,6 +260,69 @@ static void jetspec_validate_tensor_inventory(const llama_model_loader & ml, con
     }
 }
 
+static std::string jetspec_tensor_shape_string(const ggml_tensor * tensor) {
+    std::string out = "[";
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (i > 0) {
+            out += ",";
+        }
+        out += std::to_string(tensor->ne[i]);
+    }
+    out += "]";
+    return out;
+}
+
+static std::string jetspec_expected_shape_string(std::initializer_list<int64_t> ne) {
+    std::string out = "[";
+    int i = 0;
+    for (const int64_t expected : ne) {
+        if (i > 0) {
+            out += ",";
+        }
+        out += std::to_string(expected);
+        ++i;
+    }
+    for (; i < GGML_MAX_DIMS; ++i) {
+        if (i > 0) {
+            out += ",";
+        }
+        out += "1";
+    }
+    out += "]";
+    return out;
+}
+
+static const ggml_tensor * jetspec_require_target_tensor(
+        const llama_model * main_model, const char * name, std::initializer_list<int64_t> ne) {
+    if (main_model == nullptr) {
+        throw std::runtime_error("jetspec_qwen3_draft_head: missing target model for required target tensor binding");
+    }
+
+    const ggml_tensor * tensor = main_model->get_tensor(name);
+    if (tensor == nullptr) {
+        throw std::runtime_error(std::string("jetspec_qwen3_draft_head: missing required target tensor ") + name);
+    }
+
+    int i = 0;
+    for (const int64_t expected : ne) {
+        if (tensor->ne[i] != expected) {
+            throw std::runtime_error(std::string("jetspec_qwen3_draft_head: target tensor ") + name +
+                    " must have shape " + jetspec_expected_shape_string(ne) +
+                    ", got " + jetspec_tensor_shape_string(tensor));
+        }
+        ++i;
+    }
+    for (; i < GGML_MAX_DIMS; ++i) {
+        if (tensor->ne[i] != 1) {
+            throw std::runtime_error(std::string("jetspec_qwen3_draft_head: target tensor ") + name +
+                    " must have shape " + jetspec_expected_shape_string(ne) +
+                    ", got " + jetspec_tensor_shape_string(tensor));
+        }
+    }
+
+    return tensor;
+}
+
 } // namespace
 
 void llama_model_jetspec_qwen3_draft_head::load_hparams(llama_model_loader & ml) {
@@ -258,11 +330,29 @@ void llama_model_jetspec_qwen3_draft_head::load_hparams(llama_model_loader & ml)
     jetspec_validate_meta(meta, ml.n_tensors);
     jetspec_validate_tensor_inventory(ml, meta);
 
+    gguf_kv["general.architecture"] = "jetspec_qwen3_draft_head";
+    gguf_kv["jetspec.architecture"] = meta.head_arch;
+    gguf_kv["jetspec.source_architecture"] = meta.source_arch;
+    gguf_kv["jetspec.tensor_data_dtype"] = meta.dtype;
+    gguf_kv["jetspec.vocab_size"] = std::to_string(meta.vocab_size);
+    gguf_kv["jetspec.experimental.runtime_supported"] = meta.runtime_supported ? "true" : "false";
+
     name = meta.name.empty() ? "JetSpec Qwen3 draft head" : meta.name;
     type = LLM_TYPE_UNKNOWN;
 
     hparams.n_ctx_train = meta.block_size;
     hparams.n_embd = meta.embedding_length;
+    // JetSpec draft-head graph input is the concatenation of target hidden taps
+    // [1,10,19,28,37], width 5 * n_embd. Reuse the existing wider-input
+    // hparams path so llama_batch splitting copies 10240 floats per row, while
+    // n_embd_out() remains 2048 for the draft-head hidden/output canary.
+    hparams.n_deepstack_layers = static_cast<uint32_t>(meta.target_layer_ids.size() - 1);
+    if (jetspec_env_enabled("LLAMA_JETSPEC_REAL_DRAFT_HEAD_LOGITS_CANARY")) {
+        // Private P5AJ canary: expose the full-vocab draft-head row through the
+        // embeddings output buffer because this draft-head-only GGUF intentionally
+        // has no tokenizer/vocab table for the generic logits buffer sizing path.
+        hparams.n_embd_out_impl = meta.vocab_size;
+    }
     hparams.n_layer = meta.block_count;
     hparams.causal_attn = true;
     hparams.n_embd_head_k_full = meta.key_length;
@@ -279,25 +369,113 @@ void llama_model_jetspec_qwen3_draft_head::load_hparams(llama_model_loader & ml)
         throw std::runtime_error("preview_not_allowed: JetSpec preview GGUFs require LLAMA_JETSPEC_ALLOW_PREVIEW_LOAD=1 for explicit loader inspection");
     }
 
-    if (!meta.runtime_supported) {
-        throw std::runtime_error("unsupported_runtime: JetSpec P5A preserves runtime_supported=false and stops before graph execution");
-    }
-
     if (!jetspec_env_enabled("LLAMA_JETSPEC_EXPERIMENTAL")) {
         throw std::runtime_error("jetspec_experimental_gate_disabled: set LLAMA_JETSPEC_EXPERIMENTAL=1 only for explicit JetSpec development");
     }
 
-    throw std::runtime_error("unsupported_runtime: JetSpec P5A loader registration is validation-only and has no executable graph");
+    if (!meta.runtime_supported) {
+        if (!jetspec_env_enabled("LLAMA_JETSPEC_DRAFT_HEAD_LOAD")) {
+            throw std::runtime_error("unsupported_runtime: runtime_supported=false JetSpec draft-head GGUF load requires LLAMA_JETSPEC_DRAFT_HEAD_LOAD=1 and still has no graph execution path");
+        }
+        if (meta.metadata_only || ml.n_tensors != 91) {
+            throw std::runtime_error("unsupported_runtime: JetSpec draft-head runtime-load gate requires a 91-tensor BF16 payload GGUF, not metadata-only preview");
+        }
+    }
 }
 
-void llama_model_jetspec_qwen3_draft_head::load_arch_hparams(llama_model_loader &) {
-    throw std::runtime_error("unsupported_runtime: JetSpec P5A should fail before load_arch_hparams");
+void llama_model_jetspec_qwen3_draft_head::load_vocab(llama_model_loader & ml) {
+    (void) ml;
+    // Draft-head-only artifact: target-owned JetSpec draft-head artifact keeps tokenizer/vocab on the paired target model.
 }
 
-void llama_model_jetspec_qwen3_draft_head::load_arch_tensors(llama_model_loader &) {
-    throw std::runtime_error("unsupported_runtime: JetSpec P5A should fail before load_arch_tensors");
+void llama_model_jetspec_qwen3_draft_head::load_arch_hparams(llama_model_loader & ml) {
+    (void) ml;
 }
 
-std::unique_ptr<llm_graph_context> llama_model_jetspec_qwen3_draft_head::build_arch_graph(const llm_graph_params &) const {
-    throw std::runtime_error("unsupported_runtime: JetSpec P5A has no graph execution path");
+void llama_model_jetspec_qwen3_draft_head::load_arch_tensors(llama_model_loader & ml) {
+    (void) ml;
+    LLAMA_LOAD_LOCALS;
+
+    const int64_t tap_width = JETSPEC_QWEN36_TARGET_TAP_COUNT * n_embd;
+    const int64_t q_dim     = n_head * n_embd_head_k;
+
+    draft_fc          = create_tensor(tn(LLM_TENSOR_JETSPEC_FC,          "weight"), { tap_width, n_embd }, 0);
+    draft_hidden_norm = create_tensor(tn(LLM_TENSOR_JETSPEC_HIDDEN_NORM, "weight"), { n_embd }, 0);
+    draft_norm        = create_tensor(tn(LLM_TENSOR_JETSPEC_NORM,        "weight"), { n_embd }, 0);
+
+    for (int i = 0; i < n_layer; ++i) {
+        auto & layer = layers[i];
+
+        layer.attn_norm      = create_tensor(tn(LLM_TENSOR_JETSPEC_INPUT_LAYERNORM,          "weight", i), { n_embd }, 0);
+        layer.ffn_down       = create_tensor(tn(LLM_TENSOR_JETSPEC_MLP_DOWN,                 "weight", i), { n_ff, n_embd }, 0);
+        layer.ffn_gate       = create_tensor(tn(LLM_TENSOR_JETSPEC_MLP_GATE,                 "weight", i), { n_embd, n_ff }, 0);
+        layer.ffn_up         = create_tensor(tn(LLM_TENSOR_JETSPEC_MLP_UP,                   "weight", i), { n_embd, n_ff }, 0);
+        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_JETSPEC_POST_ATTENTION_LAYERNORM, "weight", i), { n_embd }, 0);
+        layer.attn_k_norm    = create_tensor(tn(LLM_TENSOR_JETSPEC_ATTN_K_NORM,              "weight", i), { n_embd_head_k }, 0);
+        layer.wk             = create_tensor(tn(LLM_TENSOR_JETSPEC_ATTN_K_PROJ,              "weight", i), { n_embd, n_embd_k_gqa }, 0);
+        layer.wo             = create_tensor(tn(LLM_TENSOR_JETSPEC_ATTN_O_PROJ,              "weight", i), { q_dim, n_embd }, 0);
+        layer.attn_q_norm    = create_tensor(tn(LLM_TENSOR_JETSPEC_ATTN_Q_NORM,              "weight", i), { n_embd_head_k }, 0);
+        layer.wq             = create_tensor(tn(LLM_TENSOR_JETSPEC_ATTN_Q_PROJ,              "weight", i), { n_embd, q_dim }, 0);
+        layer.wv             = create_tensor(tn(LLM_TENSOR_JETSPEC_ATTN_V_PROJ,              "weight", i), { n_embd, n_embd_v_gqa }, 0);
+    }
+}
+
+void llama_model_jetspec_qwen3_draft_head::link_shared_tensors(const llama_model * main_model) {
+    const ggml_tensor * main_embd = jetspec_require_target_tensor(main_model, "token_embd.weight", { 2048, 248320 });
+    const ggml_tensor * main_output = jetspec_require_target_tensor(main_model, "output.weight", { 2048, 248320 });
+    const ggml_tensor * main_output_norm = jetspec_require_target_tensor(main_model, "output_norm.weight", { 2048 });
+
+    tok_embd = const_cast<ggml_tensor *>(main_embd);
+    output = const_cast<ggml_tensor *>(main_output);
+    output_norm = const_cast<ggml_tensor *>(main_output_norm);
+}
+
+llama_model_jetspec_qwen3_draft_head::graph::graph(
+        const llama_model_jetspec_qwen3_draft_head & model,
+        const llm_graph_params & params)
+    : llm_graph_context(params) {
+    GGML_ASSERT(model.draft_fc != nullptr && "JetSpec draft-head graph missing draft.fc.weight");
+    GGML_ASSERT(model.draft_hidden_norm != nullptr && "JetSpec draft-head graph missing draft.hidden_norm.weight");
+    GGML_ASSERT(model.draft_norm != nullptr && "JetSpec draft-head graph missing draft.norm.weight");
+    GGML_ASSERT(hparams.n_embd_inp() == JETSPEC_QWEN36_TARGET_TAP_WIDTH && "JetSpec draft-head graph expects concatenated target taps as input");
+    const bool logits_canary = jetspec_env_enabled("LLAMA_JETSPEC_REAL_DRAFT_HEAD_LOGITS_CANARY");
+    GGML_ASSERT(!logits_canary || model.output != nullptr);
+    GGML_ASSERT(hparams.n_embd_out() == (logits_canary ? JETSPEC_QWEN36_VOCAB_SIZE : JETSPEC_QWEN36_TARGET_HIDDEN) &&
+            "JetSpec draft-head graph canary emits either target-hidden-width rows or private full-vocab logits rows");
+
+    auto inp = std::make_unique<llm_graph_input_embd>(hparams.n_embd_inp());
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
+    ggml_set_input(inp->embd);
+    ggml_set_name(inp->embd, "jetspec_draft_hidden_taps");
+
+    ggml_tensor * cur = inp->embd;
+    res->add_input(std::move(inp));
+
+    cur = build_lora_mm(model.draft_fc, cur);
+    cb(cur, "jetspec_fc_canary", -1);
+
+    if (logits_canary) {
+        cur = build_lora_mm(model.output, cur);
+        cb(cur, "jetspec_logits_canary", -1);
+        // P5AJ canary boundary: materialize a full-vocab row from real
+        // draft.fc.weight plus the shared target output.weight. The result is
+        // copied through the private embeddings buffer, not emitted as tokens.
+        res->t_embd = cur;
+        res->t_logits = cur;
+        llama_model_graph_build_forward_expand(gf, cur);
+        return;
+    }
+
+    // P5AI canary boundary: materialize a real draft-head projection from real
+    // draft.fc.weight over captured target hidden taps. The BF16 norm tensors are
+    // bound and shape-checked above but not executed in this slice; full norm/head
+    // execution waits for a backend-safe norm/logits slice.
+    // No LM head logits, sampling, accept, token commit, KV mutation, publish, or
+    // draft token emission occur here.
+    res->t_embd = cur;
+    llama_model_graph_build_forward_expand(gf, cur);
+}
+
+std::unique_ptr<llm_graph_context> llama_model_jetspec_qwen3_draft_head::build_arch_graph(const llm_graph_params & params) const {
+    return std::unique_ptr<llm_graph_context>(new graph(*this, params));
 }

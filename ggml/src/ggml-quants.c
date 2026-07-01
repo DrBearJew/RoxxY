@@ -2005,6 +2005,13 @@ size_t quantize_q6_K(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     return nrow * row_size;
 }
 
+size_t quantize_q8_K(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    const size_t row_size = ggml_row_size(GGML_TYPE_Q8_K, n_per_row);
+    quantize_row_q8_K_ref(src, (block_q8_K *) dst, nrow * n_per_row);
+    return nrow * row_size;
+}
+
 static void quantize_row_q4_0_impl(const float * GGML_RESTRICT x, block_q4_0 * GGML_RESTRICT y, int64_t n_per_row, const float * quant_weights) {
     static_assert(QK4_0 == 32, "QK4_0 must be 32");
 

@@ -16,6 +16,7 @@ struct llama_model;
 struct llama_context;
 struct llama_kv_cache_direct_tx;
 struct ggml_cuda_mtp_qblock_tail_page_map_v1;
+struct ggml_cuda_mtp_qblock_full_page_map_v1;
 
 // Consumer-requested V layout for get_v() overload.
 // DEFAULT delegates to the legacy v_trans heuristic.
@@ -265,7 +266,13 @@ public:
     slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
-    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
+    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool authority_mutation = true);
+
+    // Prepare cache-owned full current-K page authority once after KV metadata mutation and n_kv computation.
+    bool prepare_mtp_qblock_full_current_k_page_authority(
+            uint32_t n_kv,
+            const slot_info & sinfo,
+            const char ** reason = nullptr) const;
 
     //
     // input API
@@ -332,6 +339,48 @@ private:
             const slot_info & sinfo,
             const char ** reason = nullptr) const;
 
+    struct qblock_full_current_k_page_authority {
+        bool active = false;
+        bool dirty = true;
+        uint32_t flags = 0;
+        uint32_t logical_base_token = 0;
+        uint32_t valid_tokens = 0;
+        uint32_t page_tokens = LLAMA_MTP_QBLOCK_PAGED_STATE_PAGE_TOKENS;
+        uint32_t physical_pages = 0;
+        uint32_t block_table_pages = 0;
+        uint32_t non_identity_page_begin = 0;
+        uint32_t non_identity_page_end = 0;
+        llama_seq_id seq_id = -1;
+        uint64_t generation = 0;
+        uint64_t source_epoch = 0;
+        uint64_t published_generation = 0;
+        uint64_t published_map_signature = 0;
+        const void * owner_k_view_data = nullptr;
+        std::vector<int32_t> block_table;
+    };
+
+    void invalidate_mtp_qblock_full_current_k_page_authority(const char * reason = "unspecified") const;
+    void clear_mtp_qblock_full_current_k_page_authority(const char * reason = "unspecified") const;
+    bool rebuild_mtp_qblock_full_current_k_page_authority(
+            uint32_t n_kv,
+            uint32_t kv_size_total,
+            const slot_info & sinfo,
+            const char ** reason = nullptr) const;
+    bool publish_mtp_qblock_full_current_k_page_authority(
+            const ggml_tensor * k_view,
+            const char ** reason = nullptr) const;
+    bool publish_mtp_qblock_full_current_k_page_authority_to_registered_layers(
+            const char ** reason = nullptr) const;
+    bool extend_mtp_qblock_full_current_k_page_authority_from_ubatch(
+            const slot_info & sinfo,
+            const llama_ubatch & ubatch,
+            bool metadata_rewrite,
+            const char ** reason = nullptr) const;
+    bool map_mtp_qblock_full_current_k_slot(
+            uint32_t logical_token,
+            uint32_t * physical_slot,
+            const char ** reason = nullptr) const;
+
     bool v_trans = true;  // the value tensor is transposed
 
     const uint32_t n_seq_max = 1;
@@ -384,6 +433,8 @@ private:
     std::vector<kv_layer> layers;
 
     mutable llama_mtp_qblock_paged_state_v1 mtp_qblock_paged_state;
+    mutable qblock_full_current_k_page_authority mtp_qblock_full_current_k_page_authority;
+    mutable uint64_t mtp_qblock_full_current_k_page_authority_epoch = 1;
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
@@ -638,6 +689,9 @@ void llama_kv_cache_clear_mtp_qblock_tail_page_map(const void * k_view_data);
 void llama_kv_cache_get_mtp_qblock_tail_page_map(const void * k_view_data, struct ggml_cuda_mtp_qblock_tail_page_map_v1 * map);
 bool llama_kv_cache_get_mtp_qblock_tail_page_published_map(struct ggml_cuda_mtp_qblock_tail_page_map_v1 * map);
 void llama_kv_cache_register_mtp_qblock_full_page_map_host(const void * k_view_data, const struct ggml_cuda_mtp_qblock_full_page_map_v1 * map, const int32_t * host_block_table);
+void llama_kv_cache_register_mtp_qblock_full_page_authority_host(const void * owner_k_view_data, const struct ggml_cuda_mtp_qblock_full_page_map_v1 * map, const int32_t * host_block_table);
+size_t llama_kv_cache_register_mtp_qblock_full_page_authority_hosts(const void * const * owner_k_view_data, size_t owner_count, const struct ggml_cuda_mtp_qblock_full_page_map_v1 * map, const int32_t * host_block_table);
+void llama_kv_cache_clear_mtp_qblock_full_page_authority_host(void);
 void llama_kv_cache_clear_mtp_qblock_full_page_map(const void * k_view_data);
 void llama_kv_cache_get_mtp_qblock_full_page_map(const void * k_view_data, struct ggml_cuda_mtp_qblock_full_page_map_v1 * map);
 void llama_kv_cache_record_mtp_qblock_tail_page_dispatch_bind(const void * k_view_data, const struct ggml_cuda_mtp_qblock_tail_page_map_v1 * map, const char * node_name, int layer, int graph_inst, int nk);

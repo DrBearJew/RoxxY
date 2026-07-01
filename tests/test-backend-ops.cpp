@@ -35,6 +35,7 @@
 #include <memory>
 #include <random>
 #include <regex>
+#include <cstdlib>
 #include <set>
 #include <sstream>
 #include <string>
@@ -10638,6 +10639,106 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    if (std::getenv("GGML_TEST_I8_PREFILL_PRODUCTION_SHAPES") != nullptr) {
+        // Opt-in only: model-route oracle shapes for default-off I8 prefill candidates.
+        // Qwen3.6 27B blk.7.attn_v.weight: src0 [5120,1024], src1 rows 128/76 in server smoke.
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 1024, 128, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 1024,  76, 5120, {1, 1}, {1, 1}));
+        // Qwen3.6 35B blk.7.attn_v.weight q8_0 route-control shape.
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1024, 128, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1024,  76, 5120, {1, 1}, {1, 1}));
+        // Plain scale-only legacy quant hipBLASLt-I8 route-control shapes.
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2048, 128, 4096, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_1, GGML_TYPE_F32, 2048, 128, 4096, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_0, GGML_TYPE_F32, 2048, 128, 4096, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_1, GGML_TYPE_F32, 2048, 128, 4096, {1, 1}, {1, 1}));
+    }
+
+    if (std::getenv("GGML_TEST_I8_DENSE_FFN_GATE_UP_GROUPED_SHAPES") != nullptr) {
+        // Opt-in canary for default-off dense FFN gate+up grouped hipBLASLt-I8 routes.
+        // Shape is small but quant-legal: grouped core key [M=512,N=16,groups=2,K32/K16].
+        for (ggml_type type : {
+                GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
+                GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
+                GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 16, 512, 256,
+                false, 1, 1, false, false, true, {1, 1}));
+        }
+    }
+
+    if (std::getenv("GGML_TEST_I8_DENSE_FFN_GATE_UP_GROUPED_Q8K_SHAPES") != nullptr) {
+        // Q8_K is isolated because the generic ROCm MUL_MAT fallback aborts when the default-off dense route is disabled.
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_K, GGML_GLU_OP_SWIGLU, 16, 512, 256,
+            false, 1, 1, false, false, true, {1, 1}));
+    }
+
+    if (std::getenv("GGML_TEST_I8_DENSE_FFN_GATE_UP_GROUPED_Q2_SHAPES") != nullptr) {
+        // Q2-family dense gate+up routeproof is isolated because default-off ROCm fallback coverage varies for Q2-family types.
+        // Q2_K/IQ2_XS/IQ2_S use K16 grouped hipBLASLt-I8; IQ2_XXS uses K32 grouped hipBLASLt-I8.
+        // N=12288 matches a supported dense gate/up grouped core shape; keep this opt-in due runtime cost.
+        for (ggml_type type : { GGML_TYPE_Q2_K, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S }) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 128, 12288, 256,
+                false, 1, 1, false, false, true, {1, 1}));
+        }
+    }
+
+    if (std::getenv("GGML_TEST_I8_DENSE_FFN_GATE_UP_GROUPED_Q1_SHAPES") != nullptr) {
+        // Opt-in routeproof for exact Q1-family dense FFN gate+up grouped hipBLASLt-I8 routes.
+        // IQ1_M is intentionally absent: exact correction needs per-K8 q8 activation sums.
+        for (ggml_type type : { GGML_TYPE_Q1_0, GGML_TYPE_IQ1_S }) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 128, 12288, 256,
+                false, 1, 1, false, false, true, {1, 1}));
+        }
+    }
+
+    if (std::getenv("GGML_TEST_I8_DENSE_FFN_GATE_UP_GROUPED_TUNED_SHAPES") != nullptr) {
+        // Opt-in selector canary: hits 9B/27B dense gate+up tuned core keys without full hidden-K cost.
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 128, 12288, 256,
+            false, 1, 1, false, false, true, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q6_K, GGML_GLU_OP_SWIGLU, 128, 12288, 256,
+            false, 1, 1, false, false, true, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 128, 17408, 256,
+            false, 1, 1, false, false, true, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q6_K, GGML_GLU_OP_SWIGLU, 128, 17408, 256,
+            false, 1, 1, false, false, true, {1, 1}));
+    }
+
+    if (std::getenv("GGML_TEST_I8_GROUPED_MOE_SHAPES") != nullptr) {
+        // Opt-in canary for default-off hipBLASLt-I8 grouped MUL_MAT_ID routes.
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 16, 8, false, 2048, 4, 512));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 16, 8, false, 2048, 16, 512));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K, GGML_TYPE_F32, 16, 8, false, 2048, 16, 512));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_1, GGML_TYPE_F32, 16, 8, false, 2048, 4, 512));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_1, GGML_TYPE_F32, 16, 8, false, 2048, 16, 512));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 16, 8, false, 2048, 16, 512));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 16, 8, false, 2048, 16, 512));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 16, 8, false, 2048, 16, 512));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S,   GGML_TYPE_F32, 16, 8, false, 2048,  4, 512));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 16, 8, false, 2048, 16, 512));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ1_S,   GGML_TYPE_F32, 16, 8, false, 2048, 16, 512));
+    }
+
+    if (std::getenv("GGML_TEST_I8_GROUPED_MOE_Q8K_SHAPES") != nullptr) {
+        // Q8_K is intentionally separate from GGML_TEST_I8_GROUPED_MOE_SHAPES: the default ROCm MUL_MAT_ID fallback
+        // does not support Q8_K and aborts, so default-off controls must not instantiate this case accidentally.
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_K, GGML_TYPE_F32, 16, 8, false, 2048, 16, 512));
+    }
+
+    if (std::getenv("GGML_TEST_I8_GROUPED_MOE_Q2Q3K_SHAPES") != nullptr) {
+        // Q2_K/Q3_K/IQ2_XS/IQ2_S use the grouped K16 hipBLASLt-I8 path and are isolated because generic ROCm MUL_MAT_ID fallback coverage varies.
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K,   GGML_TYPE_F32, 16, 8, false, 2048, 16, 512));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K,   GGML_TYPE_F32, 16, 8, false, 2048, 16, 512));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XS, GGML_TYPE_F32, 16, 8, false, 2048, 16, 512));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_S,  GGML_TYPE_F32, 16, 8, false, 2048, 16, 512));
+    }
+
+    if (std::getenv("GGML_TEST_I8_GROUPED_MOE_EXACT_SHAPES") != nullptr) {
+        // Opt-in exact-shape canary for grouped hipBLASLt-I8 multi-solution selection.
+        // n_mats=n_used=128 makes every expert active with 65 rows, matching core key [M=768,N=65,groups=128,K].
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 128, 128, false, 768, 65, 512));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 768, 65, 512));
+    }
+
 #if 0
     {
         // Test paths in OpenCL
@@ -11383,7 +11484,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             16, 8, true));
     }
     // Real-ish Qwen3.5-MoE down projection dimensions: K=512 -> rows=2048, per-route expert activations.
-    for (ggml_type type : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0}) {
+    for (ggml_type type : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1}) {
         test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 16, 8, false, 2048, 4, 512));
     }
 

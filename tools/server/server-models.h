@@ -134,6 +134,9 @@ public:
     // return a copy of model metadata (thread-safe)
     std::optional<server_model_meta> get_meta(const std::string & name);
 
+    // select a model replica by tag pool:<name>, replica:<name>, or lane:<name> (thread-safe)
+    std::optional<std::string> select_replica(const std::string & name, bool require_running);
+
     // return a copy of all model metadata (thread-safe)
     std::vector<server_model_meta> get_all_meta();
 

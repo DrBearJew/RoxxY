@@ -2,8 +2,10 @@
 """Validate the P5A JetSpec production loader candidate stays default-off.
 
 This validator lives under experiments/jetspec, but it intentionally inspects the
-small approved P5A production hook set. It does not execute llama.cpp; runtime
-fail-closed behavior is verified separately by loading a metadata-only preview.
+small approved P5A production hook set. It does not execute llama.cpp; the
+metadata-only preview covers preview rejection, while P5F loader-gate/source
+checks cover LLAMA_JETSPEC_DRAFT_HEAD_LOAD and true-valued runtime_supported
+metadata rejection.
 """
 
 from __future__ import annotations
@@ -57,6 +59,8 @@ REQUIRED_FILE_TOKENS: dict[pathlib.Path, list[str]] = {
         "preview_not_allowed",
         "unsupported_runtime",
         "jetspec.experimental.runtime_supported",
+        "jetspec.experimental.runtime_supported must remain false until JetSpec draft-head graph execution is implemented",
+        "jetspec_expect(!meta.runtime_supported",
         "jetspec.experimental.metadata_only",
         "n_tensors == 0 || n_tensors == 91",
         "GGML_TYPE_BF16",

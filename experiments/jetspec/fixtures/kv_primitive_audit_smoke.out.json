@@ -83,77 +83,82 @@
   },
   "existing_symbols_audited": [
     {
-      "location_count": 10,
+      "location_count": 12,
       "locations": [
         {
-          "line": 147,
+          "line": 148,
           "path": "src/llama-kv-cache.h",
           "text": "bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;"
         },
         {
-          "line": 174,
+          "line": 189,
           "path": "src/llama-kv-cache.cpp",
           "text": "return strncmp(reason, \"seq_rm(\", 7) == 0 ||"
         },
         {
-          "line": 1508,
+          "line": 2419,
           "path": "src/llama-kv-cache.cpp",
           "text": "bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {"
         },
         {
-          "line": 1512,
+          "line": 2448,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "invalidate_mtp_qblock_full_current_k_page_authority(\"seq_rm\");"
+        },
+        {
+          "line": 2451,
           "path": "src/llama-kv-cache.cpp",
           "text": "\"seq_rm(seq=%d,p0=%lld,p1=%lld)\","
         },
         {
-          "line": 1686,
+          "line": 2625,
           "path": "src/llama-kv-cache.cpp",
           "text": "if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {"
         },
         {
-          "line": 2165,
+          "line": 3106,
           "path": "src/llama-kv-cache.cpp",
           "text": "if (!cells.is_empty(dst_idx) && cells.seq_has(dst_idx, seq_id_dst) && cells.seq_rm(dst_idx, seq_id_dst) && dst_idx < head) {"
         },
         {
-          "line": 2211,
+          "line": 3152,
           "path": "src/llama-kv-cache.cpp",
           "text": "if (!seq_rm(seq_id_dst, -1, -1)) {"
-        },
-        {
-          "line": 2937,
-          "path": "src/llama-kv-cache.cpp",
-          "text": "seq_rm(s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1);"
         }
       ],
       "purpose": "existing sequence range removal; not an exact accepted-path tree gather primitive",
       "symbol": "seq_rm"
     },
     {
-      "location_count": 5,
+      "location_count": 6,
       "locations": [
         {
-          "line": 148,
+          "line": 149,
           "path": "src/llama-kv-cache.h",
           "text": "void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;"
         },
         {
-          "line": 176,
+          "line": 191,
           "path": "src/llama-kv-cache.cpp",
           "text": "strcmp(reason, \"seq_cp\") == 0;"
         },
         {
-          "line": 1727,
+          "line": 2666,
           "path": "src/llama-kv-cache.cpp",
           "text": "void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {"
         },
         {
-          "line": 1730,
+          "line": 2669,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "invalidate_mtp_qblock_full_current_k_page_authority(\"seq_cp\");"
+        },
+        {
+          "line": 2670,
           "path": "src/llama-kv-cache.cpp",
           "text": "clear_mtp_qblock_tail_page_maps(\"seq_cp\");"
         },
         {
-          "line": 1778,
+          "line": 2718,
           "path": "src/llama-kv-cache.cpp",
           "text": "GGML_ASSERT(is_full && \"seq_cp() is only supported for full KV buffers\");"
         }
@@ -162,25 +167,30 @@
       "symbol": "seq_cp"
     },
     {
-      "location_count": 4,
+      "location_count": 5,
       "locations": [
         {
-          "line": 149,
+          "line": 150,
           "path": "src/llama-kv-cache.h",
           "text": "bool seq_import_physical(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, size_t * bytes_copied = nullptr, size_t * cells_copied = nullptr, const char ** reason = nullptr);"
         },
         {
-          "line": 1815,
+          "line": 2755,
           "path": "src/llama-kv-cache.cpp",
           "text": "bool llama_kv_cache::seq_import_physical(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, size_t * bytes_copied, size_t * cells_copied, const char ** reason) {"
         },
         {
-          "line": 1835,
+          "line": 2756,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "invalidate_mtp_qblock_full_current_k_page_authority(\"seq_import_physical\");"
+        },
+        {
+          "line": 2776,
           "path": "src/llama-kv-cache.cpp",
           "text": "clear_mtp_qblock_tail_page_maps(\"seq_import_physical\");"
         },
         {
-          "line": 1874,
+          "line": 2815,
           "path": "src/llama-kv-cache.cpp",
           "text": "\"MTP_QBLOCK_KV_PERSISTENCE: op=seq_import_physical status=%s path=%s detail=%s seq_src=%d seq_dst=%d src_count=%zu src_min=%u src_max_excl=%u bytes=%zu cells=%zu v_trans=%d n_stream=%u\\n\","
         }
@@ -189,25 +199,30 @@
       "symbol": "seq_import_physical"
     },
     {
-      "location_count": 4,
+      "location_count": 5,
       "locations": [
         {
-          "line": 150,
+          "line": 151,
           "path": "src/llama-kv-cache.h",
           "text": "void seq_keep(llama_seq_id seq_id)                                                          override;"
         },
         {
-          "line": 2340,
+          "line": 3281,
           "path": "src/llama-kv-cache.cpp",
           "text": "void llama_kv_cache::seq_keep(llama_seq_id seq_id) {"
         },
         {
-          "line": 2342,
+          "line": 3283,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "invalidate_mtp_qblock_full_current_k_page_authority(\"seq_keep\");"
+        },
+        {
+          "line": 3284,
           "path": "src/llama-kv-cache.cpp",
           "text": "clear_mtp_qblock_tail_page_maps(\"seq_keep\");"
         },
         {
-          "line": 2350,
+          "line": 3292,
           "path": "src/llama-kv-cache.cpp",
           "text": "if (cells.seq_keep(i, seq_id)) {"
         }
@@ -219,42 +234,42 @@
       "location_count": 8,
       "locations": [
         {
-          "line": 265,
+          "line": 266,
           "path": "src/llama-kv-cache.h",
           "text": "slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;"
         },
         {
-          "line": 372,
+          "line": 421,
           "path": "src/llama-kv-cache.h",
           "text": "// the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())"
         },
         {
-          "line": 373,
+          "line": 422,
           "path": "src/llama-kv-cache.h",
           "text": "// note: this is not part of the KV state and it's only used to speed-up the find_slot() method"
         },
         {
-          "line": 2215,
+          "line": 3156,
           "path": "src/llama-kv-cache.cpp",
           "text": "slot_info sinfo = find_slot(ubatch, false);"
         },
         {
-          "line": 2544,
+          "line": 3488,
           "path": "src/llama-kv-cache.cpp",
           "text": "const auto sinfo_new = find_slot(ubatch, false);"
         },
         {
-          "line": 2677,
+          "line": 3623,
           "path": "src/llama-kv-cache.cpp",
           "text": "llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {"
         },
         {
-          "line": 2974,
+          "line": 3951,
           "path": "src/llama-kv-cache.cpp",
           "text": "slot_info sinfo_new = find_slot(ubatch, false);"
         },
         {
-          "line": 4845,
+          "line": 5899,
           "path": "src/llama-kv-cache.cpp",
           "text": "sinfo = find_slot(ubatch, false);"
         }
@@ -263,47 +278,47 @@
       "symbol": "find_slot"
     },
     {
-      "location_count": 8,
+      "location_count": 9,
       "locations": [
         {
-          "line": 268,
+          "line": 269,
           "path": "src/llama-kv-cache.h",
-          "text": "void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);"
+          "text": "void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool authority_mutation = true);"
         },
         {
-          "line": 2222,
+          "line": 3163,
           "path": "src/llama-kv-cache.cpp",
           "text": "apply_ubatch(sinfo, ubatch);"
         },
         {
-          "line": 2567,
+          "line": 3512,
           "path": "src/llama-kv-cache.cpp",
-          "text": "apply_ubatch(sinfo_new, ubatch);"
+          "text": "apply_ubatch(sinfo_new, ubatch, false);"
         },
         {
-          "line": 2876,
+          "line": 3822,
           "path": "src/llama-kv-cache.cpp",
-          "text": "void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {"
+          "text": "void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool authority_mutation) {"
         },
         {
-          "line": 3006,
+          "line": 3921,
           "path": "src/llama-kv-cache.cpp",
-          "text": "apply_ubatch(tx.sinfo, ubatch);"
+          "text": "invalidate_mtp_qblock_full_current_k_page_authority(authority_reason ? authority_reason : \"apply_ubatch\");"
         },
         {
-          "line": 4851,
+          "line": 3983,
+          "path": "src/llama-kv-cache.cpp",
+          "text": "apply_ubatch(tx.sinfo, ubatch, false);"
+        },
+        {
+          "line": 5905,
           "path": "src/llama-kv-cache.cpp",
           "text": "// TODO: we cannot yet restore llama_kv_cell_ext as the apply_ubatch() does not support it yet"
         },
         {
-          "line": 4853,
+          "line": 5907,
           "path": "src/llama-kv-cache.cpp",
           "text": "apply_ubatch(sinfo, ubatch);"
-        },
-        {
-          "line": 5213,
-          "path": "src/llama-kv-cache.cpp",
-          "text": "kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);"
         }
       ],
       "purpose": "existing ubatch slot application; not an exact JetSpec gather/compact primitive",

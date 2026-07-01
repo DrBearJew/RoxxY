@@ -247,9 +247,42 @@ bool qwen35moe_prefix_moe_routed_lanes_f32_projection_shadow_diag_enabled() {
            qwen35moe_env_enabled("LLAMA_MTP_MOE_ROUTED_LANES_F32_PROJ_SHADOW_DIAG");
 }
 
+bool qwen35moe_prefix_moe_routed_lanes_real_projection_enabled() {
+    return qwen35moe_env_enabled("LLAMA_MTP_PREFIX_MOE_ROUTED_LANES_REAL_PROJ") ||
+           qwen35moe_env_enabled("LLAMA_MTP_PREFIX_MOE_ROUTED_LANES_REAL_PROJECTION") ||
+           qwen35moe_env_enabled("LLAMA_MTP_MOE_ROUTED_LANES_REAL_PROJ");
+}
+
+bool qwen35moe_prefix_moe_routed_lanes_real_gate_up_projection_enabled() {
+    return qwen35moe_prefix_moe_routed_lanes_real_projection_enabled() ||
+           qwen35moe_env_enabled("LLAMA_MTP_PREFIX_MOE_ROUTED_LANES_REAL_GATE_UP_PROJ") ||
+           qwen35moe_env_enabled("LLAMA_MTP_PREFIX_MOE_ROUTED_LANES_REAL_GATE_UP_PROJECTION") ||
+           qwen35moe_env_enabled("LLAMA_MTP_MOE_ROUTED_LANES_REAL_GATE_UP_PROJ");
+}
+
+bool qwen35moe_prefix_moe_routed_lanes_real_down_projection_enabled() {
+    return qwen35moe_prefix_moe_routed_lanes_real_projection_enabled() ||
+           qwen35moe_env_enabled("LLAMA_MTP_PREFIX_MOE_ROUTED_LANES_REAL_DOWN_PROJ") ||
+           qwen35moe_env_enabled("LLAMA_MTP_PREFIX_MOE_ROUTED_LANES_REAL_DOWN_PROJECTION") ||
+           qwen35moe_env_enabled("LLAMA_MTP_MOE_ROUTED_LANES_REAL_DOWN_PROJ");
+}
+
+int qwen35moe_prefix_moe_routed_lanes_real_projection_min_lanes() {
+    return qwen35moe_env_i32("LLAMA_MTP_PREFIX_MOE_ROUTED_LANES_REAL_PROJ_MIN_LANES",
+            qwen35moe_env_i32("LLAMA_MTP_MOE_ROUTED_LANES_REAL_PROJ_MIN_LANES", 64));
+}
+
+bool qwen35moe_prefix_moe_routed_lanes_real_projection_lanes_allowed(int64_t n_lanes) {
+    const int min_lanes = qwen35moe_prefix_moe_routed_lanes_real_projection_min_lanes();
+    return min_lanes <= 0 || n_lanes >= min_lanes;
+}
+
+bool qwen35moe_prefix_moe_routed_lanes_projection_type_supported(enum ggml_type type) {
+    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ3_S;
+}
+
 bool qwen35moe_prefix_moe_routed_lanes_quant_projection_shadow_diag_enabled(enum ggml_type type) {
-    const bool supported = type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ3_S;
-    if (!supported) {
+    if (!qwen35moe_prefix_moe_routed_lanes_projection_type_supported(type)) {
         return false;
     }
 
@@ -2193,6 +2226,52 @@ ggml_tensor * llama_model_qwen35moe::graph_prefix_verify::build_moe_ffn_stage41(
     ggml_tensor * routed_lanes_routed_act_shadow_source = nullptr;
     ggml_tensor * routed_lanes_down_shadow_source = nullptr;
     ggml_tensor * routed_lanes_moe_out_shadow_source = nullptr;
+
+    const bool routed_lanes_real_gate_up_projection_requested = qwen35moe_prefix_moe_routed_lanes_real_gate_up_projection_enabled();
+    const bool routed_lanes_real_down_projection_requested = qwen35moe_prefix_moe_routed_lanes_real_down_projection_enabled();
+    const bool routed_lanes_real_projection_lora_empty = loras == nullptr || loras->empty();
+    const ggml_type routed_lanes_gate_up_exps_type = model.layers[il].ffn_gate_up_exps != nullptr ?
+            model.layers[il].ffn_gate_up_exps->type : GGML_TYPE_COUNT;
+    const ggml_type routed_lanes_down_exps_type = model.layers[il].ffn_down_exps != nullptr ?
+            model.layers[il].ffn_down_exps->type : GGML_TYPE_COUNT;
+    const int64_t routed_lanes_real_n_lanes = n_expert_used*n_tokens;
+    const bool routed_lanes_real_shape_allowed = qwen35moe_prefix_moe_routed_lanes_real_projection_lanes_allowed(routed_lanes_real_n_lanes);
+    const bool use_routed_lanes_real_gate_up = routed_lanes_real_gate_up_projection_requested && routed_lanes_real_shape_allowed &&
+            routed_lanes_real_projection_lora_empty && !qwen35moe_prefix_moe_row_shadow_active &&
+            model.layers[il].ffn_gate_up_exps != nullptr &&
+            qwen35moe_prefix_moe_routed_lanes_projection_type_supported(routed_lanes_gate_up_exps_type);
+    const bool use_routed_lanes_real_down = routed_lanes_real_down_projection_requested && routed_lanes_real_shape_allowed &&
+            routed_lanes_real_projection_lora_empty && !qwen35moe_prefix_moe_row_shadow_active &&
+            model.layers[il].ffn_down_exps != nullptr &&
+            qwen35moe_prefix_moe_routed_lanes_projection_type_supported(routed_lanes_down_exps_type);
+
+    ggml_tensor * routed_lanes_real_lanes = nullptr;
+    ggml_tensor * routed_lanes_real_row_slot_map = nullptr;
+    ggml_tensor * routed_lanes_real_expert_bounds = nullptr;
+    ggml_tensor * routed_lanes_real_compact_x = nullptr;
+    auto ensure_routed_lanes_real_plan = [&]() {
+        if (routed_lanes_real_lanes == nullptr) {
+            routed_lanes_real_lanes = ggml_moe_routed_lanes(ctx0, selected_experts, weights, (int) n_expert);
+            cb(routed_lanes_real_lanes, "prefix59_ffn_moe_routed_lanes_real_meta", il);
+            ggml_build_forward_expand(gf, routed_lanes_real_lanes);
+        }
+        if (routed_lanes_real_row_slot_map == nullptr) {
+            routed_lanes_real_row_slot_map = ggml_moe_routed_lanes_row_slot_map(ctx0, weights, routed_lanes_real_lanes);
+            cb(routed_lanes_real_row_slot_map, "prefix59_ffn_moe_routed_lanes_real_row_slot_to_lane", il);
+        }
+        if (routed_lanes_real_expert_bounds == nullptr) {
+            routed_lanes_real_expert_bounds = ggml_moe_routed_lanes_expert_bounds(ctx0, routed_lanes_real_lanes);
+            cb(routed_lanes_real_expert_bounds, "prefix59_ffn_moe_routed_lanes_real_expert_bounds", il);
+        }
+    };
+    auto ensure_routed_lanes_real_compact_x = [&]() {
+        ensure_routed_lanes_real_plan();
+        if (routed_lanes_real_compact_x == nullptr) {
+            routed_lanes_real_compact_x = ggml_moe_routed_lanes_gather(ctx0, cur, routed_lanes_real_lanes);
+            cb(routed_lanes_real_compact_x, "prefix59_ffn_moe_routed_lanes_real_compact_x", il);
+        }
+    };
+
     auto maybe_build_routed_lanes_diag = [&]() {
         const bool metadata_diag = qwen35moe_prefix_moe_routed_lanes_diag_enabled();
         const bool gather_scatter_diag = qwen35moe_prefix_moe_routed_lanes_gather_scatter_diag_enabled();
@@ -2403,9 +2482,19 @@ ggml_tensor * llama_model_qwen35moe::graph_prefix_verify::build_moe_ffn_stage41(
 
     ggml_tensor * cur_3d = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
-    ggml_tensor * gate_up = build_lora_mm_id(model.layers[il].ffn_gate_up_exps, cur_3d, selected_experts);
+    ggml_tensor * gate_up = nullptr;
+    if (use_routed_lanes_real_gate_up) {
+        ensure_routed_lanes_real_compact_x();
+        ggml_tensor * gate_up_compact = ggml_moe_routed_lanes_projection(ctx0, model.layers[il].ffn_gate_up_exps,
+                routed_lanes_real_compact_x, routed_lanes_real_lanes, routed_lanes_real_expert_bounds);
+        cb(gate_up_compact, "prefix59_ffn_moe_routed_lanes_gate_up_compact_real", il);
+        gate_up = ggml_moe_routed_lanes_unpack_slots(ctx0, gate_up_compact, routed_lanes_real_row_slot_map);
+        cb(gate_up, "prefix59_ffn_moe_routed_lanes_gate_up_slot_real", il);
+    } else {
+        gate_up = build_lora_mm_id(model.layers[il].ffn_gate_up_exps, cur_3d, selected_experts);
+        cb(gate_up, "prefix42_ffn_moe_gate_up_batched_proj", il);
+    }
     routed_lanes_gate_up_shadow_source = gate_up;
-    cb(gate_up, "prefix42_ffn_moe_gate_up_batched_proj", il);
     trace_custom_token_rows(gate_up, "gate_up_proj");
 
     if (model.layers[il].ffn_up_exps_s) {
@@ -2465,9 +2554,21 @@ ggml_tensor * llama_model_qwen35moe::graph_prefix_verify::build_moe_ffn_stage41(
     trace_custom_token_rows(routed_act, "routed_act");
     routed_lanes_routed_act_shadow_source = routed_act;
 
-    ggml_tensor * experts = build_lora_mm_id(model.layers[il].ffn_down_exps, routed_act, selected_experts);
+    ggml_tensor * experts = nullptr;
+    if (use_routed_lanes_real_down) {
+        ensure_routed_lanes_real_plan();
+        ggml_tensor * routed_act_compact = ggml_moe_routed_lanes_pack_slots(ctx0, routed_act, routed_lanes_real_row_slot_map);
+        cb(routed_act_compact, "prefix59_ffn_moe_routed_lanes_routed_act_compact_real", il);
+        ggml_tensor * experts_compact = ggml_moe_routed_lanes_projection(ctx0, model.layers[il].ffn_down_exps,
+                routed_act_compact, routed_lanes_real_lanes, routed_lanes_real_expert_bounds);
+        cb(experts_compact, "prefix59_ffn_moe_routed_lanes_down_compact_real", il);
+        experts = ggml_moe_routed_lanes_unpack_slots(ctx0, experts_compact, routed_lanes_real_row_slot_map);
+        cb(experts, "prefix59_ffn_moe_routed_lanes_down_slot_real", il);
+    } else {
+        experts = build_lora_mm_id(model.layers[il].ffn_down_exps, routed_act, selected_experts);
+        cb(experts, "prefix42_ffn_moe_down_batched_proj", il);
+    }
     routed_lanes_down_shadow_source = experts;
-    cb(experts, "prefix42_ffn_moe_down_batched_proj", il);
     trace_custom_token_rows(experts, "down_proj");
 
     if (model.layers[il].ffn_down_exps_s) {

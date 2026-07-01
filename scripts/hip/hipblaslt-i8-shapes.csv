@@ -1,0 +1,96 @@
+label,model,priority,M,N,K,kind,notes
+27b_ffn_gate_up,qwen3.6-27b,P0,128,17408,5120,ffn_gate_up,"dense FFN gate/up, 64 main layers + MTP; q4_K common"
+27b_ffn_gate_up,qwen3.6-27b,P0,256,17408,5120,ffn_gate_up,"dense FFN gate/up, 64 main layers + MTP; q4_K common"
+27b_ffn_gate_up,qwen3.6-27b,P0,512,17408,5120,ffn_gate_up,"dense FFN gate/up, 64 main layers + MTP; q4_K common"
+27b_ffn_gate_up,qwen3.6-27b,P0,1024,17408,5120,ffn_gate_up,"dense FFN gate/up, 64 main layers + MTP; q4_K common"
+27b_ffn_gate_up,qwen3.6-27b,P0,2048,17408,5120,ffn_gate_up,"dense FFN gate/up, 64 main layers + MTP; q4_K common"
+27b_ffn_down,qwen3.6-27b,P0,128,5120,17408,ffn_down,"dense FFN down, large K; quality-sensitive residual path"
+27b_ffn_down,qwen3.6-27b,P0,256,5120,17408,ffn_down,"dense FFN down, large K; quality-sensitive residual path"
+27b_ffn_down,qwen3.6-27b,P0,512,5120,17408,ffn_down,"dense FFN down, large K; quality-sensitive residual path"
+27b_ffn_down,qwen3.6-27b,P0,1024,5120,17408,ffn_down,"dense FFN down, large K; quality-sensitive residual path"
+27b_ffn_down,qwen3.6-27b,P0,2048,5120,17408,ffn_down,"dense FFN down, large K; quality-sensitive residual path"
+27b_attn_q_gate_or_full_q,qwen3.6-27b,P1,128,12288,5120,attention_q_gate,full-attn Q/gate family from scouts
+27b_attn_q_gate_or_full_q,qwen3.6-27b,P1,256,12288,5120,attention_q_gate,full-attn Q/gate family from scouts
+27b_attn_q_gate_or_full_q,qwen3.6-27b,P1,512,12288,5120,attention_q_gate,full-attn Q/gate family from scouts
+27b_attn_q_gate_or_full_q,qwen3.6-27b,P1,1024,12288,5120,attention_q_gate,full-attn Q/gate family from scouts
+27b_recurrent_qkv_or_fused_qkv,qwen3.6-27b,P1,128,10240,5120,recurrent_or_fused_qkv,GDN/fused QKV-like family; validate route before promotion
+27b_recurrent_qkv_or_fused_qkv,qwen3.6-27b,P1,256,10240,5120,recurrent_or_fused_qkv,GDN/fused QKV-like family; validate route before promotion
+27b_recurrent_qkv_or_fused_qkv,qwen3.6-27b,P1,512,10240,5120,recurrent_or_fused_qkv,GDN/fused QKV-like family; validate route before promotion
+27b_recurrent_qkv_or_fused_qkv,qwen3.6-27b,P1,1024,10240,5120,recurrent_or_fused_qkv,GDN/fused QKV-like family; validate route before promotion
+27b_recurrent_z,qwen3.6-27b,P1,128,6144,5120,recurrent_z,GDN z projection family
+27b_recurrent_z,qwen3.6-27b,P1,256,6144,5120,recurrent_z,GDN z projection family
+27b_recurrent_z,qwen3.6-27b,P1,512,6144,5120,recurrent_z,GDN z projection family
+27b_recurrent_z,qwen3.6-27b,P1,1024,6144,5120,recurrent_z,GDN z projection family
+27b_attn_or_gdn_out,qwen3.6-27b,P1,128,5120,6144,attention_or_gdn_out,"O/out projection, K=6144"
+27b_attn_or_gdn_out,qwen3.6-27b,P1,256,5120,6144,attention_or_gdn_out,"O/out projection, K=6144"
+27b_attn_or_gdn_out,qwen3.6-27b,P1,512,5120,6144,attention_or_gdn_out,"O/out projection, K=6144"
+27b_attn_or_gdn_out,qwen3.6-27b,P1,1024,5120,6144,attention_or_gdn_out,"O/out projection, K=6144"
+27b_kv_gqa,qwen3.6-27b,P2,128,1024,5120,kv_gqa,small-N K/V GQA projection; lower arithmetic intensity
+27b_kv_gqa,qwen3.6-27b,P2,512,1024,5120,kv_gqa,small-N K/V GQA projection; lower arithmetic intensity
+27b_kv_gqa,qwen3.6-27b,P2,1024,1024,5120,kv_gqa,small-N K/V GQA projection; lower arithmetic intensity
+35b_full_attn_q_gate,qwen3.6-35b-a3b,P0,128,8192,2048,attention_q_gate,full-attn Q/gate dense family; 35B target
+35b_full_attn_q_gate,qwen3.6-35b-a3b,P0,256,8192,2048,attention_q_gate,full-attn Q/gate dense family; 35B target
+35b_full_attn_q_gate,qwen3.6-35b-a3b,P0,512,8192,2048,attention_q_gate,full-attn Q/gate dense family; 35B target
+35b_full_attn_q_gate,qwen3.6-35b-a3b,P0,1024,8192,2048,attention_q_gate,full-attn Q/gate dense family; 35B target
+35b_full_attn_q_gate,qwen3.6-35b-a3b,P0,2048,8192,2048,attention_q_gate,full-attn Q/gate dense family; 35B target
+35b_recurrent_qkv,qwen3.6-35b-a3b,P0,128,10240,2048,recurrent_qkv,GDN/recurrent qkv family; 35B target
+35b_recurrent_qkv,qwen3.6-35b-a3b,P0,256,10240,2048,recurrent_qkv,GDN/recurrent qkv family; 35B target
+35b_recurrent_qkv,qwen3.6-35b-a3b,P0,512,10240,2048,recurrent_qkv,GDN/recurrent qkv family; 35B target
+35b_recurrent_qkv,qwen3.6-35b-a3b,P0,1024,10240,2048,recurrent_qkv,GDN/recurrent qkv family; 35B target
+35b_recurrent_qkv,qwen3.6-35b-a3b,P0,2048,10240,2048,recurrent_qkv,GDN/recurrent qkv family; 35B target
+35b_recurrent_z,qwen3.6-35b-a3b,P1,128,6144,2048,recurrent_z,GDN z projection
+35b_recurrent_z,qwen3.6-35b-a3b,P1,256,6144,2048,recurrent_z,GDN z projection
+35b_recurrent_z,qwen3.6-35b-a3b,P1,512,6144,2048,recurrent_z,GDN z projection
+35b_recurrent_z,qwen3.6-35b-a3b,P1,1024,6144,2048,recurrent_z,GDN z projection
+35b_recurrent_out,qwen3.6-35b-a3b,P1,128,2048,6144,recurrent_out,GDN out projection
+35b_recurrent_out,qwen3.6-35b-a3b,P1,256,2048,6144,recurrent_out,GDN out projection
+35b_recurrent_out,qwen3.6-35b-a3b,P1,512,2048,6144,recurrent_out,GDN out projection
+35b_recurrent_out,qwen3.6-35b-a3b,P1,1024,2048,6144,recurrent_out,GDN out projection
+35b_full_attn_o,qwen3.6-35b-a3b,P1,128,2048,4096,attention_o,"full-attn output projection K=4096,N=2048"
+35b_full_attn_o,qwen3.6-35b-a3b,P1,256,2048,4096,attention_o,"full-attn output projection K=4096,N=2048"
+35b_full_attn_o,qwen3.6-35b-a3b,P1,512,2048,4096,attention_o,"full-attn output projection K=4096,N=2048"
+35b_full_attn_o,qwen3.6-35b-a3b,P1,1024,2048,4096,attention_o,"full-attn output projection K=4096,N=2048"
+35b_kv_gqa,qwen3.6-35b-a3b,P2,128,512,2048,kv_gqa,small-N K/V GQA projection
+35b_kv_gqa,qwen3.6-35b-a3b,P2,512,512,2048,kv_gqa,small-N K/V GQA projection
+35b_kv_gqa,qwen3.6-35b-a3b,P2,1024,512,2048,kv_gqa,small-N K/V GQA projection
+35b_shared_expert_gate_up,qwen3.6-35b-a3b,P2,128,512,2048,shared_expert_gate_up,shared expert dense small shape
+35b_shared_expert_gate_up,qwen3.6-35b-a3b,P2,512,512,2048,shared_expert_gate_up,shared expert dense small shape
+35b_shared_expert_gate_up,qwen3.6-35b-a3b,P2,1024,512,2048,shared_expert_gate_up,shared expert dense small shape
+35b_shared_expert_down,qwen3.6-35b-a3b,P2,128,2048,512,shared_expert_down,shared expert dense small-K shape
+35b_shared_expert_down,qwen3.6-35b-a3b,P2,512,2048,512,shared_expert_down,shared expert dense small-K shape
+35b_shared_expert_down,qwen3.6-35b-a3b,P2,1024,2048,512,shared_expert_down,shared expert dense small-K shape
+35b_moe_gate_up_expert_dense_proxy,qwen3.6-35b-a3b,P2,128,1024,2048,moe_expert_proxy,dense proxy for routed expert gate/up; real route is MUL_MAT_ID sparse
+35b_moe_gate_up_expert_dense_proxy,qwen3.6-35b-a3b,P2,512,1024,2048,moe_expert_proxy,dense proxy for routed expert gate/up; real route is MUL_MAT_ID sparse
+35b_moe_gate_up_expert_dense_proxy,qwen3.6-35b-a3b,P2,1024,1024,2048,moe_expert_proxy,dense proxy for routed expert gate/up; real route is MUL_MAT_ID sparse
+35b_moe_down_expert_dense_proxy,qwen3.6-35b-a3b,P2,128,2048,512,moe_expert_proxy,dense proxy for routed expert down; real route is MUL_MAT_ID sparse
+35b_moe_down_expert_dense_proxy,qwen3.6-35b-a3b,P2,512,2048,512,moe_expert_proxy,dense proxy for routed expert down; real route is MUL_MAT_ID sparse
+35b_moe_down_expert_dense_proxy,qwen3.6-35b-a3b,P2,1024,2048,512,moe_expert_proxy,dense proxy for routed expert down; real route is MUL_MAT_ID sparse
+35b_router,qwen3.6-35b-a3b,P3,128,256,2048,router,"small router logits; quality/routing sensitive, not first promotion"
+35b_router,qwen3.6-35b-a3b,P3,512,256,2048,router,"small router logits; quality/routing sensitive, not first promotion"
+35b_router,qwen3.6-35b-a3b,P3,1024,256,2048,router,"small router logits; quality/routing sensitive, not first promotion"
+9b_ffn_gate_up,qwen3.5-9b,P2,128,12288,4096,ffn_gate_up,9B dense FFN gate/up
+9b_ffn_gate_up,qwen3.5-9b,P2,256,12288,4096,ffn_gate_up,9B dense FFN gate/up
+9b_ffn_gate_up,qwen3.5-9b,P2,512,12288,4096,ffn_gate_up,9B dense FFN gate/up
+9b_ffn_gate_up,qwen3.5-9b,P2,1024,12288,4096,ffn_gate_up,9B dense FFN gate/up
+9b_ffn_down,qwen3.5-9b,P2,128,4096,12288,ffn_down,9B dense FFN down
+9b_ffn_down,qwen3.5-9b,P2,256,4096,12288,ffn_down,9B dense FFN down
+9b_ffn_down,qwen3.5-9b,P2,512,4096,12288,ffn_down,9B dense FFN down
+9b_ffn_down,qwen3.5-9b,P2,1024,4096,12288,ffn_down,9B dense FFN down
+9b_full_attn_q_gate,qwen3.5-9b,P3,128,8192,4096,attention_q_gate,9B full-attn Q/gate
+9b_full_attn_q_gate,qwen3.5-9b,P3,512,8192,4096,attention_q_gate,9B full-attn Q/gate
+9b_full_attn_q_gate,qwen3.5-9b,P3,1024,8192,4096,attention_q_gate,9B full-attn Q/gate
+9b_recurrent_qkv,qwen3.5-9b,P3,128,10240,4096,recurrent_qkv,9B GDN/recurrent qkv
+9b_recurrent_qkv,qwen3.5-9b,P3,512,10240,4096,recurrent_qkv,9B GDN/recurrent qkv
+9b_recurrent_qkv,qwen3.5-9b,P3,1024,10240,4096,recurrent_qkv,9B GDN/recurrent qkv
+9b_recurrent_z,qwen3.5-9b,P3,128,6144,4096,recurrent_z,9B GDN z
+9b_recurrent_z,qwen3.5-9b,P3,512,6144,4096,recurrent_z,9B GDN z
+9b_recurrent_z,qwen3.5-9b,P3,1024,6144,4096,recurrent_z,9B GDN z
+9b_recurrent_out,qwen3.5-9b,P3,128,4096,6144,recurrent_out,9B GDN out
+9b_recurrent_out,qwen3.5-9b,P3,512,4096,6144,recurrent_out,9B GDN out
+9b_recurrent_out,qwen3.5-9b,P3,1024,4096,6144,recurrent_out,9B GDN out
+9b_attn_o,qwen3.5-9b,P3,128,4096,4096,attention_o,9B attention output; existing hipBLASLt probe covered M=128 only
+9b_attn_o,qwen3.5-9b,P3,512,4096,4096,attention_o,9B attention output; existing hipBLASLt probe covered M=128 only
+9b_attn_o,qwen3.5-9b,P3,1024,4096,4096,attention_o,9B attention output; existing hipBLASLt probe covered M=128 only
+9b_kv_gqa,qwen3.5-9b,P3,128,1024,4096,kv_gqa,9B small-N K/V GQA
+9b_kv_gqa,qwen3.5-9b,P3,512,1024,4096,kv_gqa,9B small-N K/V GQA
+9b_kv_gqa,qwen3.5-9b,P3,1024,1024,4096,kv_gqa,9B small-N K/V GQA

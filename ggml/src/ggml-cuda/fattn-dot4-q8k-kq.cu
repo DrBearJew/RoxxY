@@ -1,6 +1,7 @@
 #include "fattn-dot4-q8k-kq.cuh"
 #include "dot4-packed16/mtp-v4-144-tail-page-desc.cuh"
 
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +24,11 @@ struct packed16_registry_entry {
     ggml_cuda_mtp_qblock_tail_page_map_v1 tail_page_map = {};
     ggml_cuda_mtp_qblock_full_page_map_v1 full_page_map = {};
     ggml_cuda_mtp_qblock_full_page_map_v1 full_page_map_base = {};
+    bool full_page_map_authority = false;
+    ggml_tensor * full_page_authority_payload = nullptr;
+    ggml_tensor * full_page_authority_scales = nullptr;
+    ggml_cuda_packed16_sidecar_meta full_page_authority_meta = {};
+    uint64_t full_page_authority_table_hash = 0;
     std::vector<int32_t> full_page_table_host;
     int32_t * full_page_table_device = nullptr;
     size_t full_page_table_capacity = 0;
@@ -45,6 +51,16 @@ static ggml_cuda_mtp_qblock_tail_page_map_v1 s_packed16_tail_page_published_map 
 static ggml_cuda_mtp_qblock_full_page_map_v1 s_packed16_full_page_published_map = {};
 static int32_t * s_packed16_full_page_published_table_device = nullptr;
 static size_t s_packed16_full_page_published_table_capacity = 0;
+static ggml_cuda_mtp_qblock_full_page_map_v1 s_packed16_full_page_authority_map = {};
+static const void * s_packed16_full_page_authority_owner_key = nullptr;
+static ggml_tensor * s_packed16_full_page_authority_owner_payload = nullptr;
+static ggml_tensor * s_packed16_full_page_authority_owner_scales = nullptr;
+static ggml_cuda_packed16_sidecar_meta s_packed16_full_page_authority_owner_meta = {};
+static int32_t * s_packed16_full_page_authority_table_device = nullptr;
+static size_t s_packed16_full_page_authority_table_capacity = 0;
+static uint64_t s_packed16_full_page_authority_upload_count = 0;
+static uint64_t s_packed16_full_page_authority_table_hash = 0;
+static std::atomic<uint64_t> s_packed16_full_page_authority_epoch { 1 };
 static ggml_tensor * s_packed16_full_page_published_payload = nullptr;
 static ggml_tensor * s_packed16_full_page_published_scales = nullptr;
 static ggml_cuda_packed16_sidecar_meta s_packed16_full_page_published_meta = {};
@@ -188,6 +204,26 @@ static std::unordered_map<const void *, v4_k16d16_registry_entry> s_v4_k16d16_re
 static bool ggml_cuda_mtp_qblock_tail_page_registry_trace_enabled() {
     static const bool enabled = []() {
         const char * v = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_TXN_TAIL_PAGE_REGISTRY_TRACE");
+        if (v && atoi(v) != 0) {
+            return true;
+        }
+        v = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGE_AUTHORITY_TRACE");
+        return v && atoi(v) != 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_cuda_mtp_qblock_page_authority_enabled() {
+    static const bool enabled = []() {
+        const char * v = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGE_AUTHORITY");
+        return v && atoi(v) != 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_cuda_mtp_qblock_page_authority_persistent_reuse_enabled() {
+    static const bool enabled = []() {
+        const char * v = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGE_AUTHORITY_PERSISTENT_REUSE");
         return v && atoi(v) != 0;
     }();
     return enabled;
@@ -468,7 +504,15 @@ static bool ggml_cuda_mtp_qblock_full_page_map_install_locked(
         packed16_registry_entry & entry,
         const ggml_cuda_mtp_qblock_full_page_map_v1 & map,
         const int32_t * host_block_table,
-        const char * reason);
+        const char * reason,
+        bool refresh_published = true);
+
+static void ggml_cuda_mtp_qblock_full_page_authority_epoch_bump_locked() {
+    const uint64_t next = s_packed16_full_page_authority_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (next == 0) {
+        s_packed16_full_page_authority_epoch.store(1, std::memory_order_release);
+    }
+}
 
 extern "C" {
 void llama_kv_cache_register_pdmq_k_with_layout_info(const void * k_view_data, ggml_tensor * payload, ggml_tensor * scales, int k_format, int layout_kind, uint32_t kv_capacity, uint32_t d) {
@@ -478,6 +522,8 @@ void llama_kv_cache_register_pdmq_k_with_layout_info(const void * k_view_data, g
     const ggml_tensor * old_scales  = entry.scales;
     const ggml_cuda_mtp_qblock_tail_page_map_v1 old_map = entry.tail_page_map;
     const ggml_cuda_mtp_qblock_full_page_map_v1 old_full_map_base = entry.full_page_map_base;
+    const bool old_full_page_map_authority = entry.full_page_map_authority;
+    const uint64_t old_full_page_authority_table_hash = entry.full_page_authority_table_hash;
     const std::vector<int32_t> old_full_page_table_host = entry.full_page_table_host;
     entry.payload = payload;
     entry.scales  = scales;
@@ -487,16 +533,44 @@ void llama_kv_cache_register_pdmq_k_with_layout_info(const void * k_view_data, g
         layout_kind = ggml_cuda_packed16_k_layout_kind_from_env();
     }
     entry.meta = ggml_cuda_make_pdmq_k_sidecar_meta(payload, scales, k_format, layout_kind, kv_capacity, d, ++s_packed16_generation);
+    bool authority_state_changed = false;
+    if (k_view_data == s_packed16_full_page_authority_owner_key) {
+        s_packed16_full_page_authority_map = {};
+        s_packed16_full_page_authority_owner_key = nullptr;
+        s_packed16_full_page_authority_owner_payload = nullptr;
+        s_packed16_full_page_authority_owner_scales = nullptr;
+        s_packed16_full_page_authority_owner_meta = {};
+        s_packed16_full_page_authority_table_hash = 0;
+        authority_state_changed = true;
+    }
     if (old_payload != payload || old_scales != scales) {
+        entry.full_page_map_authority = false;
+        entry.full_page_authority_payload = nullptr;
+        entry.full_page_authority_scales = nullptr;
+        entry.full_page_authority_meta = {};
+        entry.full_page_authority_table_hash = 0;
         bool rebound_full_map = false;
         if (ggml_cuda_mtp_qblock_full_page_map_valid(old_full_map_base) &&
                 old_full_page_table_host.size() == old_full_map_base.block_table_pages) {
             rebound_full_map = ggml_cuda_mtp_qblock_full_page_map_install_locked(
                 entry, old_full_map_base, old_full_page_table_host.data(), "sidecar_update_rebind");
         }
+        if (rebound_full_map && old_full_page_map_authority) {
+            entry.full_page_map_authority = true;
+            entry.full_page_authority_payload = entry.payload;
+            entry.full_page_authority_scales = entry.scales;
+            entry.full_page_authority_meta = entry.meta;
+            entry.full_page_authority_table_hash = old_full_page_authority_table_hash;
+        }
+        authority_state_changed = authority_state_changed || old_full_page_map_authority || rebound_full_map;
         if (!rebound_full_map) {
             entry.full_page_map = {};
             entry.full_page_map_base = {};
+            entry.full_page_map_authority = false;
+            entry.full_page_authority_payload = nullptr;
+            entry.full_page_authority_scales = nullptr;
+            entry.full_page_authority_meta = {};
+            entry.full_page_authority_table_hash = 0;
             entry.full_page_table_host.clear();
         }
     }
@@ -527,8 +601,12 @@ void llama_kv_cache_register_pdmq_k_with_layout_info(const void * k_view_data, g
         const packed16_pending_full_page_map_entry & pending = pending_it->second;
         if (!pending.host_block_table.empty() && ggml_cuda_mtp_qblock_full_page_map_install_locked(
                     entry, pending.map, pending.host_block_table.data(), "sidecar_register_pending")) {
+            authority_state_changed = true;
             s_packed16_pending_full_page_maps.erase(pending_it);
         }
+    }
+    if (authority_state_changed) {
+        ggml_cuda_mtp_qblock_full_page_authority_epoch_bump_locked();
     }
 }
 
@@ -699,6 +777,103 @@ static bool ggml_cuda_mtp_qblock_full_page_map_published_sidecar_matches_locked(
         s_packed16_full_page_published_meta.d == entry.meta.d;
 }
 
+static bool ggml_cuda_mtp_qblock_full_page_authority_entry_accepts_locked(
+        const packed16_registry_entry & entry,
+        const ggml_cuda_mtp_qblock_full_page_map_v1 & map) {
+    const bool map_shape_ok = map.active &&
+        map.version == GGML_CUDA_MTP_QBLOCK_FULL_PAGE_MAP_VERSION &&
+        map.abi_bytes == sizeof(ggml_cuda_mtp_qblock_full_page_map_v1) &&
+        map.logical_base_token == 0 && map.valid_tokens != 0 &&
+        map.page_tokens == GGML_CUDA_PACKED16_K_PAGE16_TOKENS &&
+        map.physical_pages != 0 && map.block_table_pages != 0 &&
+        map.non_identity_page_begin <= map.non_identity_page_end && map.non_identity_page_end <= map.block_table_pages;
+    return map_shape_ok &&
+        entry.payload != nullptr && entry.scales != nullptr &&
+        entry.meta.k_format == GGML_CUDA_PDMQ_K_FORMAT_PACKED16_Q8_272 &&
+        entry.meta.kv_capacity >= map.physical_pages * map.page_tokens;
+}
+
+static uint64_t ggml_cuda_mtp_qblock_full_page_authority_table_hash(
+        const ggml_cuda_mtp_qblock_full_page_map_v1 & map,
+        const int32_t * host_block_table) {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](uint64_t v) {
+        h ^= v;
+        h *= 1099511628211ull;
+    };
+    mix(map.version);
+    mix(map.logical_base_token);
+    mix(map.valid_tokens);
+    mix(map.page_tokens);
+    mix(map.physical_pages);
+    mix(map.block_table_pages);
+    mix(map.non_identity_page_begin);
+    mix(map.non_identity_page_end);
+    mix(map.flags);
+    for (uint32_t i = 0; i < map.block_table_pages; ++i) {
+        mix(uint32_t(host_block_table[i]));
+    }
+    return h == 0 ? 1u : h;
+}
+
+static bool ggml_cuda_mtp_qblock_full_page_authority_sidecar_matches(
+        const packed16_registry_entry & entry,
+        const ggml_tensor * payload,
+        const ggml_tensor * scales,
+        const ggml_cuda_packed16_sidecar_meta & meta) {
+    return entry.payload == payload &&
+        entry.scales == scales &&
+        entry.meta.k_format == meta.k_format &&
+        entry.meta.kv_capacity == meta.kv_capacity &&
+        entry.meta.d == meta.d;
+}
+
+static bool ggml_cuda_mtp_qblock_full_page_authority_owner_matches_locked(
+        const void * k_view_data,
+        const packed16_registry_entry & entry) {
+    return k_view_data == s_packed16_full_page_authority_owner_key &&
+        s_packed16_full_page_authority_owner_key != nullptr &&
+        ggml_cuda_mtp_qblock_full_page_authority_sidecar_matches(
+            entry,
+            s_packed16_full_page_authority_owner_payload,
+            s_packed16_full_page_authority_owner_scales,
+            s_packed16_full_page_authority_owner_meta);
+}
+
+static bool ggml_cuda_mtp_qblock_full_page_authority_entry_matches_locked(
+        const packed16_registry_entry & entry) {
+    return entry.full_page_map_authority &&
+        ggml_cuda_mtp_qblock_full_page_authority_sidecar_matches(
+            entry,
+            entry.full_page_authority_payload,
+            entry.full_page_authority_scales,
+            entry.full_page_authority_meta);
+}
+
+static bool ggml_cuda_mtp_qblock_full_page_authority_entry_base_matches_locked(
+        const packed16_registry_entry & entry,
+        const ggml_cuda_mtp_qblock_full_page_map_v1 & map,
+        uint64_t table_hash) {
+    const ggml_cuda_mtp_qblock_full_page_map_v1 & base = entry.full_page_map_base;
+    return ggml_cuda_mtp_qblock_full_page_authority_entry_matches_locked(entry) &&
+        entry.full_page_authority_table_hash == table_hash &&
+        ggml_cuda_mtp_qblock_full_page_map_valid(base) &&
+        ggml_cuda_mtp_qblock_full_page_map_valid(entry.full_page_map) &&
+        entry.full_page_table_device != nullptr &&
+        base.version == map.version &&
+        base.abi_bytes == map.abi_bytes &&
+        base.active == map.active &&
+        base.flags == map.flags &&
+        base.logical_base_token == map.logical_base_token &&
+        base.valid_tokens == map.valid_tokens &&
+        base.page_tokens == map.page_tokens &&
+        base.physical_pages == map.physical_pages &&
+        base.block_table_pages == map.block_table_pages &&
+        base.non_identity_page_begin == map.non_identity_page_begin &&
+        base.non_identity_page_end == map.non_identity_page_end &&
+        base.generation == map.generation;
+}
+
 static bool ggml_cuda_mtp_qblock_full_page_map_publish_snapshot_locked(
         const packed16_registry_entry & entry) {
     const ggml_cuda_mtp_qblock_full_page_map_v1 & src = entry.full_page_map;
@@ -707,16 +882,16 @@ static bool ggml_cuda_mtp_qblock_full_page_map_publish_snapshot_locked(
     }
     if (s_packed16_full_page_published_table_capacity < src.block_table_pages) {
         if (s_packed16_full_page_published_table_device != nullptr) {
-            CUDA_CHECK(hipFree(s_packed16_full_page_published_table_device));
+            CUDA_CHECK(cudaFree(s_packed16_full_page_published_table_device));
             s_packed16_full_page_published_table_device = nullptr;
             s_packed16_full_page_published_table_capacity = 0;
         }
-        CUDA_CHECK(hipMalloc((void **) &s_packed16_full_page_published_table_device,
+        CUDA_CHECK(cudaMalloc((void **) &s_packed16_full_page_published_table_device,
             size_t(src.block_table_pages) * sizeof(int32_t)));
         s_packed16_full_page_published_table_capacity = src.block_table_pages;
     }
-    CUDA_CHECK(hipMemcpy(s_packed16_full_page_published_table_device, src.block_table,
-        size_t(src.block_table_pages) * sizeof(int32_t), hipMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpy(s_packed16_full_page_published_table_device, src.block_table,
+        size_t(src.block_table_pages) * sizeof(int32_t), cudaMemcpyDeviceToDevice));
     s_packed16_full_page_published_map = src;
     s_packed16_full_page_published_map.block_table = s_packed16_full_page_published_table_device;
     s_packed16_full_page_published_payload = entry.payload;
@@ -744,8 +919,8 @@ static void ggml_cuda_mtp_qblock_full_page_map_restore_identity_locked(const cha
                 entry.full_page_table_host.size() != entry.full_page_map_base.block_table_pages) {
             continue;
         }
-        CUDA_CHECK(hipMemcpy(entry.full_page_table_device, entry.full_page_table_host.data(),
-            size_t(entry.full_page_map_base.block_table_pages) * sizeof(int32_t), hipMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(entry.full_page_table_device, entry.full_page_table_host.data(),
+            size_t(entry.full_page_map_base.block_table_pages) * sizeof(int32_t), cudaMemcpyHostToDevice));
         entry.full_page_map = entry.full_page_map_base;
         entry.full_page_map.block_table = entry.full_page_table_device;
         for (uint32_t i = 0; i < 4; ++i) {
@@ -754,6 +929,9 @@ static void ggml_cuda_mtp_qblock_full_page_map_restore_identity_locked(const cha
         ++restored;
     }
     ggml_cuda_mtp_qblock_full_page_map_refresh_published_locked();
+    if (restored != 0) {
+        ggml_cuda_mtp_qblock_full_page_authority_epoch_bump_locked();
+    }
     if (restored != 0 && ggml_cuda_mtp_qblock_tail_page_registry_trace_enabled()) {
         fprintf(stderr,
                 "MTP_QBLOCK_FULL_PAGE_MAP_REGISTRY: op=restore_base reason=%s restored=%zu\n",
@@ -789,8 +967,8 @@ static bool ggml_cuda_mtp_qblock_full_page_map_apply_owned_tail_overlay_locked(
         }
         table[logical_base_page + lp] = pp;
     }
-    CUDA_CHECK(hipMemcpy(entry.full_page_table_device, table.data(),
-        size_t(entry.full_page_map_base.block_table_pages) * sizeof(int32_t), hipMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(entry.full_page_table_device, table.data(),
+        size_t(entry.full_page_map_base.block_table_pages) * sizeof(int32_t), cudaMemcpyHostToDevice));
     entry.full_page_map = entry.full_page_map_base;
     entry.full_page_map.block_table = entry.full_page_table_device;
     entry.full_page_map.flags = entry.full_page_map_base.flags |
@@ -833,6 +1011,9 @@ static size_t ggml_cuda_mtp_qblock_full_page_map_apply_owned_tail_overlay_all_lo
         }
     }
     ggml_cuda_mtp_qblock_full_page_map_refresh_published_locked();
+    if (applied != 0) {
+        ggml_cuda_mtp_qblock_full_page_authority_epoch_bump_locked();
+    }
     return applied;
 }
 
@@ -840,7 +1021,8 @@ static bool ggml_cuda_mtp_qblock_full_page_map_install_locked(
         packed16_registry_entry & entry,
         const ggml_cuda_mtp_qblock_full_page_map_v1 & map,
         const int32_t * host_block_table,
-        const char * reason) {
+        const char * reason,
+        bool refresh_published) {
     const bool map_basic_ok = map.active &&
         map.version == GGML_CUDA_MTP_QBLOCK_FULL_PAGE_MAP_VERSION &&
         map.abi_bytes == sizeof(ggml_cuda_mtp_qblock_full_page_map_v1) &&
@@ -867,15 +1049,15 @@ static bool ggml_cuda_mtp_qblock_full_page_map_install_locked(
     }
     if (entry.full_page_table_capacity < map.block_table_pages) {
         if (entry.full_page_table_device != nullptr) {
-            CUDA_CHECK(hipFree(entry.full_page_table_device));
+            CUDA_CHECK(cudaFree(entry.full_page_table_device));
             entry.full_page_table_device = nullptr;
             entry.full_page_table_capacity = 0;
         }
-        CUDA_CHECK(hipMalloc((void **) &entry.full_page_table_device, size_t(map.block_table_pages) * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc((void **) &entry.full_page_table_device, size_t(map.block_table_pages) * sizeof(int32_t)));
         entry.full_page_table_capacity = map.block_table_pages;
     }
-    CUDA_CHECK(hipMemcpy(entry.full_page_table_device, host_block_table,
-        size_t(map.block_table_pages) * sizeof(int32_t), hipMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(entry.full_page_table_device, host_block_table,
+        size_t(map.block_table_pages) * sizeof(int32_t), cudaMemcpyHostToDevice));
     entry.full_page_table_host.assign(host_block_table, host_block_table + map.block_table_pages);
     entry.full_page_map_base = map;
     entry.full_page_map_base.block_table = entry.full_page_table_device;
@@ -889,7 +1071,10 @@ static bool ggml_cuda_mtp_qblock_full_page_map_install_locked(
         (void) ggml_cuda_mtp_qblock_full_page_map_apply_owned_tail_overlay_locked(
             entry, s_packed16_tail_page_owned_write_ready.map, reason ? reason : "install");
     }
-    ggml_cuda_mtp_qblock_full_page_map_refresh_published_locked();
+    if (refresh_published) {
+        ggml_cuda_mtp_qblock_full_page_map_refresh_published_locked();
+    }
+    ggml_cuda_mtp_qblock_full_page_authority_epoch_bump_locked();
     return true;
 }
 
@@ -2833,6 +3018,376 @@ void llama_kv_cache_get_mtp_qblock_tail_page_map(const void * k_view_data, ggml_
     }
 }
 
+void llama_kv_cache_register_mtp_qblock_full_page_authority_host(
+        const void * owner_k_view_data,
+        const ggml_cuda_mtp_qblock_full_page_map_v1 * map,
+        const int32_t * host_block_table) {
+    std::lock_guard<std::mutex> lock(s_packed16_mutex);
+    const bool map_basic_ok = map && map->active &&
+        map->version == GGML_CUDA_MTP_QBLOCK_FULL_PAGE_MAP_VERSION &&
+        map->abi_bytes == sizeof(ggml_cuda_mtp_qblock_full_page_map_v1) &&
+        map->logical_base_token == 0 && map->valid_tokens != 0 &&
+        map->page_tokens == GGML_CUDA_PACKED16_K_PAGE16_TOKENS &&
+        map->physical_pages != 0 && map->block_table_pages != 0 &&
+        host_block_table != nullptr &&
+        map->non_identity_page_begin <= map->non_identity_page_end && map->non_identity_page_end <= map->block_table_pages;
+    bool table_ok = map_basic_ok;
+    if (table_ok) {
+        const uint32_t required_pages = (map->valid_tokens + map->page_tokens - 1u) / map->page_tokens;
+        table_ok = required_pages != 0 && required_pages <= map->block_table_pages && map->block_table_pages <= map->physical_pages;
+        std::vector<uint8_t> seen(map->physical_pages, 0);
+        for (uint32_t i = 0; table_ok && i < map->block_table_pages; ++i) {
+            table_ok = host_block_table[i] >= 0 && uint32_t(host_block_table[i]) < map->physical_pages;
+            if (table_ok) {
+                const uint32_t pp = uint32_t(host_block_table[i]);
+                table_ok = seen[pp] == 0;
+                seen[pp] = 1;
+            }
+        }
+    }
+    auto owner_it = owner_k_view_data ? s_packed16_registry.find(owner_k_view_data) : s_packed16_registry.end();
+    const bool owner_ok = map_basic_ok && table_ok && owner_it != s_packed16_registry.end() &&
+        ggml_cuda_mtp_qblock_full_page_authority_entry_accepts_locked(owner_it->second, *map);
+    if (!map_basic_ok || !table_ok || !owner_ok) {
+        s_packed16_full_page_authority_map = {};
+        s_packed16_full_page_authority_owner_key = nullptr;
+        s_packed16_full_page_authority_owner_payload = nullptr;
+        s_packed16_full_page_authority_owner_scales = nullptr;
+        s_packed16_full_page_authority_owner_meta = {};
+        s_packed16_full_page_authority_table_hash = 0;
+        if (ggml_cuda_mtp_qblock_tail_page_registry_trace_enabled()) {
+            const bool owner_found = owner_it != s_packed16_registry.end();
+            const bool owner_payload_ok = owner_found && owner_it->second.payload != nullptr;
+            const bool owner_scales_ok = owner_found && owner_it->second.scales != nullptr;
+            const bool owner_k_format_ok = owner_found && owner_it->second.meta.k_format == GGML_CUDA_PDMQ_K_FORMAT_PACKED16_Q8_272;
+            const bool owner_capacity_ok = owner_found && map_basic_ok && owner_it->second.meta.kv_capacity >= map->physical_pages * map->page_tokens;
+            fprintf(stderr,
+                    "MTP_QBLOCK_FULL_PAGE_AUTHORITY: op=register status=reject map_basic_ok=%d table_ok=%d owner_ok=%d owner=%p owner_found=%d payload_ok=%d scales_ok=%d k_format=%u k_format_ok=%d kv_capacity=%u required=%u capacity_ok=%d meta_d=%u\n",
+                    map_basic_ok ? 1 : 0,
+                    table_ok ? 1 : 0,
+                    owner_ok ? 1 : 0,
+                    owner_k_view_data,
+                    owner_found ? 1 : 0,
+                    owner_payload_ok ? 1 : 0,
+                    owner_scales_ok ? 1 : 0,
+                    owner_found ? (unsigned) owner_it->second.meta.k_format : 0u,
+                    owner_k_format_ok ? 1 : 0,
+                    owner_found ? (unsigned) owner_it->second.meta.kv_capacity : 0u,
+                    map_basic_ok ? (unsigned) (map->physical_pages * map->page_tokens) : 0u,
+                    owner_capacity_ok ? 1 : 0,
+                    owner_found ? (unsigned) owner_it->second.meta.d : 0u);
+        }
+        ggml_cuda_mtp_qblock_full_page_authority_epoch_bump_locked();
+        return;
+    }
+
+    const uint64_t table_hash = ggml_cuda_mtp_qblock_full_page_authority_table_hash(*map, host_block_table);
+    const bool persistent_reuse_enabled = ggml_cuda_mtp_qblock_page_authority_persistent_reuse_enabled();
+    const bool persistent_entry_reuse = persistent_reuse_enabled &&
+        ggml_cuda_mtp_qblock_full_page_authority_entry_base_matches_locked(owner_it->second, *map, table_hash);
+    if (persistent_entry_reuse) {
+        s_packed16_full_page_authority_map = owner_it->second.full_page_map;
+        s_packed16_full_page_authority_owner_key = owner_k_view_data;
+        s_packed16_full_page_authority_owner_payload = owner_it->second.payload;
+        s_packed16_full_page_authority_owner_scales = owner_it->second.scales;
+        s_packed16_full_page_authority_owner_meta = owner_it->second.meta;
+        s_packed16_full_page_authority_table_hash = table_hash;
+        if (ggml_cuda_mtp_qblock_tail_page_registry_trace_enabled()) {
+            fprintf(stderr,
+                    "MTP_QBLOCK_FULL_PAGE_AUTHORITY: op=register status=ok owner=%p pages=%u valid_tokens=%u physical_pages=%u table_ptr=%p generation=%llu table_hash=%llu reused=1 persistent_reuse=1 uploads=%llu first_pages=[%d,%d,%d,%d]\n",
+                    s_packed16_full_page_authority_owner_key,
+                    s_packed16_full_page_authority_map.block_table_pages,
+                    s_packed16_full_page_authority_map.valid_tokens,
+                    s_packed16_full_page_authority_map.physical_pages,
+                    (const void *) s_packed16_full_page_authority_map.block_table,
+                    (unsigned long long) s_packed16_full_page_authority_map.generation,
+                    (unsigned long long) s_packed16_full_page_authority_table_hash,
+                    (unsigned long long) s_packed16_full_page_authority_upload_count,
+                    s_packed16_full_page_authority_map.debug_first_pages[0],
+                    s_packed16_full_page_authority_map.debug_first_pages[1],
+                    s_packed16_full_page_authority_map.debug_first_pages[2],
+                    s_packed16_full_page_authority_map.debug_first_pages[3]);
+        }
+        ggml_cuda_mtp_qblock_full_page_authority_epoch_bump_locked();
+        return;
+    }
+    const bool same_generation = ggml_cuda_mtp_qblock_full_page_map_valid(s_packed16_full_page_authority_map) &&
+        (s_packed16_full_page_authority_owner_key == owner_k_view_data || persistent_reuse_enabled) &&
+        s_packed16_full_page_authority_map.generation == map->generation &&
+        s_packed16_full_page_authority_map.block_table_pages == map->block_table_pages &&
+        s_packed16_full_page_authority_map.valid_tokens == map->valid_tokens &&
+        s_packed16_full_page_authority_map.physical_pages == map->physical_pages &&
+        s_packed16_full_page_authority_table_hash == table_hash;
+    if (!same_generation) {
+        if (s_packed16_full_page_authority_table_capacity < map->block_table_pages) {
+            if (s_packed16_full_page_authority_table_device != nullptr) {
+                CUDA_CHECK(cudaFree(s_packed16_full_page_authority_table_device));
+                s_packed16_full_page_authority_table_device = nullptr;
+                s_packed16_full_page_authority_table_capacity = 0;
+            }
+            CUDA_CHECK(cudaMalloc((void **) &s_packed16_full_page_authority_table_device,
+                size_t(map->block_table_pages) * sizeof(int32_t)));
+            s_packed16_full_page_authority_table_capacity = map->block_table_pages;
+        }
+        CUDA_CHECK(cudaMemcpy(s_packed16_full_page_authority_table_device, host_block_table,
+            size_t(map->block_table_pages) * sizeof(int32_t), cudaMemcpyHostToDevice));
+        ++s_packed16_full_page_authority_upload_count;
+    }
+    if (!ggml_cuda_mtp_qblock_full_page_map_install_locked(owner_it->second, *map, host_block_table, "authority_register")) {
+        s_packed16_full_page_authority_map = {};
+        s_packed16_full_page_authority_owner_key = nullptr;
+        s_packed16_full_page_authority_owner_payload = nullptr;
+        s_packed16_full_page_authority_owner_scales = nullptr;
+        s_packed16_full_page_authority_owner_meta = {};
+        s_packed16_full_page_authority_table_hash = 0;
+        owner_it->second.full_page_map_authority = false;
+        owner_it->second.full_page_authority_payload = nullptr;
+        owner_it->second.full_page_authority_scales = nullptr;
+        owner_it->second.full_page_authority_meta = {};
+        owner_it->second.full_page_authority_table_hash = 0;
+        ggml_cuda_mtp_qblock_full_page_authority_epoch_bump_locked();
+        return;
+    }
+    owner_it->second.full_page_map_authority = true;
+    owner_it->second.full_page_authority_payload = owner_it->second.payload;
+    owner_it->second.full_page_authority_scales = owner_it->second.scales;
+    owner_it->second.full_page_authority_meta = owner_it->second.meta;
+    owner_it->second.full_page_authority_table_hash = table_hash;
+
+    s_packed16_full_page_authority_map = *map;
+    s_packed16_full_page_authority_map.block_table = s_packed16_full_page_authority_table_device;
+    s_packed16_full_page_authority_owner_key = owner_k_view_data;
+    s_packed16_full_page_authority_owner_payload = owner_it->second.payload;
+    s_packed16_full_page_authority_owner_scales = owner_it->second.scales;
+    s_packed16_full_page_authority_owner_meta = owner_it->second.meta;
+    s_packed16_full_page_authority_table_hash = table_hash;
+    for (uint32_t i = 0; i < 4; ++i) {
+        s_packed16_full_page_authority_map.debug_first_pages[i] = i < map->block_table_pages ? host_block_table[i] : -1;
+    }
+    ggml_cuda_mtp_qblock_full_page_authority_epoch_bump_locked();
+    if (ggml_cuda_mtp_qblock_tail_page_registry_trace_enabled()) {
+        fprintf(stderr,
+                "MTP_QBLOCK_FULL_PAGE_AUTHORITY: op=register status=ok owner=%p pages=%u valid_tokens=%u physical_pages=%u table_ptr=%p generation=%llu table_hash=%llu reused=%d uploads=%llu first_pages=[%d,%d,%d,%d]\n",
+                s_packed16_full_page_authority_owner_key,
+                s_packed16_full_page_authority_map.block_table_pages,
+                s_packed16_full_page_authority_map.valid_tokens,
+                s_packed16_full_page_authority_map.physical_pages,
+                (const void *) s_packed16_full_page_authority_map.block_table,
+                (unsigned long long) s_packed16_full_page_authority_map.generation,
+                (unsigned long long) s_packed16_full_page_authority_table_hash,
+                same_generation ? 1 : 0,
+                (unsigned long long) s_packed16_full_page_authority_upload_count,
+                s_packed16_full_page_authority_map.debug_first_pages[0],
+                s_packed16_full_page_authority_map.debug_first_pages[1],
+                s_packed16_full_page_authority_map.debug_first_pages[2],
+                s_packed16_full_page_authority_map.debug_first_pages[3]);
+    }
+}
+
+size_t llama_kv_cache_register_mtp_qblock_full_page_authority_hosts(
+        const void * const * owner_k_view_data,
+        size_t owner_count,
+        const ggml_cuda_mtp_qblock_full_page_map_v1 * map,
+        const int32_t * host_block_table) {
+    std::lock_guard<std::mutex> lock(s_packed16_mutex);
+    const bool map_basic_ok = owner_k_view_data != nullptr && owner_count != 0 && map && map->active &&
+        map->version == GGML_CUDA_MTP_QBLOCK_FULL_PAGE_MAP_VERSION &&
+        map->abi_bytes == sizeof(ggml_cuda_mtp_qblock_full_page_map_v1) &&
+        map->logical_base_token == 0 && map->valid_tokens != 0 &&
+        map->page_tokens == GGML_CUDA_PACKED16_K_PAGE16_TOKENS &&
+        map->physical_pages != 0 && map->block_table_pages != 0 &&
+        host_block_table != nullptr &&
+        map->non_identity_page_begin <= map->non_identity_page_end && map->non_identity_page_end <= map->block_table_pages;
+    bool table_ok = map_basic_ok;
+    if (table_ok) {
+        const uint32_t required_pages = (map->valid_tokens + map->page_tokens - 1u) / map->page_tokens;
+        table_ok = required_pages != 0 && required_pages <= map->block_table_pages && map->block_table_pages <= map->physical_pages;
+        std::vector<uint8_t> seen(map->physical_pages, 0);
+        for (uint32_t i = 0; table_ok && i < map->block_table_pages; ++i) {
+            table_ok = host_block_table[i] >= 0 && uint32_t(host_block_table[i]) < map->physical_pages;
+            if (table_ok) {
+                const uint32_t pp = uint32_t(host_block_table[i]);
+                table_ok = seen[pp] == 0;
+                seen[pp] = 1;
+            }
+        }
+    }
+    if (!map_basic_ok || !table_ok) {
+        return 0;
+    }
+
+    std::vector<std::pair<const void *, packed16_registry_entry *>> owners;
+    owners.reserve(owner_count);
+    std::unordered_set<const void *> seen_owners;
+    for (size_t i = 0; i < owner_count; ++i) {
+        const void * owner = owner_k_view_data[i];
+        if (owner == nullptr || seen_owners.count(owner) != 0) {
+            return 0;
+        }
+        seen_owners.insert(owner);
+        auto owner_it = s_packed16_registry.find(owner);
+        if (owner_it == s_packed16_registry.end() ||
+                !ggml_cuda_mtp_qblock_full_page_authority_entry_accepts_locked(owner_it->second, *map)) {
+            return 0;
+        }
+        owners.push_back({ owner, &owner_it->second });
+    }
+    if (owners.empty()) {
+        return 0;
+    }
+
+    const uint64_t table_hash = ggml_cuda_mtp_qblock_full_page_authority_table_hash(*map, host_block_table);
+    const bool persistent_reuse_enabled = ggml_cuda_mtp_qblock_page_authority_persistent_reuse_enabled();
+    const bool same_generation = ggml_cuda_mtp_qblock_full_page_map_valid(s_packed16_full_page_authority_map) &&
+        persistent_reuse_enabled &&
+        s_packed16_full_page_authority_map.generation == map->generation &&
+        s_packed16_full_page_authority_map.block_table_pages == map->block_table_pages &&
+        s_packed16_full_page_authority_map.valid_tokens == map->valid_tokens &&
+        s_packed16_full_page_authority_map.physical_pages == map->physical_pages &&
+        s_packed16_full_page_authority_table_hash == table_hash;
+    if (!same_generation) {
+        if (s_packed16_full_page_authority_table_capacity < map->block_table_pages) {
+            if (s_packed16_full_page_authority_table_device != nullptr) {
+                CUDA_CHECK(cudaFree(s_packed16_full_page_authority_table_device));
+                s_packed16_full_page_authority_table_device = nullptr;
+                s_packed16_full_page_authority_table_capacity = 0;
+            }
+            CUDA_CHECK(cudaMalloc((void **) &s_packed16_full_page_authority_table_device,
+                size_t(map->block_table_pages) * sizeof(int32_t)));
+            s_packed16_full_page_authority_table_capacity = map->block_table_pages;
+        }
+        CUDA_CHECK(cudaMemcpy(s_packed16_full_page_authority_table_device, host_block_table,
+            size_t(map->block_table_pages) * sizeof(int32_t), cudaMemcpyHostToDevice));
+        ++s_packed16_full_page_authority_upload_count;
+    }
+
+    size_t installed_entries = 0;
+    size_t reused_entries = 0;
+    for (auto & owner_pair : owners) {
+        packed16_registry_entry & entry = *owner_pair.second;
+        if (persistent_reuse_enabled &&
+                ggml_cuda_mtp_qblock_full_page_authority_entry_base_matches_locked(entry, *map, table_hash)) {
+            ++reused_entries;
+        } else if (ggml_cuda_mtp_qblock_full_page_map_install_locked(entry, *map, host_block_table, "authority_register_many", false)) {
+            ++installed_entries;
+        } else {
+            entry.full_page_map = {};
+            entry.full_page_map_base = {};
+            entry.full_page_map_authority = false;
+            entry.full_page_authority_payload = nullptr;
+            entry.full_page_authority_scales = nullptr;
+            entry.full_page_authority_meta = {};
+            entry.full_page_authority_table_hash = 0;
+            entry.full_page_table_host.clear();
+            ggml_cuda_mtp_qblock_full_page_authority_epoch_bump_locked();
+            return 0;
+        }
+        entry.full_page_map_authority = true;
+        entry.full_page_authority_payload = entry.payload;
+        entry.full_page_authority_scales = entry.scales;
+        entry.full_page_authority_meta = entry.meta;
+        entry.full_page_authority_table_hash = table_hash;
+    }
+    if (installed_entries != 0) {
+        ggml_cuda_mtp_qblock_full_page_map_refresh_published_locked();
+    }
+
+    packed16_registry_entry & first_entry = *owners[0].second;
+    s_packed16_full_page_authority_map = *map;
+    s_packed16_full_page_authority_map.block_table = s_packed16_full_page_authority_table_device;
+    s_packed16_full_page_authority_owner_key = owners[0].first;
+    s_packed16_full_page_authority_owner_payload = first_entry.payload;
+    s_packed16_full_page_authority_owner_scales = first_entry.scales;
+    s_packed16_full_page_authority_owner_meta = first_entry.meta;
+    s_packed16_full_page_authority_table_hash = table_hash;
+    for (uint32_t i = 0; i < 4; ++i) {
+        s_packed16_full_page_authority_map.debug_first_pages[i] = i < map->block_table_pages ? host_block_table[i] : -1;
+    }
+    ggml_cuda_mtp_qblock_full_page_authority_epoch_bump_locked();
+    if (ggml_cuda_mtp_qblock_tail_page_registry_trace_enabled()) {
+        fprintf(stderr,
+                "MTP_QBLOCK_FULL_PAGE_AUTHORITY: op=register status=ok mode=many owners=%zu installed=%zu reused_entries=%zu pages=%u valid_tokens=%u physical_pages=%u table_ptr=%p generation=%llu table_hash=%llu reused_global=%d uploads=%llu first_pages=[%d,%d,%d,%d]\n",
+                owners.size(),
+                installed_entries,
+                reused_entries,
+                s_packed16_full_page_authority_map.block_table_pages,
+                s_packed16_full_page_authority_map.valid_tokens,
+                s_packed16_full_page_authority_map.physical_pages,
+                (const void *) s_packed16_full_page_authority_map.block_table,
+                (unsigned long long) s_packed16_full_page_authority_map.generation,
+                (unsigned long long) s_packed16_full_page_authority_table_hash,
+                same_generation ? 1 : 0,
+                (unsigned long long) s_packed16_full_page_authority_upload_count,
+                s_packed16_full_page_authority_map.debug_first_pages[0],
+                s_packed16_full_page_authority_map.debug_first_pages[1],
+                s_packed16_full_page_authority_map.debug_first_pages[2],
+                s_packed16_full_page_authority_map.debug_first_pages[3]);
+    }
+    return owners.size();
+}
+
+void llama_kv_cache_clear_mtp_qblock_full_page_authority_host(void) {
+    std::lock_guard<std::mutex> lock(s_packed16_mutex);
+    if (ggml_cuda_mtp_qblock_full_page_map_valid(s_packed16_full_page_authority_map) &&
+            ggml_cuda_mtp_qblock_tail_page_registry_trace_enabled()) {
+        fprintf(stderr,
+                "MTP_QBLOCK_FULL_PAGE_AUTHORITY: op=clear pages=%u valid_tokens=%u generation=%llu\n",
+                s_packed16_full_page_authority_map.block_table_pages,
+                s_packed16_full_page_authority_map.valid_tokens,
+                (unsigned long long) s_packed16_full_page_authority_map.generation);
+    }
+    s_packed16_full_page_authority_map = {};
+    s_packed16_full_page_authority_owner_key = nullptr;
+    s_packed16_full_page_authority_owner_payload = nullptr;
+    s_packed16_full_page_authority_owner_scales = nullptr;
+    s_packed16_full_page_authority_owner_meta = {};
+    s_packed16_full_page_authority_table_hash = 0;
+    ggml_cuda_mtp_qblock_full_page_authority_epoch_bump_locked();
+}
+
+uint64_t llama_kv_cache_mtp_qblock_full_page_authority_epoch(void) {
+    if (!ggml_cuda_mtp_qblock_page_authority_enabled()) {
+        return 0;
+    }
+    return s_packed16_full_page_authority_epoch.load(std::memory_order_acquire);
+}
+
+bool llama_kv_cache_try_get_mtp_qblock_full_page_authority_dispatch_map(
+        const void * k_view_data,
+        ggml_cuda_mtp_qblock_full_page_map_v1 * map,
+        uint64_t * epoch) {
+    if (map) {
+        *map = {};
+    }
+    if (epoch) {
+        *epoch = 0;
+    }
+    if (!map || !ggml_cuda_mtp_qblock_page_authority_enabled()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(s_packed16_mutex);
+    const uint64_t current_epoch = s_packed16_full_page_authority_epoch.load(std::memory_order_relaxed);
+    if (epoch) {
+        *epoch = current_epoch;
+    }
+    auto it = s_packed16_registry.find(k_view_data);
+    if (it != s_packed16_registry.end() &&
+            ggml_cuda_mtp_qblock_full_page_map_valid(it->second.full_page_map) &&
+            ggml_cuda_mtp_qblock_full_page_authority_entry_matches_locked(it->second) &&
+            ggml_cuda_mtp_qblock_full_page_authority_entry_accepts_locked(it->second, it->second.full_page_map)) {
+        *map = it->second.full_page_map;
+        return true;
+    }
+    if (it != s_packed16_registry.end() &&
+            ggml_cuda_mtp_qblock_full_page_map_valid(s_packed16_full_page_authority_map) &&
+            ggml_cuda_mtp_qblock_full_page_authority_owner_matches_locked(k_view_data, it->second) &&
+            ggml_cuda_mtp_qblock_full_page_authority_entry_accepts_locked(it->second, s_packed16_full_page_authority_map)) {
+        *map = s_packed16_full_page_authority_map;
+        return true;
+    }
+    return false;
+}
+
 void llama_kv_cache_register_mtp_qblock_full_page_map_host(
         const void * k_view_data,
         const ggml_cuda_mtp_qblock_full_page_map_v1 * map,
@@ -2862,7 +3417,13 @@ void llama_kv_cache_register_mtp_qblock_full_page_map_host(
         if (it != s_packed16_registry.end()) {
             it->second.full_page_map = {};
             it->second.full_page_map_base = {};
+            it->second.full_page_map_authority = false;
+            it->second.full_page_authority_payload = nullptr;
+            it->second.full_page_authority_scales = nullptr;
+            it->second.full_page_authority_meta = {};
+            it->second.full_page_authority_table_hash = 0;
             it->second.full_page_table_host.clear();
+            ggml_cuda_mtp_qblock_full_page_authority_epoch_bump_locked();
         }
     };
     if (!map_basic_ok || !table_ok) {
@@ -2905,6 +3466,11 @@ void llama_kv_cache_register_mtp_qblock_full_page_map_host(
         s_packed16_pending_full_page_maps.erase(k_view_data);
         return;
     }
+    entry.full_page_map_authority = false;
+    entry.full_page_authority_payload = nullptr;
+    entry.full_page_authority_scales = nullptr;
+    entry.full_page_authority_meta = {};
+    entry.full_page_authority_table_hash = 0;
     s_packed16_pending_full_page_maps.erase(k_view_data);
     if (ggml_cuda_mtp_qblock_tail_page_registry_trace_enabled()) {
         fprintf(stderr,
@@ -2930,6 +3496,19 @@ void llama_kv_cache_clear_mtp_qblock_full_page_map(const void * k_view_data) {
     auto it = s_packed16_registry.find(k_view_data);
     s_packed16_pending_full_page_maps.erase(k_view_data);
     if (it != s_packed16_registry.end()) {
+        if (k_view_data == s_packed16_full_page_authority_owner_key) {
+            s_packed16_full_page_authority_map = {};
+            s_packed16_full_page_authority_owner_key = nullptr;
+            s_packed16_full_page_authority_owner_payload = nullptr;
+            s_packed16_full_page_authority_owner_scales = nullptr;
+            s_packed16_full_page_authority_owner_meta = {};
+            s_packed16_full_page_authority_table_hash = 0;
+        }
+        it->second.full_page_map_authority = false;
+        it->second.full_page_authority_payload = nullptr;
+        it->second.full_page_authority_scales = nullptr;
+        it->second.full_page_authority_meta = {};
+        it->second.full_page_authority_table_hash = 0;
         if (ggml_cuda_mtp_qblock_full_page_map_valid(s_packed16_full_page_published_map) &&
                 ggml_cuda_mtp_qblock_full_page_map_published_sidecar_matches_locked(it->second)) {
             ggml_cuda_mtp_qblock_full_page_map_clear_published_locked();
@@ -2938,6 +3517,7 @@ void llama_kv_cache_clear_mtp_qblock_full_page_map(const void * k_view_data) {
         it->second.full_page_map_base = {};
         it->second.full_page_table_host.clear();
         ggml_cuda_mtp_qblock_full_page_map_refresh_published_locked();
+        ggml_cuda_mtp_qblock_full_page_authority_epoch_bump_locked();
     }
 }
 
@@ -2948,6 +3528,64 @@ void llama_kv_cache_get_mtp_qblock_full_page_map(const void * k_view_data, ggml_
     *map = {};
     std::lock_guard<std::mutex> lock(s_packed16_mutex);
     auto it = s_packed16_registry.find(k_view_data);
+    if (ggml_cuda_mtp_qblock_page_authority_enabled()) {
+        if (it != s_packed16_registry.end() &&
+                ggml_cuda_mtp_qblock_full_page_map_valid(it->second.full_page_map) &&
+                ggml_cuda_mtp_qblock_full_page_authority_entry_matches_locked(it->second) &&
+                ggml_cuda_mtp_qblock_full_page_authority_entry_accepts_locked(it->second, it->second.full_page_map)) {
+            *map = it->second.full_page_map;
+            if (ggml_cuda_mtp_qblock_tail_page_registry_trace_enabled()) {
+                fprintf(stderr,
+                        "MTP_QBLOCK_FULL_PAGE_AUTHORITY: op=get key=%p owner=%p valid_tokens=%u pages=%u table_ptr=%p generation=%llu scope=entry\n",
+                        k_view_data,
+                        k_view_data,
+                        map->valid_tokens,
+                        map->block_table_pages,
+                        (const void *) map->block_table,
+                        (unsigned long long) map->generation);
+            }
+            return;
+        }
+        if (it != s_packed16_registry.end() &&
+                ggml_cuda_mtp_qblock_full_page_map_valid(s_packed16_full_page_authority_map) &&
+                ggml_cuda_mtp_qblock_full_page_authority_owner_matches_locked(k_view_data, it->second) &&
+                ggml_cuda_mtp_qblock_full_page_authority_entry_accepts_locked(it->second, s_packed16_full_page_authority_map)) {
+            *map = s_packed16_full_page_authority_map;
+            if (ggml_cuda_mtp_qblock_tail_page_registry_trace_enabled()) {
+                fprintf(stderr,
+                        "MTP_QBLOCK_FULL_PAGE_AUTHORITY: op=get key=%p owner=%p valid_tokens=%u pages=%u table_ptr=%p generation=%llu scope=global\n",
+                        k_view_data,
+                        s_packed16_full_page_authority_owner_key,
+                        map->valid_tokens,
+                        map->block_table_pages,
+                        (const void *) map->block_table,
+                        (unsigned long long) map->generation);
+            }
+            return;
+        }
+        if (ggml_cuda_mtp_qblock_tail_page_registry_trace_enabled()) {
+            const bool found = it != s_packed16_registry.end();
+            const bool entry_map_valid = found && ggml_cuda_mtp_qblock_full_page_map_valid(it->second.full_page_map);
+            const bool entry_sidecar_match = found && ggml_cuda_mtp_qblock_full_page_authority_entry_matches_locked(it->second);
+            const bool entry_accepts = found && ggml_cuda_mtp_qblock_full_page_authority_entry_accepts_locked(it->second, it->second.full_page_map);
+            fprintf(stderr,
+                    "MTP_QBLOCK_FULL_PAGE_AUTHORITY: op=get_miss_authority_only key=%p found=%d owner=%p active=%d entry_authority=%d entry_map_valid=%d entry_sidecar_match=%d entry_accepts=%d entry_generation=%llu current_k_format=%u saved_k_format=%u current_capacity=%u saved_capacity=%u\n",
+                    k_view_data,
+                    found ? 1 : 0,
+                    s_packed16_full_page_authority_owner_key,
+                    ggml_cuda_mtp_qblock_full_page_map_valid(s_packed16_full_page_authority_map) ? 1 : 0,
+                    found && it->second.full_page_map_authority ? 1 : 0,
+                    entry_map_valid ? 1 : 0,
+                    entry_sidecar_match ? 1 : 0,
+                    entry_accepts ? 1 : 0,
+                    found ? (unsigned long long) it->second.full_page_map.generation : 0ull,
+                    found ? (unsigned) it->second.meta.k_format : 0u,
+                    found ? (unsigned) it->second.full_page_authority_meta.k_format : 0u,
+                    found ? (unsigned) it->second.meta.kv_capacity : 0u,
+                    found ? (unsigned) it->second.full_page_authority_meta.kv_capacity : 0u);
+        }
+        return;
+    }
     if (it != s_packed16_registry.end() && ggml_cuda_mtp_qblock_full_page_map_valid(it->second.full_page_map)) {
         *map = it->second.full_page_map;
         return;
@@ -3231,10 +3869,21 @@ void llama_kv_cache_reset_mtp_qblock_tail_page_lifecycle_preserve_snapshot(bool 
     }
     if (data_invalidates) {
         ggml_cuda_mtp_qblock_full_page_map_clear_published_locked();
+        s_packed16_full_page_authority_map = {};
+        s_packed16_full_page_authority_owner_key = nullptr;
+        s_packed16_full_page_authority_owner_payload = nullptr;
+        s_packed16_full_page_authority_owner_scales = nullptr;
+        s_packed16_full_page_authority_owner_meta = {};
+        s_packed16_full_page_authority_table_hash = 0;
         s_packed16_pending_full_page_maps.clear();
         for (auto & kv : s_packed16_registry) {
             kv.second.full_page_map = {};
             kv.second.full_page_map_base = {};
+            kv.second.full_page_map_authority = false;
+            kv.second.full_page_authority_payload = nullptr;
+            kv.second.full_page_authority_scales = nullptr;
+            kv.second.full_page_authority_meta = {};
+            kv.second.full_page_authority_table_hash = 0;
             kv.second.full_page_table_host.clear();
         }
         s_packed16_tail_page_consumer_no_map_nk_max = 0;
@@ -3446,8 +4095,8 @@ static inline int ggml_cuda_q8k_dot4_decode_stage_split_size(const int nk, const
 
 struct ggml_cuda_packed16_timing_trace_event {
     bool active = false;
-    hipEvent_t start = nullptr;
-    hipEvent_t stop = nullptr;
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop = nullptr;
 };
 
 static inline bool ggml_cuda_packed16_timing_trace_enabled() {
@@ -3463,8 +4112,8 @@ static inline void ggml_cuda_packed16_timing_trace_begin(
     if (!ggml_cuda_packed16_timing_trace_enabled()) {
         return;
     }
-    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
-    if (hipStreamIsCapturing(stream, &capture_status) == hipSuccess && capture_status != hipStreamCaptureStatusNone) {
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &capture_status) == cudaSuccess && capture_status != cudaStreamCaptureStatusNone) {
         static bool warned = false;
         if (!warned) {
             warned = true;
@@ -3472,9 +4121,9 @@ static inline void ggml_cuda_packed16_timing_trace_begin(
         }
         return;
     }
-    CUDA_CHECK(hipEventCreate(&ev.start));
-    CUDA_CHECK(hipEventCreate(&ev.stop));
-    CUDA_CHECK(hipEventRecord(ev.start, stream));
+    CUDA_CHECK(cudaEventCreate(&ev.start));
+    CUDA_CHECK(cudaEventCreate(&ev.stop));
+    CUDA_CHECK(cudaEventRecord(ev.start, stream));
     ev.active = true;
 }
 
@@ -3484,12 +4133,12 @@ static inline float ggml_cuda_packed16_timing_trace_end(
     if (!ev.active) {
         return -1.0f;
     }
-    CUDA_CHECK(hipEventRecord(ev.stop, stream));
-    CUDA_CHECK(hipEventSynchronize(ev.stop));
+    CUDA_CHECK(cudaEventRecord(ev.stop, stream));
+    CUDA_CHECK(cudaEventSynchronize(ev.stop));
     float elapsed_ms = 0.0f;
-    CUDA_CHECK(hipEventElapsedTime(&elapsed_ms, ev.start, ev.stop));
-    CUDA_CHECK(hipEventDestroy(ev.start));
-    CUDA_CHECK(hipEventDestroy(ev.stop));
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, ev.start, ev.stop));
+    CUDA_CHECK(cudaEventDestroy(ev.start));
+    CUDA_CHECK(cudaEventDestroy(ev.stop));
     ev = {};
     return elapsed_ms;
 }
@@ -3632,9 +4281,9 @@ static ggml_cuda_mtp_qblock_txn_tail_backend_idx_probe ggml_cuda_mtp_qblock_txn_
     if (idxs == nullptr || idxs->data == nullptr || nk_cur <= 0 || nk_cur > 8 || kv_size <= 0) {
         return probe;
     }
-    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
-    CUDA_CHECK(hipStreamIsCapturing(stream, &capture_status));
-    if (capture_status != hipStreamCaptureStatusNone) {
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+    if (capture_status != cudaStreamCaptureStatusNone) {
         probe.capture_skipped = true;
         probe.status = MTP_V4_144_TAIL_STAGE_OK;
         return probe;
@@ -3764,19 +4413,19 @@ static bool ggml_cuda_q8k_dot4_packed16_sidecar_valid(
     return false;
 }
 
-static inline void ggml_cuda_q8k_dot4_kq_event_create(hipEvent_t * event) {
-    CUDA_CHECK(hipEventCreate(event));
+static inline void ggml_cuda_q8k_dot4_kq_event_create(cudaEvent_t * event) {
+    CUDA_CHECK(cudaEventCreate(event));
 }
 
-static inline void ggml_cuda_q8k_dot4_kq_event_destroy(hipEvent_t event) {
+static inline void ggml_cuda_q8k_dot4_kq_event_destroy(cudaEvent_t event) {
     if (event != nullptr) {
-        CUDA_CHECK(hipEventDestroy(event));
+        CUDA_CHECK(cudaEventDestroy(event));
     }
 }
 
-static inline float ggml_cuda_q8k_dot4_kq_event_elapsed_ms(hipEvent_t start, hipEvent_t stop) {
+static inline float ggml_cuda_q8k_dot4_kq_event_elapsed_ms(cudaEvent_t start, cudaEvent_t stop) {
     float ms = 0.0f;
-    CUDA_CHECK(hipEventElapsedTime(&ms, start, stop));
+    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
     return ms;
 }
 
@@ -5278,9 +5927,9 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
     const int dot4_debug = ggml_cuda_q8k_dot4_kq_env_enabled("GGML_CUDA_DOT4_DEBUG") ? 1 : 0;
     bool stream_is_capturing = false;
 #ifdef USE_CUDA_GRAPH
-    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
-    CUDA_CHECK(hipStreamIsCapturing(ctx.stream(), &capture_status));
-    stream_is_capturing = capture_status != hipStreamCaptureStatusNone;
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &capture_status));
+    stream_is_capturing = capture_status != cudaStreamCaptureStatusNone;
 #endif // USE_CUDA_GRAPH
     const int timing_every = max(1, ggml_cuda_q8k_dot4_kq_env_int("GGML_CUDA_ROCM_Q8K_DOT4_KQ_TIMING_EVERY", 1));
     static unsigned long long timing_counter = 0;
@@ -5290,7 +5939,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
     q_payload.alloc(q_rows * (GGML_CUDA_Q8K_DOT4_KQ_D / 4));
     q_scales.alloc(q_rows * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS);
 
-    // Persistent packed16 K cache: hipMalloc once per K tensor, reuse across passes.
+    // Persistent packed16 K cache: cudaMalloc once per K tensor, reuse across passes.
     // Skips re-pack when k_rows hasn't grown since last repack.
     static std::mutex s_cache_mutex;
     static std::unordered_map<const void *, std::pair<int *, half *>> s_cache;
@@ -5302,7 +5951,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
     }
     bool skip_k_repack = false;
     if (use_packed16) {
-        // Prefer GGML tensors from registry (allocated by KV cache). Fall back to hipMalloc.
+        // Prefer GGML tensors from registry (allocated by KV cache). Fall back to cudaMalloc.
         ggml_tensor * payload_tensor = nullptr;
         ggml_tensor * scales_tensor  = nullptr;
         llama_kv_cache_get_packed16_tensors(K->data, &payload_tensor, &scales_tensor);
@@ -5313,7 +5962,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
             GGML_ABORT("q8k_dot4_kq packed16 sidecar contract failed for physical I32+F16-scale K");
         }
         if (payload_tensor && scales_tensor) {
-            // Use GGML tensors directly — no hipMalloc needed.
+            // Use GGML tensors directly — no cudaMalloc needed.
             k_payload.ptr = (int *) payload_tensor->data;
             k_scales.ptr  = (half *) scales_tensor->data;
             // One-time DOT4 packed16 registry dump
@@ -5338,7 +5987,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                 skip_k_repack = true;
             }
         } else {
-            // Fallback: hipMalloc persistent buffers.
+            // Fallback: cudaMalloc persistent buffers.
             const size_t need_payload = (size_t)k_rows * (GGML_CUDA_Q8K_DOT4_KQ_D / 4);
             const size_t need_scales  = (size_t)k_rows * GGML_CUDA_Q8K_DOT4_KQ_BLOCKS;
             std::lock_guard<std::mutex> lock(s_cache_mutex);
@@ -5346,11 +5995,11 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
             size_t & prev_rows = s_cache_rows[K->data];
             if (e.first == nullptr || prev_rows < (size_t)k_rows) {
                 if (e.first && prev_rows < (size_t)k_rows) {
-                    CUDA_CHECK(hipFree(e.first));
-                    CUDA_CHECK(hipFree(e.second));
+                    CUDA_CHECK(cudaFree(e.first));
+                    CUDA_CHECK(cudaFree(e.second));
                 }
-                CUDA_CHECK(hipMalloc(&e.first,  need_payload * sizeof(int)));
-                CUDA_CHECK(hipMalloc(&e.second, need_scales  * sizeof(half)));
+                CUDA_CHECK(cudaMalloc(&e.first,  need_payload * sizeof(int)));
+                CUDA_CHECK(cudaMalloc(&e.second, need_scales  * sizeof(half)));
             } else {
                 skip_k_repack = true;
             }
@@ -5391,14 +6040,14 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
     dim3 q_grid(nq, n_heads_q, batch);
     dim3 block(256);
 
-    hipEvent_t ev_start = nullptr;
-    hipEvent_t ev_q_quant = nullptr;
-    hipEvent_t ev_k_pack = nullptr;
-    hipEvent_t ev_kq = nullptr;
-    hipEvent_t ev_ref = nullptr;
-    hipEvent_t ev_err = nullptr;
-    hipEvent_t ev_blockfa = nullptr;
-    hipEvent_t ev_zero = nullptr;
+    cudaEvent_t ev_start = nullptr;
+    cudaEvent_t ev_q_quant = nullptr;
+    cudaEvent_t ev_k_pack = nullptr;
+    cudaEvent_t ev_kq = nullptr;
+    cudaEvent_t ev_ref = nullptr;
+    cudaEvent_t ev_err = nullptr;
+    cudaEvent_t ev_blockfa = nullptr;
+    cudaEvent_t ev_zero = nullptr;
     if (timing) {
         ggml_cuda_q8k_dot4_kq_event_create(&ev_start);
         ggml_cuda_q8k_dot4_kq_event_create(&ev_q_quant);
@@ -5408,7 +6057,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
         ggml_cuda_q8k_dot4_kq_event_create(&ev_err);
         ggml_cuda_q8k_dot4_kq_event_create(&ev_blockfa);
         ggml_cuda_q8k_dot4_kq_event_create(&ev_zero);
-        CUDA_CHECK(hipEventRecord(ev_start, stream));
+        CUDA_CHECK(cudaEventRecord(ev_start, stream));
     }
 
     ggml_cuda_q8k_dot4_quant_q_packed16_kernel<<<q_grid, block, 0, stream>>>(
@@ -5416,7 +6065,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
         Q->nb[1], Q->nb[2], Q->nb[3], nq, n_heads_q, batch);
     CUDA_CHECK(cudaGetLastError());
     if (timing) {
-        CUDA_CHECK(hipEventRecord(ev_q_quant, stream));
+        CUDA_CHECK(cudaEventRecord(ev_q_quant, stream));
     }
 
     {
@@ -5446,7 +6095,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
             }
         }
         if (timing) {
-            CUDA_CHECK(hipEventRecord(ev_k_pack, stream));
+            CUDA_CHECK(cudaEventRecord(ev_k_pack, stream));
         }
     }
 
@@ -5462,7 +6111,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
         CUDA_CHECK(cudaGetLastError());
     }
     if (timing) {
-        CUDA_CHECK(hipEventRecord(ev_kq, stream));
+        CUDA_CHECK(cudaEventRecord(ev_kq, stream));
     }
 
     if (check && !fused_variant_effective) {
@@ -5475,13 +6124,13 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
             nq, nk, n_heads_q, n_heads_k, gqa_ratio, batch);
         CUDA_CHECK(cudaGetLastError());
         if (timing) {
-            CUDA_CHECK(hipEventRecord(ev_ref, stream));
+            CUDA_CHECK(cudaEventRecord(ev_ref, stream));
         }
         ggml_cuda_q8k_dot4_kq_error_kernel<<<(logits_ne + 255) / 256, 256, 0, stream>>>(
             logits.ptr, ref_logits.ptr, metrics.ptr, logits_ne);
         CUDA_CHECK(cudaGetLastError());
         if (timing) {
-            CUDA_CHECK(hipEventRecord(ev_err, stream));
+            CUDA_CHECK(cudaEventRecord(ev_err, stream));
         }
         float h_metrics[3] = {0.0f, 0.0f, 0.0f};
         CUDA_CHECK(cudaMemcpyAsync(h_metrics, metrics.ptr, 3 * sizeof(float), cudaMemcpyDeviceToHost, stream));
@@ -5917,7 +6566,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
                     }
                 }
                 if (timing) {
-                    CUDA_CHECK(hipEventRecord(ev_blockfa, stream));
+                    CUDA_CHECK(cudaEventRecord(ev_blockfa, stream));
                 }
             }
         } else {
@@ -5935,8 +6584,8 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
         CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
     }
     if (timing) {
-        CUDA_CHECK(hipEventRecord(ev_zero, stream));
-        CUDA_CHECK(hipEventSynchronize(ev_zero));
+        CUDA_CHECK(cudaEventRecord(ev_zero, stream));
+        CUDA_CHECK(cudaEventSynchronize(ev_zero));
         const float q_quant_ms = ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_start, ev_q_quant);
         const float k_pack_ms  = ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_q_quant, ev_k_pack);
         const float kq_ms      = ggml_cuda_q8k_dot4_kq_event_elapsed_ms(ev_k_pack, ev_kq);
@@ -5972,7 +6621,7 @@ void ggml_cuda_flash_attn_ext_q8k_dot4_kq(ggml_backend_cuda_context & ctx, ggml_
             blockfa_recthist_v4_single_effective ? blockfa_q_offset : 0, blockfa_recthist_prefix_k, blockfa_recthist_tail_k);
     }
 
-    // Detach hipMalloc'd persistent buffers from pool allocator destructors.
+    // Detach cudaMalloc'd persistent buffers from pool allocator destructors.
     if (ggml_cuda_q8k_dot4_packed16_k_cache_enabled()) {
         k_payload.ptr = nullptr;
         k_scales.ptr  = nullptr;

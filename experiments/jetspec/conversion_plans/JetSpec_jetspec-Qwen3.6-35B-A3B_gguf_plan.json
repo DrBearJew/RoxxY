@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-06-27T13:03:19+00:00",
+  "generated_at": "2026-07-01T00:18:41+00:00",
   "inputs": {
     "manifest": "/home/mrtrent/.harness/tmp/roxxY-push-20260624-002659/experiments/jetspec/manifests/JetSpec_jetspec-Qwen3.6-35B-A3B_main.manifest.json",
     "tensor_map": "/home/mrtrent/.harness/tmp/roxxY-push-20260624-002659/experiments/jetspec/tensor_map_qwen36_head.json"

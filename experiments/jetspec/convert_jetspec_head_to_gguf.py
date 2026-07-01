@@ -187,8 +187,50 @@ def _validate_plan(plan: dict[str, Any]) -> None:
     proposed = plan.get("proposed_output") or {}
     if proposed.get("runtime_supported") is not False:
         raise ConversionError("expected runtime_supported=false for inert JetSpec staging")
-    if proposed.get("tensor_count") != len(plan.get("tensors") or []):
+
+    tensors = list(plan.get("tensors") or [])
+    if proposed.get("tensor_count") != len(tensors):
         raise ConversionError("planned tensor_count does not match tensor list length")
+
+    seen_hf: set[str] = set()
+    seen_gguf: set[str] = set()
+    total_payload = 0
+    last_end = 0
+    for index, tensor in enumerate(tensors):
+        hf_name = tensor.get("hf_name")
+        gguf_name = tensor.get("gguf_name")
+        if not isinstance(hf_name, str) or not hf_name:
+            raise ConversionError(f"tensor {index} has invalid hf_name")
+        if not isinstance(gguf_name, str) or not gguf_name:
+            raise ConversionError(f"tensor {index} has invalid gguf_name")
+        if hf_name in seen_hf:
+            raise ConversionError(f"duplicate hf tensor name: {hf_name}")
+        if gguf_name in seen_gguf:
+            raise ConversionError(f"duplicate GGUF tensor name: {gguf_name}")
+        seen_hf.add(hf_name)
+        seen_gguf.add(gguf_name)
+        if tensor.get("dtype") != "BF16":
+            raise ConversionError(f"tensor {hf_name} must remain raw BF16, got {tensor.get('dtype')}")
+        shape = [int(x) for x in tensor.get("shape", [])]
+        if not shape or any(dim <= 0 for dim in shape):
+            raise ConversionError(f"tensor {hf_name} has invalid shape: {shape}")
+        numel = 1
+        for dim in shape:
+            numel *= dim
+        nbytes = int(tensor.get("nbytes", -1))
+        if nbytes != numel * 2:
+            raise ConversionError(f"tensor {hf_name} BF16 byte count mismatch: nbytes={nbytes} numel={numel}")
+        offsets = [int(x) for x in tensor.get("source_data_offsets", [])]
+        if len(offsets) != 2 or offsets[0] < 0 or offsets[1] <= offsets[0]:
+            raise ConversionError(f"tensor {hf_name} has invalid source_data_offsets: {offsets}")
+        if offsets[0] < last_end:
+            raise ConversionError(f"tensor {hf_name} source offsets overlap or regress: {offsets} after {last_end}")
+        if offsets[1] - offsets[0] != nbytes:
+            raise ConversionError(f"tensor {hf_name} source offset length does not match nbytes")
+        last_end = offsets[1]
+        total_payload += nbytes
+    if proposed.get("tensor_payload_bytes") is not None and int(proposed.get("tensor_payload_bytes")) != total_payload:
+        raise ConversionError("planned tensor_payload_bytes does not match summed tensor nbytes")
 
 
 def _read_safetensors_header(path: pathlib.Path) -> tuple[dict[str, Any], int]:

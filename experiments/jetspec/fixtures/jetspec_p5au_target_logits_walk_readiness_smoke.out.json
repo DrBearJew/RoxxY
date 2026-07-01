@@ -1,0 +1,121 @@
+{
+  "approvals": {
+    "draft_token_emission_approved": false,
+    "performance_promotion_approved": false,
+    "product_runtime_hooks_approved": false,
+    "real_hidden_kv_commit_approved": false,
+    "real_publish_approved": false,
+    "real_rejected_branch_discard_approved": false,
+    "real_token_commit_approved": false,
+    "target_accept_walk_approved": false,
+    "target_logits_walk_approved": false,
+    "visible_token_publish_approved": false
+  },
+  "completed_chain": [
+    "P5AK",
+    "P5AL",
+    "P5AM",
+    "P5AN",
+    "P5AO",
+    "P5AP",
+    "P5AQ",
+    "P5AR",
+    "P5AS",
+    "P5AT"
+  ],
+  "context_created": false,
+  "draft_tokens_emitted": false,
+  "errors": [],
+  "kv_mutated": false,
+  "model_loaded": false,
+  "ok": true,
+  "p5at_status": "p5at_real_draft_head_topk_promotion_blocker_verified_not_executed",
+  "promotion_result": "target_logits_walk_blocked_pending_explicit_approval",
+  "runtime_boundary": {
+    "accept_executed": false,
+    "context_created": false,
+    "draft_tokens_emitted": false,
+    "kv_mutated": false,
+    "llama_decode_called": false,
+    "model_loaded": false,
+    "real_hidden_kv_commit_executed": false,
+    "real_publish_executed": false,
+    "real_rejected_branch_discard_executed": false,
+    "real_token_commit_executed": false,
+    "runtime_executed": false,
+    "target_accept_walk_executed": false,
+    "target_logits_walk_executed": false,
+    "visible_state_changed": false,
+    "visible_token_publish_executed": false
+  },
+  "runtime_executed": false,
+  "runtime_hooks": {
+    "common_speculative_hook": false,
+    "ggml_kv_mutation_hook": false,
+    "p5ad_root_publish_noop_product_hook_reuse": false,
+    "p5au_target_logits_walk_runtime_hook": false,
+    "p5t_token_commit_runtime_product_hook": false,
+    "p5u_hidden_kv_survivor_commit_runtime_product_hook": false,
+    "p5v_rejected_branch_discard_runtime_product_hook": false,
+    "p5w_publish_gate_runtime_product_hook": false,
+    "public_api_route_hook": false,
+    "server_draft_token_emission_hook": false
+  },
+  "side_effect_counters": {
+    "actual_accepted_nodes": 0,
+    "actual_committed_tokens": 0,
+    "actual_draft_tokens_emitted": 0,
+    "actual_pages_discarded": 0,
+    "actual_publish_visible_state": 0,
+    "actual_survivor_pages_committed": 0,
+    "actual_target_accept_steps": 0,
+    "actual_target_logits_rows_walked": 0,
+    "rejected_branch_pages_reachable_after_discard": 0
+  },
+  "source_tree": {
+    "actual_tree_nodes": 3,
+    "actual_verify_mask_entries": 5,
+    "allowed_edges": [
+      "0:0",
+      "1:0",
+      "1:1",
+      "2:0",
+      "2:2"
+    ],
+    "candidate_ids": [
+      92637,
+      2054
+    ],
+    "candidate_nodes": 2,
+    "real_tree_token_ids": [
+      13,
+      92637,
+      2054
+    ]
+  },
+  "status": "p5au_target_logits_walk_readiness_verified_not_executed",
+  "target_accept_walk_executed": false,
+  "target_logits_plan": {
+    "actual_accepted_nodes": 0,
+    "actual_target_accept_steps": 0,
+    "actual_target_logits_rows_walked": 0,
+    "correction_token_present": 0,
+    "planned_accept_decision_source": "target_logits_not_yet_executed",
+    "planned_candidate_ids": [
+      92637,
+      2054
+    ],
+    "planned_candidate_nodes": [
+      1,
+      2
+    ],
+    "planned_parent_nodes": [
+      0
+    ],
+    "planned_row_semantics": "parent_position_scores_candidate_children",
+    "planned_target_logits_rows": 1,
+    "planned_target_logits_source": "target_model_full_vocab_logits",
+    "planned_target_position_source": "target_cache_position_for_parent_node_0"
+  },
+  "target_logits_walk_executed": false
+}

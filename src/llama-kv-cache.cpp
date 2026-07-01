@@ -108,6 +108,16 @@ static bool llama_mtp_qblock_dbv_paged_attention_enabled() {
     return paged && atoi(paged) != 0 && !llama_mtp_qblock_dbv_paged_attention_suppress_full_map_publish_enabled();
 }
 
+static bool llama_mtp_qblock_page_authority_enabled() {
+    const char * authority = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGE_AUTHORITY");
+    return llama_mtp_qblock_dbv_paged_attention_enabled() && authority && atoi(authority) != 0;
+}
+
+static bool llama_mtp_qblock_page_authority_trace_enabled() {
+    const char * trace = getenv("GGML_CUDA_ROCM_MTP_QBLOCK_PAGE_AUTHORITY_TRACE");
+    return (trace && atoi(trace) != 0) || llama_mtp_qblock_tail_page_registry_trace_enabled();
+}
+
 static int llama_mtp_qblock_env_int(const char * name, int def) {
     const char * v = getenv(name);
     return v && *v ? atoi(v) : def;
@@ -910,6 +920,826 @@ void llama_kv_cache::clear_mtp_qblock_paged_state() const {
     llama_mtp_qblock_paged_state_clear(mtp_qblock_paged_state, mtp_qblock_paged_state.generation + 1);
 }
 
+void llama_kv_cache::invalidate_mtp_qblock_full_current_k_page_authority(const char * reason) const {
+    const bool should_clear_global = mtp_qblock_full_current_k_page_authority.published_generation != 0 ||
+        mtp_qblock_full_current_k_page_authority.active;
+    mtp_qblock_full_current_k_page_authority.dirty = true;
+    mtp_qblock_full_current_k_page_authority.published_generation = 0;
+    mtp_qblock_full_current_k_page_authority.published_map_signature = 0;
+    mtp_qblock_full_current_k_page_authority.owner_k_view_data = nullptr;
+    ++mtp_qblock_full_current_k_page_authority_epoch;
+    if (should_clear_global) {
+        llama_kv_cache_clear_mtp_qblock_full_page_authority_host();
+    }
+    if (llama_mtp_qblock_page_authority_trace_enabled()) {
+        fprintf(stderr,
+                "MTP_QBLOCK_PAGE_AUTHORITY: op=invalidate reason=%s epoch=%llu generation=%llu active=%d cleared_global=%d\n",
+                reason ? reason : "unspecified",
+                (unsigned long long) mtp_qblock_full_current_k_page_authority_epoch,
+                (unsigned long long) mtp_qblock_full_current_k_page_authority.generation,
+                mtp_qblock_full_current_k_page_authority.active ? 1 : 0,
+                should_clear_global ? 1 : 0);
+    }
+}
+
+void llama_kv_cache::clear_mtp_qblock_full_current_k_page_authority(const char * reason) const {
+    const bool should_clear_global = mtp_qblock_full_current_k_page_authority.published_generation != 0 ||
+        mtp_qblock_full_current_k_page_authority.active;
+    mtp_qblock_full_current_k_page_authority = qblock_full_current_k_page_authority{};
+    ++mtp_qblock_full_current_k_page_authority_epoch;
+    if (should_clear_global) {
+        llama_kv_cache_clear_mtp_qblock_full_page_authority_host();
+    }
+    if (llama_mtp_qblock_page_authority_trace_enabled()) {
+        fprintf(stderr,
+                "MTP_QBLOCK_PAGE_AUTHORITY: op=clear reason=%s epoch=%llu cleared_global=%d\n",
+                reason ? reason : "unspecified",
+                (unsigned long long) mtp_qblock_full_current_k_page_authority_epoch,
+                should_clear_global ? 1 : 0);
+    }
+}
+
+bool llama_kv_cache::rebuild_mtp_qblock_full_current_k_page_authority(
+        uint32_t n_kv,
+        uint32_t kv_size_total,
+        const slot_info & sinfo,
+        const char ** reason) const {
+    auto fail = [&](const char * why) {
+        if (reason) {
+            *reason = why;
+        }
+        clear_mtp_qblock_full_current_k_page_authority(why);
+        return false;
+    };
+
+    if (!llama_mtp_qblock_page_authority_enabled()) {
+        return fail("authority_disabled");
+    }
+    if (n_stream != 1 || sinfo.n_stream() != 1 || sinfo.strm.empty()) {
+        return fail("multi_stream_unsupported");
+    }
+    if (n_kv == 0 || kv_size_total == 0) {
+        return fail("empty_kv");
+    }
+    constexpr uint32_t page_tokens = LLAMA_MTP_QBLOCK_PAGED_STATE_PAGE_TOKENS;
+    if (page_tokens != 16u || kv_size_total % page_tokens != 0) {
+        return fail("kv_capacity_not_page_aligned");
+    }
+    const uint32_t physical_pages = kv_size_total / page_tokens;
+    if (n_kv > kv_size_total || physical_pages == 0) {
+        return fail("bad_page_count");
+    }
+    if (sinfo.strm[0] >= v_cells.size()) {
+        return fail("bad_stream");
+    }
+
+    const auto & cells = v_cells[sinfo.strm[0]];
+    if (cells.size() != kv_size_total) {
+        return fail("kv_size_mismatch");
+    }
+    if (sinfo.idxs.empty() || sinfo.idxs[0].empty()) {
+        return fail("missing_current_indices");
+    }
+
+    llama_seq_id target_seq_id = -1;
+    bool dense_identity_current_k = false;
+    for (uint32_t idx : sinfo.idxs[0]) {
+        if (idx >= kv_size_total || cells.is_empty(idx)) {
+            return fail("current_idx_empty");
+        }
+        if (cells.seq_count(idx) != 1) {
+            dense_identity_current_k = true;
+            break;
+        }
+        const llama_seq_id cur_seq = cells.seq_get(idx);
+        if (target_seq_id < 0) {
+            target_seq_id = cur_seq;
+        } else if (target_seq_id != cur_seq) {
+            dense_identity_current_k = true;
+            break;
+        }
+    }
+    if (target_seq_id < 0 && !dense_identity_current_k) {
+        return fail("missing_current_seq");
+    }
+
+    qblock_full_current_k_page_authority & auth = mtp_qblock_full_current_k_page_authority;
+    auto build_dense_identity_authority = [&](const char * why) -> bool {
+        const uint32_t map_valid_tokens = n_kv;
+        const uint32_t block_table_pages = (map_valid_tokens + page_tokens - 1u) / page_tokens;
+        if (map_valid_tokens == 0 || block_table_pages == 0 || block_table_pages > physical_pages) {
+            return fail("dense_identity_bad_pages");
+        }
+        if (auth.active && !auth.dirty && auth.source_epoch == mtp_qblock_full_current_k_page_authority_epoch &&
+                auth.seq_id == -1 && auth.flags == GGML_CUDA_MTP_QBLOCK_FULL_PAGE_MAP_FLAG_IDENTITY &&
+                auth.valid_tokens == map_valid_tokens && auth.physical_pages == physical_pages &&
+                auth.page_tokens == page_tokens && auth.block_table_pages == block_table_pages &&
+                auth.block_table.size() == auth.block_table_pages) {
+            if (reason) {
+                *reason = "ok_dense_identity_reuse";
+            }
+            return true;
+        }
+        std::vector<int32_t> block_table(block_table_pages);
+        for (uint32_t page = 0; page < block_table_pages; ++page) {
+            block_table[page] = (int32_t) page;
+        }
+        auth.active = true;
+        auth.dirty = false;
+        auth.flags = GGML_CUDA_MTP_QBLOCK_FULL_PAGE_MAP_FLAG_IDENTITY;
+        auth.logical_base_token = 0;
+        auth.valid_tokens = map_valid_tokens;
+        auth.page_tokens = page_tokens;
+        auth.physical_pages = physical_pages;
+        auth.block_table_pages = block_table_pages;
+        auth.non_identity_page_begin = block_table_pages;
+        auth.non_identity_page_end = block_table_pages;
+        auth.seq_id = -1;
+        const uint64_t raw_generation = (uint64_t(mtp_qblock_full_current_k_page_authority_epoch) << 40) ^
+            (uint64_t(map_valid_tokens) << 24) ^ (uint64_t(block_table_pages) << 8) ^
+            uint64_t(kv_size_total) ^ uint64_t(auth.flags) ^ (0xffffffffull << 32);
+        auth.generation = raw_generation == 0 ? 1u : raw_generation;
+        auth.source_epoch = mtp_qblock_full_current_k_page_authority_epoch;
+        auth.published_generation = 0;
+        auth.published_map_signature = 0;
+        auth.owner_k_view_data = nullptr;
+        auth.block_table = std::move(block_table);
+        if (reason) {
+            *reason = why;
+        }
+        if (llama_mtp_qblock_page_authority_trace_enabled()) {
+            fprintf(stderr,
+                    "MTP_QBLOCK_PAGE_AUTHORITY: op=rebuild reason=%s valid_tokens=%u pages=%u physical_pages=%u epoch=%llu generation=%llu first_pages=[%d,%d,%d,%d]\n",
+                    why ? why : "ok_dense_identity",
+                    auth.valid_tokens,
+                    auth.block_table_pages,
+                    auth.physical_pages,
+                    (unsigned long long) auth.source_epoch,
+                    (unsigned long long) auth.generation,
+                    auth.block_table_pages > 0 ? auth.block_table[0] : -1,
+                    auth.block_table_pages > 1 ? auth.block_table[1] : -1,
+                    auth.block_table_pages > 2 ? auth.block_table[2] : -1,
+                    auth.block_table_pages > 3 ? auth.block_table[3] : -1);
+        }
+        return true;
+    };
+    if (dense_identity_current_k) {
+        return build_dense_identity_authority("ok_dense_identity_multi_seq");
+    }
+    if (auth.active && !auth.dirty && auth.source_epoch == mtp_qblock_full_current_k_page_authority_epoch &&
+            auth.seq_id == target_seq_id &&
+            auth.valid_tokens != 0 && auth.valid_tokens >= n_kv && auth.valid_tokens <= kv_size_total &&
+            auth.physical_pages == physical_pages && auth.page_tokens == page_tokens &&
+            auth.block_table_pages != 0 && auth.block_table_pages <= auth.physical_pages &&
+            auth.block_table.size() == auth.block_table_pages) {
+        if (reason) {
+            *reason = "ok_reuse";
+        }
+        return true;
+    }
+
+    llama_pos pos_min = std::numeric_limits<llama_pos>::max();
+    llama_pos pos_max = std::numeric_limits<llama_pos>::min();
+    uint32_t cell_count = 0;
+    for (uint32_t i = 0; i < kv_size_total; ++i) {
+        if (cells.is_empty(i) || !cells.seq_has(i, target_seq_id)) {
+            continue;
+        }
+        if (cells.seq_count(i) != 1) {
+            return fail("multi_seq_cell");
+        }
+        const llama_pos pos = cells.pos_get(i);
+        if (pos < 0) {
+            return fail("negative_pos");
+        }
+        pos_min = std::min(pos_min, pos);
+        pos_max = std::max(pos_max, pos);
+        ++cell_count;
+    }
+    if (cell_count == 0 || pos_max < pos_min) {
+        return fail("empty_cells");
+    }
+    if (pos_min != 0) {
+        return fail("nonzero_logical_base_unsupported");
+    }
+    const uint64_t logical_tokens64 = uint64_t(pos_max - pos_min) + 1u;
+    if (logical_tokens64 == 0 || logical_tokens64 > uint64_t(n_kv) || logical_tokens64 > uint64_t(kv_size_total) ||
+            logical_tokens64 > uint64_t(std::numeric_limits<uint32_t>::max())) {
+        return fail("logical_span_out_of_range");
+    }
+    const uint32_t logical_valid_tokens = (uint32_t) logical_tokens64;
+    if (cell_count != logical_valid_tokens) {
+        return fail("logical_position_hole");
+    }
+    const uint32_t map_valid_tokens = std::max(logical_valid_tokens, n_kv);
+
+    std::vector<uint32_t> physical_by_logical(logical_valid_tokens, std::numeric_limits<uint32_t>::max());
+    for (uint32_t i = 0; i < kv_size_total; ++i) {
+        if (cells.is_empty(i) || !cells.seq_has(i, target_seq_id)) {
+            continue;
+        }
+        const uint32_t logical = (uint32_t) (cells.pos_get(i) - pos_min);
+        if (logical >= logical_valid_tokens || physical_by_logical[logical] != std::numeric_limits<uint32_t>::max()) {
+            return fail("duplicate_logical_pos");
+        }
+        physical_by_logical[logical] = i;
+    }
+
+    const uint32_t block_table_pages = (map_valid_tokens + page_tokens - 1u) / page_tokens;
+    if (block_table_pages == 0 || block_table_pages > physical_pages) {
+        return fail("bad_block_table_pages");
+    }
+    std::vector<int32_t> block_table(block_table_pages);
+    bool identity = true;
+    uint32_t non_identity_page_begin = block_table_pages;
+    uint32_t non_identity_page_end = block_table_pages;
+    for (uint32_t page = 0; page < block_table_pages; ++page) {
+        const uint32_t logical_base = page * page_tokens;
+        const uint32_t page_valid = std::min(page_tokens, map_valid_tokens - logical_base);
+        if (logical_base >= logical_valid_tokens) {
+            block_table[page] = (int32_t) page;
+            continue;
+        }
+        const uint32_t logical_page_valid = std::min(page_tokens, logical_valid_tokens - logical_base);
+        const uint32_t first_physical = physical_by_logical[logical_base];
+        if (first_physical == std::numeric_limits<uint32_t>::max() || first_physical % page_tokens != 0) {
+            return build_dense_identity_authority("ok_dense_identity_physical_unaligned");
+        }
+        const uint32_t physical_page = first_physical / page_tokens;
+        if (physical_page >= physical_pages) {
+            return fail("physical_page_oob");
+        }
+        for (uint32_t slot = 0; slot < logical_page_valid; ++slot) {
+            if (physical_by_logical[logical_base + slot] != first_physical + slot) {
+                return build_dense_identity_authority("ok_dense_identity_physical_not_contiguous");
+            }
+        }
+        block_table[page] = (int32_t) physical_page;
+        if (physical_page != page) {
+            identity = false;
+            non_identity_page_begin = std::min(non_identity_page_begin, page);
+            non_identity_page_end = page + 1u;
+        }
+    }
+
+    auth.active = true;
+    auth.dirty = false;
+    // Cache-owned authority always carries an explicit block table. Do not set
+    // IDENTITY here: the new path must exercise table authority instead of
+    // silently falling back to logical==physical addressing.
+    auth.flags = 0u;
+    auth.logical_base_token = 0;
+    auth.valid_tokens = map_valid_tokens;
+    auth.page_tokens = page_tokens;
+    auth.physical_pages = physical_pages;
+    auth.block_table_pages = block_table_pages;
+    auth.non_identity_page_begin = non_identity_page_begin;
+    auth.non_identity_page_end = non_identity_page_end;
+    auth.seq_id = target_seq_id;
+    const uint64_t seq_generation = target_seq_id < 0 ? 0ull : uint64_t(uint32_t(target_seq_id));
+    const uint64_t raw_generation = (uint64_t(mtp_qblock_full_current_k_page_authority_epoch) << 40) ^
+        (uint64_t(map_valid_tokens) << 24) ^ (uint64_t(block_table_pages) << 8) ^
+        uint64_t(kv_size_total) ^ uint64_t(auth.flags) ^ (seq_generation << 32) ^
+        (uint64_t(non_identity_page_begin) << 48) ^ (uint64_t(non_identity_page_end) << 16);
+    auth.generation = raw_generation == 0 ? 1u : raw_generation;
+    auth.source_epoch = mtp_qblock_full_current_k_page_authority_epoch;
+    auth.published_generation = 0;
+    auth.published_map_signature = 0;
+    auth.owner_k_view_data = nullptr;
+    auth.block_table = std::move(block_table);
+
+    if (reason) {
+        *reason = identity ? "ok_identity" : "ok_full_physical";
+    }
+    if (llama_mtp_qblock_page_authority_trace_enabled()) {
+        fprintf(stderr,
+                "MTP_QBLOCK_PAGE_AUTHORITY: op=rebuild reason=%s seq=%d valid_tokens=%u pages=%u physical_pages=%u identity=%d epoch=%llu generation=%llu first_pages=[%d,%d,%d,%d]\n",
+                identity ? "ok_identity" : "ok_full_physical",
+                (int) auth.seq_id,
+                auth.valid_tokens,
+                auth.block_table_pages,
+                auth.physical_pages,
+                identity ? 1 : 0,
+                (unsigned long long) auth.source_epoch,
+                (unsigned long long) auth.generation,
+                auth.block_table_pages > 0 ? auth.block_table[0] : -1,
+                auth.block_table_pages > 1 ? auth.block_table[1] : -1,
+                auth.block_table_pages > 2 ? auth.block_table[2] : -1,
+                auth.block_table_pages > 3 ? auth.block_table[3] : -1);
+    }
+    return true;
+}
+
+bool llama_kv_cache::prepare_mtp_qblock_full_current_k_page_authority(
+        uint32_t n_kv,
+        const slot_info & sinfo,
+        const char ** reason) const {
+    if (!llama_mtp_qblock_page_authority_enabled()) {
+        if (reason) {
+            *reason = "authority_disabled";
+        }
+        return true;
+    }
+    if (sinfo.empty() || sinfo.size() < (size_t) llama_mtp_qblock_dbv_paged_attention_min_nq()) {
+        if (reason) {
+            *reason = "authority_not_eligible";
+        }
+        return true;
+    }
+    const uint32_t kv_size_total = get_size();
+    if (!rebuild_mtp_qblock_full_current_k_page_authority(n_kv, kv_size_total, sinfo, reason)) {
+        return false;
+    }
+    const qblock_full_current_k_page_authority & auth = mtp_qblock_full_current_k_page_authority;
+    if (auth.published_generation == auth.generation && auth.owner_k_view_data != nullptr) {
+        if (reason) {
+            *reason = "ok_authority_already_published";
+        }
+        return true;
+    }
+    return publish_mtp_qblock_full_current_k_page_authority_to_registered_layers(reason);
+}
+
+bool llama_kv_cache::publish_mtp_qblock_full_current_k_page_authority(
+        const ggml_tensor * k_view,
+        const char ** reason) const {
+    qblock_full_current_k_page_authority & auth = mtp_qblock_full_current_k_page_authority;
+    auto fail = [&](const char * why) {
+        if (reason) {
+            *reason = why;
+        }
+        auth.dirty = true;
+        auth.published_generation = 0;
+        auth.published_map_signature = 0;
+        auth.owner_k_view_data = nullptr;
+        llama_kv_cache_clear_mtp_qblock_full_page_authority_host();
+        if (k_view && k_view->data) {
+            llama_kv_cache_clear_mtp_qblock_full_page_map(k_view->data);
+        }
+        return false;
+    };
+    if (!llama_mtp_qblock_page_authority_enabled()) {
+        return fail("authority_disabled");
+    }
+    if (k_view == nullptr || k_view->data == nullptr) {
+        return fail("missing_k_view");
+    }
+    if (!auth.active || auth.dirty || auth.block_table.empty() || auth.block_table_pages != auth.block_table.size()) {
+        return fail("authority_not_ready");
+    }
+
+    ggml_cuda_mtp_qblock_full_page_map_v1 map = {};
+    map.version = GGML_CUDA_MTP_QBLOCK_FULL_PAGE_MAP_VERSION;
+    map.abi_bytes = sizeof(ggml_cuda_mtp_qblock_full_page_map_v1);
+    map.active = 1;
+    map.flags = auth.flags;
+    map.logical_base_token = auth.logical_base_token;
+    map.valid_tokens = auth.block_table_pages <= UINT32_MAX / auth.page_tokens ?
+        std::max(auth.valid_tokens, auth.block_table_pages * auth.page_tokens) : auth.valid_tokens;
+    map.page_tokens = auth.page_tokens;
+    map.physical_pages = auth.physical_pages;
+    map.block_table_pages = auth.block_table_pages;
+    map.non_identity_page_begin = auth.non_identity_page_begin;
+    map.non_identity_page_end = auth.non_identity_page_end;
+    map.block_table = nullptr;
+    for (uint32_t i = 0; i < 4; ++i) {
+        map.debug_first_pages[i] = i < auth.block_table_pages ? auth.block_table[i] : -1;
+    }
+    map.generation = auth.generation;
+    auto map_signature = [&]() {
+        uint64_t h = 1469598103934665603ull;
+        auto mix = [&](uint64_t v) {
+            h ^= v;
+            h *= 1099511628211ull;
+        };
+        mix(map.flags);
+        mix(map.logical_base_token);
+        mix(map.valid_tokens);
+        mix(map.page_tokens);
+        mix(map.physical_pages);
+        mix(map.block_table_pages);
+        mix(map.non_identity_page_begin);
+        mix(map.non_identity_page_end);
+        return h == 0 ? 1ull : h;
+    };
+    const uint64_t publish_signature = map_signature();
+
+    if (auth.owner_k_view_data == k_view->data && auth.published_map_signature == publish_signature) {
+        if (reason) {
+            *reason = "ok_authority_reuse";
+        }
+        if (llama_mtp_qblock_page_authority_trace_enabled()) {
+            fprintf(stderr,
+                    "MTP_QBLOCK_PAGE_AUTHORITY: op=publish_reuse key=%p valid_tokens=%u pages=%u generation=%llu signature=%llu\n",
+                    k_view->data,
+                    auth.valid_tokens,
+                    auth.block_table_pages,
+                    (unsigned long long) auth.generation,
+                    (unsigned long long) publish_signature);
+        }
+        return true;
+    }
+
+    const void * owner = k_view->data;
+    const size_t published = llama_kv_cache_register_mtp_qblock_full_page_authority_hosts(&owner, 1, &map, auth.block_table.data());
+    if (published != 1) {
+        return fail("authority_register_failed");
+    }
+    auth.published_generation = auth.generation;
+    auth.published_map_signature = publish_signature;
+    auth.owner_k_view_data = k_view->data;
+    if (reason) {
+        *reason = "ok_authority";
+    }
+    if (llama_mtp_qblock_page_authority_trace_enabled()) {
+        fprintf(stderr,
+                "MTP_QBLOCK_PAGE_AUTHORITY: op=publish key=%p valid_tokens=%u pages=%u table_ptr=%p generation=%llu\n",
+                k_view->data,
+                map.valid_tokens,
+                map.block_table_pages,
+                (const void *) nullptr,
+                (unsigned long long) map.generation);
+    }
+    return true;
+}
+
+bool llama_kv_cache::publish_mtp_qblock_full_current_k_page_authority_to_registered_layers(
+        const char ** reason) const {
+    qblock_full_current_k_page_authority & auth = mtp_qblock_full_current_k_page_authority;
+    auto fail = [&](const char * why) {
+        if (reason) {
+            *reason = why;
+        }
+        auth.dirty = true;
+        auth.published_generation = 0;
+        auth.published_map_signature = 0;
+        auth.owner_k_view_data = nullptr;
+        llama_kv_cache_clear_mtp_qblock_full_page_authority_host();
+        return false;
+    };
+
+    if (!llama_mtp_qblock_page_authority_enabled()) {
+        return fail("authority_disabled");
+    }
+    if (!auth.active || auth.dirty || auth.block_table.empty() || auth.block_table_pages != auth.block_table.size()) {
+        return fail("authority_not_ready");
+    }
+    if (auth.published_generation == auth.generation && auth.owner_k_view_data != nullptr) {
+        if (reason) {
+            *reason = "ok_authority_layers_reuse";
+        }
+        if (llama_mtp_qblock_page_authority_trace_enabled()) {
+            fprintf(stderr,
+                    "MTP_QBLOCK_PAGE_AUTHORITY: op=publish_layers_reuse owners=known valid_tokens=%u pages=%u generation=%llu\n",
+                    auth.valid_tokens,
+                    auth.block_table_pages,
+                    (unsigned long long) auth.generation);
+        }
+        return true;
+    }
+
+    ggml_cuda_mtp_qblock_full_page_map_v1 map = {};
+    map.version = GGML_CUDA_MTP_QBLOCK_FULL_PAGE_MAP_VERSION;
+    map.abi_bytes = sizeof(ggml_cuda_mtp_qblock_full_page_map_v1);
+    map.active = 1;
+    map.flags = auth.flags;
+    map.logical_base_token = auth.logical_base_token;
+    map.valid_tokens = auth.block_table_pages <= UINT32_MAX / auth.page_tokens ?
+        std::max(auth.valid_tokens, auth.block_table_pages * auth.page_tokens) : auth.valid_tokens;
+    map.page_tokens = auth.page_tokens;
+    map.physical_pages = auth.physical_pages;
+    map.block_table_pages = auth.block_table_pages;
+    map.non_identity_page_begin = auth.non_identity_page_begin;
+    map.non_identity_page_end = auth.non_identity_page_end;
+    map.block_table = nullptr;
+    for (uint32_t i = 0; i < 4; ++i) {
+        map.debug_first_pages[i] = i < auth.block_table_pages ? auth.block_table[i] : -1;
+    }
+    map.generation = auth.generation;
+    auto map_signature = [&]() {
+        uint64_t h = 1469598103934665603ull;
+        auto mix = [&](uint64_t v) {
+            h ^= v;
+            h *= 1099511628211ull;
+        };
+        mix(map.flags);
+        mix(map.logical_base_token);
+        mix(map.valid_tokens);
+        mix(map.page_tokens);
+        mix(map.physical_pages);
+        mix(map.block_table_pages);
+        mix(map.non_identity_page_begin);
+        mix(map.non_identity_page_end);
+        return h == 0 ? 1ull : h;
+    };
+    const uint64_t publish_signature = map_signature();
+    if (auth.owner_k_view_data != nullptr && auth.published_map_signature == publish_signature) {
+        if (reason) {
+            *reason = "ok_authority_layers_reuse";
+        }
+        if (llama_mtp_qblock_page_authority_trace_enabled()) {
+            fprintf(stderr,
+                    "MTP_QBLOCK_PAGE_AUTHORITY: op=publish_layers_reuse owners=known valid_tokens=%u pages=%u generation=%llu signature=%llu\n",
+                    auth.valid_tokens,
+                    auth.block_table_pages,
+                    (unsigned long long) auth.generation,
+                    (unsigned long long) publish_signature);
+        }
+        return true;
+    }
+
+    std::vector<const void *> owners;
+    size_t skipped_unsupported_k_format = 0;
+    int first_unsupported_k_format = LLAMA_PDMQ_K_FORMAT_NONE;
+    for (const kv_layer & layer : layers) {
+        if (layer.k_payload == nullptr || layer.k_scales == nullptr) {
+            continue;
+        }
+        const uint32_t d = (uint32_t) hparams.n_embd_head_k(layer.il);
+        const int layer_format = (layer.k_payload->ne[0] == (int64_t) d / 8) ?
+            LLAMA_PDMQ_K_FORMAT_PACKED8_Q4_144 : LLAMA_PDMQ_K_FORMAT_PACKED16_Q8_272;
+        if (layer_format != LLAMA_PDMQ_K_FORMAT_PACKED16_Q8_272) {
+            ++skipped_unsupported_k_format;
+            if (first_unsupported_k_format == LLAMA_PDMQ_K_FORMAT_NONE) {
+                first_unsupported_k_format = layer_format;
+            }
+            continue;
+        }
+        const void * owner = layer.k ? layer.k->data : layer.k_payload->data;
+        if (owner == nullptr) {
+            continue;
+        }
+        bool duplicate = false;
+        for (const void * existing : owners) {
+            duplicate = duplicate || existing == owner;
+        }
+        if (!duplicate) {
+            owners.push_back(owner);
+        }
+    }
+
+    if (owners.empty()) {
+        if (llama_mtp_qblock_page_authority_trace_enabled() && skipped_unsupported_k_format != 0) {
+            fprintf(stderr,
+                    "MTP_QBLOCK_PAGE_AUTHORITY: op=publish_layers status=skip reason=unsupported_k_format skipped=%zu first_format=%d valid_tokens=%u pages=%u\n",
+                    skipped_unsupported_k_format,
+                    first_unsupported_k_format,
+                    auth.valid_tokens,
+                    auth.block_table_pages);
+        }
+        return fail(skipped_unsupported_k_format != 0 ? "authority_unsupported_k_format" : "authority_no_layer_owners");
+    }
+
+    const size_t published = llama_kv_cache_register_mtp_qblock_full_page_authority_hosts(
+            owners.data(), owners.size(), &map, auth.block_table.data());
+    if (published != owners.size()) {
+        return fail("authority_layer_register_failed");
+    }
+
+    auth.published_generation = auth.generation;
+    auth.published_map_signature = publish_signature;
+    auth.owner_k_view_data = owners[0];
+    if (reason) {
+        *reason = "ok_authority_layers";
+    }
+    if (llama_mtp_qblock_page_authority_trace_enabled()) {
+        fprintf(stderr,
+                "MTP_QBLOCK_PAGE_AUTHORITY: op=publish_layers owners=%zu attempted=%zu valid_tokens=%u pages=%u generation=%llu\n",
+                published,
+                owners.size(),
+                auth.valid_tokens,
+                auth.block_table_pages,
+                (unsigned long long) auth.generation);
+    }
+    return true;
+}
+
+bool llama_kv_cache::extend_mtp_qblock_full_current_k_page_authority_from_ubatch(
+        const slot_info & sinfo,
+        const llama_ubatch & ubatch,
+        bool metadata_rewrite,
+        const char ** reason) const {
+    qblock_full_current_k_page_authority & auth = mtp_qblock_full_current_k_page_authority;
+    auto fail = [&](const char * why) {
+        if (reason) {
+            *reason = why;
+        }
+        return false;
+    };
+
+    if (!llama_mtp_qblock_page_authority_enabled()) {
+        return fail("authority_disabled");
+    }
+    if (!auth.active) {
+        if (reason) {
+            *reason = "apply_ubatch_authority_deferred";
+        }
+        return true;
+    }
+    if (auth.dirty || auth.block_table.empty() || auth.block_table_pages != auth.block_table.size()) {
+        return fail("apply_ubatch_authority_not_ready");
+    }
+    if (metadata_rewrite) {
+        return fail("apply_ubatch_metadata_rewrite");
+    }
+    if (n_stream != 1 || sinfo.n_stream() != 1 || sinfo.strm.empty() || sinfo.strm[0] >= v_cells.size()) {
+        return fail("apply_ubatch_multistream");
+    }
+    if (ubatch.n_tokens <= 0 || (uint32_t) ubatch.n_tokens != sinfo.size() || ubatch.pos == nullptr ||
+            ubatch.n_seq_id == nullptr || ubatch.seq_id == nullptr) {
+        return fail("apply_ubatch_bad_shape");
+    }
+    llama_seq_id ubatch_seq_id = -1;
+    for (uint32_t i = 0; i < (uint32_t) ubatch.n_tokens; ++i) {
+        if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i] == nullptr) {
+            return fail("apply_ubatch_bad_seq");
+        }
+        const llama_seq_id cur_seq = ubatch.seq_id[i][0];
+        if (ubatch_seq_id < 0) {
+            ubatch_seq_id = cur_seq;
+        } else if (ubatch_seq_id != cur_seq) {
+            return fail("apply_ubatch_multi_seq");
+        }
+    }
+    if (auth.seq_id != ubatch_seq_id) {
+        return fail("apply_ubatch_seq_switch");
+    }
+    if (auth.logical_base_token != 0 || auth.page_tokens != LLAMA_MTP_QBLOCK_PAGED_STATE_PAGE_TOKENS || auth.page_tokens == 0 ||
+            auth.physical_pages == 0) {
+        return fail("apply_ubatch_bad_authority_shape");
+    }
+    const uint32_t append_tokens = (uint32_t) ubatch.n_tokens;
+    if (append_tokens > uint32_t(std::numeric_limits<uint32_t>::max() - auth.valid_tokens)) {
+        return fail("apply_ubatch_append_overflow");
+    }
+    const uint32_t old_valid_tokens = auth.valid_tokens;
+    const uint32_t old_pages = auth.block_table_pages;
+    const uint32_t new_valid_tokens = old_valid_tokens + append_tokens;
+    const uint64_t capacity_tokens = uint64_t(auth.physical_pages) * uint64_t(auth.page_tokens);
+    if (uint64_t(new_valid_tokens) > capacity_tokens) {
+        return fail("apply_ubatch_append_capacity");
+    }
+
+    const uint32_t new_pages = (new_valid_tokens + auth.page_tokens - 1u) / auth.page_tokens;
+    if (new_pages == 0 || new_pages > auth.physical_pages || new_pages < old_pages) {
+        return fail("apply_ubatch_bad_page_count");
+    }
+
+    std::vector<int32_t> new_block_table = auth.block_table;
+    if (new_block_table.size() < new_pages) {
+        new_block_table.resize(new_pages, -1);
+    }
+    std::vector<uint8_t> seen(auth.physical_pages, 0);
+    for (uint32_t page = 0; page < old_pages; ++page) {
+        const int32_t pp = new_block_table[page];
+        if (pp < 0 || uint32_t(pp) >= auth.physical_pages) {
+            return fail("apply_ubatch_bad_existing_page");
+        }
+        if (seen[(uint32_t) pp] != 0) {
+            return fail("apply_ubatch_duplicate_existing_page");
+        }
+        seen[(uint32_t) pp] = 1;
+    }
+
+    for (uint32_t i = 0; i < append_tokens; ++i) {
+        const uint32_t logical = old_valid_tokens + i;
+        const llama_pos expected_pos = (llama_pos) logical;
+        if (ubatch.pos[i] != expected_pos) {
+            return fail("apply_ubatch_not_contiguous_append");
+        }
+        if (ubatch.seq_id[i][0] != auth.seq_id) {
+            return fail("apply_ubatch_seq_mismatch");
+        }
+        const uint32_t physical_slot = sinfo.idxs[0][i];
+        if (uint64_t(physical_slot) >= capacity_tokens) {
+            return fail("apply_ubatch_physical_slot_oob");
+        }
+        const uint32_t logical_page = logical / auth.page_tokens;
+        const uint32_t logical_slot = logical % auth.page_tokens;
+        const uint32_t physical_page = physical_slot / auth.page_tokens;
+        const uint32_t physical_slot_in_page = physical_slot % auth.page_tokens;
+        if (logical_page >= new_pages || physical_page >= auth.physical_pages) {
+            return fail("apply_ubatch_page_oob");
+        }
+        if (physical_slot_in_page != logical_slot) {
+            return fail("apply_ubatch_page_slot_mismatch");
+        }
+        int32_t & mapped_page = new_block_table[logical_page];
+        if (mapped_page >= 0) {
+            if ((uint32_t) mapped_page != physical_page) {
+                return fail("apply_ubatch_page_conflict");
+            }
+        } else {
+            if (seen[physical_page] != 0) {
+                return fail("apply_ubatch_duplicate_new_page");
+            }
+            mapped_page = (int32_t) physical_page;
+            seen[physical_page] = 1;
+        }
+    }
+
+    uint32_t non_identity_page_begin = new_pages;
+    uint32_t non_identity_page_end = new_pages;
+    for (uint32_t page = 0; page < new_pages; ++page) {
+        if (new_block_table[page] < 0 || uint32_t(new_block_table[page]) >= auth.physical_pages) {
+            return fail("apply_ubatch_unbound_page");
+        }
+        if (new_block_table[page] != (int32_t) page) {
+            non_identity_page_begin = std::min(non_identity_page_begin, page);
+            non_identity_page_end = page + 1u;
+        }
+    }
+
+    bool table_changed = new_pages != old_pages;
+    for (uint32_t page = 0; !table_changed && page < old_pages; ++page) {
+        table_changed = new_block_table[page] != auth.block_table[page];
+    }
+
+    auth.block_table = std::move(new_block_table);
+    auth.valid_tokens = new_valid_tokens;
+    auth.block_table_pages = new_pages;
+    auth.non_identity_page_begin = non_identity_page_begin;
+    auth.non_identity_page_end = non_identity_page_end;
+    auth.flags = 0;
+    const uint64_t seq_generation = auth.seq_id < 0 ? 0ull : uint64_t(uint32_t(auth.seq_id));
+    const uint64_t raw_generation = (uint64_t(mtp_qblock_full_current_k_page_authority_epoch) << 40) ^
+        (uint64_t(auth.valid_tokens) << 24) ^ (uint64_t(auth.block_table_pages) << 8) ^
+        uint64_t(auth.physical_pages * auth.page_tokens) ^ uint64_t(auth.flags) ^ (seq_generation << 32) ^
+        (uint64_t(auth.non_identity_page_begin) << 48) ^ (uint64_t(auth.non_identity_page_end) << 16);
+    auth.generation = raw_generation == 0 ? 1u : raw_generation;
+    auth.source_epoch = mtp_qblock_full_current_k_page_authority_epoch;
+    if (table_changed) {
+        auth.published_generation = 0;
+        auth.published_map_signature = 0;
+        auth.owner_k_view_data = nullptr;
+        llama_kv_cache_clear_mtp_qblock_full_page_authority_host();
+    }
+    auth.dirty = false;
+
+    if (reason) {
+        *reason = "ok_append_identity";
+    }
+    if (llama_mtp_qblock_page_authority_trace_enabled()) {
+        fprintf(stderr,
+                "MTP_QBLOCK_PAGE_AUTHORITY: op=extend reason=ok_append_identity old_valid=%u new_valid=%u pages=%u generation=%llu\n",
+                old_valid_tokens,
+                auth.valid_tokens,
+                auth.block_table_pages,
+                (unsigned long long) auth.generation);
+    }
+    return true;
+}
+
+bool llama_kv_cache::map_mtp_qblock_full_current_k_slot(
+        uint32_t logical_token,
+        uint32_t * physical_slot,
+        const char ** reason) const {
+    if (physical_slot) {
+        *physical_slot = logical_token;
+    }
+    const qblock_full_current_k_page_authority & auth = mtp_qblock_full_current_k_page_authority;
+    auto fail = [&](const char * why) {
+        if (reason) {
+            *reason = why;
+        }
+        return false;
+    };
+    if (!llama_mtp_qblock_page_authority_enabled()) {
+        return fail("authority_disabled");
+    }
+    if (!auth.active || auth.dirty || auth.page_tokens != LLAMA_MTP_QBLOCK_PAGED_STATE_PAGE_TOKENS ||
+            auth.block_table.empty() || auth.block_table_pages != auth.block_table.size()) {
+        return fail("authority_not_ready");
+    }
+    if (logical_token < auth.logical_base_token) {
+        return fail("token_before_base");
+    }
+    const uint32_t rel = logical_token - auth.logical_base_token;
+    if (rel >= auth.valid_tokens) {
+        return fail("token_not_visible");
+    }
+    const uint32_t logical_page = rel / auth.page_tokens;
+    const uint32_t slot = rel - logical_page * auth.page_tokens;
+    if (logical_page >= auth.block_table_pages) {
+        return fail("bad_logical_page");
+    }
+    const int32_t physical_page_i32 = auth.block_table[logical_page];
+    if (physical_page_i32 < 0 || uint32_t(physical_page_i32) >= auth.physical_pages) {
+        return fail("bad_physical_page");
+    }
+    const uint64_t physical = uint64_t(uint32_t(physical_page_i32)) * uint64_t(auth.page_tokens) + uint64_t(slot);
+    if (physical > uint64_t(std::numeric_limits<uint32_t>::max())) {
+        return fail("physical_slot_oob");
+    }
+    if (physical_slot) {
+        *physical_slot = (uint32_t) physical;
+    }
+    if (reason) {
+        *reason = "ok";
+    }
+    return true;
+}
+
 bool llama_kv_cache::init_mtp_qblock_paged_state(llama_pos logical_base_token, uint32_t physical_pages, const char ** reason) const {
     auto fail = [&](const char * why) {
         if (reason) {
@@ -979,6 +1809,64 @@ bool llama_kv_cache::mtp_qblock_paged_state_commit_pages(
     if (status != LLAMA_MTP_QBLOCK_PAGED_STATE_OK) {
         return false;
     }
+    if (llama_mtp_qblock_page_authority_enabled() && mtp_qblock_full_current_k_page_authority.active) {
+        qblock_full_current_k_page_authority & auth = mtp_qblock_full_current_k_page_authority;
+        const uint32_t page_tokens = auth.page_tokens;
+        const uint32_t logical_base = mtp_qblock_paged_state.logical_base_token;
+        const uint32_t required_pages = page_tokens == 0 ? 0u : (valid_tail_tokens + page_tokens - 1u) / page_tokens;
+        const bool commit_ok = page_tokens == LLAMA_MTP_QBLOCK_PAGED_STATE_PAGE_TOKENS &&
+            logical_base % page_tokens == 0 && required_pages != 0 && required_pages <= block_table_pages &&
+            logical_base / page_tokens + required_pages <= auth.block_table_pages &&
+            auth.block_table.size() == auth.block_table_pages && auth.physical_pages != 0;
+        if (!commit_ok) {
+            if (reason) {
+                *reason = "authority_commit_rejected";
+            }
+            clear_mtp_qblock_full_current_k_page_authority("commit_rejected");
+            return false;
+        }
+        const uint32_t logical_base_page = logical_base / page_tokens;
+        for (uint32_t lp = 0; lp < required_pages; ++lp) {
+            const int32_t pp = block_table[lp];
+            if (pp < 0 || uint32_t(pp) >= auth.physical_pages) {
+                if (reason) {
+                    *reason = "authority_commit_bad_physical_page";
+                }
+                clear_mtp_qblock_full_current_k_page_authority("commit_bad_physical_page");
+                return false;
+            }
+            auth.block_table[logical_base_page + lp] = pp;
+        }
+        auth.flags = 0;
+        auth.valid_tokens = std::max(auth.valid_tokens, logical_base + valid_tail_tokens);
+        auth.non_identity_page_begin = std::min(auth.non_identity_page_begin, logical_base_page);
+        auth.non_identity_page_end = std::max(auth.non_identity_page_end, logical_base_page + required_pages);
+        auth.generation = (auth.generation ^ (uint64_t(mtp_qblock_paged_state.generation) << 1) ^
+            (uint64_t(logical_base_page) << 32) ^ uint64_t(required_pages)) + 1u;
+        auth.dirty = false;
+        auth.source_epoch = mtp_qblock_full_current_k_page_authority_epoch;
+        auth.published_generation = 0;
+        auth.published_map_signature = 0;
+        auth.owner_k_view_data = nullptr;
+        const char * publish_reason = nullptr;
+        if (!publish_mtp_qblock_full_current_k_page_authority_to_registered_layers(&publish_reason)) {
+            if (reason) {
+                *reason = publish_reason ? publish_reason : "authority_commit_register_failed";
+            }
+            clear_mtp_qblock_full_current_k_page_authority(publish_reason ? publish_reason : "authority_commit_register_failed");
+            return false;
+        }
+        if (llama_mtp_qblock_page_authority_trace_enabled()) {
+            fprintf(stderr,
+                    "MTP_QBLOCK_PAGE_AUTHORITY: op=commit logical_base=%u valid_tail=%u logical_base_page=%u pages=%u generation=%llu table0=%d\n",
+                    logical_base,
+                    valid_tail_tokens,
+                    logical_base_page,
+                    required_pages,
+                    (unsigned long long) auth.generation,
+                    auth.block_table.empty() ? -1 : auth.block_table[0]);
+        }
+    }
     llama_kv_cache_reset_mtp_qblock_tail_page_lifecycle(false);
     return true;
 }
@@ -987,6 +1875,13 @@ bool llama_kv_cache::mtp_qblock_paged_state_rollback_txn_pages(const char ** rea
     const llama_mtp_qblock_paged_state_status status = llama_mtp_qblock_paged_state_rollback_txn_pages(mtp_qblock_paged_state);
     if (reason) {
         *reason = llama_mtp_qblock_paged_state_status_reason(status);
+    }
+    if (status == LLAMA_MTP_QBLOCK_PAGED_STATE_OK && llama_mtp_qblock_page_authority_trace_enabled() &&
+            mtp_qblock_full_current_k_page_authority.active) {
+        fprintf(stderr,
+                "MTP_QBLOCK_PAGE_AUTHORITY: op=rollback_txn keep_canonical=1 generation=%llu pages=%u\n",
+                (unsigned long long) mtp_qblock_full_current_k_page_authority.generation,
+                mtp_qblock_full_current_k_page_authority.block_table_pages);
     }
     return status == LLAMA_MTP_QBLOCK_PAGED_STATE_OK;
 }
@@ -1008,6 +1903,7 @@ void llama_kv_cache::clear_mtp_qblock_tail_page_maps(const char * reason, bool d
     };
 
     if (data_invalidates) {
+        clear_mtp_qblock_full_current_k_page_authority(reason ? reason : "tail_page_data_invalidate");
         const bool keep_producer_snapshot = llama_mtp_qblock_tail_page_keep_producer_snapshot_on_clear(reason);
         llama_kv_cache_reset_mtp_qblock_tail_page_lifecycle_preserve_snapshot(true, keep_producer_snapshot);
         if (llama_mtp_qblock_tail_page_persist_data_clear_unsafe_enabled() && llama_mtp_qblock_tail_page_registry_trace_enabled()) {
@@ -1505,6 +2401,7 @@ bool llama_kv_cache::register_mtp_qblock_tail_page_map_from_paged_state(
 }
 
 void llama_kv_cache::clear(bool data) {
+    clear_mtp_qblock_full_current_k_page_authority(data ? "clear_data" : "clear_metadata");
     clear_mtp_qblock_tail_page_maps(data ? "clear_data" : "clear_metadata", data);
 
     for (uint32_t s = 0; s < n_stream; ++s) {
@@ -1521,6 +2418,34 @@ void llama_kv_cache::clear(bool data) {
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
+
+    const llama_pos p0_effective = p0 < 0 ? 0 : p0;
+    const llama_pos p1_effective = p1 < 0 ? std::numeric_limits<llama_pos>::max() : p1;
+    bool would_modify_cells = false;
+    if (seq_id >= 0) {
+        const auto & cells = v_cells[seq_to_stream[seq_id]];
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (!cells.is_empty(i) && cells.pos_in(i, p0_effective, p1_effective) && cells.seq_has(i, seq_id)) {
+                would_modify_cells = true;
+                break;
+            }
+        }
+    } else {
+        for (uint32_t s = 0; s < n_stream && !would_modify_cells; ++s) {
+            const auto & cells = v_cells[s];
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                if (!cells.is_empty(i) && cells.pos_in(i, p0_effective, p1_effective)) {
+                    would_modify_cells = true;
+                    break;
+                }
+            }
+        }
+    }
+    if (!would_modify_cells) {
+        return true;
+    }
+
+    invalidate_mtp_qblock_full_current_k_page_authority("seq_rm");
     char tail_page_clear_reason[96];
     snprintf(tail_page_clear_reason, sizeof(tail_page_clear_reason),
             "seq_rm(seq=%d,p0=%lld,p1=%lld)",
@@ -1741,6 +2666,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     GGML_ASSERT(seq_id_src >= 0 && (size_t) seq_id_src < seq_to_stream.size());
     GGML_ASSERT(seq_id_dst >= 0 && (size_t) seq_id_dst < seq_to_stream.size());
+    invalidate_mtp_qblock_full_current_k_page_authority("seq_cp");
     clear_mtp_qblock_tail_page_maps("seq_cp");
 
     const auto s0 = seq_to_stream[seq_id_src];
@@ -1827,6 +2753,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 }
 
 bool llama_kv_cache::seq_import_physical(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, size_t * bytes_copied, size_t * cells_copied, const char ** reason) {
+    invalidate_mtp_qblock_full_current_k_page_authority("seq_import_physical");
     auto fail = [&](const char * why) {
         if (reason) {
             *reason = why;
@@ -2353,6 +3280,7 @@ bool llama_kv_cache::seq_import_physical(llama_seq_id seq_id_src, llama_seq_id s
 
 void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+    invalidate_mtp_qblock_full_current_k_page_authority("seq_keep");
     clear_mtp_qblock_tail_page_maps("seq_keep");
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
@@ -2377,6 +3305,7 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
+    invalidate_mtp_qblock_full_current_k_page_authority("seq_add");
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
     auto & head  = v_heads[seq_to_stream[seq_id]];
@@ -2423,6 +3352,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_div() is only supported for n_pos_per_embd() == 1");
+    invalidate_mtp_qblock_full_current_k_page_authority("seq_div");
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
 
@@ -2577,8 +3507,9 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             states.push_back(std::move(state));
         }
 
-        // now emplace the ubatch
-        apply_ubatch(sinfo_new, ubatch);
+        // now emplace the ubatch speculatively. The cells are restored below, so
+        // do not invalidate or extend the cache-owned QBlock page authority here.
+        apply_ubatch(sinfo_new, ubatch, false);
     }
 
     GGML_ASSERT(!states.empty() || !success);
@@ -2607,6 +3538,7 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     bool updated = false;
     if (do_shift || !sc_info.empty()) {
         clear_mtp_qblock_tail_page_maps("update_shift_or_copy");
+        clear_mtp_qblock_full_current_k_page_authority("update_shift_or_copy");
     }
 
     auto * sched = lctx->get_sched();
@@ -2887,7 +3819,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     return res;
 }
 
-void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool authority_mutation) {
     // keep track of the max sequence position that we would overwrite with this ubatch
     // for non-SWA cache, this would be always empty
     llama_seq_id seq_pos_max_rm[LLAMA_MAX_SEQ];
@@ -2896,6 +3828,8 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     }
 
     assert(ubatch.n_tokens == sinfo.n_stream()*sinfo.size());
+
+    bool authority_metadata_rewrite = false;
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
@@ -2906,6 +3840,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             const auto idx = sinfo.idxs[s][ii];
 
             if (!cells.is_empty(idx)) {
+                authority_metadata_rewrite = true;
                 assert(cells.seq_count(idx) == 1);
 
                 const llama_seq_id seq_id = cells.seq_get(idx);
@@ -2948,7 +3883,28 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             LLAMA_LOG_DEBUG("%s: purging positions [%d, %d] of sequence %d from KV cache\n",
                     __func__, cells.seq_pos_min(s), seq_pos_max_rm[s], s);
 
-            seq_rm(s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1);
+            authority_metadata_rewrite = true;
+            if (authority_mutation) {
+                seq_rm(s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1);
+            } else {
+                const llama_pos p0 = cells.seq_pos_min(s);
+                const llama_pos p1 = seq_pos_max_rm[s] + 1;
+                uint32_t new_head = cells.size();
+                for (uint32_t i = 0; i < cells.size(); ++i) {
+                    if (!cells.pos_in(i, p0, p1)) {
+                        continue;
+                    }
+                    if (cells.seq_has(i, s) && cells.seq_rm(i, s)) {
+                        if (new_head == cells.size()) {
+                            new_head = i;
+                        }
+                    }
+                }
+                auto & head = v_heads[seq_to_stream[s]];
+                if (new_head != cells.size() && new_head < head) {
+                    head = new_head;
+                }
+            }
         }
     }
 
@@ -2957,6 +3913,13 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         auto & head = v_heads[sinfo.strm[s]];
 
         head = sinfo.idxs[s].back() + 1;
+    }
+
+    if (authority_mutation) {
+        const char * authority_reason = nullptr;
+        if (!extend_mtp_qblock_full_current_k_page_authority_from_ubatch(sinfo, ubatch, authority_metadata_rewrite, &authority_reason)) {
+            invalidate_mtp_qblock_full_current_k_page_authority(authority_reason ? authority_reason : "apply_ubatch");
+        }
     }
 }
 
@@ -3017,7 +3980,7 @@ bool llama_kv_cache::direct_tx_apply_metadata(const llama_ubatch & ubatch, llama
     }
 
     clear_mtp_qblock_tail_page_maps("direct_tx_apply_metadata");
-    apply_ubatch(tx.sinfo, ubatch);
+    apply_ubatch(tx.sinfo, ubatch, false);
     tx.applied_metadata = true;
     return true;
 }
@@ -3045,6 +4008,7 @@ bool llama_kv_cache::direct_tx_validate_metadata(const llama_kv_cache_direct_tx 
 
 void llama_kv_cache::direct_tx_rollback(llama_kv_cache_direct_tx & tx) {
     clear_mtp_qblock_tail_page_maps("direct_tx_rollback");
+    clear_mtp_qblock_full_current_k_page_authority("direct_tx_rollback");
     if (!tx.rollback_ready) {
         tx = llama_kv_cache_direct_tx{};
         return;
@@ -3064,6 +4028,7 @@ void llama_kv_cache::direct_tx_rollback(llama_kv_cache_direct_tx & tx) {
 
 void llama_kv_cache::direct_tx_commit(llama_kv_cache_direct_tx & tx) {
     clear_mtp_qblock_tail_page_maps("direct_tx_commit");
+    clear_mtp_qblock_full_current_k_page_authority("direct_tx_commit");
     if (!tx.begun || !tx.applied_metadata || !tx.rollback_ready) {
         return;
     }
@@ -3183,10 +4148,10 @@ bool llama_kv_cache::get_implicit_causal_mask_meta(const slot_info & sinfo, cons
     llama_pos p_last = std::numeric_limits<llama_pos>::min();
     uint32_t cell_count = 0;
     for (uint32_t i = 0; i < cells.size(); ++i) {
-        if (cells.is_empty(i)) {
+        if (cells.is_empty(i) || !cells.seq_has(i, seq_id)) {
             continue;
         }
-        if (cells.seq_count(i) != 1 || !cells.seq_has(i, seq_id)) {
+        if (cells.seq_count(i) != 1) {
             return false;
         }
         const llama_pos pos = cells.pos_get(i);
@@ -3213,16 +4178,34 @@ bool llama_kv_cache::get_implicit_causal_mask_meta(const slot_info & sinfo, cons
         return false;
     }
 
-    std::vector<uint8_t> seen(n_kv_valid, 0);
+    std::vector<uint32_t> physical_by_logical(n_kv_valid, std::numeric_limits<uint32_t>::max());
     for (uint32_t i = 0; i < cells.size(); ++i) {
-        if (cells.is_empty(i)) {
+        if (cells.is_empty(i) || !cells.seq_has(i, seq_id)) {
             continue;
         }
-        const uint32_t logical = (uint32_t) (cells.pos_get(i) - p_base);
-        if (logical >= n_kv_valid || seen[logical]) {
+        if (cells.seq_count(i) != 1) {
             return false;
         }
-        seen[logical] = 1;
+        const uint32_t logical = (uint32_t) (cells.pos_get(i) - p_base);
+        if (logical >= n_kv_valid || physical_by_logical[logical] != std::numeric_limits<uint32_t>::max()) {
+            return false;
+        }
+        physical_by_logical[logical] = i;
+    }
+    constexpr uint32_t page_tokens = LLAMA_MTP_QBLOCK_PAGED_STATE_PAGE_TOKENS;
+    const uint32_t block_table_pages = (n_kv_valid + page_tokens - 1u) / page_tokens;
+    for (uint32_t page = 0; page < block_table_pages; ++page) {
+        const uint32_t logical_base = page * page_tokens;
+        const uint32_t page_valid = std::min(page_tokens, n_kv_valid - logical_base);
+        const uint32_t first_physical = physical_by_logical[logical_base];
+        if (first_physical == std::numeric_limits<uint32_t>::max() || first_physical % page_tokens != 0) {
+            return false;
+        }
+        for (uint32_t slot = 0; slot < page_valid; ++slot) {
+            if (physical_by_logical[logical_base + slot] != first_physical + slot) {
+                return false;
+            }
+        }
     }
 
     if (ubatch->pos[0] < p_base) {
@@ -3284,6 +4267,20 @@ bool llama_kv_cache::register_mtp_qblock_full_current_k_page_map(
     if (n_kv == 0 || kv_size_total == 0) {
         return fail("empty_kv");
     }
+    if (llama_mtp_qblock_page_authority_enabled()) {
+        GGML_UNUSED(n_kv);
+        GGML_UNUSED(kv_size_total);
+        GGML_UNUSED(sinfo);
+        const qblock_full_current_k_page_authority & auth = mtp_qblock_full_current_k_page_authority;
+        if (!auth.active || auth.dirty || auth.block_table.empty() || auth.block_table_pages != auth.block_table.size() ||
+                auth.owner_k_view_data == nullptr) {
+            return fail("authority_not_prepared");
+        }
+        if (reason) {
+            *reason = "ok_authority_prepared";
+        }
+        return true;
+    }
     constexpr uint32_t page_tokens = LLAMA_MTP_QBLOCK_PAGED_STATE_PAGE_TOKENS;
     if (kv_size_total % page_tokens != 0) {
         return fail("kv_capacity_not_page_aligned");
@@ -3328,6 +4325,9 @@ bool llama_kv_cache::register_mtp_qblock_full_current_k_page_map(
     }
     if (cell_count == 0 || seq_id < 0 || pos_max < pos_min) {
         return fail("empty_cells");
+    }
+    if (pos_min != 0) {
+        return fail("nonzero_logical_base_unsupported");
     }
     const uint64_t logical_tokens64 = uint64_t(pos_max - pos_min) + 1u;
     if (logical_tokens64 == 0 || logical_tokens64 > uint64_t(n_kv) || logical_tokens64 > uint64_t(kv_size_total) ||
@@ -3959,11 +4959,25 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     int64_t * data = (int64_t *) dst->data;
 
+    const bool page_authority_remap = llama_mtp_qblock_page_authority_enabled() &&
+        mtp_qblock_full_current_k_page_authority.active && !mtp_qblock_full_current_k_page_authority.dirty;
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const int64_t offs = sinfo.strm[s]*get_size();
 
         for (uint32_t i = 0; i < sinfo.size(); ++i) {
-            data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
+            uint32_t idx = sinfo.idxs[s][i];
+            if (page_authority_remap) {
+                const uint32_t flat_i = s*sinfo.size() + i;
+                if (ubatch->pos[flat_i] < 0 || uint64_t(ubatch->pos[flat_i]) > uint64_t(std::numeric_limits<uint32_t>::max())) {
+                    GGML_ABORT("MTP_QBLOCK_PAGE_AUTHORITY: K slot remap rejected bad logical pos=%lld", (long long) ubatch->pos[flat_i]);
+                }
+                const char * map_reason = nullptr;
+                if (!map_mtp_qblock_full_current_k_slot((uint32_t) ubatch->pos[flat_i], &idx, &map_reason)) {
+                    GGML_ABORT("MTP_QBLOCK_PAGE_AUTHORITY: K slot remap rejected reason=%s logical=%lld fallback_idx=%u",
+                            map_reason ? map_reason : "unknown", (long long) ubatch->pos[flat_i], sinfo.idxs[s][i]);
+                }
+            }
+            data[s*sinfo.size() + i] = offs + idx;
         }
     }
 }
@@ -3975,12 +4989,26 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     int64_t * data = (int64_t *) dst->data;
 
+    const bool page_authority_remap = llama_mtp_qblock_page_authority_enabled() &&
+        mtp_qblock_full_current_k_page_authority.active && !mtp_qblock_full_current_k_page_authority.dirty;
     if (!v_trans) {
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
             const int64_t offs = sinfo.strm[s]*get_size();
 
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
-                data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
+                uint32_t idx = sinfo.idxs[s][i];
+                if (page_authority_remap) {
+                    const uint32_t flat_i = s*sinfo.size() + i;
+                    if (ubatch->pos[flat_i] < 0 || uint64_t(ubatch->pos[flat_i]) > uint64_t(std::numeric_limits<uint32_t>::max())) {
+                        GGML_ABORT("MTP_QBLOCK_PAGE_AUTHORITY: V slot remap rejected bad logical pos=%lld", (long long) ubatch->pos[flat_i]);
+                    }
+                    const char * map_reason = nullptr;
+                    if (!map_mtp_qblock_full_current_k_slot((uint32_t) ubatch->pos[flat_i], &idx, &map_reason)) {
+                        GGML_ABORT("MTP_QBLOCK_PAGE_AUTHORITY: V slot remap rejected reason=%s logical=%lld fallback_idx=%u",
+                                map_reason ? map_reason : "unknown", (long long) ubatch->pos[flat_i], sinfo.idxs[s][i]);
+                    }
+                }
+                data[s*sinfo.size() + i] = offs + idx;
             }
         }
     } else {
@@ -3993,8 +5021,20 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
             const int64_t offs = sinfo.strm[s]*kv_size*n_embd_v_gqa;
 
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
+                uint32_t idx = sinfo.idxs[s][i];
+                if (page_authority_remap) {
+                    const uint32_t flat_i = s*sinfo.size() + i;
+                    if (ubatch->pos[flat_i] < 0 || uint64_t(ubatch->pos[flat_i]) > uint64_t(std::numeric_limits<uint32_t>::max())) {
+                        GGML_ABORT("MTP_QBLOCK_PAGE_AUTHORITY: Vt slot remap rejected bad logical pos=%lld", (long long) ubatch->pos[flat_i]);
+                    }
+                    const char * map_reason = nullptr;
+                    if (!map_mtp_qblock_full_current_k_slot((uint32_t) ubatch->pos[flat_i], &idx, &map_reason)) {
+                        GGML_ABORT("MTP_QBLOCK_PAGE_AUTHORITY: Vt slot remap rejected reason=%s logical=%lld fallback_idx=%u",
+                                map_reason ? map_reason : "unknown", (long long) ubatch->pos[flat_i], sinfo.idxs[s][i]);
+                    }
+                }
                 for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
-                    data[s*sinfo.size()*n_embd_v_gqa + i*n_embd_v_gqa + j] = offs + j*kv_size + sinfo.idxs[s][i];
+                    data[s*sinfo.size()*n_embd_v_gqa + i*n_embd_v_gqa + j] = offs + j*kv_size + idx;
                 }
             }
         }
@@ -5226,6 +6266,9 @@ bool llama_kv_cache_context::apply() {
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
+
+    const char * authority_reason = nullptr;
+    (void) kv->prepare_mtp_qblock_full_current_k_page_authority(n_kv, sinfos[i_cur], &authority_reason);
 
     return true;
 }

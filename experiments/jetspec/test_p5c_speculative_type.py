@@ -24,6 +24,7 @@ class P5CSpeculativeTypeTests(unittest.TestCase):
             "common/common.h",
             "common/speculative.cpp",
             "docs/speculative.md",
+            "tools/server/server-context.cpp",
         }
         self.assertEqual({str(path) for path in P5C_ALLOWED_FILES}, expected)
 
@@ -47,15 +48,22 @@ class P5CSpeculativeTypeTests(unittest.TestCase):
         self.assertIn("llama_set_jetspec_target_hidden_taps(params.draft.ctx_tgt, true, true)", spec_cpp)
         self.assertIn("llama_set_jetspec_target_hidden_taps(params.draft.ctx_tgt, false, true)", spec_cpp)
 
-    def test_no_public_server_or_cmake_route(self) -> None:
+    def test_no_public_api_or_cmake_route(self) -> None:
         for rel in [
             pathlib.Path("include/llama.h"),
-            pathlib.Path("tools/server/server-context.cpp"),
             pathlib.Path("common/speculative.h"),
         ]:
             text = (REPO_ROOT / rel).read_text(encoding="utf-8", errors="replace")
             self.assertNotIn("COMMON_SPECULATIVE_TYPE_DRAFT_JETSPEC", text, rel)
             self.assertNotIn("draft-jetspec", text, rel)
+
+    def test_server_reference_is_model_only_binding(self) -> None:
+        text = (REPO_ROOT / "tools/server/server-context.cpp").read_text(encoding="utf-8", errors="replace")
+        self.assertIn("COMMON_SPECULATIVE_TYPE_DRAFT_JETSPEC", text)
+        self.assertIn("spec_jetspec", text)
+        self.assertIn("llama_model_link_shared_tensors(model_dft.get(), model_tgt)", text)
+        self.assertIn("params_base.speculative.draft.ctx_dft = nullptr", text)
+        self.assertIn("loaded JetSpec draft-head model-only binding; draft context and graph execution remain disabled", text)
 
     def test_docs_mark_route_experimental(self) -> None:
         text = (REPO_ROOT / "docs/speculative.md").read_text(encoding="utf-8")

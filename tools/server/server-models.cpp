@@ -568,6 +568,45 @@ std::optional<server_model_meta> server_models::get_meta(const std::string & nam
     return std::nullopt;
 }
 
+std::optional<std::string> server_models::select_replica(const std::string & name, bool require_running) {
+    std::lock_guard<std::mutex> lk(mutex);
+
+    const std::string pool_tag    = "pool:"    + name;
+    const std::string replica_tag = "replica:" + name;
+    const std::string lane_tag    = "lane:"    + name;
+
+    std::string best_name;
+    int64_t best_last_used = 0;
+    bool best_set = false;
+
+    for (const auto & [key, inst] : mapping) {
+        const auto & meta = inst.meta;
+        const bool in_pool = meta.tags.count(pool_tag) || meta.tags.count(replica_tag) || meta.tags.count(lane_tag);
+        if (!in_pool) {
+            continue;
+        }
+        if (require_running && !meta.is_running()) {
+            continue;
+        }
+        if (!best_set || meta.last_used < best_last_used ||
+                (meta.last_used == best_last_used && meta.name < best_name)) {
+            best_name = meta.name;
+            best_last_used = meta.last_used;
+            best_set = true;
+        }
+    }
+
+    if (!best_set) {
+        return std::nullopt;
+    }
+
+    // Reserve immediately so concurrent router requests round-robin instead of
+    // racing into the same least-recently-used replica before proxy_request()
+    // updates last_used.
+    mapping[best_name].meta.last_used = ggml_time_ms();
+    return best_name;
+}
+
 static int get_free_port() {
 #ifdef _WIN32
     WSADATA wsaData;
@@ -1055,12 +1094,32 @@ static bool router_validate_model(std::string & name, server_models & models, bo
         res_err(res, format_error_response("model name is missing from the request", ERROR_TYPE_INVALID_REQUEST));
         return false;
     }
+
+    const std::string requested_name = name;
     auto meta = models.get_meta(name);
     if (!meta.has_value()) {
-        res_err(res, format_error_response(string_format("model '%s' not found", name.c_str()), ERROR_TYPE_INVALID_REQUEST));
+        // Replica pools allow several uniquely named model instances to expose one
+        // logical model name without alias conflicts. Tag the replicas with one of:
+        //   --tags pool:<name>
+        //   --tags replica:<name>
+        //   --tags lane:<name>
+        // The router chooses the least-recently-used running replica, falling back
+        // to an unloaded replica when autoload is enabled.
+        std::optional<std::string> replica = models.select_replica(requested_name, true);
+        if (!replica.has_value() && models_autoload) {
+            replica = models.select_replica(requested_name, false);
+        }
+        if (replica.has_value()) {
+            name = *replica;
+            meta = models.get_meta(name);
+            SRV_INF("resolved model pool '%s' to replica '%s'\n", requested_name.c_str(), name.c_str());
+        }
+    }
+    if (!meta.has_value()) {
+        res_err(res, format_error_response(string_format("model '%s' not found", requested_name.c_str()), ERROR_TYPE_INVALID_REQUEST));
         return false;
     }
-    // resolve alias to canonical model name
+    // resolve alias/pool to canonical model name
     name = meta->name;
     if (models_autoload) {
         models.ensure_model_ready(name);

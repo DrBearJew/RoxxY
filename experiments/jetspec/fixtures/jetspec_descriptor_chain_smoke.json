@@ -1,0 +1,26 @@
+{
+  "descriptors": [
+    {"id": "p5o_pre_round_snapshot", "phase": "snapshot_pre_round", "ready": true, "hash": 101, "actuals": {}},
+    {"id": "p5n_transaction_plan", "phase": "transaction_plan_scaffold", "ready": true, "hash": 102, "actuals": {}},
+    {"id": "p5p_transient_reservation", "phase": "reserve_transient_tree_pages", "rollback_point": "after_reserve", "ready": true, "hash": 103, "actuals": {"actual_pages_reserved": 0}},
+    {"id": "p5q_tree_build", "phase": "build_tree", "rollback_point": "after_build_tree", "ready": true, "hash": 104, "actuals": {"actual_tree_nodes": 0}},
+    {"id": "p5r_verify_mask", "phase": "build_verify_mask", "rollback_point": "after_verify_mask", "ready": true, "hash": 105, "actuals": {"actual_verify_mask_entries": 0}},
+    {"id": "p5s_accept_path", "phase": "accept_path", "rollback_point": "after_accept", "ready": true, "hash": 106, "actuals": {"actual_accepted_nodes": 0, "correction_token_present": 0}},
+    {"id": "p5t_token_commit", "phase": "commit_tokens", "rollback_point": "after_token_commit", "ready": true, "hash": 107, "actuals": {"actual_committed_tokens": 0}},
+    {"id": "p5u_hidden_kv_survivor_commit", "phase": "commit_hidden_kv_survivors", "rollback_point": "after_hidden_kv_commit", "ready": true, "hash": 108, "actuals": {"actual_survivor_pages_committed": 0}},
+    {"id": "p5v_rejected_branch_discard", "phase": "discard_rejected_branches", "rollback_point": "after_rejected_discard", "ready": true, "hash": 109, "actuals": {"actual_pages_discarded": 0, "rejected_branch_pages_reachable_after_discard": 0}},
+    {"id": "p5w_publish_gate", "phase": "publish_post_commit_state", "ready": true, "hash": 110, "actuals": {"actual_publish_visible_state": 0}}
+  ],
+  "runtime_boundary": {
+    "draft_head_graph_executed": false,
+    "draft_tokens_emitted": false,
+    "real_tree_built": false,
+    "real_verify_mask_built": false,
+    "real_accept_executed": false,
+    "real_token_commit_executed": false,
+    "real_kv_mutated": false,
+    "real_publish_executed": false,
+    "server_route_added": false,
+    "public_api_added": false
+  }
+}
