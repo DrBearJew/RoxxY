@@ -85,8 +85,17 @@ route vs **23.2 GiB** on Vulkan with f16 K, about **1.4 GiB less**.
 
 ![128k active MTP VRAM smoke](docs/assets/active-mtp-vram-128k-20260531-v3.png)
 
-Quality cost of `q4_0` V-cache vs full f16 V: perplexity ratio **1.002**
-(effectively unchanged), **97%** same top-token match on a WikiText-2 smoke.
+V-cache quality on a WikiText-2 smoke, relative to full f16 V:
+
+| V cache | PPL ratio vs f16 | Same top token | Notes |
+|---|---:|---:|---|
+| f16 | 1.000 (reference) | 100% | most VRAM, slowest |
+| **q4_0 (default)** | 1.002 | 97.1% | **fastest, smallest VRAM** |
+| q8_0 | **1.001** | **97.9%** | closest to f16, more VRAM than q4_0 |
+
+`q4_0` is the recommended default: it gives up a fraction of a percent of
+quality for the best speed and VRAM. Use `q8_0` if you have VRAM to spare and
+want to close that gap.
 
 ![WikiText-2 V-cache quality smoke](docs/assets/wikitext-v-cache-quality-20260531.png)
 
