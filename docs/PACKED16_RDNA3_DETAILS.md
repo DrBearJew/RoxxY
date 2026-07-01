@@ -244,6 +244,115 @@ LLAMA_MTP_PREFILL_CHUNK=1024  # match --ubatch-size
 ---
 
 
+## Benchmark details
+
+RX 7900 XTX / gfx1100, `llama-bench -fa 1 -ngl 99` unless noted. Record your
+ROCm and compiler versions when rerunning these numbers.
+
+### Long-context server smoke
+
+Qwen3.6 27B Q4_K_M MTP, `llama-server`, `ctx=49152`, `--cache-type-v q4_0`,
+`--cache-type-v-draft q4_0`, packed16/I32 K, production auto route on commit
+`0ea6db58e`.
+
+| Prompt / predict | Route | Prompt tok/s | Decode tok/s | SHA |
+|---|---|---:|---:|---|
+| 32k / tg128 | PWMMA BM64 i8-QK PV-WMMA DBV | **589.43** | 33.17 | `33fc0c55` |
+
+Route evidence: `selected=pwmma_bm64_i8qk_pvwmma_dbv`, `desc_layout=0`,
+packed16/I32 K, q4 V, no BM32 prefill route selected. Draft acceptance and very
+short tg32 runs are intentionally omitted from this table; these rows are
+route/hash/speed smoke tests, not acceptance-quality benchmarks.
+
+Route smoke snapshot from the same model/settings, pp32k-style prompt smoke
+(`tokens_evaluated=32768`):
+
+| K selection | V selection | Prompt tok/s | Decode tok/s | SHA | Notes |
+|---|---|---:|---:|---|---|
+| omit `--cache-type-k` → packed16 / 272B K | `q4_0` | ~583–589 | ~33 | `33fc0c55` | headline prefill path |
+| `--cache-type-k q8_0` or `q4_0` → packed8 / 144B K | `q4_0` | ~560–566 | ~31 | `33fc0c55` | smaller K, not faster yet |
+| q4 K | `q8_0` | ~550 | ~39 | `33fc0c55` | faster decode, slower prefill |
+| q4 K | `f16` | ~551 | ~38 | `33fc0c55` | faster decode, slower prefill |
+
+Older 8k clean auto-table smoke: prompt ~744 tok/s, decode ~51 tok/s, SHA `4219d799`.
+
+### Historical llama-bench prefill (`nq > 1`)
+
+| Model | Route | pp512 | pp1024 | pp2048 | pp4096 |
+|---|---|---:|---:|---:|---:|
+| 35B | DOT4-MMQ GQA1, historical/pinned | 2628 | 2541 | 2320 | 2050 |
+| 35B | DOT4-MMQ KSHARED, opt-in | 2649 | 2533 | — | — |
+| 35B | PWMMA BM32 reg-out direct-V, production auto | **2707** | **2633** | — | 2569* |
+| 35B | PWMMA BM16 | 2590 | 2394 | — | — |
+| 35B | PWMMA BM64 512t | 2612 | 2578 | — | — |
+| 27B | DOT4-MMQ GQA1, historical/pinned | 894 | — | — | — |
+| 27B | DOT4-MMQ KSHARED, opt-in | 905 | — | — | — |
+| 27B | PWMMA BM32 reg-out direct-V, production auto | **929** | — | — | — |
+| 27B | PWMMA BM64 512t | 922 | — | — | — |
+
+\* pp1024+ configuration.
+
+### Decode (`nq = 1`)
+
+Decode uses DOT4 decode kernels, not the prefill WMMA kernels.
+
+| Model | tg128, packed16 + DOT4 decode |
+|---|---:|
+| 35B | 92.8 tok/s |
+| 27B | 28.7 tok/s |
+
+Takeaways:
+
+- PWMMA BM64 i8-QK PV-WMMA DBV is the production auto packed16 prefill route
+  for target Qwen row/default shapes from `nk >= 512`; the first long prefill
+  chunk now goes BM64 DBV instead of BM32 direct-V.
+- Optional packed8/packed4 q4 K storage is operational and route-validated,
+  but current prefill expands q4 K to i8 before WMMA and is not faster than
+  the packed16 headline baseline.
+- DOT4-MMQ/PDMQ remains available for route-pinned validation, small-Q/MTP
+  roles, decode, and experimental V formats.
+- A clean upstream q8_0 VEC FA baseline table is still TODO; current tables
+  compare the packed16 route family and measured variants.
+
+### V-cache quality smoke
+
+Short WikiText-2 raw smoke on the 27B MTP model, `ctx=512`, `chunks=4`
+(~1020 evaluated tokens/candidate), all with `K=i32` and
+`selected=rocm_packed16_dot4_mmq`. This is a fast sanity check, not a full
+quality benchmark.
+
+![WikiText-2 V-cache quality smoke](assets/wikitext-v-cache-quality-20260531.png)
+
+| V cache | PPL / ratio vs f16 V | Mean KLD vs f16 V | Median KLD | Same top token |
+|---|---:|---:|---:|---:|
+| f16 | `5.6891 ± 0.4459` | baseline | baseline | baseline |
+| q4_0 | `1.00198 ± 0.00422` ratio | `0.004550 ± 0.000338` | `0.001818` | `97.06%` |
+| q8_0 | `1.00101 ± 0.00336` ratio | `0.002825 ± 0.000334` | `0.000863` | `97.94%` |
+
+Takeaway: q4_0 is the default compression choice; q8_0 is the higher-precision
+choice and is measurably closer to f16 V on this smoke.
+
+### 128k active MTP VRAM smoke
+
+A 128k-context server-ready VRAM smoke on the 27B MTP GGUF with active
+`draft-mtp`, `q4_0` V, and `--spec-draft-type-v q4_0`. The ROCm packed16 run
+omits main and draft K CLI overrides; the Vulkan comparison uses normal f16
+main K plus q4 V.
+
+![128k active MTP VRAM smoke](assets/active-mtp-vram-128k-20260531-v3.png)
+
+| Run | Total VRAM used | Delta over idle |
+|---|---:|---:|
+| ROCm packed16/I32 route + q4 V active MTP | `21.760 GiB` | `21.079 GiB` |
+| Vulkan f16 K + q4 V active MTP | `23.180 GiB` | `22.500 GiB` |
+
+Measured saving: Vulkan uses `+1.420 GiB` more total VRAM (`+1.422 GiB` delta
+over idle). ROCm route evidence included the packed16 DOT4/MMQ route and
+`PDMQ QK probe PASSED`.
+
+---
+
+
 ## Experiment journey
 
 This branch is the second-stage result of the DOT4 FlashAttention work. The
