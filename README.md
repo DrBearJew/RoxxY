@@ -4,20 +4,19 @@
 
 AMD-first `llama.cpp` fork for RDNA3 / gfx1100 GPUs (RX 7900 XTX and similar).
 
-Standard quantized-KV attention spends real prefill time unpacking 8-bit K
-values back to f16 inside the kernel, competing with the actual matmul for
-bandwidth. RoxxY stores K in a packed layout that RDNA3's matrix units can
-read directly with no unpack step, and auto-selects the fastest matching
-kernel at runtime.
+Standard quantized-KV attention unpacks 8-bit K values back to f16 inside the
+kernel, which competes with the matmul itself for bandwidth during prefill.
+RoxxY stores K in a packed layout that RDNA3's matrix units read directly,
+skipping that unpack step, and auto-selects the fastest matching kernel at
+runtime.
 
-Goals:
+The goal is to make RDNA3 consumer GPUs viable for long-context local
+inference without complicating the default path: build it, run it, and the
+runtime picks the fast route on its own. Experimental options, like the
+compact K-cache variant, are documented as what they are (smaller, not yet
+faster) rather than oversold.
 
-- Make RDNA3 consumer GPUs viable for long-context local inference.
-- Keep the default path simple: build, run, the runtime picks the fast route.
-- Don't oversell experimental options: the compact K-cache variant is
-  smaller, not (yet) faster, and the README says so.
-
-Use your normal GGUF models: this isn't a new model format, just a faster
+Use your normal GGUF models. This isn't a new model format, just a faster
 runtime.
 
 ## Quick start
