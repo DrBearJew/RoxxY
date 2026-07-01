@@ -87,8 +87,12 @@ Long-context server smoke, 27B MTP, 32k-token prompt: **~589 tok/s prefill**,
 VRAM at 128k context with active MTP (27B): **21.8 GiB** on the packed16
 route vs **23.2 GiB** on Vulkan with f16 K — about **1.4 GiB less**.
 
+![128k active MTP VRAM smoke](docs/assets/active-mtp-vram-128k-20260531-v3.png)
+
 Quality cost of `q4_0` V-cache vs full f16 V: perplexity ratio **1.002**
 (effectively unchanged), **97%** same top-token match on a WikiText-2 smoke.
+
+![WikiText-2 V-cache quality smoke](docs/assets/wikitext-v-cache-quality-20260531.png)
 
 Full benchmark tables, per-route breakdowns, and methodology are in the
 [technical notes](docs/PACKED16_RDNA3_DETAILS.md).
