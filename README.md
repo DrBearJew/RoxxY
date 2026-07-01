@@ -130,11 +130,29 @@ during development include GGUF releases from
 ## Learn more
 
 - [Technical notes](docs/PACKED16_RDNA3_DETAILS.md): how packed16 works,
-  kernel routes, full benchmark tables, debugging flags, and credits.
+  kernel routes, full benchmark tables, and debugging flags.
 
-This branch builds on [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
-and earlier RDNA3 attention prototyping; see the technical notes for the full
-list of prior work this owes credit to.
+## Credits
+
+This branch builds on:
+
+- [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp): base runtime,
+  ggml backends, FlashAttention, and upstream infrastructure.
+- [Indras-Mirror/llama.cpp-mtp](https://github.com/Indras-Mirror/llama.cpp-mtp):
+  MTP/TurboQuant fork foundation, tensor sharing, CUDA TBQ4 FA.
+- [DrBearJew/dot4-flash-attention](https://github.com/DrBearJew/dot4-flash-attention):
+  earlier DOT4 FlashAttention prototype, packed16 K-cache experiment notes,
+  and the path that led to this branch.
+- [adelj88/rocm_wmma_gemm](https://github.com/adelj88/rocm_wmma_gemm): RDNA3
+  rocWMMA GEMM reference, autotuner, config lookup, LDS buffering.
+- [ROCm/amd_matrix_instruction_calculator](https://github.com/ROCm/amd_matrix_instruction_calculator):
+  official AMD matrix-instruction calculator for WMMA shapes and throughput.
+- [Kaden-Schutt/hipfire](https://github.com/Kaden-Schutt/hipfire):
+  dispatch-screening and WMMA references.
+- [Stormrage34/llama.cpp-turboquant-hip](https://github.com/Stormrage34/llama.cpp-turboquant-hip):
+  AMD VEC TurboQuant-style path.
+- [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant):
+  original TurboQuant block-format reference.
 
 ## License
 
