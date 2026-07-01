@@ -22,6 +22,13 @@ runtime.
 
 ## Quick start
 
+Requirements:
+
+- ROCm HIP toolchain
+- rocWMMA headers/libraries available to CMake for the PWMMA path
+- gfx1100-class RDNA3 GPU (RX 7900 XTX is the primary target)
+- a normal GGUF model (see [Tested models](#tested-models))
+
 ```bash
 git clone https://github.com/DrBearJew/RoxxY
 cd RoxxY
@@ -57,6 +64,14 @@ For Qwen3.6 MTP models, add:
 Don't pass `--spec-default`: ngram speculative decoding doesn't work
 correctly on this build.
 
+Benchmark it yourself:
+
+```bash
+./build-rocm/bin/llama-bench \
+  -m /path/to/model.gguf \
+  -fa 1 -ngl 99 -p 512 -n 1
+```
+
 ## Recommended settings
 
 | Setting | Value | Why |
@@ -64,6 +79,10 @@ correctly on this build.
 | K cache | leave `--cache-type-k` unset | fastest validated path |
 | V cache | `--cache-type-v q4_0` | best speed/VRAM tradeoff |
 | MTP | `--spec-type draft-mtp` | working MTP path on this build |
+| PV4/V144 | automatic default | current fast V route, no flags needed |
+
+`q4_0` V only affects the `P @ V` side of attention; QK always uses the
+selected packed K path regardless of V precision.
 
 K cache comes in two sizes per row (D=256):
 
@@ -111,9 +130,11 @@ Full benchmark tables, per-route breakdowns, and methodology are in the
 
 ## Supported hardware
 
-Tested on RX 7900 XTX (gfx1100). Other RDNA3 cards are expected to work but
-aren't separately validated. RDNA2, RDNA4, CDNA, and CUDA GPUs are out of
-scope for this branch.
+Tested on RX 7900 XTX (gfx1100). Other RDNA3 cards (like the RX 7900 XT) are
+expected to work but aren't separately validated. RDNA4 (gfx12xx) is
+untested and may need its own route/compiler validation, not excluded by
+design. RDNA2, CDNA, and NVIDIA/CUDA are out of scope: this branch targets
+RDNA3 packed16/WMMA specifically.
 
 ## Tested models
 
