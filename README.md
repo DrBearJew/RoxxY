@@ -4,10 +4,21 @@
 
 AMD-first `llama.cpp` fork for RDNA3 / gfx1100 GPUs (RX 7900 XTX and similar).
 
-It speeds up long-context local inference on RDNA3 by storing the attention
-K-cache in a packed layout instead of raw f16, and auto-selects the fastest
-matching kernel at runtime. Use your normal GGUF models — this isn't a new
-model format, just a faster runtime.
+Standard quantized-KV attention spends real prefill time unpacking 8-bit K
+values back to f16 inside the kernel, competing with the actual matmul for
+bandwidth. RoxxY stores K in a packed layout that RDNA3's matrix units can
+read directly — no unpack step — and auto-selects the fastest matching kernel
+at runtime.
+
+Goals:
+
+- Make RDNA3 consumer GPUs viable for long-context local inference.
+- Keep the default path simple: build, run, the runtime picks the fast route.
+- Don't oversell experimental options — the compact K-cache variant is
+  smaller, not (yet) faster, and the README says so.
+
+Use your normal GGUF models — this isn't a new model format, just a faster
+runtime.
 
 ## Quick start
 
@@ -54,14 +65,32 @@ correctly on this build.
 | V cache | `--cache-type-v q4_0` | best speed/VRAM tradeoff |
 | MTP | `--spec-type draft-mtp` | working MTP path on this build |
 
-A smaller (but not currently faster) K cache is available via
-`--cache-type-k q4_0`, if VRAM is tighter than speed. See the
-[technical notes](docs/PACKED16_RDNA3_DETAILS.md) for the full breakdown.
+K cache comes in two sizes per row (D=256):
+
+| K cache | Setting | Row size | Notes |
+|---|---|---:|---|
+| packed16 (default) | leave `--cache-type-k` unset | 272 B | same size class as f16, fastest validated route |
+| packed8 | `--cache-type-k q4_0` | 144 B | half the size, not faster yet — use it for VRAM, not speed |
 
 ## Performance
 
-RX 7900 XTX, Qwen3.6 27B Q4_K_M MTP, 32k-token prompt: **~589 tok/s prefill**,
-**~33 tok/s decode**. Full benchmark tables and route names are in the
+RX 7900 XTX, `llama-bench -fa 1 -ngl 99`:
+
+| Model | Prefill (pp512) | Decode (tg128) |
+|---|---:|---:|
+| Qwen3.6 27B Q4_K_M | ~929 tok/s | ~28.7 tok/s |
+| Qwen3.6 35B-A3B MoE | ~2707 tok/s | ~92.8 tok/s |
+
+Long-context server smoke, 27B MTP, 32k-token prompt: **~589 tok/s prefill**,
+**~33 tok/s decode**.
+
+VRAM at 128k context with active MTP (27B): **21.8 GiB** on the packed16
+route vs **23.2 GiB** on Vulkan with f16 K — about **1.4 GiB less**.
+
+Quality cost of `q4_0` V-cache vs full f16 V: perplexity ratio **1.002**
+(effectively unchanged), **97%** same top-token match on a WikiText-2 smoke.
+
+Full benchmark tables, per-route breakdowns, and methodology are in the
 [technical notes](docs/PACKED16_RDNA3_DETAILS.md).
 
 ## Roadmap
