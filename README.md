@@ -1,4 +1,4 @@
-# RoxxY — RDNA3 Packed-K FlashAttention
+# RoxxY: RDNA3 Packed-K FlashAttention
 
 ![RoxxY](assets/github-social-preview.jpg)
 
@@ -7,17 +7,17 @@ AMD-first `llama.cpp` fork for RDNA3 / gfx1100 GPUs (RX 7900 XTX and similar).
 Standard quantized-KV attention spends real prefill time unpacking 8-bit K
 values back to f16 inside the kernel, competing with the actual matmul for
 bandwidth. RoxxY stores K in a packed layout that RDNA3's matrix units can
-read directly — no unpack step — and auto-selects the fastest matching kernel
-at runtime.
+read directly with no unpack step, and auto-selects the fastest matching
+kernel at runtime.
 
 Goals:
 
 - Make RDNA3 consumer GPUs viable for long-context local inference.
 - Keep the default path simple: build, run, the runtime picks the fast route.
-- Don't oversell experimental options — the compact K-cache variant is
+- Don't oversell experimental options: the compact K-cache variant is
   smaller, not (yet) faster, and the README says so.
 
-Use your normal GGUF models — this isn't a new model format, just a faster
+Use your normal GGUF models: this isn't a new model format, just a faster
 runtime.
 
 ## Quick start
@@ -54,7 +54,7 @@ For Qwen3.6 MTP models, add:
 --spec-draft-prio 2 --spec-draft-prio-batch 2
 ```
 
-Don't pass `--spec-default` — ngram speculative decoding doesn't work
+Don't pass `--spec-default`: ngram speculative decoding doesn't work
 correctly on this build.
 
 ## Recommended settings
@@ -70,22 +70,18 @@ K cache comes in two sizes per row (D=256):
 | K cache | Setting | Row size | Notes |
 |---|---|---:|---|
 | packed16 (default) | leave `--cache-type-k` unset | 272 B | same size class as f16, fastest validated route |
-| packed8 | `--cache-type-k q4_0` | 144 B | half the size, not faster yet — use it for VRAM, not speed |
+| packed8 | `--cache-type-k q4_0` or `q8_0` | 144 B | half the size, not faster yet; use it for VRAM, not speed |
 
 ## Performance
 
-RX 7900 XTX, `llama-bench -fa 1 -ngl 99`:
+RX 7900 XTX, Qwen3.6 27B Q4_K_M MTP, `--spec-type draft-mtp`:
 
-| Model | Prefill (pp512) | Decode (tg128) |
+| Context | Prefill | Decode |
 |---|---:|---:|
-| Qwen3.6 27B Q4_K_M | ~929 tok/s | ~28.7 tok/s |
-| Qwen3.6 35B-A3B MoE | ~2707 tok/s | ~92.8 tok/s |
-
-Long-context server smoke, 27B MTP, 32k-token prompt: **~589 tok/s prefill**,
-**~33 tok/s decode**.
+| 32k prompt | **~589 tok/s** | **~33 tok/s** |
 
 VRAM at 128k context with active MTP (27B): **21.8 GiB** on the packed16
-route vs **23.2 GiB** on Vulkan with f16 K — about **1.4 GiB less**.
+route vs **23.2 GiB** on Vulkan with f16 K, about **1.4 GiB less**.
 
 ![128k active MTP VRAM smoke](docs/assets/active-mtp-vram-128k-20260531-v3.png)
 
@@ -99,9 +95,9 @@ Full benchmark tables, per-route breakdowns, and methodology are in the
 
 ## Roadmap
 
-1. Paged attention for long-context throughput — the top priority, so speed
-   doesn't fall off as context grows.
-2. Faster packed8 (the compact K-cache option) — currently smaller, not faster.
+1. Paged attention for long-context throughput. Top priority: speed shouldn't
+   fall off as context grows.
+2. Faster packed8 (the compact K-cache option): currently smaller, not faster.
 3. Gemma support.
 
 ## Supported hardware
@@ -113,7 +109,7 @@ scope for this branch.
 ## Tested models
 
 Qwen3.6 27B, 35B-A3B, and 9B GGUFs, including MTP variants. Other model
-families are untested — GQA/MoE assumptions may not match. Model sources used
+families are untested: GQA/MoE assumptions may not match. Model sources used
 during development include GGUF releases from
 [llmfan46](https://huggingface.co/llmfan46),
 [HauhauCS](https://huggingface.co/HauhauCS),
@@ -124,7 +120,7 @@ during development include GGUF releases from
 
 ## Learn more
 
-- [Technical notes](docs/PACKED16_RDNA3_DETAILS.md) — how packed16 works,
+- [Technical notes](docs/PACKED16_RDNA3_DETAILS.md): how packed16 works,
   kernel routes, full benchmark tables, debugging flags, and credits.
 
 This branch builds on [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
